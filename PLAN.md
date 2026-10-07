@@ -88,8 +88,9 @@ r_texture_stream_*              (streaming de texturas)
   `CRenderDeviceVulkan::OnLowMemoryNotification` (expulsa texturas).
 - `Vr/FilterFidelityLevelsByGPUMemoryRatio 1`: descarta niveles de fidelidad que no caben.
 - Estimación (no medida) del proceso en Frame: ~6–7,5 GB.
-- **Vision Pro con memoria ampliada: ~8,1 GB disponibles** (incluye GPU; si se supera,
-  jetsam mata la app). Plan:
+- **Vision Pro con memoria ampliada: 8133 MB disponibles para la app (medido en el
+  dispositivo)**. Es el presupuesto total del proceso, GPU incluida; si se supera, jetsam
+  mata la app. Plan:
   - Pool de texturas por defecto ~2 GB (ajustable en el menú: calidad de texturas).
   - MoltenVK debe reportar en `VK_EXT_memory_budget` la memoria **disponible para el
     proceso** (`os_proc_available_memory`), no la RAM total.
