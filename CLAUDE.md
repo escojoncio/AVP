@@ -1,8 +1,8 @@
-# Instrucciones para Claude en este repo
+# Instructions for Claude in this repo
 
-- Lee **`PLAN.md`** antes de hacer nada: contiene la investigación, las decisiones y las fases.
-  Actualízalo cuando cambie una decisión o se complete un paso.
-- Trabaja en pasos pequeños con un commit por paso.
-- Nunca subas binarios ni contenido de Valve (`.so`, `.vpk`, carpetas del juego) al repo,
-  releases ni artefactos. El IPA solo lleva código del proyecto: todo lo del juego lo
-  descarga y adapta la app en el Vision Pro.
+- Read **`PLAN.md`** before doing anything: it holds the research, decisions and phases.
+  Update it whenever a decision changes or a step is completed.
+- Work in small steps, one commit per step.
+- Never push Valve binaries or content (`.so`, `.vpk`, game folders) to the repo,
+  releases or artifacts. The IPA only carries project code: everything from the game is
+  downloaded and adapted by the app on the Vision Pro.

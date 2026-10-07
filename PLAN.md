@@ -1,74 +1,74 @@
-# AVP — Plan de trabajo
+# AVP — Work plan
 
-Port de **Half-Life: Alyx** (build ARM64 nativa de Steam Frame) a **Apple Vision Pro**
-(visionOS, objetivo principal: Vision Pro M2), con un enfoque tipo Klepton.
+Port of **Half-Life: Alyx** (Steam Frame's native ARM64 build) to **Apple Vision Pro**
+(visionOS, main target: Vision Pro M2), using a Klepton-style approach.
 
-> Estado: **planificación**. Todavía no hay código. Este documento recoge todo lo decidido
-> e investigado para poder arrancar sin repetir la investigación.
-
----
-
-## 1. Objetivo
-
-Una app de visionOS (el IPA de este proyecto) que hace **todo desde el propio Vision Pro**,
-sin pasos en el PC:
-
-1. Inicia sesión en Steam (con Steam Guard / 2FA si hace falta).
-2. Pulsa **Descargar** y la app baja el juego de la propia cuenta del usuario
-   (contenido + binarios ARM64) a una **carpeta accesible por el usuario**.
-3. La app adapta los ficheros para que arranquen con este proyecto e incluye una
-   **pre-caché completa de shaders**.
-4. Un **menú de inicio** permite ajustar resolución, foveado, antialiasing y reescalado.
-5. Pulsa **Jugar**.
-
-Requisito principal: **buen rendimiento y nitidez en Vision Pro M2**, con un foveado
-parecido al de Steam Frame (centro nítido, periferia reducida) y regulable.
+> Status: **planning**. There is no code yet. This document collects everything that has
+> been decided and researched so work can start without repeating the research.
 
 ---
 
-## 2. Hechos verificados sobre el juego
+## 1. Goal
+
+A visionOS app (this project's IPA) that does **everything on the Vision Pro itself**,
+with no steps on a PC:
+
+1. Sign in to Steam (with Steam Guard / 2FA if needed).
+2. Tap **Download** and the app fetches the game from the user's own account
+   (content + ARM64 binaries) into a **user-accessible folder**.
+3. The app adapts the files so they launch with this project, including a
+   **full shader pre-cache**.
+4. A **launch menu** lets the user tune resolution, foveation, anti-aliasing and upscaling.
+5. Tap **Play**.
+
+Main requirement: **good performance and sharpness on Vision Pro M2**, with foveation
+similar to Steam Frame's (sharp centre, reduced periphery) and adjustable.
+
+---
+
+## 2. Verified facts about the game
 
 ### Depots (app 546560)
-| Depot  | Contenido                          | Notas |
+| Depot  | Content                            | Notes |
 |--------|------------------------------------|-------|
-| 546561 | Contenido común (~67 GB)           | Datos, sin código. Igual en todas las plataformas |
-| 546563 | Binarios Windows                   | **Solo x86-64** (comprobado: PE `0x8664`, sin metadatos ARM64EC) |
-| 546564 | Binarios Linux                     | Incluye **x86-64 y ARM64** en carpetas separadas |
+| 546561 | Shared content (~67 GB)            | Data, no code. Same on every platform |
+| 546563 | Windows binaries                   | **x86-64 only** (checked: PE `0x8664`, no ARM64EC metadata) |
+| 546564 | Linux binaries                     | Contains **x86-64 and ARM64** in separate folders |
 
-La app descarga **546561 + 546564** (de este último solo se usa la parte ARM64).
+The app downloads **546561 + 546564** (only the ARM64 part of the latter is used).
 
-### Estructura del depot Linux
+### Linux depot layout
 ```
-game/hlvr.sh                         # lanzador; recrea symlinks de libs
-game/bin/linuxsteamrt64/             # x86-64 (no se usa)
-game/bin/linuxsteamrtarm64/          # ARM64  <-- lo que portamos
+game/hlvr.sh                         # launcher; recreates library symlinks
+game/bin/linuxsteamrt64/             # x86-64 (unused)
+game/bin/linuxsteamrtarm64/          # ARM64  <-- what we port
 game/hlvr/bin/linuxsteamrtarm64/     # libclient.so, libserver.so, libhost.so
 ```
-Los symlinks de librerías (pares `enlace:destino` en la función `create_symlinks` de
-`hlvr.sh`) hay que recrearlos durante la preparación.
+The library symlinks (`link:target` pairs in the `create_symlinks` function of
+`hlvr.sh`) must be recreated during preparation.
 
-### Binarios ARM64 (comprobado)
-- ELF64 **aarch64**, enlazados contra **glibc** (versión máxima requerida `GLIBC_2.38`,
-  Steam Runtime). **No es Android/bionic** → Klepton necesita una capa glibc.
-- Dependencias clave:
+### ARM64 binaries (checked)
+- ELF64 **aarch64**, linked against **glibc** (highest required version `GLIBC_2.38`,
+  Steam Runtime). **Not Android/bionic** → Klepton needs a glibc layer.
+- Key dependencies:
   - `hlvr` → `libmimalloc.so`, `libstdc++.so.6`, `libc.so.6`
   - `libengine2.so` → `libm`, `libstdc++`, `libuuid.so.1`, `ld-linux-aarch64.so.1`,
     `libtier0`, `libvstdlib`, **`libsteam_api.so`**, `libc`
-  - `libvr.so` → **`libopenvr_api.so`** (VR por **OpenVR**, no OpenXR)
-  - `librendersystemvulkan.so` → **`libxcb.so.1`** (ventana X11), carga Vulkan
-    dinámicamente (0 imports `vk*` directos)
-- Driver Vulkan propio incluido: `libvulkan_freedreno_hlvr.so` + ICD
-  `freedreno_hlvr_icd.aarch64.json` (Turnip/Adreno, API 1.4). **Inútil en Apple** → se
-  sustituye por MoltenVK apuntando el loader a otro ICD.
-- Scripting: V8 (`libv8*.so`) y `libvscript.so`.
+  - `libvr.so` → **`libopenvr_api.so`** (VR through **OpenVR**, not OpenXR)
+  - `librendersystemvulkan.so` → **`libxcb.so.1`** (X11 window), loads Vulkan
+    dynamically (0 direct `vk*` imports)
+- Bundled Vulkan driver: `libvulkan_freedreno_hlvr.so` + ICD
+  `freedreno_hlvr_icd.aarch64.json` (Turnip/Adreno, API 1.4). **Useless on Apple** →
+  replaced by MoltenVK by pointing the loader at another ICD.
+- Scripting: V8 (`libv8*.so`) and `libvscript.so`.
 
-### Foveado y ajustes del motor (strings de los binarios)
-El render ya implementa foveado con:
-- `VK_EXT_fragment_density_map` y `VK_EXT_fragment_density_map_offset`
+### Foveation and engine settings (binary strings)
+The renderer already implements foveation with:
+- `VK_EXT_fragment_density_map` and `VK_EXT_fragment_density_map_offset`
   ("Using VK_EXT_fragment_density_map_offset for eyetracking support")
 - Flag `-vulkan_disable_ext_fragment_density_map`
 
-ConVars útiles encontradas:
+Useful ConVars found:
 ```
 vr_foveation_disable            vr_foveated_boundary
 vr_foveated_inner_scalar        vr_foveated_outer_scalar
@@ -76,255 +76,256 @@ vr_foveated_overlap             vr_fdm_offset (+ _debug, _flip_y)
 vr_msaa                         vr_msaa_submit
 vr_alternating_msaa_2x          vr_force_native_resolution
 vr_reprojection_cpu_auto        vr_vulkan_wait_fence_between_eyes
-r_texture_stream_*              (streaming de texturas)
+r_texture_stream_*              (texture streaming)
 ```
 
-### Memoria (gameinfo.gi + binarios)
-- `RenderSystem` en `game/hlvr/gameinfo.gi`: `DeckardTexturePoolSizeMB 2816` (Steam Frame =
-  "Deckard": ~2,75 GB de texturas), `MinStreamingPoolSizeMB 1536`,
+### Memory (gameinfo.gi + binaries)
+- `RenderSystem` in `game/hlvr/gameinfo.gi`: `DeckardTexturePoolSizeMB 2816` (Steam Frame =
+  "Deckard": ~2.75 GB of textures), `MinStreamingPoolSizeMB 1536`,
   `SetInitialStreamingPoolSizeFromBudget 1`, `VulkanUseStreamingTextureManager 1`.
-- Presupuesto dinámico vía `VK_EXT_memory_budget` (`r_texture_budget_dynamic`,
-  `r_texture_budget_threshold`), `-vr_gpu_memory_reserve_mb`, y
-  `CRenderDeviceVulkan::OnLowMemoryNotification` (expulsa texturas).
-- `Vr/FilterFidelityLevelsByGPUMemoryRatio 1`: descarta niveles de fidelidad que no caben.
-- Estimación (no medida) del proceso en Frame: ~6–7,5 GB.
-- **Vision Pro con memoria ampliada: 8133 MB disponibles para la app (medido en el
-  dispositivo)**. Es el presupuesto total del proceso, GPU incluida; si se supera, jetsam
-  mata la app. Plan:
-  - Pool de texturas por defecto = valor de Steam Frame (2816 MB); ajustable a la baja en
-    el menú (calidad de texturas). Se sabe que el juego cabe en este presupuesto incluso
-    con ajustes altos: la memoria **no** es el cuello de botella, el **framerate** sí.
-  - MoltenVK debe reportar en `VK_EXT_memory_budget` la memoria **disponible para el
-    proceso** (`os_proc_available_memory`), no la RAM total.
-  - Aviso de memoria de visionOS → `OnLowMemoryNotification` del motor.
-  - Contar el consumo propio (MoltenVK, textura foveada intermedia, MetalFX, runtime).
+- Dynamic budget via `VK_EXT_memory_budget` (`r_texture_budget_dynamic`,
+  `r_texture_budget_threshold`), `-vr_gpu_memory_reserve_mb`, and
+  `CRenderDeviceVulkan::OnLowMemoryNotification` (evicts textures).
+- `Vr/FilterFidelityLevelsByGPUMemoryRatio 1`: drops fidelity levels that don't fit.
+- Estimate (not measured) for the process on Frame: ~6–7.5 GB.
+- **Vision Pro with increased memory limit: 8133 MB available to the app (measured on
+  device)**. This is the whole process budget, GPU included; if exceeded, jetsam kills
+  the app. Plan:
+  - Default texture pool = Steam Frame value (2816 MB); can be lowered in the menu
+    (texture quality). The game is known to fit in this budget even at high settings:
+    memory is **not** the bottleneck, **framerate** is.
+  - MoltenVK must report the memory **available to the process**
+    (`os_proc_available_memory`) in `VK_EXT_memory_budget`, not total RAM.
+  - visionOS memory warning → the engine's `OnLowMemoryNotification`.
+  - Account for our own usage (MoltenVK, intermediate foveated texture, MetalFX, runtime).
 
-### Idioma (en los binarios ARM64)
-- Parámetros de arranque: `-language`, `-textlanguage` / `-textsublanguage`; claves
+### Language (in the ARM64 binaries)
+- Launch parameters: `-language`, `-textlanguage` / `-textsublanguage`; keys
   `AudioLanguage` / `AudioSubLanguage`, convar `cl_language`, search path `game_language`.
-- El motor también consulta `ISteamApps::GetCurrentGameLanguage` y
-  `GetAvailableGameLanguages` → el **shim de Steam** debe devolver el idioma elegido en el
-  menú y la lista disponible.
-- 28 idiomas de texto/subtítulos; **voces solo en inglés**. Un único selector (texto);
-  el audio se fija en inglés. Lista: info de la app en Steam y/o ficheros descargados.
+- The engine also queries `ISteamApps::GetCurrentGameLanguage` and
+  `GetAvailableGameLanguages` → the **Steam shim** must return the language picked in the
+  menu and the available list.
+- 28 text/subtitle languages; **voice-over in English only**. A single selector (text);
+  audio is fixed to English. List: Steam app info and/or downloaded files.
 
-### Resolución dinámica: Auto-Fidelity System (en los binarios ARM64)
-- `vr_fidelity_level` = nivel de una tabla (cada nivel = escala de resolución + MSAA;
+### Dynamic resolution: Auto-Fidelity System (in the ARM64 binaries)
+- `vr_fidelity_level` = a level from a table (each level = resolution scale + MSAA;
   log: "Level %d: Scale = %.3f Resolution = %d x %d").
-- `vr_fidelity_level_auto` ajusta el nivel según el tiempo de GPU por frame (CRITICAL /
+- `vr_fidelity_level_auto` adjusts the level from per-frame GPU time (CRITICAL /
   PREDICTIVE / MAX DROP, MIN INCREASE).
-- Ajustes: `vr_fidelity_threshold_frame_percent_{min,max,critical,extrapolation}`,
+- Settings: `vr_fidelity_threshold_frame_percent_{min,max,critical,extrapolation}`,
   `vr_fidelity_target_extra_ms`, `vr_fidelity_target_half_rate`,
   `vr_perf_mode_max_fidelity_level`, `vr_fidelity_memory_threshold`,
   `vr_fidelity_visualizer`, `vr_spew_fidelity_data`.
 - Flags: `-autofidelityconfig`, `-forcefidelitylevel`, `-noautofidelity`.
-- Requisitos para AVP: el runtime OpenVR debe dar **tiempos de GPU reales** por frame
-  (Metal/Compositor Services); la tabla se elige por fabricante de GPU (con MoltenVK =
-  Apple) → crear **tabla de niveles propia para M2** vía `-autofidelityconfig`.
-- Combina con MetalFX Spatial: resolución interna variable, salida fija.
+- Requirements for AVP: the OpenVR runtime must provide **real per-frame GPU times**
+  (Metal/Compositor Services); the table is chosen by GPU vendor (with MoltenVK = Apple) →
+  create an **M2-specific level table** via `-autofidelityconfig`.
+- Pairs with MetalFX Spatial: variable internal resolution, fixed output.
 
 ---
 
-## 3. Restricciones de la plataforma
+## 3. Platform constraints
 
-- **App nativa de visionOS.** AVP es siempre una app nativa propia. No se usa LiveContainer
-  ni ningún otro contenedor/host; como mucho se toman técnicas como referencia.
-- **Sin JIT en ningún caso.** visionOS solo ejecuta código firmado. Hay dos vías para
-  cargar el motor adaptado sin JIT, y la Fase 0 decide cuál se usa:
-  - **Opción 2 (preferida): firma en el dispositivo.** La app descarga los binarios ARM64,
-    los adapta y los **firma en el propio Vision Pro con el certificado de desarrollo
-    gratuito que SideStore genera para el Apple ID del usuario** (importado una vez en la
-    app desde SideStore) antes de cargarlos. IPA limpio de Valve, todo desde la app.
-    No está confirmado que visionOS lo acepte → Fase 0.
-  - **Instalación:** el usuario instala IPAs con **SideStore** (Apple ID gratuito, sin
-    cuenta de desarrollador de pago). Implicaciones:
-    - SideStore **refresca AVP cada 7 días** como cualquier app (lo que caduca es el
-      **perfil de aprovisionamiento**, no el certificado). Si el certificado no cambia, las
-      `.dylib` firmadas en el casco siguen siendo válidas. Si SideStore genera uno nuevo
-      (revocación, re-login, caducidad), AVP lo detecta al abrir, lo importa y **re-firma**
-      (segundos; sin repetir descarga ni conversión).
-    - La firma on-device solo necesita certificado + clave privada y un firmador de
-      código abierto (zsign/ldid, revisar licencia). **No** se reutiliza código de
-      SideStore ni se habla con Apple.
-    - Límites de cuenta gratuita: **3 apps activas** (SideStore cuenta como una) y
-      **10 App IDs / 7 días**. AVP debe costar solo **1 app + 1 App ID**: diseñarla
-      **sin app extensions** (cada una gasta un App ID extra). Firmar las `.dylib` en el
-      dispositivo y re-firmarlas no crea App IDs ni apps nuevas.
-    - Lo que importa es el **App ID**: mientras siga registrado, el usuario puede
-      desinstalar e instalar apps libremente para alternarlas. AVP **no necesita
-      StikDebug** (sin JIT).
-    - La Opción 1 también es compatible: SideStore firma el IPA con todo lo que lleve dentro.
-  - **Opción 1 (respaldo): motor adaptado dentro del IPA** (forma de Klepton). Conversión al
-    compilar, el código viaja firmado en la app. Funciona seguro, pero el IPA lleva código
-    de Valve: se genera desde la copia del usuario y no se comparte ni se publica. El
-    contenido (546561) se sigue descargando desde la app.
-  - Todo lo demás (runtime OpenVR, foveado, menú, descarga de contenido, shaders) es
-    idéntico en ambas opciones.
-- **Sin mirada.** visionOS no expone el gaze a las apps. El foveado será **fijo, centrado**
-  (no sigue los ojos). `vr_fdm_offset` queda sin uso.
-- **Foveado por defecto de Compositor Services** en apps Metal inmersivas = mapa estático
-  y suave. Por eso usamos un mapa propio (ver §5.3).
-- **Copyright:** el IPA y el repo **no contienen nada de Valve**. Todo lo del juego lo
-  descarga el usuario con su propia cuenta en su dispositivo.
+- **Native visionOS app.** AVP is always its own native app. No LiveContainer or any other
+  container/host is used; at most, techniques are taken as reference.
+- **No JIT, ever.** visionOS only runs signed code. There are two ways to load the adapted
+  engine without JIT, and Phase 0 decides which one is used:
+  - **Option 2 (preferred): on-device signing.** The app downloads the ARM64 binaries,
+    adapts them and **signs them on the Vision Pro itself with the free development
+    certificate SideStore generates for the user's Apple ID** (imported once into the app
+    from SideStore) before loading them. Valve-free IPA, everything from the app.
+    Not confirmed that visionOS accepts this → Phase 0.
+  - **Installation:** IPAs are installed with **SideStore** (free Apple ID, no paid
+    developer account). Implications:
+    - SideStore **refreshes AVP every 7 days** like any app (what expires is the
+      **provisioning profile**, not the certificate). If the certificate doesn't change,
+      the `.dylib`s signed on device remain valid. If SideStore issues a new one
+      (revocation, re-login, expiry), AVP detects it on launch, imports it and **re-signs**
+      (seconds; no re-download or re-conversion).
+    - On-device signing only needs certificate + private key and an open-source signer
+      (zsign/ldid, check licence). SideStore code is **not** reused and Apple is not
+      contacted.
+    - Free account limits: **3 active apps** (SideStore counts as one) and
+      **10 App IDs / 7 days**. AVP must cost only **1 app + 1 App ID**: design it
+      **without app extensions** (each one uses an extra App ID). Signing and re-signing
+      `.dylib`s on device creates no new App IDs or apps.
+    - What matters is the **App ID**: while it stays registered, the user can freely
+      uninstall and install apps to switch between them. AVP **does not need StikDebug**
+      (no JIT).
+    - Option 1 is compatible too: SideStore signs the IPA with everything inside it.
+  - **Option 1 (fallback): adapted engine inside the IPA** (Klepton's way). Conversion at
+    build time, code ships signed in the app. Guaranteed to work, but the IPA contains
+    Valve code: it is generated from the user's copy and is never shared or published.
+    Content (546561) is still downloaded from the app.
+  - Everything else (OpenVR runtime, foveation, menu, content download, shaders) is
+    identical in both options.
+- **No gaze.** visionOS doesn't expose gaze to apps. Foveation will be **fixed, centred**
+  (doesn't follow the eyes). `vr_fdm_offset` stays unused.
+- **Compositor Services default foveation** for immersive Metal apps = static, mild map.
+  That's why we use our own map (see §5.3).
+- **Copyright:** the IPA and the repo **contain nothing from Valve**. All game files are
+  downloaded by the user with their own account on their own device.
 
 ---
 
-## 4. Arquitectura
+## 4. Architecture
 
 ```
-[GitHub Actions macOS, solo manual o con [build]]
-  compila SOLO el código del proyecto (loader, runtime, MoltenVK, UI)
-  -> IPA sin contenido de Valve (Opción 2) / con el motor adaptado (Opción 1, privado)
+[GitHub Actions macOS, manual or [build] only]
+  builds ONLY the project's code (loader, runtime, MoltenVK, UI)
+  -> Valve-free IPA (Option 2) / with the adapted engine (Option 1, private)
 
-[Vision Pro, todo dentro de la app]
-  1. login Steam (2FA)
-  2. descarga depots 546561 + 546564 (manifests fijados a una versión probada)
-     -> carpeta accesible por el usuario (app Archivos: "En mi Vision Pro > AVP")
-  3. preparación: symlinks, ELF->Mach-O + firma on-device (Opción 2), pre-caché de shaders
-  4. menú de inicio -> juego
+[Vision Pro, all inside the app]
+  1. Steam login (2FA)
+  2. download depots 546561 + 546564 (manifests pinned to a tested version)
+     -> user-accessible folder (Files app: "On My Apple Vision Pro > AVP")
+  3. preparation: symlinks, ELF->Mach-O + on-device signing (Option 2), shader pre-cache
+  4. launch menu -> game
 ```
 
-### Carpeta del usuario
-- La app expone su carpeta de datos en **Archivos** (`UIFileSharingEnabled` +
+### User folder
+- The app exposes its data folder in **Files** (`UIFileSharingEnabled` +
   `LSSupportsOpeningDocumentsInPlace`).
-- Ahí se instalan los ficheros descargados y ahí el usuario puede **colocar sus propios
-  ficheros legales ya adaptados** para el arranque con este proyecto (alternativa a la
-  descarga/adaptación automática). La app detecta lo que hay y solo hace lo que falte.
-- Estructura propuesta:
+- Downloaded files are installed there, and the user can **place their own legally
+  obtained, already adapted files** there to launch with this project (alternative to the
+  automatic download/adaptation). The app detects what is present and only does what's
+  missing.
+- Proposed layout:
   ```
   AVP/
-    game/            # depots tal cual (contenido + ARM64)
-    adapted/         # binarios convertidos y firmados (generados o aportados)
-    cache/shaders/   # MSL compilado + MTLBinaryArchive
-    config/          # ajustes del menú + cfg generados para el juego
+    game/            # depots as-is (content + ARM64)
+    adapted/         # converted and signed binaries (generated or provided)
+    cache/shaders/   # compiled MSL + MTLBinaryArchive
+    config/          # menu settings + generated game cfg
     logs/
   ```
-- Los manifests quedan **fijados** a una versión probada para que una actualización de
-  Valve no rompa el juego; actualizar a una versión nueva es una acción explícita.
+- Manifests are **pinned** to a tested version so a Valve update can't break the game;
+  updating to a new version is an explicit action.
 
-### Componentes
-1. **Loader** — fork de Klepton con "personalidad" Linux/glibc: ELF→Mach-O (ejecutable
-   **en el dispositivo**), `ld-linux`, `libc`/`libm`/`libstdc++`/`libuuid` shims, TLS, `x18`
-   (Darwin lo pone a cero en cada excepción: revisar si el código de Valve lo usa).
-2. **Firma on-device** (solo Opción 2) — importar el certificado de SideStore y firmar los
-   Mach-O generados (y re-firmarlos cuando el certificado se renueve), dentro de AVP.
-3. **Vulkan** — MoltenVK (evaluar también KosmicKrisp si está maduro). Stub de `libxcb`.
-4. **Runtime OpenVR propio** (`libopenvr_api` sustituto) sobre **Compositor Services + ARKit**:
+### Components
+1. **Loader** — Klepton fork with a Linux/glibc "personality": ELF→Mach-O (runs
+   **on device**), `ld-linux`, `libc`/`libm`/`libstdc++`/`libuuid` shims, TLS, `x18`
+   (Darwin zeroes it on every exception: check whether Valve's code uses it).
+2. **On-device signing** (Option 2 only) — import the SideStore certificate and sign the
+   generated Mach-Os (and re-sign them when the certificate changes), inside AVP.
+3. **Vulkan** — MoltenVK (also evaluate KosmicKrisp if mature). `libxcb` stub.
+4. **Custom OpenVR runtime** (`libopenvr_api` replacement) on **Compositor Services + ARKit**:
    - `VR_InitInternal`, `VR_GetGenericInterface`, `VR_ShutdownInternal`, etc.
-   - `IVRSystem` (proyecciones, `GetRecommendedRenderTargetSize` = palanca de resolución real)
-   - `IVRCompositor` (submit por ojo → drawable, timing, pose prediction)
-   - `IVRInput` (mandos: PS VR2 Sense / mandos de juego vía GameController; manos vía ARKit)
-5. **Foveado** — traducción FDM → `MTLRasterizationRateMap` propio (§5.3).
-6. **Shim de Steam** — `libsteam_api` mínimo, solo para la copia del usuario.
-7. **Cliente Steam en Swift** — login (2FA/Steam Guard, refresh token en Keychain),
-   licencias, manifests, claves de depot, CDN, descarga reanudable.
-8. **App visionOS** — SwiftUI: login, descarga, preparación, menú, lanzamiento.
+   - `IVRSystem` (projections, `GetRecommendedRenderTargetSize` = real resolution lever)
+   - `IVRCompositor` (per-eye submit → drawable, timing, pose prediction)
+   - `IVRInput` (controllers: PS VR2 Sense / gamepads via GameController; hands via ARKit)
+5. **Foveation** — FDM → custom `MTLRasterizationRateMap` translation (§5.3).
+6. **Steam shim** — minimal `libsteam_api`, only for the user's own copy.
+7. **Swift Steam client** — login (2FA/Steam Guard, refresh token in Keychain),
+   licences, manifests, depot keys, CDN, resumable download.
+8. **visionOS app** — SwiftUI: login, download, preparation, menu, launch.
 
 ---
 
-## 5. Diseño de la app
+## 5. App design
 
-### 5.1 Flujo
-Login → Descargar (progreso, reanudable, comprobación de espacio libre ~70 GB+) →
-Preparar (adaptación + firma + shaders; puede tardar del orden de 10–15 min) → Menú → Jugar.
+### 5.1 Flow
+Login → Download (progress, resumable, free-space check ~70 GB+) →
+Prepare (adaptation + signing + shaders; may take around 10–15 min) → Menu → Play.
 
-### 5.2 Pre-caché de shaders
-- Recorrer los shaders Vulkan del contenido (SPIR-V en VPK), traducir **todos** a MSL y
-  compilarlos (`MTLLibrary`) tras la descarga.
-- Los PSO (combinaciones de estado) no se pueden precalcular al 100 %: guardar en
-  `MTLBinaryArchive` la primera vez y reutilizar.
-- El contenido trae `shaders_vulkan_*.vpk` (~1,25 GB) y una caché de pipelines Fossilize
-  (`vulkan_shader_cache.foz`, referenciada en `gameinfo.gi` como
-  `VulkanAdditionalShaderCache`) → reproducirla para precompilar también PSOs.
-- Invalidar caché si cambia el manifest o la versión de MoltenVK.
+### 5.2 Shader pre-cache
+- Walk the content's Vulkan shaders (SPIR-V in VPKs), translate **all** of them to MSL and
+  compile them (`MTLLibrary`) after download.
+- PSOs (state combinations) can't be fully precomputed: store them in a
+  `MTLBinaryArchive` the first time and reuse.
+- The content ships `shaders_vulkan_*.vpk` (~1.25 GB) and a Fossilize pipeline cache
+  (`vulkan_shader_cache.foz`, referenced in `gameinfo.gi` as
+  `VulkanAdditionalShaderCache`) → replay it to precompile PSOs as well.
+- Invalidate the cache if the manifest or the MoltenVK version changes.
 
-### 5.3 Foveado (objetivo: parecido a Steam Frame, pero fijo)
-- Renderizar a una **textura intermedia** con un `MTLRasterizationRateMap` propio y luego
-  componer en el drawable de Compositor Services.
-- Alimentar también las convars `vr_foveated_*` para que el motor reparta igual.
+### 5.3 Foveation (goal: similar to Steam Frame, but fixed)
+- Render to an **intermediate texture** with our own `MTLRasterizationRateMap`, then
+  composite into the Compositor Services drawable.
+- Also feed the `vr_foveated_*` convars so the engine distributes detail the same way.
 
-### 5.4 Menú de inicio (ajustes guardados, aplicados en cada arranque)
-| Ajuste | Opciones |
-|--------|----------|
-| **Resolución real** | % sobre nativa (vía `GetRecommendedRenderTargetSize` + cfg del juego) |
-| **Resolución dinámica** | On/Off · rango mín–máx · objetivo de margen (estable ↔ nítido) |
-| **Calidad de texturas** | Tamaño del pool de streaming (mín. 1536 MB; por defecto 2816 MB) |
-| **Idioma** | 28 idiomas de texto/subtítulos (voces siempre en inglés, único idioma con audio) |
-| **Foveado** | Desactivado / Suave / Medio (≈Steam Frame) / Fuerte / Personalizado |
-| ↳ Personalizado | Tamaño zona nítida · Calidad periferia · Suavidad transición |
-| **Antialiasing** | Off / MSAA 2x / MSAA 2x alterno (`vr_alternating_msaa_2x`) / MSAA 4x |
-| **Reescalado** | Ninguno / MetalFX Spatial / MetalFX Temporal (*experimental*) |
-| **Nitidez** | Slider (solo con MetalFX) |
+### 5.4 Launch menu (saved settings, applied on every launch)
+| Setting | Options |
+|---------|---------|
+| **Real resolution** | % of native (via `GetRecommendedRenderTargetSize` + game cfg) |
+| **Dynamic resolution** | On/Off · min–max range · headroom target (stable ↔ sharp) |
+| **Texture quality** | Streaming pool size (min 1536 MB; default 2816 MB) |
+| **Language** | 28 text/subtitle languages (voices always English, the only audio language) |
+| **Foveation** | Off / Light / Medium (≈Steam Frame) / Strong / Custom |
+| ↳ Custom | Sharp-zone size · Periphery quality · Transition smoothness |
+| **Anti-aliasing** | Off / MSAA 2x / Alternating MSAA 2x (`vr_alternating_msaa_2x`) / MSAA 4x |
+| **Upscaling** | None / MetalFX Spatial / MetalFX Temporal (*experimental*) |
+| **Sharpness** | Slider (MetalFX only) |
 
-- Esquema visual del reparto de calidad por ojo y **coste estimado** de la combinación.
-- MetalFX Temporal necesita vectores de movimiento que Alyx no genera (nunca tuvo TAA):
-  aproximarlos con profundidad + pose de cabeza → ghosting en objetos móviles. Desactivado
-  por defecto. Si se activa, el menú **desactiva MSAA** automáticamente.
-- MSAA + MetalFX Spatial: combinación válida (AA primero, reescalado después).
-- Los valores se escriben en los ficheros de configuración del propio juego + parámetros
-  del runtime.
+- Visual diagram of the per-eye quality distribution and the **estimated cost** of the
+  combination.
+- MetalFX Temporal needs motion vectors that Alyx doesn't generate (it never had TAA):
+  approximate them from depth + head pose → ghosting on moving objects. Off by default.
+  When enabled, the menu **turns MSAA off** automatically.
+- MSAA + MetalFX Spatial: valid combination (AA first, upscaling after).
+- Values are written to the game's own config files + runtime parameters.
 
 ---
 
-## 5.5 Prioridad: framerate
-El objetivo nº 1 es el framerate. Orden de trabajo:
-1. **Medir antes de optimizar:** HUD propio con tiempo de CPU (hilo principal y de render),
-   tiempo de GPU, fps y nivel de fidelidad. Saber si va limitado por CPU o por GPU.
-2. **Si es GPU:** foveado propio (§5.3), resolución real/dinámica, MSAA 2x alterno,
-   MetalFX Spatial. Es donde más se gana.
-3. **Si es CPU:** sobrecoste de MoltenVK por draw call y traducción de shaders en caliente;
-   mantener `MultiviewInstancing` (activo en gameinfo) para no duplicar draws por ojo,
-   pre-caché completa de shaders y PSOs, revisar sincronizaciones
+## 5.5 Priority: framerate
+Framerate is goal no. 1. Order of work:
+1. **Measure before optimising:** custom HUD with CPU time (main and render threads),
+   GPU time, fps and fidelity level. Find out whether it is CPU- or GPU-bound.
+2. **If GPU-bound:** custom foveation (§5.3), real/dynamic resolution, alternating MSAA 2x,
+   MetalFX Spatial. This is where most is gained.
+3. **If CPU-bound:** MoltenVK per-draw-call overhead and on-the-fly shader translation;
+   keep `MultiviewInstancing` (enabled in gameinfo) to avoid duplicating draws per eye,
+   full shader and PSO pre-cache, review synchronisation
    (`vr_vulkan_wait_fence_between_eyes`).
-4. **Reproyección:** entregar la profundidad al compositor de visionOS para que su
-   reproyección sea más estable cuando un frame llega tarde (equivalente a la depth
-   reprojection de Steam Frame).
+4. **Reprojection:** pass depth to the visionOS compositor so its reprojection is more
+   stable when a frame is late (equivalent to Steam Frame's depth reprojection).
 
-## 6. Fases
+## 6. Phases
 
-### Fase 0 — Verificar la firma on-device (bloqueante, barata)
-Prototipo mínimo nativo en visionOS, instalado con SideStore: importar el certificado
-desde SideStore, descargar un `.dylib`, firmarlo en el casco y cargarlo con `dlopen`, sin JIT.
-- **Funciona** → Opción 2 (todo desde la app, IPA sin nada de Valve).
-- **No funciona** → Opción 1 (motor adaptado dentro del IPA, ver §3).
+### Phase 0 — Verify on-device signing (blocking, cheap)
+Minimal native visionOS prototype, installed with SideStore: import the certificate from
+SideStore, download a `.dylib`, sign it on the headset and load it with `dlopen`, no JIT.
+- **Works** → Option 2 (everything from the app, Valve-free IPA).
+- **Doesn't work** → Option 1 (adapted engine inside the IPA, see §3).
 
-### Fase 1 — Que arranque y se juegue bien (prioridad)
-1. Scaffold del proyecto Xcode/visionOS + workflow CI (reglas de minutos, §7).
-2. Carpeta accesible en Archivos; el usuario coloca ahí los ficheros del juego.
-3. Fork de Klepton + capa glibc + conversión y firma on-device; cargar
+### Phase 1 — Boot and play well (priority)
+1. Xcode/visionOS project scaffold + CI workflow.
+2. Accessible folder in Files; the user places the game files there.
+3. Klepton fork + glibc layer + on-device conversion and signing; load
    `libtier0` → `libengine2` → `hlvr`.
-4. MoltenVK + stub `libxcb`; primer frame.
-5. Runtime OpenVR sobre Compositor Services/ARKit; estéreo + pose de cabeza.
-6. Input (mandos y/o manos).
-7. Foveado propio (§5.3) y menú de ajustes (§5.4).
-8. Pruebas y perfilado en Vision Pro M2.
+4. MoltenVK + `libxcb` stub; first frame.
+5. OpenVR runtime on Compositor Services/ARKit; stereo + head pose.
+6. Input (controllers and/or hands).
+7. Custom foveation (§5.3) and settings menu (§5.4).
+8. Testing and profiling on Vision Pro M2.
 
-### Fase 2 — Experiencia "descargar y jugar"
-1. Cliente Steam en Swift (login + 2FA, Keychain).
-2. Descarga de 546561 + 546564 fijada al manifest, reanudable, a la carpeta del usuario.
-3. Preparación automática + pre-caché completa de shaders.
-
----
-
-## 7. Contenido de Valve
-- **Nada de Valve** en git, releases ni artefactos (ver `.gitignore`). Con la Opción 2 el
-  IPA no contiene nada de Valve y el repo podría hacerse público (revisar historial antes).
-  Con la Opción 1 el IPA se genera solo de forma privada.
+### Phase 2 — "Download and play" experience
+1. Swift Steam client (login + 2FA, Keychain).
+2. Download of 546561 + 546564 pinned to the manifest, resumable, into the user folder.
+3. Automatic preparation + full shader pre-cache.
 
 ---
 
-## 8. Preguntas abiertas
-- ¿Funciona en visionOS la importación del certificado de SideStore + firma on-device +
-  `dlopen` sin JIT? (Fase 0)
-- Mandos objetivo: PS VR2 Sense vía GameController, mandos genéricos, o hand tracking.
-- Formato exacto de los shaders Vulkan en los VPK y si el build ARM64 trae caché propia.
-- Si Klepton upstream añade soporte glibc o JIT entretanto.
-- Uso de `x18` en el código de Valve (compilado para Linux, puede usarlo como registro libre).
-- Espacio: ~67 GB de contenido + binarios + caché de shaders en el Vision Pro.
+## 7. Valve content
+- **Nothing from Valve** in git, releases or artifacts (see `.gitignore`). With Option 2
+  the IPA contains nothing from Valve and the repo could be made public (review history
+  first). With Option 1 the IPA is only generated privately.
 
 ---
 
-## 9. Créditos técnicos a considerar
-Klepton · zsign (firma on-device, referencia) · MoltenVK · SPIRV-Cross ·
-OpenVR (headers) · SteamKit2 / DepotDownloader (referencia de protocolo) ·
+## 8. Open questions
+- Does importing the SideStore certificate + on-device signing + `dlopen` without JIT
+  work on visionOS? (Phase 0)
+- Target controllers: PS VR2 Sense via GameController, generic gamepads, or hand tracking.
+- Exact format of the Vulkan shaders in the VPKs and whether the ARM64 build ships its own
+  cache.
+- Whether upstream Klepton adds glibc or JIT support in the meantime.
+- Use of `x18` in Valve's code (built for Linux, may use it as a free register).
+- Storage: ~67 GB of content + binaries + shader cache on the Vision Pro.
+
+---
+
+## 9. Technical credits to consider
+Klepton · zsign (on-device signing, reference) · MoltenVK · SPIRV-Cross ·
+OpenVR (headers) · SteamKit2 / DepotDownloader (protocol reference) ·
 Apple Compositor Services / ARKit / MetalFX.
