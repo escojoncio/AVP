@@ -92,7 +92,8 @@ r_texture_stream_*              (streaming de texturas)
   dispositivo)**. Es el presupuesto total del proceso, GPU incluida; si se supera, jetsam
   mata la app. Plan:
   - Pool de texturas por defecto = valor de Steam Frame (2816 MB); ajustable a la baja en
-    el menú (calidad de texturas). Se sabe que el juego cabe en este presupuesto.
+    el menú (calidad de texturas). Se sabe que el juego cabe en este presupuesto incluso
+    con ajustes altos: la memoria **no** es el cuello de botella, el **framerate** sí.
   - MoltenVK debe reportar en `VK_EXT_memory_budget` la memoria **disponible para el
     proceso** (`os_proc_available_memory`), no la RAM total.
   - Aviso de memoria de visionOS → `OnLowMemoryNotification` del motor.
@@ -264,6 +265,20 @@ Preparar (adaptación + firma + shaders; puede tardar del orden de 10–15 min) 
   del runtime.
 
 ---
+
+## 5.5 Prioridad: framerate
+El objetivo nº 1 es el framerate. Orden de trabajo:
+1. **Medir antes de optimizar:** HUD propio con tiempo de CPU (hilo principal y de render),
+   tiempo de GPU, fps y nivel de fidelidad. Saber si va limitado por CPU o por GPU.
+2. **Si es GPU:** foveado propio (§5.3), resolución real/dinámica, MSAA 2x alterno,
+   MetalFX Spatial. Es donde más se gana.
+3. **Si es CPU:** sobrecoste de MoltenVK por draw call y traducción de shaders en caliente;
+   mantener `MultiviewInstancing` (activo en gameinfo) para no duplicar draws por ojo,
+   pre-caché completa de shaders y PSOs, revisar sincronizaciones
+   (`vr_vulkan_wait_fence_between_eyes`).
+4. **Reproyección:** entregar la profundidad al compositor de visionOS para que su
+   reproyección sea más estable cuando un frame llega tarde (equivalente a la depth
+   reprojection de Steam Frame).
 
 ## 6. Fases
 
