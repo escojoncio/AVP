@@ -79,6 +79,23 @@ vr_reprojection_cpu_auto        vr_vulkan_wait_fence_between_eyes
 r_texture_stream_*              (streaming de texturas)
 ```
 
+### Memoria (gameinfo.gi + binarios)
+- `RenderSystem` en `game/hlvr/gameinfo.gi`: `DeckardTexturePoolSizeMB 2816` (Steam Frame =
+  "Deckard": ~2,75 GB de texturas), `MinStreamingPoolSizeMB 1536`,
+  `SetInitialStreamingPoolSizeFromBudget 1`, `VulkanUseStreamingTextureManager 1`.
+- Presupuesto dinámico vía `VK_EXT_memory_budget` (`r_texture_budget_dynamic`,
+  `r_texture_budget_threshold`), `-vr_gpu_memory_reserve_mb`, y
+  `CRenderDeviceVulkan::OnLowMemoryNotification` (expulsa texturas).
+- `Vr/FilterFidelityLevelsByGPUMemoryRatio 1`: descarta niveles de fidelidad que no caben.
+- Estimación (no medida) del proceso en Frame: ~6–7,5 GB.
+- **Vision Pro con memoria ampliada: ~8,1 GB disponibles** (incluye GPU; si se supera,
+  jetsam mata la app). Plan:
+  - Pool de texturas por defecto ~2 GB (ajustable en el menú: calidad de texturas).
+  - MoltenVK debe reportar en `VK_EXT_memory_budget` la memoria **disponible para el
+    proceso** (`os_proc_available_memory`), no la RAM total.
+  - Aviso de memoria de visionOS → `OnLowMemoryNotification` del motor.
+  - Contar el consumo propio (MoltenVK, textura foveada intermedia, MetalFX, runtime).
+
 ### Idioma (en los binarios ARM64)
 - Parámetros de arranque: `-language`, `-textlanguage` / `-textsublanguage`; claves
   `AudioLanguage` / `AudioSubLanguage`, convar `cl_language`, search path `game_language`.
@@ -213,6 +230,9 @@ Preparar (adaptación + firma + shaders; puede tardar del orden de 10–15 min) 
   compilarlos (`MTLLibrary`) tras la descarga.
 - Los PSO (combinaciones de estado) no se pueden precalcular al 100 %: guardar en
   `MTLBinaryArchive` la primera vez y reutilizar.
+- El contenido trae `shaders_vulkan_*.vpk` (~1,25 GB) y una caché de pipelines Fossilize
+  (`vulkan_shader_cache.foz`, referenciada en `gameinfo.gi` como
+  `VulkanAdditionalShaderCache`) → reproducirla para precompilar también PSOs.
 - Invalidar caché si cambia el manifest o la versión de MoltenVK.
 
 ### 5.3 Foveado (objetivo: parecido a Steam Frame, pero fijo)
@@ -225,6 +245,7 @@ Preparar (adaptación + firma + shaders; puede tardar del orden de 10–15 min) 
 |--------|----------|
 | **Resolución real** | % sobre nativa (vía `GetRecommendedRenderTargetSize` + cfg del juego) |
 | **Resolución dinámica** | On/Off · rango mín–máx · objetivo de margen (estable ↔ nítido) |
+| **Calidad de texturas** | Tamaño del pool de streaming (mín. 1536 MB; por defecto ~2 GB) |
 | **Idioma** | 28 idiomas de texto/subtítulos (voces siempre en inglés, único idioma con audio) |
 | **Foveado** | Desactivado / Suave / Medio (≈Steam Frame) / Fuerte / Personalizado |
 | ↳ Personalizado | Tamaño zona nítida · Calidad periferia · Suavidad transición |
