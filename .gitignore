@@ -1,0 +1,18 @@
+# Nunca subir binarios ni contenido de Valve
+*.so
+*.so.*
+*.vpk
+*.vcs
+*.ipa
+ARM64/
+game/
+depot_*/
+linuxsteamrtarm64/
+linuxsteamrt64/
+
+# Build / Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
