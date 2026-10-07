@@ -91,7 +91,8 @@ r_texture_stream_*              (streaming de texturas)
 - **Vision Pro con memoria ampliada: 8133 MB disponibles para la app (medido en el
   dispositivo)**. Es el presupuesto total del proceso, GPU incluida; si se supera, jetsam
   mata la app. Plan:
-  - Pool de texturas por defecto ~2 GB (ajustable en el menú: calidad de texturas).
+  - Pool de texturas por defecto = valor de Steam Frame (2816 MB); ajustable a la baja en
+    el menú (calidad de texturas). Se sabe que el juego cabe en este presupuesto.
   - MoltenVK debe reportar en `VK_EXT_memory_budget` la memoria **disponible para el
     proceso** (`os_proc_available_memory`), no la RAM total.
   - Aviso de memoria de visionOS → `OnLowMemoryNotification` del motor.
@@ -246,7 +247,7 @@ Preparar (adaptación + firma + shaders; puede tardar del orden de 10–15 min) 
 |--------|----------|
 | **Resolución real** | % sobre nativa (vía `GetRecommendedRenderTargetSize` + cfg del juego) |
 | **Resolución dinámica** | On/Off · rango mín–máx · objetivo de margen (estable ↔ nítido) |
-| **Calidad de texturas** | Tamaño del pool de streaming (mín. 1536 MB; por defecto ~2 GB) |
+| **Calidad de texturas** | Tamaño del pool de streaming (mín. 1536 MB; por defecto 2816 MB) |
 | **Idioma** | 28 idiomas de texto/subtítulos (voces siempre en inglés, único idioma con audio) |
 | **Foveado** | Desactivado / Suave / Medio (≈Steam Frame) / Fuerte / Personalizado |
 | ↳ Personalizado | Tamaño zona nítida · Calidad periferia · Suavidad transición |
