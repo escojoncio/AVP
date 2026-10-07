@@ -1,13 +1,14 @@
 # AVP
 
-Port experimental de Half-Life: Alyx (build ARM64 de Steam Frame) a Apple Vision Pro.
+Experimental port of Half-Life: Alyx (Steam Frame's ARM64 build) to Apple Vision Pro.
 
-Requiere una copia legítima del juego en tu cuenta de Steam. Este repositorio no contiene
-ni distribuye binarios ni contenido de Valve.
+Requires a legitimate copy of the game on your Steam account. This repository does not
+contain or distribute any Valve binaries or content.
 
-Estado: en planificación — ver [`PLAN.md`](PLAN.md).
+Status: planning — see [`PLAN.md`](PLAN.md).
 
 ---
 
-Escrito por Claude sobre el gran trabajo de Klepton, MoltenVK, SPIRV-Cross y OpenVR; el
-propietario del repositorio solo aportó ideas sobre cómo adaptar algunas cosas.
+Written by Claude, building on the great work of Klepton, MoltenVK, SPIRV-Cross and
+OpenVR; the owner of this repository only contributed ideas on how some things could be
+adapted.

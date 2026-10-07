@@ -1,4 +1,4 @@
-# Nunca subir binarios ni contenido de Valve
+# Never commit Valve binaries or content
 *.so
 *.so.*
 *.vpk
