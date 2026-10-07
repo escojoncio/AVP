@@ -284,6 +284,9 @@ and vibration (GameController + ARKit accessory tracking). Goal: haptics that fe
 - **Capacitive touch** (`GCControllerLiveInput`, `touchedInput`; thumbstick, A/B,
   grip, trigger) → OpenVR skeletal/finger input so Alyx's hand poses follow the fingers.
   Analog proximity is **not** exposed by Apple → touch is binary; smooth the transitions.
+  Per-finger mapping: **thumb** ← thumbstick / A / B touch, **index** ← trigger touch +
+  analog trigger value, **middle/ring/pinky** ← grip touch + grip press. Index curl blends
+  touch (half-curl) with trigger value (full curl).
 - **Buttons:** triggers analog via `pressedInput.value`; PS button reserved by the system.
 - **Adaptive (resistive) triggers:** no public visionOS API confirmed for Sense controllers,
   and the game's OpenVR path doesn't use them → out of scope unless Apple exposes them.
