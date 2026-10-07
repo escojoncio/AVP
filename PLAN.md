@@ -267,6 +267,29 @@ Prepare (adaptation + signing + shaders; may take around 10–15 min) → Menu �
 
 ---
 
+### 5.6 PS VR2 Sense controllers (input + haptics)
+visionOS 26 supports PS VR2 Sense controllers with 6DoF tracking, capacitive finger touch
+and vibration (GameController + ARKit accessory tracking). Goal: haptics that feel exact.
+- **Haptics path:** the game requests haptics through OpenVR (`IVRInput::TriggerHapticVibrationAction`:
+  duration, frequency, amplitude; plus legacy `IVRSystem::TriggerHapticPulse`). The
+  runtime maps them to **Core Haptics** on each controller (`GCController.haptics`, one
+  engine per hand/locality):
+  - amplitude → intensity, frequency → sharpness (calibrated curve), duration → event
+    length; continuous events for long rumbles, transients for short pulses.
+  - **Low latency:** engines started and kept alive, pre-created
+    `CHHapticAdvancedPatternPlayer`s per hand, live updates with `sendParameters`, haptics
+    dispatched off the render thread; restart engines on reset/stop callbacks.
+  - Test map of the game's haptic events (gravity gloves, weapon fire, reload, damage,
+    object contact) to tune each one on device.
+- **Capacitive touch** (`GCControllerLiveInput`, `touchedInput`; thumbstick, A/B,
+  grip, trigger) → OpenVR skeletal/finger input so Alyx's hand poses follow the fingers.
+  Analog proximity is **not** exposed by Apple → touch is binary; smooth the transitions.
+- **Buttons:** triggers analog via `pressedInput.value`; PS button reserved by the system.
+- **Adaptive (resistive) triggers:** no public visionOS API confirmed for Sense controllers,
+  and the game's OpenVR path doesn't use them → out of scope unless Apple exposes them.
+- **Tracking:** controller pose from ARKit accessory tracking, with prediction aligned
+  to the compositor's frame timing.
+
 ## 5.5 Priority: framerate
 Framerate is goal no. 1. Order of work:
 1. **Measure before optimising:** custom HUD with CPU time (main and render threads),
@@ -316,7 +339,8 @@ SideStore, download a `.dylib`, sign it on the headset and load it with `dlopen`
 ## 8. Open questions
 - Does importing the SideStore certificate + on-device signing + `dlopen` without JIT
   work on visionOS? (Phase 0)
-- Target controllers: PS VR2 Sense via GameController, generic gamepads, or hand tracking.
+- Target controllers: PS VR2 Sense first (see §5.6); hand tracking as fallback.
+- Whether visionOS exposes Sense precision haptics beyond basic vibration (frequency range).
 - Exact format of the Vulkan shaders in the VPKs and whether the ARM64 build ships its own
   cache.
 - Whether upstream Klepton adds glibc or JIT support in the meantime.
