@@ -1,23 +1,14 @@
-# Log — AVP
+# Bitácora — AVP
 
-Half-Life: Alyx (Steam Frame ARM64 Linux build) as a native visionOS app for Apple Vision Pro, Klepton-style (Linux ARM64 ELF loaded natively, no CPU translation).
+## Estado (2026-10-13)
+- Plan rehecho en `PLAN.md` tras analizar Glovebox (MIT): todo en el visor (Steam oficial con
+  comprobación de propiedad, descarga ARM64, conversión `klepton_ld` en proceso, firma `vp_codesign`,
+  receta de pipelines), gráficos VPEngine, VPKTAA nativo con vectores de movimiento generados por
+  VPEngine (Alyx no tiene SpaceWarp), la app impone sus ajustes en cada arranque.
+- Fase 0 (firma on-device) resuelta: ya funciona en VisionQuestPro.
+- Sin código aún.
 
-## State
-- **No code yet.** The repository holds the plan only: `PLAN.md` (research, verified facts about the game binaries, platform constraints, architecture, app design, phases).
-- `CLAUDE.md`: repo rules (read PLAN.md first; one commit per step; never push Valve binaries or content).
-
-## Decisions recorded in PLAN.md
-- Native visionOS app; LiveContainer ruled out.
-- Everything main is downloaded by the app (Swift Steam client with 2FA), not from a PC; downloaded files go to a user-accessible folder in Files, where the user can also place their own adapted files.
-- Fixed strong foveation (Steam Frame-like), launch menu: real render resolution, foveation amount, antialiasing and MetalFX upscaling options; full shader pre-cache after download.
-- Framerate is the priority. Memory budget on the target device with Increased Memory Limit: 8133 MB.
-- PS VR2 Sense controllers (input + haptics) planned (§5.6).
-
-## Next step
-- **Phase 0 (blocking, cheap):** minimal visionOS prototype installed with SideStore — import SideStore's certificate, download a `.dylib`, sign it on the headset and `dlopen` it without JIT.
-  - Works → Option 2 (everything from the app, Valve-free IPA).
-  - Fails → Option 1 (adapted engine inside the IPA).
-- Then Phase 1 (scaffold + CI with `[build]`-only builds, user folder, Klepton fork + glibc layer, MoltenVK, OpenVR on Compositor Services/ARKit, input, foveation, menu).
-
-## Related
-- The FEX/JIT and memory work proven in AstroVisionPro (16 KB pages, SIGBUS on Darwin for permission faults, StikDebug JIT arena) is reusable if any translation layer is ever needed.
+## Siguiente
+- Fase 1: scaffold desde VisionQuestPro (copia propia de Klepton, CI solo `[build]`).
+- Antes de copiar el VPKTAA, revisar el estado más reciente de VisionQuestPro (se está terminando allí).
+- Huecos de VPEngine para Source 2: ver PLAN §5.1.
