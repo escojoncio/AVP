@@ -1,6 +1,7 @@
 // Guest dlopen/dlsym/dladdr, backed by klepton's own image registry.
 // The guest's dynamic-linking API maps almost one-to-one onto kl_load/kl_sym.
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -810,7 +811,13 @@ void *klb_dlopen(const char *path, int flags) {
     if (strchr(path, '/')) snprintf(full, sizeof full, "%s", path);
     else                   snprintf(full, sizeof full, "%s/%s", g_libdir, path);
 
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     kl_image *img = kl_load_recursive(full);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    // The whole guest dlopen (dependencies, translated dylibs, relocation, initialisers): boot-log accounting of
+    // where the load time goes (with kl_image.c's per-dylib dlopen times).
+    const double load_ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
     if (!img) {
         // Keep dlerror() SHORT and Android-shaped: a guest's own load-failure
         // path copies this into a fixed buffer sized for Android's terse
@@ -852,7 +859,7 @@ void *klb_dlopen(const char *path, int flags) {
         pthread_mutex_unlock(&g_lock);
         return NULL;
     }
-    fprintf(stderr, "  [klepton] guest dlopen(\"%s\") -> %p\n", path, (void *)img);
+    fprintf(stderr, "  [klepton] guest dlopen(\"%s\") -> %p (%.0f ms)\n", path, (void *)img, load_ms);
     return img;
 }
 

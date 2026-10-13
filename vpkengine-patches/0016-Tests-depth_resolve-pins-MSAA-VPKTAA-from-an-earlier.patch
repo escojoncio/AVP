@@ -1,0 +1,63 @@
+From 1a048b2021bc7ad74cd19c9f42e71e9df7bce6d5 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 16:39:02 +0000
+Subject: [PATCH 2/3] Tests: depth_resolve pins MSAA (VPKTAA from an earlier
+ test forced 1x); std::get_if instead of aborting
+
+---
+ gpu/vulkan/tests/vk_tests.cpp | 23 ++++++++++++++++++-----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index 98636ed..0cc2c50 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -1003,6 +1003,14 @@ void testAlyxSurface() {
+ // Depth/stencil resolve: render pass 2 (VkSubpassDescriptionDepthStencilResolve) and dynamic
+ // rendering both resolve the 4x depth attachment into the 1x target with the requested filter.
+ void testDepthResolve() {
++  // The resolves under test need real 4x images. "physical" leaves VPKTAA enabled through the host
++  // config API, and force_single_sample follows VPKTAA by default (VPKTAA does the AA), so the
++  // multisampled images below would be created at 1x and the resolves dropped. Pin it off here and
++  // put the default back on the way out.
++  vpvk_config_set_force_single_sample(0);
++  struct RestoreForce1x {
++    ~RestoreForce1x() { vpvk_config_set_force_single_sample(-1); }
++  } restoreForce1x;
+   Ctx c;
+   VkDeviceMemory m = alloc(c, 32 << 20, 0);
+   auto make = [&](VkFormat f, VkSampleCountFlagBits s, VkImageUsageFlags u) {
+@@ -1070,11 +1078,14 @@ void testDepthResolve() {
+   TranslateStats st;
+   translate(*from<CommandBuffer>(cb)->rec, frame, st);
+   CHECK(frame.commands().size() == 2 && st.dropped == 0);
+-  if (frame.commands().size() == 2) {
+-    const auto& a = std::get<vpgpu::RenderPass>(frame.commands()[0]).desc.depth;
++  const auto* pa = frame.commands().size() == 2 ? std::get_if<vpgpu::RenderPass>(&frame.commands()[0]) : nullptr;
++  const auto* pb = frame.commands().size() == 2 ? std::get_if<vpgpu::RenderPass>(&frame.commands()[1]) : nullptr;
++  CHECK(pa && pb);
++  if (pa && pb) {
++    const auto& a = pa->desc.depth;
+     CHECK(a.resolve == from<Image>(ss)->id && a.store == vpgpu::StoreAction::Resolve &&
+           a.depthResolve == vpgpu::Attachment::DepthResolve::Max);
+-    const auto& b = std::get<vpgpu::RenderPass>(frame.commands()[1]).desc.depth;
++    const auto& b = pb->desc.depth;
+     CHECK(b.resolve == from<Image>(ss)->id && b.store == vpgpu::StoreAction::Resolve &&
+           b.depthResolve == vpgpu::Attachment::DepthResolve::Min);
+   }
+@@ -1089,8 +1100,10 @@ void testDepthResolve() {
+   TranslateStats s2;
+   translate(*from<CommandBuffer>(cb)->rec, f2, s2);
+   CHECK(f2.commands().size() == 1);
+-  if (f2.commands().size() == 1) {
+-    const auto& p = std::get<vpgpu::RenderPass>(f2.commands()[0]);
++  const auto* pr = f2.commands().size() == 1 ? std::get_if<vpgpu::RenderPass>(&f2.commands()[0]) : nullptr;
++  CHECK(pr);
++  if (pr) {
++    const auto& p = *pr;
+     CHECK(p.draws.empty() && p.desc.depth.texture == from<Image>(ms)->id && p.desc.depth.load == vpgpu::LoadAction::Load &&
+           p.desc.depth.store == vpgpu::StoreAction::StoreAndResolve && p.desc.depth.resolve == from<Image>(ss)->id);
+   }
+-- 
+2.43.0
+

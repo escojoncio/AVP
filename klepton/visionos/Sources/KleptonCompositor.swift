@@ -594,6 +594,22 @@ final class KleptonCompositor {
     private let cmdLock = NSLock()
     private var cmdCompleted = 0
     private var cmdError: Error?
+    // Every composite command buffer that came back with an error (not only the first): build 12
+    // hung the GPU from the guest's queue and only one "InnocentVictim" was ever printed here, so
+    // whether the compositor's own work kept running afterwards could not be read. Counted under
+    // cmdLock; each new kind of error is printed (up to 16), and the count is in the alive line.
+    private var cmdErrors = 0
+    private var cmdErrorLast = ""
+    private var cmdErrorKinds = 0
+    // Eye picture probe: every `Self.eyeProbeEvery` composites with a picture, a handful of
+    // pixels of each texture the composite samples (and of the guest's own eye image when VPKTAA
+    // replaces it) are blitted to a shared buffer in a command buffer of their own and printed when
+    // it completes — no wait on this thread. Says whether "nothing visible" is a black, a
+    // transparent or a real picture before the composite.
+    private var eyeProbeCount = 0
+    private var probeItems: [(String, MTLTexture, Int)] = []   // this frame's, from every encodeViews call
+    private var eyeProbeBusy = false   // under cmdLock: one probe in flight at a time
+    private static let eyeProbeEvery = 450
     // Startup diagnostics for the signal-9 wall: what the last renderFrame saw,
     // surfaced into the alive report, plus a short per-frame trace of the first
     // few seconds so the log can say whether the loop keeps iterating and
@@ -1922,7 +1938,8 @@ final class KleptonCompositor {
             iterations += 1
             if Date() >= nextReport {
                 nextReport = Date().addingTimeInterval(0.5)
-                cmdLock.lock(); let done = cmdCompleted; cmdLock.unlock()
+                cmdLock.lock(); let done = cmdCompleted; let cmdErrs = cmdErrors; cmdLock.unlock()
+                let errNote: String = cmdErrs > 0 ? " (\(cmdErrs) with errors)" : ""
                 NSLog("[cp] alive: \(iterations) iters, \(presented) with a picture, "
                       + "\(blackFrames) black, guest=\(kl_app_guest_state()), "
                       + "bail(frame/drawable/pipeline)="
@@ -1930,7 +1947,7 @@ final class KleptonCompositor {
                       // committed vs completed: if these diverge and stay
                       // diverged, the GPU is waiting on the guest's fence and
                       // nothing is being drawn at all.
-                      + "cmdbuf \(done)/\(cmdCommitted) done"
+                      + "cmdbuf \(done)/\(cmdCommitted) done" + errNote
                       + " fence=\(lastGlFenceSeen) layers=\(lastProjLayersSeen) enc=\(lastEncodedSeen)"
                       + (fenceBacklogSkips > 0 ? " fence-skips \(fenceBacklogSkips)" : "")
                       + (noFence ? " (NOFENCE)" : ""))
@@ -1952,6 +1969,105 @@ final class KleptonCompositor {
         } else if syncGuest { kl_app_lifecycle_report() } else { kl_app_guest_stop() }
         // VisionQuestPro: the space is gone — bring the launcher back (or exit).
         Task { @MainActor in Lifecycle.immersiveEnded() }
+    }
+
+    /// Bytes per pixel of the formats the eye probe can read raw (0: not probed).
+    private static func probeBytes(_ f: MTLPixelFormat) -> Int {
+        switch f {
+        case .rgba8Unorm, .rgba8Unorm_srgb, .bgra8Unorm, .bgra8Unorm_srgb, .rgb10a2Unorm, .bgr10a2Unorm,
+             .rg11b10Float, .rgb9e5Float:
+            return 4
+        case .rgba16Float, .rgba16Unorm: return 8
+        case .rgba32Float: return 16
+        default: return 0
+        }
+    }
+
+    /// The eye picture probe: 5 pixels (centre, and the centres of the four quadrants) of every
+    /// texture in `items` (name, texture, slice), copied by a blit in a command buffer of its own on
+    /// the compositor's queue and printed from its completion handler, raw bytes in the format's
+    /// own channel order. All zero = black AND transparent; alpha 00 with colour = transparent.
+    private func probeEyes(_ items: [(String, MTLTexture, Int)]) {
+        guard let q = queue else { return }
+        cmdLock.lock()
+        if eyeProbeBusy { cmdLock.unlock(); return }
+        eyeProbeBusy = true
+        cmdLock.unlock()
+        var seen: [ObjectIdentifier] = []
+        var jobs: [(String, MTLTexture, Int, Int)] = []   // name, texture, slice, bytes per pixel
+        var skipped: [String] = []
+        for (name, t, slice) in items {
+            let id = ObjectIdentifier(t)
+            if seen.contains(id) { continue }
+            seen.append(id)
+            let bpp = Self.probeBytes(t.pixelFormat)
+            let slices = t.textureType == .type2DArray ? t.arrayLength : 1
+            if bpp == 0 || t.storageMode == .memoryless || t.sampleCount > 1 || t.width < 4 || t.height < 4
+                || (t.textureType != .type2D && t.textureType != .type2DArray) || slice >= slices {
+                skipped.append("\(name) fmt \(t.pixelFormat.rawValue) type \(t.textureType.rawValue) "
+                               + "\(t.width)x\(t.height) storage \(t.storageMode.rawValue) not probed")
+                continue
+            }
+            jobs.append((name, t, slice, bpp))
+        }
+        let points = [(1, 1), (1, 3), (3, 1), (3, 3), (2, 2)]   // in quarters of the size
+        let stride = 16
+        guard !jobs.isEmpty,
+              let buf = q.device.makeBuffer(length: jobs.count * points.count * stride, options: .storageModeShared),
+              let cb = q.makeCommandBuffer() else {
+            cmdLock.lock(); eyeProbeBusy = false; cmdLock.unlock()
+            if !skipped.isEmpty { NSLog("[cp] eye probe #\(eyeProbeCount): " + skipped.joined(separator: "; ")) }
+            return
+        }
+        cb.label = "klepton eye probe"
+        // The same guest-frame wait as this frame's composite (`cmd`, renderFrame): without it the
+        // blit can read the eye before the guest has finished drawing it and report a false zero.
+        if let w = taaWait { cb.encodeWaitForEvent(w.0, value: w.1) }
+        guard let blit = cb.makeBlitCommandEncoder() else {
+            cmdLock.lock(); eyeProbeBusy = false; cmdLock.unlock()
+            return
+        }
+        blit.label = "klepton eye probe"
+        for (j, job) in jobs.enumerated() {
+            let t = job.1
+            for (k, p) in points.enumerated() {
+                blit.copy(from: t, sourceSlice: job.2, sourceLevel: 0,
+                          sourceOrigin: MTLOrigin(x: t.width * p.0 / 4, y: t.height * p.1 / 4, z: 0),
+                          sourceSize: MTLSize(width: 1, height: 1, depth: 1),
+                          to: buf, destinationOffset: (j * points.count + k) * stride,
+                          destinationBytesPerRow: job.3, destinationBytesPerImage: job.3)
+            }
+        }
+        blit.endEncoding()
+        let n = eyeProbeCount
+        let serial = kl_vulkan_frame_serial()
+        let done = jobs, notProbed = skipped, count = points.count   // immutable for the handler
+        cb.addCompletedHandler { [weak self] c in
+            var line = "[cp] eye probe #\(n) (guest frame \(serial))"
+            if let e = c.error { line += " FAILED: \((e as NSError).localizedDescription)" } else {
+                let base = buf.contents()
+                for (j, job) in done.enumerated() {
+                    var allZero = true
+                    var px: [String] = []
+                    for k in 0..<count {
+                        let p = base.advanced(by: (j * count + k) * stride).assumingMemoryBound(to: UInt8.self)
+                        var hex = ""
+                        for b in 0..<job.3 {
+                            if p[b] != 0 { allZero = false }
+                            hex += String(format: "%02x", p[b])
+                        }
+                        px.append(hex)
+                    }
+                    line += " | \(job.0) \(job.1.width)x\(job.1.height) s\(job.2) fmt \(job.1.pixelFormat.rawValue): "
+                          + px.joined(separator: " ") + (allZero ? " ALL ZERO" : "")
+                }
+            }
+            if !notProbed.isEmpty { line += " | " + notProbed.joined(separator: "; ") }
+            NSLog("%@", line)
+            guard let self else { return }
+            self.cmdLock.lock(); self.eyeProbeBusy = false; self.cmdLock.unlock()
+        }
+        cb.commit()
     }
 
     /// What each swapchain stage actually holds, per report interval.
@@ -2520,6 +2636,13 @@ final class KleptonCompositor {
             drawable.encodePresent(commandBuffer: cmd)
         }
 
+        // Eye picture probe, once per frame with every view's textures (see eyeProbeEvery).
+        if !probeItems.isEmpty {
+            eyeProbeCount += 1
+            if eyeProbeCount == 30 || eyeProbeCount % Self.eyeProbeEvery == 0 { probeEyes(probeItems) }
+            probeItems.removeAll(keepingCapacity: true)
+        }
+
         // The one thing worth saying out loud about the decoupling: how long
         // the guest took to put anything in a drawable. Under the old inline
         // shape this could not be measured, because the loop did not run until
@@ -2544,7 +2667,21 @@ final class KleptonCompositor {
             let n = self.cmdCompleted
             let first = self.cmdError == nil && b.error != nil
             if first { self.cmdError = b.error }
+            var newKind: String? = nil
+            if let e = b.error {
+                self.cmdErrors += 1
+                let d = (e as NSError).localizedDescription
+                if d != self.cmdErrorLast && self.cmdErrorKinds < 16 {
+                    self.cmdErrorLast = d
+                    self.cmdErrorKinds += 1
+                    newKind = d
+                }
+            }
+            let errs = self.cmdErrors
             self.cmdLock.unlock()
+            if let d = newKind, !first {
+                NSLog("[cp] composite command buffer error #\(errs) (new kind): \(d)")
+            }
             if n <= 12 { NSLog("[cp] cmdbuf #\(n) COMPLETED" + (b.error != nil ? " err=\(b.error!)" : "")) }
             if first { NSLog("[cp] composite command buffer error: \(b.error!)") }
         }
@@ -2866,6 +3003,7 @@ final class KleptonCompositor {
         // parallel to `uniforms` and must be appended to on every path through
         // the loop, including the ones that skip a view.
         var sources: [MTLTexture?] = []
+        var probe: [(String, MTLTexture, Int)] = []   // eye picture probe (see eyeProbeEvery)
         var visible = 0
         for vi in viewIndices {
             let view = drawable.views[vi]
@@ -2919,7 +3057,12 @@ final class KleptonCompositor {
             u.visible = alloc == nil ? 0 : 1
             uniforms.append(u)
             sources.append(alloc?.texture)
+            if let al = alloc {
+                probe.append((taaOut[vi] != nil ? "vpktaa\(vi)" : "eye\(vi)", al.texture, al.slice))
+                if taaOut[vi] != nil, let g = a { probe.append(("guest\(vi)", g.texture, g.slice)) }
+            }
         }
+        probeItems += probe   // probed once per frame, in renderFrame (a per-view path calls this per eye)
 
         // The two texture slots the shader has, and which view reaches which.
         //

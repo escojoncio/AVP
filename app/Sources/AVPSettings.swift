@@ -293,6 +293,16 @@ final class AVPSettings: ObservableObject {
             env += [("KL_CAPTURE_DIR", logs.path), ("VP_DUMP_FRAME", "600"), ("VP_DUMP_DIR", logs.path)]
         }
         if let driver = AVPLaunch.driverPath { env.append(("KL_MVK_DYLIB", driver)) }
+        // VPKEngine's persistent pipeline caches (recipes + Metal binary archive) and whether a full prewarm already
+        // filled them for this VPVulkan build and this pipeline list (then neither the launcher nor the game replays).
+        if engine == .vpkengine {
+            let cache = AVPPipelineCache.configure(data: p.dataDir, pipelines: p.pipelines, engine: engine.rawValue)
+            env.append(("VP_PIPELINE_CACHE_DIR", cache.dir.path))
+            if cache.archiveOff { env.append(("VP_PIPELINE_ARCHIVE", "0")) }
+            env.append(("KL_VK_FOZ_GAME_REPLAY", cache.warm ? "0" : "1"))
+        } else {
+            AVPPipelineCache.current = nil
+        }
 
         var text = "# Written by AVP at every launch from the app's settings. Do not edit: the app rewrites it.\n"
         for (k, v) in env { text += "\(k)=\(v)\n" }

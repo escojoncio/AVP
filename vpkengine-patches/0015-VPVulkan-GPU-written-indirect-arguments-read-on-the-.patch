@@ -1,0 +1,823 @@
+From 02b1f3f3da87194b105eaccbf46744a5e2eeb849 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 16:39:02 +0000
+Subject: [PATCH 1/3] VPVulkan: GPU-written indirect arguments read on the GPU
+ (metal2 fix-up kernel: count, multiview, clamp), CPU-path clamps, per-encoder
+ hang diagnostics, command queue recovery
+
+Alyx (build 12) hung the GPU on its first scene frame: indirect draw arguments
+written by the GPU were read on the CPU at submit (stale/garbage counts), then
+Metal ignored every later submission.
+---
+ gpu/core/include/vpgpu/core/commands.h    |  11 +-
+ gpu/core/src/commands.cpp                 |  14 +-
+ gpu/metal2/src/metal_backend.mm           | 337 ++++++++++++++++++++++
+ gpu/vulkan/src/commands.cpp               | 111 +++++++
+ gpu/vulkan/src/commands.h                 |   6 +
+ gpu/vulkan/src/sync.cpp                   |  10 +
+ gpu/vulkan/src/vpvk.h                     |   3 +
+ integrations/shadps4/gpu/src/renderer.cpp |   4 +-
+ 8 files changed, 490 insertions(+), 6 deletions(-)
+
+diff --git a/gpu/core/include/vpgpu/core/commands.h b/gpu/core/include/vpgpu/core/commands.h
+index ade3b8a..636aac5 100644
+--- a/gpu/core/include/vpgpu/core/commands.h
++++ b/gpu/core/include/vpgpu/core/commands.h
+@@ -144,6 +144,13 @@ enum class Winding : uint8_t { CounterClockwise, Clockwise };  // which winding
+ struct Indirect {
+   BufferId buffer;
+   uint64_t offset = 0;
++  // Draws (gpu/metal2): `drawCount` commands `stride` bytes apart (Vulkan multiDrawIndirect),
++  // optionally capped by the 32-bit count at `countBuffer`+`countOffset` (vkCmdDraw*IndirectCount).
++  // `viewCount` > 1: multiview by instancing, so instanceCount and firstInstance are multiplied by
++  // it on the GPU before Metal reads them (gpu/metal2 runs a fix-up kernel into its own scratch).
++  uint32_t drawCount = 1, stride = 0, viewCount = 1;
++  BufferId countBuffer;  // null: drawCount draws
++  uint64_t countOffset = 0;
+ };
+ 
+ // Depth/stencil state set per draw (Vulkan dynamic state) instead of the pipeline's. Same
+@@ -179,8 +186,8 @@ struct Draw {
+   float depthBias = 0, depthBiasSlope = 0, depthBiasClamp = 0;
+   bool depthClamp = false;
+   std::vector<ViewBinding> views;
+-  // Set: first/count/instances/baseVertex come from the buffer (count stays the upper bound of the
+-  // index range read, for hazards). gpu/metal only.
++  // Set: first/count/instances/baseVertex come from the buffer (the whole index buffer is then a
++  // hazard read). gpu/metal (one draw) and gpu/metal2 (Indirect::drawCount draws).
+   std::optional<Indirect> indirect;
+ };
+ 
+diff --git a/gpu/core/src/commands.cpp b/gpu/core/src/commands.cpp
+index 7a248e9..0adba79 100644
+--- a/gpu/core/src/commands.cpp
++++ b/gpu/core/src/commands.cpp
+@@ -98,13 +98,23 @@ std::vector<Access> attachmentAccesses(const RenderPassDesc& d) {
+ 
+ std::vector<Access> drawAccesses(const Draw& d) {
+   std::vector<Access> out = d.bindings;
+-  if (d.index) {
++  if (d.index && d.indirect) {
++    // The GPU picks the index range: the whole buffer is read.
++    out.push_back(read(ResourceRange::wholeBuffer(d.index->buffer), stage::vertex));
++  } else if (d.index) {
+     const uint64_t stride = d.index->wide ? 4 : 2;
+     out.push_back(read(ResourceRange::bytes(d.index->buffer, d.index->offset + uint64_t{d.first} * stride,
+                                             uint64_t{d.count} * stride),
+                        stage::vertex));
+   }
+-  if (d.indirect) out.push_back(read(ResourceRange::bytes(d.indirect->buffer, d.indirect->offset, d.index ? 20 : 16), stage::vertex));
++  if (d.indirect) {
++    const uint64_t one = d.index ? 20 : 16;
++    const uint64_t n = d.indirect->drawCount ? d.indirect->drawCount : 1;
++    const uint64_t span = (n - 1) * uint64_t{d.indirect->stride} + one;
++    out.push_back(read(ResourceRange::bytes(d.indirect->buffer, d.indirect->offset, span), stage::vertex));
++    if (d.indirect->countBuffer)
++      out.push_back(read(ResourceRange::bytes(d.indirect->countBuffer, d.indirect->countOffset, 4), stage::vertex));
++  }
+   return out;
+ }
+ 
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 491fdf9..f1dab5b 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -58,6 +58,15 @@ constexpr MTLResourceOptions kSharedUntracked = MTLResourceStorageModeShared | M
+ constexpr uint64_t kArgRingBytes = 1 << 20;   // per frame slot
+ constexpr uint64_t kArgAlign = 256;           // safe offset alignment for buffer bindings on every GPU
+ constexpr NSUInteger kMaxSamples = 2048;      // timestamp samples per frame slot (2 per sub-encoder)
++// Indirect draws whose arguments the GPU writes (Draw::indirect): rewritten per frame slot by the
++// fix-up kernel into Metal's layout. 16-byte diagnostic header, then 20 (indexed) or 16 bytes per
++// draw: 1 MiB holds ~52k draws a frame.
++constexpr uint64_t kIndirectScratchBytes = 8 << 20;  // per frame slot; IndirectCount reserves maxDrawCount
++constexpr uint64_t kIndirectHeader = 16;
++// Same limits as VPVulkan's submit-time path (commands.cpp): past them a draw is garbage that would
++// trip the GPU watchdog, so the kernel turns it into an empty draw and counts it.
++constexpr uint32_t kIndirectMaxCount = 1u << 25;
++constexpr uint32_t kIndirectMaxInstances = 1u << 20;
+ 
+ MTLPixelFormat pixelFormat(Format f) {
+   switch (f) {
+@@ -347,6 +356,7 @@ struct MetalBackend::Impl {
+   // Per frame in flight: things the GPU may still read until that frame completes.
+   struct Slot {
+     id<MTLBuffer> args;
++    id<MTLBuffer> indirect;  // fix-up kernel output (kIndirectScratchBytes)
+     id<MTLCounterSampleBuffer> samples;
+     std::vector<id<MTLFence>> fences;
+     std::vector<id> retired;  // destroyed resources kept alive until the slot is reused
+@@ -388,6 +398,20 @@ struct MetalBackend::Impl {
+   id<MTLSamplerState> blitSamplers[2];  // nearest, linear
+   std::unordered_set<std::string> blitWarned;  // reasons already logged
+   id<MTLRenderPipelineState> blitPipeline(MTLPixelFormat format, std::string& error);
++  // Indirect fix-up kernel (GPU-written draw arguments), built on first use. Submit thread only.
++  id<MTLComputePipelineState> indirectFix;
++  bool indirectFixFailed = false;
++  std::atomic<uint64_t> indirectClampedFrames{0};
++  id<MTLComputePipelineState> indirectFixPipeline(std::string& error);
++  // A command buffer that hung the GPU leaves the queue refusing work ("Ignored (for causing
++  // prior/excessive GPU errors)", every later frame: build 12 showed 6700 of them and no picture).
++  // The completion handler raises this; the next submit replaces the queue (bounded).
++  std::atomic<bool> queueRefused{false};
++  // Bumped on every queue swap: only an error from a command buffer of the CURRENT queue asks for another
++  // (the old queue's frames still in flight all come back SubmissionsIgnored).
++  std::atomic<uint32_t> queueGen{0};
++  uint32_t queueRebuilds = 0;
++  std::atomic<uint32_t> hangReports{0};
+ 
+   // pipelineMutex guards only the maps (the submit thread takes it every frame, so it is never
+   // held across a Metal compile). archiveMutex guards the session's binary archive: adding to it
+@@ -568,6 +592,8 @@ void MetalBackend::Impl::init() {
+   for (Slot& s : slots) {
+     s.args = [device newBufferWithLength:kArgRingBytes options:kSharedUntracked];
+     s.args.label = @"vpgpu.args";
++    s.indirect = [device newBufferWithLength:kIndirectScratchBytes options:kSharedUntracked];
++    s.indirect.label = @"vpgpu.indirect";
+     if (!stageSamples) continue;
+     MTLCounterSampleBufferDescriptor* sd = [MTLCounterSampleBufferDescriptor new];
+     sd.counterSet = timestamps;
+@@ -839,6 +865,50 @@ void MetalBackend::prewarmShader(uint64_t shaderId) {
+ }
+ 
+ namespace {
++// Indirect fix-up: one thread per Vulkan draw command of one indirect batch. Reads the arguments
++// (and the optional draw count) where the GPU wrote them, applies the count, the multiview instance
++// multiplication and the garbage limits, and writes Metal's indirect arguments (same field order as
++// Vulkan's: count, instances, first, [baseVertex,] baseInstance). Buffers are bound at a 256-byte
++// aligned offset and indexed in words from there (srcWord/countWord), so no binding is misaligned.
++constexpr const char* kIndirectFixMsl = R"(#include <metal_stdlib>
++using namespace metal;
++struct VpFix {
++    uint srcWord, strideWords, maxCount, indexed;
++    uint viewCount, hasCount, countWord, dstWord;
++    uint maxIndices, maxInstances, pad0, pad1;
++};
++kernel void vp_indirect_fix(device const uint* src [[buffer(0)]], device const uint* cnt [[buffer(1)]],
++                            device uint* dst [[buffer(2)]], device atomic_uint* diag [[buffer(3)]],
++                            constant VpFix& p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
++    if (i >= p.maxCount) return;
++    const uint words = p.indexed ? 5u : 4u;
++    device uint* o = dst + p.dstWord + i * words;
++    uint n = p.maxCount;
++    if (p.hasCount) n = min(n, cnt[p.countWord]);
++    if (i >= n) {
++        for (uint k = 0; k < words; ++k) o[k] = 0u;
++        return;
++    }
++    device const uint* a = src + p.srcWord + i * p.strideWords;
++    uint count = a[0], inst = a[1];
++    if (count > p.maxIndices || inst > p.maxInstances) {
++        atomic_fetch_add_explicit(&diag[0], 1u, memory_order_relaxed);
++        atomic_fetch_max_explicit(&diag[1], count, memory_order_relaxed);
++        atomic_fetch_max_explicit(&diag[2], inst, memory_order_relaxed);
++        count = 0u, inst = 0u;
++    }
++    o[0] = count;
++    o[1] = inst * p.viewCount;
++    o[2] = a[2];
++    if (p.indexed) {
++        o[3] = a[3];
++        o[4] = a[4] * p.viewCount;
++    } else {
++        o[3] = a[3] * p.viewCount;
++    }
++}
++)";
++
+ // Sampled blit: a triangle covering the viewport (the destination rect); `rect` maps the
+ // viewport's unit square to source UVs (origin, size; a negative size mirrors).
+ constexpr const char* kBlitMsl = R"(#include <metal_stdlib>
+@@ -861,6 +931,26 @@ fragment float4 vp_blit_fs(VpBlitV in [[stage_in]], texture2d<float> src [[textu
+ )";
+ }  // namespace
+ 
++id<MTLComputePipelineState> MetalBackend::Impl::indirectFixPipeline(std::string& error) {
++  if (indirectFix || indirectFixFailed) {
++    if (!indirectFix) error = "failed_before";
++    return indirectFix;
++  }
++  MTLCompileOptions* o = [MTLCompileOptions new];
++  o.languageVersion = MTLLanguageVersion3_0;
++  NSError* e = nil;
++  id<MTLLibrary> lib = [device newLibraryWithSource:@(kIndirectFixMsl) options:o error:&e];
++  id<MTLFunction> f = lib ? [lib newFunctionWithName:@"vp_indirect_fix"] : nil;
++  indirectFix = f ? [device newComputePipelineStateWithFunction:f error:&e] : nil;
++  if (!indirectFix) {
++    indirectFixFailed = true;  // logged once by the caller; those draws are then skipped
++    error = str(e);
++  } else {
++    info("gpu.indirect fix_kernel=ready");
++  }
++  return indirectFix;
++}
++
+ id<MTLRenderPipelineState> MetalBackend::Impl::blitPipeline(MTLPixelFormat format, std::string& error) {
+   if (auto it = blitPipelines.find(NSUInteger(format)); it != blitPipelines.end()) {
+     if (!it->second) error = "pipeline_failed";
+@@ -1038,6 +1128,19 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
+ 
+ namespace {
+ 
++// What one core encoder of a frame did, kept until the frame completes so that a GPU fault or hang
++// names the pass: target, draw count, largest direct draw/dispatch, indirect draws, and the
++// pipelines it bound (their labels carry the guest's shader names and the ".mv" motion variant).
++struct EncDiag {
++  char kind = 'c';  // 'r' render, 'c' compute/copy
++  uint32_t draws = 0, indirect = 0, layers = 1, width = 0, height = 0;
++  uint64_t maxWork = 0;  // render: count x instances; compute: groups
++  NSUInteger color0 = 0, depth = 0;
++  std::string label;
++  std::vector<id> states;  // distinct pipeline states, first kMaxDiagStates
++};
++constexpr size_t kMaxDiagStates = 6;
++
+ // The Metal encoder currently open. A core compute encoder becomes compute and blit encoders as
+ // its items alternate between dispatches and copies (M4: one MTL4ComputeCommandEncoder does both).
+ struct Open {
+@@ -1292,6 +1395,21 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     return;
+   }
+   dispatch_semaphore_wait(inFlight, DISPATCH_TIME_FOREVER);
++  if (queueRefused.exchange(false) && queueRebuilds < 16) {
++    // A fresh queue (fences only order work inside one queue: the frontier's go with the old one).
++    id<MTLCommandQueue> q = [device newCommandQueue];
++    if (q) {
++      ++queueRebuilds;
++      q.label = [NSString stringWithFormat:@"vpgpu.r%u", queueRebuilds];
++      if (residency) [q addResidencySet:residency];
++      queue = q;
++      ++queueGen;
++      frontier.clear();
++      info("gpu.recover what=new_queue n=" + std::to_string(queueRebuilds) + " f=" + std::to_string(frameIndex));
++    } else {
++      err("what=recover_queue_failed f=%llu", (unsigned long long)frameIndex);
++    }
++  }
+   // Consecutive command buffers use different slots, so the frontier carried over from the
+   // previous one never holds a fence this one updates.
+   Slot& slot = slots[submits++ % slots.size()];
+@@ -1318,6 +1436,19 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   uint8_t* argBase = static_cast<uint8_t*>(slot.args.contents);
+   uint64_t argUsed = 0;
+   uint32_t missingPipelines = 0, missingResources = 0, argOverflow = 0;
++  // Indirect fix-up output of this frame (the slot's previous frame has completed: its header and
++  // entries are free to overwrite). Draw (command, item) -> byte offset of its first entry.
++  uint64_t indirectUsed = kIndirectHeader;
++  uint32_t indirectOverflow = 0, indirectDraws = 0;
++  std::unordered_map<uint64_t, uint64_t> fixOffsets;
++  if (slot.indirect) std::memset(slot.indirect.contents, 0, kIndirectHeader);
++  auto diag = std::make_shared<std::vector<EncDiag>>(compiled.encoders.size());
++  auto noteState = [](EncDiag& g, id st) {
++    if (!st || g.states.size() >= kMaxDiagStates) return;
++    for (id x : g.states)
++      if (x == st) return;
++    g.states.push_back(st);
++  };
+   size_t fenceUsed = 0;
+   NSUInteger sampleUsed = 0;
+   // Per core encoder: first start sample and last end sample (NSNotFound = unsampled).
+@@ -1661,6 +1792,93 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     return encoded;
+   };
+ 
++  // Indirect draws of render encoder `e` whose arguments the GPU writes: a compute encoder of their
++  // own, ordered after everything unordered so far (the frontier, which it leaves in place for the
++  // render encoder's own wait), rewrites them into slot.indirect. Returns the fence the render
++  // encoder waits on before its vertex stage (nil: nothing encoded; such draws are then skipped).
++  auto encodeIndirectFix = [&](uint32_t e, const Encoder& enc) -> id<MTLFence> {
++    std::vector<std::pair<uint32_t, uint32_t>> items;
++    for (uint32_t ci : enc.commands) {
++      const auto& draws = std::get<RenderPass>(cmds[ci]).draws;
++      for (uint32_t j = 0; j < draws.size(); ++j)
++        if (draws[j].indirect && !compiled.skipped(ci, j)) items.push_back({ci, j});
++    }
++    if (items.empty() || !slot.indirect) return nil;
++    std::string why;
++    id<MTLComputePipelineState> ps = indirectFixPipeline(why);
++    if (!ps) {
++      static bool logged = false;
++      if (!logged) logged = true, err("what=indirect_fix_pipeline error=%s", token(why).c_str());
++      return nil;
++    }
++    id<MTLComputeCommandEncoder> fx = [cb computeCommandEncoder];
++    if (!fx) {
++      err("what=indirect_fix_encoder f=%llu enc=%u", (unsigned long long)frameIndex, e);
++      return nil;
++    }
++    fx.label = [NSString stringWithFormat:@"indirect_fix%u", e];
++    for (id<MTLFence> f : frontier) [fx waitForFence:f];
++    [fx setComputePipelineState:ps];
++    [fx setBuffer:slot.indirect offset:0 atIndex:2];
++    [fx setBuffer:slot.indirect offset:0 atIndex:3];  // diagnostic header (words 0..2)
++    struct Fix {
++      uint32_t srcWord, strideWords, maxCount, indexed;
++      uint32_t viewCount, hasCount, countWord, dstWord;
++      uint32_t maxIndices, maxInstances, pad0, pad1;
++    };
++    // Binds buffer `which` at a 256-byte aligned offset of its MTLBuffer; `word` is where it starts from there.
++    auto bindAligned = [&](BufferId which, uint64_t at, NSUInteger index, uint32_t& word) -> bool {
++      uint64_t off = 0;
++      id<MTLBuffer> mb = buffer(BufferSpan{which, at, 0, 0, 0}, off);
++      if (!mb || off % 4) return false;
++      const uint64_t base = off & ~uint64_t{255};
++      [fx setBuffer:mb offset:base atIndex:index];
++      word = uint32_t((off - base) / 4);
++      return true;
++    };
++    for (const auto& [ci, j] : items) {
++      const Draw& d = std::get<RenderPass>(cmds[ci]).draws[j];
++      const Indirect& in = *d.indirect;
++      const uint32_t words = d.index ? 5 : 4;
++      const uint32_t n = std::max(1u, in.drawCount);
++      const uint64_t bytes = uint64_t{n} * words * 4;
++      if (indirectUsed + bytes > kIndirectScratchBytes) {
++        ++indirectOverflow;
++        continue;
++      }
++      Fix fp{};
++      fp.strideWords = in.stride / 4;
++      fp.maxCount = n;
++      fp.indexed = d.index ? 1 : 0;
++      fp.viewCount = std::max(1u, in.viewCount);
++      fp.maxIndices = kIndirectMaxCount;
++      fp.maxInstances = kIndirectMaxInstances;
++      fp.dstWord = uint32_t(indirectUsed / 4);
++      if (in.stride % 4 || !bindAligned(in.buffer, in.offset, 0, fp.srcWord)) {
++        ++missingResources;
++        continue;
++      }
++      if (in.countBuffer) {
++        if (!bindAligned(in.countBuffer, in.countOffset, 1, fp.countWord)) {
++          ++missingResources;
++          continue;
++        }
++        fp.hasCount = 1;
++      } else {
++        [fx setBuffer:slot.indirect offset:0 atIndex:1];  // bound, never read
++      }
++      [fx setBytes:&fp length:sizeof fp atIndex:4];
++      [fx dispatchThreadgroups:MTLSizeMake((n + 63) / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
++      fixOffsets[(uint64_t{ci} << 32) | j] = indirectUsed;
++      indirectUsed += bytes;
++      ++indirectDraws;
++    }
++    id<MTLFence> f = nextFence();
++    [fx updateFence:f];
++    [fx endEncoding];
++    return f;
++  };
++
+   size_t b = 0;  // cursor into compiled.barriers (sorted by encoder, item)
+   for (uint32_t e = 0; e < compiled.encoders.size(); ++e) {
+     const Encoder& enc = compiled.encoders[e];
+@@ -1675,6 +1893,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     close();
+ 
+     if (enc.kind == Encoder::Kind::Render) {
++      id<MTLFence> fixFence = encodeIndirectFix(e, enc);
+       MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+       std::unordered_map<uint64_t, size_t> taken;
+       // Tile-local attachments render into a memoryless stand-in: same shape, no memory.
+@@ -1747,6 +1966,17 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         continue;
+       }
+       opened([NSString stringWithFormat:@"render%u", e], boundary, before);
++      if (fixFence) [open.render waitForFence:fixFence beforeStages:MTLRenderStageVertex];
++      {
++        EncDiag& g = (*diag)[e];
++        g.kind = 'r';
++        g.layers = enc.pass.layerCount;
++        id<MTLTexture> t0 = rp.colorAttachments[0].texture, td = rp.depthAttachment.texture;
++        if (t0) g.color0 = t0.pixelFormat;
++        if (td) g.depth = td.pixelFormat;
++        if (id<MTLTexture> t = t0 ? t0 : td) g.width = uint32_t(t.width), g.height = uint32_t(t.height);
++        if (!enc.commands.empty()) g.label = std::get<RenderPass>(cmds[enc.commands[0]]).desc.label;
++      }
+       if (dumping) {
+         DumpItem it;
+         it.what = "render";
+@@ -1798,6 +2028,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+           }
+           useBound();
+           [open.render setRenderPipelineState:p->render];
++          {
++            EncDiag& g = (*diag)[e];
++            ++g.draws;
++            noteState(g, p->render);
++            if (d.indirect) ++g.indirect;
++            else g.maxWork = std::max(g.maxWork, uint64_t{d.count} * d.instances);
++          }
+           [open.render setDepthStencilState:d.depthStencil ? dynamicDepthStencil(*d.depthStencil) : p->depth];
+           [open.render setCullMode:d.cull ? (*d.cull == uint8_t(CullMode::Front) ? MTLCullModeFront
+                                              : *d.cull == uint8_t(CullMode::Back) ? MTLCullModeBack
+@@ -1825,6 +2062,21 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+               continue;
+             }
+             const uint64_t stride = d.index->wide ? 4 : 2;
++            if (d.indirect) {
++              const auto fo = fixOffsets.find((uint64_t{ci} << 32) | j);
++              if (fo == fixOffsets.end()) {
++                ++missingResources;
++                continue;
++              }
++              for (uint32_t k = 0; k < std::max(1u, d.indirect->drawCount); ++k)
++                [open.render drawIndexedPrimitives:primitiveType(d.primitive)
++                                         indexType:d.index->wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
++                                       indexBuffer:ib
++                                 indexBufferOffset:off
++                                    indirectBuffer:slot.indirect
++                              indirectBufferOffset:fo->second + uint64_t{k} * 20];
++              continue;
++            }
+             [open.render drawIndexedPrimitives:primitiveType(d.primitive)
+                                     indexCount:d.count
+                                      indexType:d.index->wide ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+@@ -1833,6 +2085,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+                                  instanceCount:d.instances
+                                     baseVertex:d.baseVertex
+                                   baseInstance:d.baseInstance];
++          } else if (d.indirect) {
++            const auto fo = fixOffsets.find((uint64_t{ci} << 32) | j);
++            if (fo == fixOffsets.end()) {
++              ++missingResources;
++              continue;
++            }
++            for (uint32_t k = 0; k < std::max(1u, d.indirect->drawCount); ++k)
++              [open.render drawPrimitives:primitiveType(d.primitive)
++                           indirectBuffer:slot.indirect
++                     indirectBufferOffset:fo->second + uint64_t{k} * 16];
+           } else {
+             [open.render drawPrimitives:primitiveType(d.primitive)
+                             vertexStart:d.first
+@@ -1931,7 +2193,25 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+             dumpQueue(std::move(it), t, 0, 0);
+           }
+         [open.compute setComputePipelineState:p->compute];
++        {
++          EncDiag& g = (*diag)[e];
++          ++g.draws;
++          noteState(g, p->compute);
++          if (d.indirect) ++g.indirect;
++          else g.maxWork = std::max(g.maxWork, uint64_t{d.groups[0]} * d.groups[1] * d.groups[2]);
++          if (g.label.empty()) g.label = d.label;
++        }
+         if (at >= 0) [open.compute setBuffer:slot.args offset:at atIndex:p->stage[0].index];
++        if (d.indirect) {  // group counts written by the GPU ({x, y, z}, Vulkan's layout too)
++          uint64_t ao = 0;
++          id<MTLBuffer> ab = buffer(BufferSpan{d.indirect->buffer, d.indirect->offset, 0, 0, 0}, ao);
++          if (!ab || ao % 4) {
++            ++missingResources;
++            continue;
++          }
++          [open.compute dispatchThreadgroupsWithIndirectBuffer:ab indirectBufferOffset:ao threadsPerThreadgroup:p->threads];
++          continue;
++        }
+         [open.compute dispatchThreadgroups:MTLSizeMake(d.groups[0], d.groups[1], d.groups[2]) threadsPerThreadgroup:p->threads];
+         continue;
+       }
+@@ -2027,9 +2307,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         (unsigned long long)frameIndex, missingPipelines, missingResources, argOverflow, skippedDraws,
+         skippedDraws ? token(firstSkip).c_str() : "-");
+ 
++  if (indirectOverflow)
++    err("what=indirect_scratch_full f=%llu dropped=%u kept=%u", (unsigned long long)frameIndex, indirectOverflow,
++        indirectDraws);
++  id<MTLBuffer> fixScratch = indirectDraws ? slot.indirect : nil;
+   id<MTLCounterSampleBuffer> samples = slot.samples;
+   const NSUInteger sampleCount = sampleUsed;
+   dispatch_semaphore_t sem = inFlight;
++  const uint32_t gen = queueGen.load();
+   Impl* impl = this;  // the destructor waits for every frame, so the handler never outlives *this
+   if (dumping) info("gpu.dump frame=" + std::to_string(frameIndex) + " items=" + std::to_string(dumpItems->size()) +
+                     " copy_mb=" + std::to_string(dumpBytes >> 20));
+@@ -2057,6 +2342,58 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+           encs += (encs.empty() ? "" : ",") + token(i.label.UTF8String ?: "?");
+       impl->err("what=command_buffer f=%llu error=%s encoders=%s", (unsigned long long)frameIndex,
+                 token(str(finished.error)).c_str(), encs.c_str());
++      const std::string what = str(finished.error);
++      const bool ignored = what.find("SubmissionsIgnored") != std::string::npos;
++      if ((ignored || finished.error.code == MTLCommandBufferErrorAccessRevoked) && gen == impl->queueGen.load())
++        impl->queueRefused = true;
++      // The encoders that did not complete, described (the first frames that fault or hang; an
++      // ignored command buffer ran nothing, so it has nothing to name).
++      if (!ignored && impl->hangReports.fetch_add(1) < 24) {
++        unsigned lines = 0;
++        for (id<MTLCommandBufferEncoderInfo> i in infos) {
++          if (i.errorState == MTLCommandEncoderErrorStateCompleted || lines >= 8) continue;
++          ++lines;
++          const char* lab = i.label.UTF8String ?: "?";
++          const char* dig = lab;
++          while (*dig && (*dig < '0' || *dig > '9')) ++dig;
++          const unsigned long e = *dig ? std::strtoul(dig, nullptr, 10) : ~0ul;
++          const char* st = i.errorState == MTLCommandEncoderErrorStateFaulted    ? "faulted"
++                           : i.errorState == MTLCommandEncoderErrorStateAffected ? "affected"
++                           : i.errorState == MTLCommandEncoderErrorStatePending  ? "pending"
++                                                                                 : "unknown";
++          std::string desc = "-";
++          if (diag && e < diag->size()) {
++            const EncDiag& g = (*diag)[e];
++            char buf[320];
++            std::snprintf(buf, sizeof buf, "kind=%c label=%s target=%ux%ux%u fmt=%lu depth=%lu items=%u indirect=%u max_work=%llu",
++                          g.kind, token(g.label.empty() ? "-" : g.label).c_str(), g.width, g.height, g.layers,
++                          (unsigned long)g.color0, (unsigned long)g.depth, g.draws, g.indirect,
++                          (unsigned long long)g.maxWork);
++            desc = buf;
++            std::string pipes;
++            for (id x : g.states) {
++              NSString* l = [x respondsToSelector:@selector(label)] ? [x label] : nil;
++              pipes += (pipes.empty() ? "" : "|") + token(l.UTF8String ?: "?");
++            }
++            desc += " pipelines=" + (pipes.empty() ? std::string("-") : pipes);
++          }
++          // Not err(): its 512-byte line would cut the pipeline labels.
++          impl->info("gpu.err what=encoder_fault f=" + std::to_string(frameIndex) + " enc=" + token(lab) + " state=" + st +
++                     " code=" + std::to_string(long(finished.error.code)) + " " + desc);
++        }
++        if (!lines)
++          impl->err("what=encoder_fault f=%llu enc=none_reported encoders=%u", (unsigned long long)frameIndex,
++                    unsigned(infos.count));
++      }
++    }
++    if (fixScratch) {
++      const uint32_t* h = static_cast<const uint32_t*>(fixScratch.contents);
++      if (h[0]) {
++        const uint64_t n = ++impl->indirectClampedFrames;
++        if (n <= 32 || n % 256 == 0)
++          impl->err("what=indirect_clamped f=%llu draws=%u max_count=%u max_instances=%u frames=%llu",
++                    (unsigned long long)frameIndex, h[0], h[1], h[2], (unsigned long long)n);
++      }
+     }
+     if (sampleCount) {
+       NSData* data = [samples resolveCounterRange:NSMakeRange(0, sampleCount)];
+diff --git a/gpu/vulkan/src/commands.cpp b/gpu/vulkan/src/commands.cpp
+index fa2e0da..ce54ee5 100644
+--- a/gpu/vulkan/src/commands.cpp
++++ b/gpu/vulkan/src/commands.cpp
+@@ -4,7 +4,10 @@
+ #include <atomic>
+ 
+ #include <bit>
++#include <cstdio>
+ #include <cstring>
++#include <mutex>
++#include <unordered_set>
+ 
+ namespace vpvk {
+ 
+@@ -151,6 +154,49 @@ uint32_t layersOf(const Image* im, const VkImageSubresourceRange& r) {
+   return r.layerCount == VK_REMAINING_ARRAY_LAYERS ? im->desc.layers - r.baseArrayLayer : r.layerCount;
+ }
+ 
++// ---- Indirect arguments: who writes them ---------------------------------------------------------
++// Arguments read at submit (below) are right only for buffers the host fills before vkQueueSubmit.
++// Source 2 also builds draw arguments on the GPU (culling: fill/clear the count, compute appends),
++// and reading those at submit gets the bytes of an earlier frame — or uninitialised memory, whose
++// counts hang the GPU (build 12: kIOGPUCommandBufferCallbackErrorHang on the first scene frames,
++// after which Metal ignores every command buffer of the queue). Any buffer a GPU command writes is
++// remembered for good (by core buffer and by its VkDeviceMemory, for aliases), and indirect
++// commands whose arguments or count live there are handed to the GPU (vpgpu::Indirect).
++std::mutex g_gpuWrittenMutex;
++std::unordered_set<uint64_t> g_gpuWritten;
++uint64_t bufferKey(vpgpu::BufferId b) { return (uint64_t{b.index} << 32) | b.generation; }
++
++void markGpuWritten(vpgpu::BufferId b) {
++  if (!b) return;
++  std::lock_guard lock(g_gpuWrittenMutex);
++  g_gpuWritten.insert(bufferKey(b));
++}
++void markGpuWritten(const Buffer* b) {
++  if (!b) return;
++  if (b->memory) b->memory->gpuWritten = true;
++  markGpuWritten(b->id);
++}
++void markGpuWrites(const std::vector<vpgpu::Access>& bindings) {
++  for (const vpgpu::Access& a : bindings)
++    if (a.write && a.range.kind == vpgpu::ResourceRange::Kind::Buffer)
++      markGpuWritten(vpgpu::BufferId{a.range.index, a.range.generation});
++}
++bool gpuWritten(const Buffer* b) {
++  if (!b) return false;
++  if (b->memory && b->memory->gpuWritten) return true;
++  if (!b->id) return false;
++  std::lock_guard lock(g_gpuWrittenMutex);
++  return g_gpuWritten.count(bufferKey(b->id)) != 0;
++}
++
++// Arguments past these are not a real draw/dispatch but garbage (they would run for seconds and
++// trip the GPU watchdog): the command is dropped and counted. Per Vulkan command, before the
++// multiview instance multiplication. The same limits apply on the GPU (gpu/metal2 fix-up kernel).
++constexpr uint32_t kMaxIndirectCount = 1u << 25;      // indices / vertices of one draw
++constexpr uint32_t kMaxIndirectInstances = 1u << 20;  // instances of one draw
++constexpr uint32_t kMaxDispatchDim = 65535;           // maxComputeWorkGroupCount we report
++constexpr uint64_t kMaxDispatchGroups = 1ull << 22;   // groups of one dispatch
++
+ struct Translator {
+   vpgpu::Frame& frame;
+   TranslateStats& st;
+@@ -291,15 +337,18 @@ struct Translator {
+         if (!c->src->id || !c->dst->id) { ++st.dropped; continue; }
+         frame.copyBuffer({c->src->id, c->region.srcOffset, c->region.size},
+                          {c->dst->id, c->region.dstOffset, c->region.size});
++        markGpuWritten(c->dst);
+         ++st.copies;
+       } else if (const auto* u = std::get_if<OpUpload>(&op)) {
+         if (!u->dst->id) { ++st.dropped; continue; }
+         frame.copyBuffer({u->src, u->srcOffset, u->size}, {u->dst->id, u->dstOffset, u->size});
++        markGpuWritten(u->dst);  // vkCmdUpdateBuffer: the GPU writes it when it gets there
+         ++st.copies;
+       } else if (const auto* f = std::get_if<OpFillBuffer>(&op)) {
+         if (!f->dst->id) { ++st.dropped; continue; }
+         const VkDeviceSize size = f->size == VK_WHOLE_SIZE ? f->dst->size - f->offset : f->size;
+         frame.fillBuffer({f->dst->id, f->offset, size}, static_cast<uint8_t>(f->data));
++        markGpuWritten(f->dst);
+         ++st.copies;
+       } else if (const auto* cc = std::get_if<OpClearColor>(&op)) {
+         if (!cc->image->id) { ++st.dropped; continue; }
+@@ -357,6 +406,7 @@ struct Translator {
+       } else if (const auto* bi = std::get_if<OpCopyBufferToImage>(&op)) {
+         bufferImage(bi->src, bi->dst, bi->region, true);
+       } else if (const auto* ib = std::get_if<OpCopyImageToBuffer>(&op)) {
++        markGpuWritten(ib->dst);
+         bufferImage(ib->dst, ib->src, ib->region, false);
+       } else if (const auto* ci = std::get_if<OpCopyImage>(&op)) {
+         if (!ci->src->id || !ci->dst->id) { ++st.dropped; continue; }
+@@ -420,12 +470,34 @@ struct Translator {
+       } else if (const auto* x = std::get_if<OpDispatch>(&op)) {
+         if (!x->ok) { ++st.skippedDispatches; continue; }
+         vpgpu::Dispatch dp = x->dispatch;
++        markGpuWrites(dp.bindings);
++        if (x->indirect && gpuWritten(x->indirect) && x->indirect->id &&
++            x->indirectOffset + 12 <= x->indirect->size) {
++          // Group counts written by the GPU: Metal reads them (same {x, y, z} layout).
++          dp.indirect = vpgpu::Indirect{x->indirect->id, x->indirectOffset};
++          ++st.indirectGpu;
++          frame.dispatch(std::move(dp));
++          ++st.dispatches;
++          continue;
++        }
+         if (x->indirect) {
+           const uint8_t* p = indirectData(x->indirect, x->indirectOffset, 12);
+           if (!p) { ++st.skippedDispatches; continue; }
+           std::memcpy(dp.groups.data(), p, 12);
++          ++st.indirectCpu;
+         }
+         if (!dp.groups[0] || !dp.groups[1] || !dp.groups[2]) continue;
++        if (dp.groups[0] > kMaxDispatchDim || dp.groups[1] > kMaxDispatchDim || dp.groups[2] > kMaxDispatchDim ||
++            uint64_t{dp.groups[0]} * dp.groups[1] * dp.groups[2] > kMaxDispatchGroups) {
++          if (!st.indirectClamped++) {
++            char buf[96];
++            std::snprintf(buf, sizeof buf, "dispatch:%ux%ux%u%s", dp.groups[0], dp.groups[1], dp.groups[2],
++                          x->indirect ? ":indirect" : "");
++            st.clampWhat = buf;
++          }
++          ++st.skippedDispatches;
++          continue;
++        }
+         frame.dispatch(std::move(dp));
+         ++st.dispatches;
+       } else if (const auto* e = std::get_if<OpExecute>(&op)) {
+@@ -549,6 +621,7 @@ struct Translator {
+   }
+ 
+   void drawResolved(const OpDraw& d) {
++    markGpuWrites(d.draw.bindings);  // storage writes of vertex/fragment shaders
+     if (!d.indirect) {
+       frame.draw(d.draw);
+       ++st.draws;
+@@ -556,6 +629,33 @@ struct Translator {
+     }
+     const bool indexed = d.draw.index.has_value();
+     const uint32_t size = indexed ? 20 : 16;
++    if (!d.indirectCount) return;
++    // Arguments or count written by a GPU command: the GPU reads both when it gets to the draw
++    // (a host-written count with GPU-written arguments, or the reverse, is read there too — unified
++    // memory: what the host wrote before vkQueueSubmit is visible to the GPU).
++    if (gpuWritten(d.indirect) || (d.countBuffer && gpuWritten(d.countBuffer))) {
++      const VkDeviceSize stride = d.indirectCount > 1 ? d.indirectStride : 0;
++      const VkDeviceSize span = VkDeviceSize(d.indirectCount - 1) * stride + size;
++      if (!d.indirect->id || d.indirectOffset % 4 || stride % 4 || d.indirectOffset + span > d.indirect->size ||
++          (d.countBuffer && (!d.countBuffer->id || d.countOffset % 4 || d.countOffset + 4 > d.countBuffer->size))) {
++        ++st.skippedDraws;
++        return;
++      }
++      vpgpu::Draw dr = d.draw;
++      vpgpu::Indirect in;
++      in.buffer = d.indirect->id;
++      in.offset = d.indirectOffset;
++      in.drawCount = d.indirectCount;
++      in.stride = uint32_t(stride);
++      in.viewCount = d.viewCount ? d.viewCount : 1;
++      if (d.countBuffer) in.countBuffer = d.countBuffer->id, in.countOffset = d.countOffset;
++      dr.indirect = in;
++      dr.first = 0, dr.count = 0, dr.instances = 0, dr.baseVertex = 0, dr.baseInstance = 0;
++      frame.draw(std::move(dr));
++      ++st.draws;
++      ++st.indirectGpu;
++      return;
++    }
+     uint32_t count = d.indirectCount;
+     if (d.countBuffer) {  // read at submit like the arguments (unified memory, in-order queue)
+       const uint8_t* c = indirectData(d.countBuffer, d.countOffset, 4);
+@@ -581,7 +681,18 @@ struct Translator {
+         dr.count = c.vertexCount, dr.instances = c.instanceCount * d.viewCount, dr.first = c.firstVertex;
+         dr.baseInstance = c.firstInstance * d.viewCount;
+       }
++      ++st.indirectCpu;
+       if (!dr.count || !dr.instances) continue;
++      const uint32_t vkInstances = d.viewCount ? dr.instances / d.viewCount : dr.instances;
++      if (dr.count > kMaxIndirectCount || vkInstances > kMaxIndirectInstances) {
++        if (!st.indirectClamped++) {
++          char buf[96];
++          std::snprintf(buf, sizeof buf, "draw:count=%u:instances=%u:views=%u", dr.count, vkInstances, d.viewCount);
++          st.clampWhat = buf;
++        }
++        ++st.skippedDraws;
++        continue;
++      }
+       frame.draw(std::move(dr));
+       ++st.draws;
+     }
+diff --git a/gpu/vulkan/src/commands.h b/gpu/vulkan/src/commands.h
+index 6f0643c..dd98ca1 100644
+--- a/gpu/vulkan/src/commands.h
++++ b/gpu/vulkan/src/commands.h
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <string>
+ #include <variant>
+ #include <vector>
+ 
+@@ -245,6 +246,11 @@ struct Recorder {
+ struct TranslateStats {
+   uint32_t passes = 0, copies = 0, clears = 0, draws = 0, dispatches = 0, skippedDraws = 0,
+            skippedDispatches = 0, dropped = 0, localReads = 0;
++  // Indirect commands: arguments read at submit (host-written buffers), read by the GPU (buffers a
++  // GPU command writes), and draws/dispatches dropped because their arguments are absurd (a GPU
++  // hang otherwise); `clampWhat` names the first one.
++  uint32_t indirectCpu = 0, indirectGpu = 0, indirectClamped = 0;
++  std::string clampWhat;
+ };
+ 
+ // Appends the recorded work to `frame`. Ops whose resources are not bound yet are dropped
+diff --git a/gpu/vulkan/src/sync.cpp b/gpu/vulkan/src/sync.cpp
+index 6f2c1af..34e7210 100644
+--- a/gpu/vulkan/src/sync.cpp
++++ b/gpu/vulkan/src/sync.cpp
+@@ -174,6 +174,16 @@ VkResult submit(Device& d, std::vector<Batch>& batches, Fence* fence) {
+          "draws_skipped=%u dispatch_skipped=%u dropped=%u local_reads=%u",
+          static_cast<unsigned long long>(d.submits), cbs, st.passes, st.draws, st.dispatches, st.copies, st.clears,
+          barriers, st.skippedDraws, st.skippedDispatches, st.dropped, st.localReads);
++  // Indirect commands (see commands.cpp): the first submits that have any, every 600th, and every
++  // one that dropped absurd arguments (a would-be GPU hang).
++  {
++    static uint64_t indirectSubmits = 0;
++    const bool any = st.indirectCpu || st.indirectGpu || st.indirectClamped;
++    if (any) ++indirectSubmits;
++    if (st.indirectClamped || (any && (indirectSubmits <= 8 || d.submits % 600 == 0)))
++      logf("vk.indirect n=%llu cpu=%u gpu=%u clamped=%u first_clamp=%s", static_cast<unsigned long long>(d.submits),
++           st.indirectCpu, st.indirectGpu, st.indirectClamped, st.clampWhat.empty() ? "-" : st.clampWhat.c_str());
++  }
+   // Everything submitted so far completes with the last frame (in-order queue).
+   const uint64_t doneWith = d.lastFrame;
+   for (Batch& b : batches)
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index 318791d..ada4ff8 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -67,6 +67,9 @@ struct DeviceMemory {
+   uint32_t typeIndex = 0;
+   uint8_t* host = nullptr;  // page-aligned; unified memory: GPU buffers alias it in place
+   bool mapped = false;
++  // Some GPU command (copy, fill, update, storage write) wrote a buffer bound here: indirect
++  // arguments read from it must be read by the GPU, not at submit (commands.cpp). Submit thread.
++  bool gpuWritten = false;
+ };
+ 
+ struct Buffer {
+diff --git a/integrations/shadps4/gpu/src/renderer.cpp b/integrations/shadps4/gpu/src/renderer.cpp
+index 76f9c4f..df5c8c0 100644
+--- a/integrations/shadps4/gpu/src/renderer.cpp
++++ b/integrations/shadps4/gpu/src/renderer.cpp
+@@ -1263,7 +1263,7 @@ struct Renderer::Impl {
+             const uint64_t argBytes = d.indexAddress ? 20 : 16;
+             if (!guestBuffer(d.indirectAddress, argBytes, id, offset, available) || argBytes > available || offset % 4)
+                 return skip("indirect arguments outside guest memory");
+-            draw.indirect = vpgpu::Indirect{id, offset};
++            { vpgpu::Indirect ind; ind.buffer = id; ind.offset = offset; draw.indirect = ind; }
+             if (d.indexAddress) {
+                 BufferId ib;
+                 uint64_t ioff = 0, iavail = 0;
+@@ -1381,7 +1381,7 @@ struct Renderer::Impl {
+             uint64_t offset = 0, available = 0;
+             if (!guestBuffer(d.indirectAddress, 12, id, offset, available) || available < 12 || offset % 4)
+                 return skip("indirect arguments outside guest memory");
+-            x.indirect = vpgpu::Indirect{id, offset};
++            { vpgpu::Indirect ind; ind.buffer = id; ind.offset = offset; x.indirect = ind; }
+             ++r.stats_.indirect;
+         }
+         closePass();
+-- 
+2.43.0
+
