@@ -81,6 +81,7 @@ enum AVPLaunch {
         KleptonCompositor.loadingEnabled = true
         AVPLog.log("Arranque: pantalla de carga con \(art.filter { !$0.isEmpty }.count) de 2 imágenes de Steam en caché")
         AVPLog.mirrorToFolder()
+        AVPLog.startPeriodicMirror()
         try? FileManager.default.createDirectory(at: AVPLog.directory, withIntermediateDirectories: true)
         setenv("KL_ALYX_LOG_DIR", AVPLog.directory.path, 1)
         // Configure only: BootView (KleptonApp.swift) then runs kl_app_boot and opens the immersive space.

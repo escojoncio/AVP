@@ -261,9 +261,13 @@ final class AVPModel: ObservableObject {
         AVPLog.log("Descarga: en pausa")
     }
 
+    private var mirroredAtOpen = false
     func scenePhaseChanged(_ phase: ScenePhase) {
         switch phase {
         case .active:
+            // The previous session's logs (its boot log is still in Documents until the next Play) reach the
+            // AVP folder as soon as the app is open again, even if that session was killed in the immersive space.
+            if !mirroredAtOpen { mirroredAtOpen = true; DispatchQueue.global(qos: .utility).async { AVPLog.mirrorToFolder() } }
             if resumeWhenActive { startInstall() }
             refreshControllerAccess()
         case .background:
