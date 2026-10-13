@@ -81,8 +81,9 @@ enum AVPPrepare {
     static func prewarm(_ paths: AVPLaunchPaths, progress: @escaping Progress) {
         let t0 = Date()
         let done = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var rc: Int32 = 0
         Thread.detachNewThread {
-            AlyxBoot.prewarm(paths)
+            rc = AlyxBoot.prewarm(paths)
             done.signal()
         }
         while done.wait(timeout: .now() + 0.25) == .timedOut {
@@ -92,7 +93,7 @@ enum AVPPrepare {
         }
         let p = AlyxBoot.pipelineProgress()
         progress(4, 1, AVPL("Shaders listos", "Shaders ready"))
-        AVPLog.log("Preparar: precompilados \(p.done)/\(p.total) pipelines en \(Int(Date().timeIntervalSince(t0))) s")
+        AVPLog.log("Preparar: precompilados \(p.done)/\(p.total) pipelines en \(Int(Date().timeIntervalSince(t0))) s (rc \(rc): \(String(cString: kl_app_status())))")
     }
 
     // MARK: 1. Runtime libraries
@@ -214,8 +215,11 @@ enum AVPPrepare {
     static func sources(game: URL, runtime: URL) -> [Source] {
         let fm = FileManager.default
         var out: [Source] = []
-        var seen = Set<String>()
-        for dir in [game.appendingPathComponent("bin/linuxsteamrtarm64"), game.appendingPathComponent("hlvr/bin/linuxsteamrtarm64"), runtime] {
+        // Several files can share a stem (libavcodec.so and libavcodec.so.58.91.100): the largest is the real
+        // library, the others are the depot's small copies of soname links.
+        var best: [String: (url: URL, size: Int64, dir: Int)] = [:]
+        var order: [String] = []
+        for (d, dir) in [game.appendingPathComponent("bin/linuxsteamrtarm64"), game.appendingPathComponent("hlvr/bin/linuxsteamrtarm64"), runtime].enumerated() {
             let names = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).sorted()
             for name in names where !name.hasPrefix(".") {
                 let url = dir.appendingPathComponent(name)
@@ -223,13 +227,20 @@ enum AVPPrepare {
                 guard (attrs?[.type] as? FileAttributeType) == .typeRegular else { continue }
                 guard name.contains(".so") || !name.contains("."), isELF(url) else { continue }
                 let s = stem(name)
-                guard seen.insert(s).inserted else {
-                    AVPLog.log("Preparar: \(url.path) repite el nombre \(s); se usa el primero")
+                let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+                if let prev = best[s] {
+                    // Only within one folder; across folders the first folder wins, as the loader's search order does.
+                    if prev.dir == d, size > prev.size {
+                        AVPLog.log("Preparar: \(s): se usa \(name) (\(size >> 10) KB) en vez de \(prev.url.lastPathComponent) (\(prev.size >> 10) KB)")
+                        best[s] = (url, size, d)
+                    }
                     continue
                 }
-                out.append(Source(url: url, stem: s))
+                best[s] = (url, size, d)
+                order.append(s)
             }
         }
+        for s in order { if let b = best[s] { out.append(Source(url: b.url, stem: s)) } }
         return out
     }
 
