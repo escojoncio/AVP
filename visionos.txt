@@ -1,0 +1,165 @@
+# visionos - 0610d6af7c7170bbd4ce23048c7bf4e82ff0d448 - 2026-10-13T06:36:47Z
+
+## vpvulkan.log:      381 lines
+### errors
+### end
+  158 |   } front, back;
+      |     ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:55: note: replace 'default' with 'delete'
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |                                                       ^~~~~~~
+      |                                                       delete
+1 warning generated.
+[26/37] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/precompile.cpp.o
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/vulkan/src/precompile.cpp:26:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/vulkan/src/vpvk.h:19:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/device.h:13:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/backend.h:9:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/frame_compiler.h:21:
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |        ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:158:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
+  158 |   } front, back;
+      |     ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:55: note: replace 'default' with 'delete'
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |                                                       ^~~~~~~
+      |                                                       delete
+1 warning generated.
+[27/37] Building CXX object shader/spirv/CMakeFiles/vpspirv.dir/src/lower.cpp.o
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/shader/spirv/src/lower.cpp:33:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/shader/spirv/../../vulkan/include/vpvk/spirv_frontend.h:35:
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |        ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:158:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
+  158 |   } front, back;
+      |     ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:55: note: replace 'default' with 'delete'
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |                                                       ^~~~~~~
+      |                                                       delete
+1 warning generated.
+[28/37] Linking CXX static library shader/spirv/libvpspirv.a
+[29/37] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/recipes.cpp.o
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/vulkan/src/recipes.cpp:1:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/vulkan/src/recipes.h:31:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/pipeline_cache.h:16:
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |        ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:158:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
+  158 |   } front, back;
+      |     ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:55: note: replace 'default' with 'delete'
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |                                                       ^~~~~~~
+      |                                                       delete
+1 warning generated.
+[30/37] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/pipelines.cpp.o
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/vulkan/src/pipelines.cpp:21:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/vulkan/src/commands.h:15:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/vulkan/src/vpvk.h:19:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/device.h:13:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/backend.h:9:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/frame_compiler.h:21:
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |        ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:158:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
+  158 |   } front, back;
+      |     ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:55: note: replace 'default' with 'delete'
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |                                                       ^~~~~~~
+      |                                                       delete
+1 warning generated.
+[31/37] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/queries.cpp.o
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/vulkan/src/queries.cpp:10:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/vulkan/src/commands.h:15:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/vulkan/src/vpvk.h:19:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/device.h:13:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/backend.h:9:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/frame_compiler.h:21:
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |        ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:158:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
+  158 |   } front, back;
+      |     ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:55: note: replace 'default' with 'delete'
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |                                                       ^~~~~~~
+      |                                                       delete
+1 warning generated.
+[32/37] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/motion.cpp.o
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/vulkan/src/motion.cpp:23:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/vulkan/src/commands.h:15:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/vulkan/src/vpvk.h:19:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/device.h:13:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/backend.h:9:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/frame_compiler.h:21:
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |        ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:158:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
+  158 |   } front, back;
+      |     ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:55: note: replace 'default' with 'delete'
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |                                                       ^~~~~~~
+      |                                                       delete
+1 warning generated.
+[33/37] Building OBJCXX object metal2/CMakeFiles/vpgpu_metal2.dir/src/metal_backend.mm.o
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/metal2/src/metal_backend.mm:13:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/metal2/include/vpgpu/metal2/metal_backend.h:35:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/backend.h:9:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/frame_compiler.h:21:
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |        ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:158:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
+  158 |   } front, back;
+      |     ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:55: note: replace 'default' with 'delete'
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |                                                       ^~~~~~~
+      |                                                       delete
+1 warning generated.
+[34/37] Building OBJCXX object vulkan/CMakeFiles/VPVulkan.dir/src/platform_metal.mm.o
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/vulkan/src/platform_metal.mm:3:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/metal2/include/vpgpu/metal2/metal_backend.h:35:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/backend.h:9:
+In file included from /Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/frame_compiler.h:21:
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |        ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:158:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
+  158 |   } front, back;
+      |     ^
+/Users/runner/work/AVP/AVP/vpengine/gpu/core/include/vpgpu/core/commands.h:159:55: note: replace 'default' with 'delete'
+  159 |   bool operator==(const DepthStencilDynamic&) const = default;
+      |                                                       ^~~~~~~
+      |                                                       delete
+1 warning generated.
+[35/37] Linking CXX static library metal2/libvpgpu_metal2.a
+[36/37] Linking CXX shared library vulkan/libVPVulkan.dylib
+ platform VISIONOS
+    minos 26.0
+exported vk* symbols: 222
+total 2768
+drwxr-xr-x  4 runner  staff      128 Oct 13 06:36 .
+drwxr-xr-x  4 runner  staff      128 Oct 13 06:36 ..
+-rw-r--r--  1 runner  staff      663 Oct 13 06:36 Info.plist
+-rwxr-xr-x  1 runner  staff  1410928 Oct 13 06:36 VPVulkan
+
+## luajit.log:        3 lines
+### errors
+1-[luajit] building c6ffc141 for arm64-apple-xros26.0 (no JIT, GC64)
+2-Makefile:322: *** missing: export MACOSX_DEPLOYMENT_TARGET=XX.YY.  Stop.
+3:make: *** [clean] Error 2
+### end
+[luajit] building c6ffc141 for arm64-apple-xros26.0 (no JIT, GC64)
+Makefile:322: *** missing: export MACOSX_DEPLOYMENT_TARGET=XX.YY.  Stop.
+make: *** [clean] Error 2
