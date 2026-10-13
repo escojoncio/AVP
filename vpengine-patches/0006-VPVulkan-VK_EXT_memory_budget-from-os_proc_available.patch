@@ -1,0 +1,187 @@
+From 281cc4849be028a4b2cba9fd53139cd4748d9e91 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 04:46:28 +0000
+Subject: [PATCH 06/10] VPVulkan: VK_EXT_memory_budget from
+ os_proc_available_memory
+
+heapUsage = VkDeviceMemory currently allocated (all devices); heapBudget = usage + what visionOS
+still lets the process allocate (os_proc_available_memory, the jetsam limit), capped by the heap
+size; 80 % of the heap before a device exists or on hosts without the call (Linux tests). Source 2
+sizes its texture streaming pool from this.
+
+Test: gpu_vulkan.alyx (usage follows an allocation, budget covers it).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
+---
+ gpu/vulkan/include/vpvk/platform.h |  3 +++
+ gpu/vulkan/src/entry.cpp           | 23 +++++++++++++++++++++++
+ gpu/vulkan/src/physical_device.cpp |  1 +
+ gpu/vulkan/src/platform_metal.mm   |  2 ++
+ gpu/vulkan/src/vpvk.h              |  4 ++++
+ gpu/vulkan/tests/vk_tests.cpp      |  9 +++++++++
+ 6 files changed, 42 insertions(+)
+
+diff --git a/gpu/vulkan/include/vpvk/platform.h b/gpu/vulkan/include/vpvk/platform.h
+index 375a976..9e74cc2 100644
+--- a/gpu/vulkan/include/vpvk/platform.h
++++ b/gpu/vulkan/include/vpvk/platform.h
+@@ -55,6 +55,9 @@ class Platform {
+   virtual void destroyTextureView(vpgpu::TextureId) {}
+   // Blocks until all submitted GPU work finished (vkQueueWaitIdle / vkDeviceWaitIdle / fences).
+   virtual void waitIdle() {}
++  // Bytes the process may still allocate before the OS kills it (visionOS: os_proc_available_memory),
++  // 0 = unknown. VK_EXT_memory_budget reports usage + this as the heap budget.
++  virtual uint64_t availableMemory() { return 0; }
+ };
+ 
+ // Defined by exactly one platform source linked into the dylib.
+diff --git a/gpu/vulkan/src/entry.cpp b/gpu/vulkan/src/entry.cpp
+index d89a413..93e806a 100644
+--- a/gpu/vulkan/src/entry.cpp
++++ b/gpu/vulkan/src/entry.cpp
+@@ -46,6 +46,11 @@ void logf(const char* fmt, ...) {
+ 
+ CommandBuffer::~CommandBuffer() = default;
+ 
++std::atomic<uint64_t>& allocatedBytes() {
++  static std::atomic<uint64_t> n{0};
++  return n;
++}
++
+ namespace {
+ 
+ uint64_t alignUp(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
+@@ -340,9 +345,23 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties(
+   *m = memoryProperties();
+ }
+ 
++// VK_EXT_memory_budget: usage = VkDeviceMemory allocated (textures are accounted by their image
++// memory too: Metal owns their storage, the allocation is its size); budget = usage + what the OS
++// still lets the process allocate (visionOS jetsam limit), capped by the heap. Without a device yet
++// (or on hosts that cannot tell) the budget is 80 % of the heap.
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties2(
+     VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties2* m) {
+   vkGetPhysicalDeviceMemoryProperties(pd, &m->memoryProperties);
++  if (auto* b = static_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(
++          findNextOut(m->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT))) {
++    std::memset(b->heapBudget, 0, sizeof b->heapBudget);
++    std::memset(b->heapUsage, 0, sizeof b->heapUsage);
++    const uint64_t heap = memoryProperties().memoryHeaps[0].size, used = allocatedBytes().load();
++    const Device* d = from<PhysicalDevice>(pd)->instance ? from<PhysicalDevice>(pd)->instance->device : nullptr;
++    const uint64_t avail = d && d->platform ? d->platform->availableMemory() : 0;
++    b->heapUsage[0] = used;
++    b->heapBudget[0] = avail ? std::min(heap, used + avail) : heap / 10 * 8;
++  }
+ }
+ 
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice,
+@@ -468,6 +487,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
+   }
+   logUnsupportedFeatures(*ci);
+   d->platform = createPlatform();
++  if (d->physical->instance) d->physical->instance->device = d;
+   // Pipeline compiles run on background workers (never the submit thread); leave the game's
+   // render/main threads two cores.
+   const unsigned workers = std::clamp(std::thread::hardware_concurrency(), 4u, 8u) - 2u;
+@@ -488,6 +508,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllocationCallbacks*) {
+   if (!dv) return;
+   Device* d = from<Device>(dv);
++  if (d->physical && d->physical->instance && d->physical->instance->device == d) d->physical->instance->device = nullptr;
+   d->platform->waitIdle();
+   d->gpu.reset();
+   delete d;
+@@ -524,6 +545,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice, const VkMe
+     logf("vk.err what=alloc size=%llu", static_cast<unsigned long long>(ai->allocationSize));
+     return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
++  allocatedBytes() += m->size;
+   *out = to<VkDeviceMemory>(m);
+   return VK_SUCCESS;
+ }
+@@ -532,6 +554,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkFreeMemory(VkDevice, VkDeviceMemory mem
+                                                     const VkAllocationCallbacks*) {
+   if (!mem) return;
+   DeviceMemory* m = from<DeviceMemory>(mem);
++  allocatedBytes() -= m->size;
+   std::free(m->host);
+   delete m;
+ }
+diff --git a/gpu/vulkan/src/physical_device.cpp b/gpu/vulkan/src/physical_device.cpp
+index 0c2ada3..a648d0d 100644
+--- a/gpu/vulkan/src/physical_device.cpp
++++ b/gpu/vulkan/src/physical_device.cpp
+@@ -273,6 +273,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
+           {VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, 1},
+           {VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME, 1},
+           {VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, 1},
++          {VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, 1},
+           {VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME, 1},
+           {VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, 1},
+           {VK_KHR_SHADER_TERMINATE_INVOCATION_EXTENSION_NAME, 1},
+diff --git a/gpu/vulkan/src/platform_metal.mm b/gpu/vulkan/src/platform_metal.mm
+index f94090c..f09cd5c 100644
+--- a/gpu/vulkan/src/platform_metal.mm
++++ b/gpu/vulkan/src/platform_metal.mm
+@@ -4,6 +4,7 @@
+ #include "vpvk.h"
+ 
+ #include <cstdlib>
++#include <os/proc.h>
+ #include <mutex>
+ #include <unordered_set>
+ 
+@@ -28,6 +29,7 @@ class MetalPlatform final : public Platform {
+   void flushCaches() { backend_.saveArchive(); }  // pipeline binary archive, if any is pending
+   vpgpu::Backend& backend() override { return backend_; }
+   void waitIdle() override { backend_.waitIdle(); }
++  uint64_t availableMemory() override { return os_proc_available_memory(); }
+   void addShader(uint64_t id, ShaderBlob b) override {
+     vpgpu::metal2::MslShader m;
+     m.source = std::move(b.source);
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index 0d0ef11..66c3ee2 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -50,6 +50,7 @@ struct Instance : Dispatchable {
+   uint32_t apiVersion = VK_API_VERSION_1_0;
+   PhysicalDevice physical;
+   std::string appName, engineName;
++  Device* device = nullptr;  // the last device created (memory budget queries go through its platform)
+ };
+ 
+ struct Queue : Dispatchable {
+@@ -57,6 +58,9 @@ struct Queue : Dispatchable {
+   uint32_t family = 0, index = 0;
+ };
+ 
++// Bytes of VkDeviceMemory currently allocated (all devices): VK_EXT_memory_budget heapUsage.
++std::atomic<uint64_t>& allocatedBytes();
++
+ struct DeviceMemory {
+   VkDeviceSize size = 0;
+   uint32_t typeIndex = 0;
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index d7a7507..1c98949 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -984,6 +984,15 @@ void testAlyxSurface() {
+   CHECK(vkCreateImage(c.dev, &ii, nullptr, &im) == VK_SUCCESS);
+   CHECK(from<Image>(im)->desc.usage & vpgpu::usage::sampled);
+   vkDestroyImage(c.dev, im, nullptr);
++  // VK_EXT_memory_budget: usage follows allocations; the budget covers it.
++  VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
++  VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &mb};
++  vkGetPhysicalDeviceMemoryProperties2(c.pd, &mp);
++  const uint64_t used0 = mb.heapUsage[0];
++  VkDeviceMemory big = alloc(c, 64 << 20, 0);
++  vkGetPhysicalDeviceMemoryProperties2(c.pd, &mp);
++  CHECK(mb.heapUsage[0] == used0 + (64 << 20) && mb.heapBudget[0] >= mb.heapUsage[0] && mb.heapBudget[1] == 0);
++  vkFreeMemory(c.dev, big, nullptr);
+   VkFormatProperties3 fp3{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+   VkFormatProperties2 fp2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &fp3};
+   vkGetPhysicalDeviceFormatProperties2(c.pd, VK_FORMAT_D32_SFLOAT_S8_UINT, &fp2);
+-- 
+2.43.0
+

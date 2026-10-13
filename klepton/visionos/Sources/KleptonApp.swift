@@ -1,6 +1,10 @@
 import SwiftUI
 import Foundation
 import CompositorServices
+import AVKit
+import CoreMedia
+import QuartzCore
+import UIKit
 
 // The visionOS host app (Swift for the platform layer).
 //
@@ -68,6 +72,13 @@ enum Immersive {
     // environment overrides either way (KL_FULL=0 forces .mixed back).
     static var mixed: Bool { !klEnvOn("KL_FULL", default: kl_app_target_wants_full() != 0) }
 
+    // A fully immersive target opens .mixed and turns .full at the guest's first
+    // picture. Before it (Alyx's first launch replays its pipeline list for about
+    // 3 minutes) a .full space is a black void around the launcher window; .mixed
+    // with transparent frames (KleptonCompositor's clears) keeps the room in view.
+    // KL_PREP_PASSTHROUGH=0 opens .full straight away, as before.
+    static var prepPassthrough: Bool { !mixed && klEnvOn("KL_PREP_PASSTHROUGH", default: true) }
+
     // How many times the CompositorLayer closure has been entered. SwiftUI may
     // re-evaluate a scene, and a second layer would mean the render loop the log
     // describes is not the one on screen.
@@ -126,8 +137,8 @@ enum Lifecycle {
         immersiveOpen = false
         NSLog("[app] immersive space ended (phase \(lastPhase))")
         if lastPhase != .background, let open = reopenLauncher {
-            VQModel.shared.ended = true
-            open(id: VQMainWindow.id)
+            AVPModel.shared.ended = true
+            open(id: AVPMainWindow.id)
             NSLog("[app] launcher window reopened")
             return
         }
@@ -144,6 +155,15 @@ enum Lifecycle {
         fflush(nil)
         _exit(0)
     }
+    /// Set when the game starts (AlyxBoot.launch). With the Alyx launcher compiled in, backgrounding before that is
+    /// the launcher being closed or looked away from — an ordinary app suspending, with a download handed to the
+    /// system's background session — so it does not exit.
+    static var gameStarted = false
+    /// Set once the compositor has shown a frame with the game's picture in it (KleptonCompositor), and when boot
+    /// failed: the launcher keeps its window, with the game's loading progress, until the first, and shows the
+    /// boot report on the second (AlyxBoot.swift).
+    static var firstPicture = false
+    static var bootFailed = false
 
     static func scenePhaseChanged(to phase: ScenePhase) {
         NSLog("[app] scene phase -> \(phase) (immersive open: \(immersiveOpen))")
@@ -168,34 +188,69 @@ enum Lifecycle {
             NSLog("[app] backgrounded with the immersive space open — staying alive")
             return
         }
+        #if KL_ALYX_LAUNCHER
+        guard gameStarted else {
+            NSLog("[app] backgrounded in the launcher (no game yet) — not exiting")
+            return
+        }
+        #endif
         guard klEnvOn("KL_EXIT_ON_BACKGROUND", default: true) else {
             NSLog("[app] backgrounded; KL_EXIT_ON_BACKGROUND=0, staying alive")
             return
         }
         NSLog("[app] backgrounded — exiting (KL_EXIT_ON_BACKGROUND)")
-        // Flush before exit rather than relying on it. The guest's log is a
-        // file in the container (kl_app.c redirects stdout/stderr there) and it
-        // is the only account of the run that survives; `exit` does flush
-        // stdio, but it also runs atexit handlers and static destructors inside
-        // a guest whose threads are still live, and one of those blocking would
-        // turn a clean exit into a watchdog kill with a truncated log.
+        // Flush, then `_exit`: the guest's log is a file in the container
+        // (kl_app.c redirects stdout/stderr there) and it is the only account
+        // of the run that survives. `exit` would also run atexit handlers and
+        // static destructors while the guest's threads are still live, and a
+        // render thread submitting a frame into a destroyed object faults (seen
+        // in klvr's eye copy) or aborts on a destroyed mutex. The game's own
+        // Quit ends the same way, with `_exit(0)`; the system reclaims the rest.
         fflush(nil)
-        exit(0)
+        _exit(0)
+    }
+}
+
+/// One-shot: when Documents/.clear-shader-cache exists (copied in with devicectl, which cannot delete inside the
+/// container), the app deletes its Metal shader cache at launch, before anything makes a Metal device, then the flag.
+/// The next "Preparing graphics" then compiles everything cold, as on a player's first launch.
+enum ShaderCacheReset {
+    static func runIfFlagged() {
+        let fm = FileManager.default
+        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first,
+              let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first else { return }
+        let flag = docs.appendingPathComponent(".clear-shader-cache")
+        guard fm.fileExists(atPath: flag.path) else { return }
+        let mine = caches.appendingPathComponent(Bundle.main.bundleIdentifier ?? "-")
+        for name in ["com.apple.metal", "com.apple.metalfe"] {
+            let dir = mine.appendingPathComponent(name)
+            guard fm.fileExists(atPath: dir.path) else { continue }
+            do { try fm.removeItem(at: dir); NSLog("[app] shader cache cleared: \(dir.path)") }
+            catch { NSLog("[app] shader cache NOT cleared (\(dir.path)): \(error)") }
+        }
+        try? fm.removeItem(at: flag)
     }
 }
 
 @main
 struct KleptonApp: App {
+    @UIApplicationDelegateAdaptor(AVPAppDelegate.self) private var avpAppDelegate
     @Environment(\.scenePhase) private var scenePhase
     /// Observed so the Matting panel's hand-matting toggle re-evaluates the
     /// immersive scene's `.upperLimbVisibility` live. The object is the shared
     /// singleton the panel edits, not a second copy.
     @ObservedObject private var chroma = KleptonChroma.shared
 
+    init() {
+        ShaderCacheReset.runIfFlagged()
+        kl_app_memprobe(Paths.resources, Paths.container)  // what the signature got us: Documents/klepton-memprobe.txt
+    }
+
     var body: some Scene {
         // VisionQuestPro: the launcher (VQLauncher.swift) is the window; BootView is its
         // "running" page.
-        WindowGroup(id: VQMainWindow.id) { VQRootView() }
+        // AVP: AlyxBootHost hands the window's openImmersiveSpace/openWindow/dismissWindow to AlyxBoot.launch.
+        WindowGroup(id: AVPMainWindow.id) { AVPRootView().modifier(AlyxBootHost()) }
             .defaultSize(width: 1280, height: 800)
             // On the app's phase, not this window's: closing the boot window
             // while the immersive space is up is not backgrounding, and must
@@ -313,6 +368,7 @@ struct KeyboardEntryView: View {
 }
 
 struct BootView: View {
+    @Environment(\.dismissWindow) private var dismissWindow
     @State private var log = ""
     @State private var status = "idle"
     @State private var running = false
@@ -428,7 +484,7 @@ struct BootView: View {
         Lifecycle.immersiveOpen = true
         Lifecycle.reopenLauncher = openWindow
         NSLog("[app] immersive space open — dismissing the launcher window")
-        dismissWindow(id: VQMainWindow.id)
+        dismissWindow(id: AVPMainWindow.id)
     }
 
     // One typed character to the guest, as the Android keycode SDL expects. The
@@ -443,7 +499,7 @@ struct BootView: View {
     private var bootReport: some View {
         Group {
           if !showLog {
-            VQLoadingView(running: running, finished: finished, succeeded: succeeded,
+            AVPLoadingView(running: running, finished: finished, succeeded: succeeded,
                           openedSpace: openedSpace, status: status) { showLog = true }
           } else {
           VStack(alignment: .leading, spacing: 12) {
@@ -581,6 +637,7 @@ struct BootView: View {
         // next thing to do with a finished run is press Boot again.
         guard !running, !finished else { return }
         running = true; log = ""
+        Lifecycle.gameStarted = true
 
         // Off the main thread: the guest blocks — Unity's Baselib waits on
         // futexes, IL2CPP's GC suspends the world — and a blocked main thread
@@ -588,7 +645,7 @@ struct BootView: View {
         // with no report rather than as the hang it is.
         Thread.detachNewThread {
             // VisionQuestPro: the game the launcher chose (paths in QUEST), not the compiled table.
-            let rc = VQLaunch.configure()
+            let rc = AVPLaunch.configure()
             if rc != 0 {
                 // To the SYSTEM log as well as the window, because this is the
                 // one failure that happens before there is a klepton-boot.log to
@@ -618,7 +675,7 @@ struct BootView: View {
             // on it — the native VR kind opens .full) is finally knowable. Publish
             // it on the main actor before the space opens; the scene observes it.
             DispatchQueue.main.async {
-                KleptonChroma.shared.immersionFull = !Immersive.mixed
+                KleptonChroma.shared.immersionFull = !Immersive.mixed && !Immersive.prepPassthrough
                 KleptonChroma.shared.startPassthroughWatch()
             }
 
@@ -703,6 +760,7 @@ struct BootView: View {
                 log = text
                 status = String(cString: kl_app_status())
                 succeeded = (result == 0)
+                if result != 0 { Lifecycle.bootFailed = true }
                 running = false; finished = true
                 // The space opens only after boot has succeeded, and from here
                 // rather than from .task, because the compositor's very first
@@ -712,6 +770,14 @@ struct BootView: View {
                 // run first" and reads like a missing binding.
                 if result == 0, Immersive.wanted, !openedSpace {
                     openedSpace = true
+                    // Alyx draws its own hands; the system's passthrough hands
+                    // (and the PSVR2 controllers in them) sat on top of them.
+                    // KL_ALYX_LIMBS=1 keeps the system's hands (A/B for the PS
+                    // button no longer reaching visionOS Home since this change).
+                    if kl_app_target_is_linux() != 0,
+                       ProcessInfo.processInfo.environment["KL_ALYX_LIMBS"] != "1" {
+                        KleptonChroma.shared.settings.handMatting = false
+                    }
                     // The result is logged rather than discarded: `.error` and
                     // `.userCancelled` both leave the app alive with no
                     // compositor, which is indistinguishable in the log from a
@@ -719,7 +785,23 @@ struct BootView: View {
                     // completely different next moves.
                     Task {
                         let r = await openImmersiveSpace(id: Immersive.id)
-                        NSLog("[cp] openImmersiveSpace -> \(r)")
+                        NSLog("[cp] openImmersiveSpace -> \(r); upperLimbVisibility \(KleptonChroma.shared.upperLimbVisibility == .hidden ? "hidden" : "automatic")")
+                        if case .opened = r, Immersive.prepPassthrough {
+                            Task { @MainActor in
+                                while !Lifecycle.firstPicture && !Lifecycle.bootFailed {
+                                    try? await Task.sleep(nanoseconds: 100_000_000)
+                                }
+                                guard Lifecycle.firstPicture else { return }
+                                NSLog("[cp] first picture — the space turns fully immersive")
+                                KleptonChroma.shared.immersionFull = true
+                            }
+                        }
+                        if case .opened = r, kl_app_target_is_linux() != 0, KLRateHint.wanted {
+                            NSLog("[hint] immersive space open — applying the 120 Hz hints (KL_HINT_120=1)")
+                            KLRateHint.shared.apply()
+                        }
+                        // The launcher window goes away once the space is up (spaceOpened); the
+                        // launcher's own loading view covers the time until the first picture.
                         await MainActor.run { spaceOpened(r) }
                     }
                 }
@@ -737,5 +819,54 @@ struct BootView: View {
 
         from the repo root with the device paired and unlocked.
         """
+    }
+}
+
+
+/// KL_HINT_120=1 (a rate experiment, off by default): Compositor Services has no refresh-rate request, and the panel
+/// runs 90 Hz by day and 120 (or 60) in the evenings. The only app-side rate hints in the visionOS SDK belong to
+/// window content, so with the flag the boot window is kept (not dismissed) and carries both of them:
+///  - AVKit: `window.avDisplayManager.preferredDisplayCriteria` = 120 Hz (video frame-rate matching);
+///  - UIKit: a continuous `UIUpdateLink` on the window's scene with `preferredFrameRateRange` 120/120/120.
+/// Whether either reaches an immersive space is the question; the compositor's "[cp] display rate" lines answer it.
+@MainActor final class KLRateHint {
+    static let shared = KLRateHint()
+    static var wanted: Bool { klEnvOn("KL_HINT_120", default: false) }
+    private var link: UIUpdateLink?
+    private var ticks = 0
+    private var tickT0 = CACurrentMediaTime()
+
+    func apply() {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        NSLog("[hint] \(scenes.count) window scene(s): " + scenes.map { "\($0.session.role.rawValue) (\($0.windows.count) window(s))" }.joined(separator: ", "))
+        guard let scene = scenes.first(where: { !$0.windows.isEmpty }), let window = scene.windows.first else {
+            NSLog("[hint] no UIWindow to carry the hints — nothing applied")
+            return
+        }
+        var fd: CMVideoFormatDescription?
+        let st = CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault, codecType: kCMVideoCodecType_H264,
+                                                width: 1920, height: 1080, extensions: nil, formatDescriptionOut: &fd)
+        if st == noErr, let fd {
+            let dm = window.avDisplayManager
+            dm.preferredDisplayCriteria = AVDisplayCriteria(refreshRate: 120, formatDescription: fd)
+            NSLog("[hint] avDisplayManager.preferredDisplayCriteria = 120 Hz (display criteria matching enabled: \(dm.isDisplayCriteriaMatchingEnabled))")
+        } else {
+            NSLog("[hint] no format description (\(st)) — display criteria not set")
+        }
+        let l = UIUpdateLink(windowScene: scene)
+        l.addAction { [weak self] _, _ in
+            guard let self else { return }
+            self.ticks += 1
+            let now = CACurrentMediaTime()
+            if now - self.tickT0 >= 5 {
+                NSLog(String(format: "[hint] UIUpdateLink %.1f updates/s", Double(self.ticks) / (now - self.tickT0)))
+                self.ticks = 0; self.tickT0 = now
+            }
+        }
+        l.preferredFrameRateRange = CAFrameRateRange(minimum: 120, maximum: 120, preferred: 120)
+        l.requiresContinuousUpdates = true
+        l.isEnabled = true
+        link = l
+        NSLog("[hint] UIUpdateLink on the boot window's scene: 120/120/120, continuous, enabled")
     }
 }

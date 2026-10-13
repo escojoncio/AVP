@@ -1390,7 +1390,10 @@ int   klb_pthread_detach(pthread_t t)          { return px(pthread_detach(t)); }
 void  klb_pthread_exit(void *r)                { thread_unregister(pthread_self()); pthread_exit(r); }
 pthread_t klb_pthread_self(void)               { return pthread_self(); }
 int   klb_pthread_equal(pthread_t a, pthread_t b) { return pthread_equal(a, b); }
-int   klb_pthread_kill(pthread_t t, int sig)   {
+int kl_sig_lx2dw(int s);                           // kl_libc.c
+int   klb_pthread_kill(pthread_t t, int lsig)  {
+    int sig = lsig ? kl_sig_lx2dw(lsig) : 0;         // Linux numbering in
+    if (sig < 0) return EINVAL;
     int r = px(pthread_kill(t, sig));
     if (kl_env_on("KL_TRACE_SIG", 0))
         fprintf(stderr, "  [sig] pthread_kill(%p, %d) -> %d%s\n", (void *)t, sig, r,
@@ -1420,11 +1423,13 @@ static int kl_sigmask_how(int linux_how) {
     }
 }
 
+uint32_t kl_sigmask_lx2dw(uint64_t m);             // kl_libc.c
+uint64_t kl_sigmask_dw2lx(uint32_t d);
 int klb_pthread_sigmask(int how, const uint64_t *s, uint64_t *o) {
     sigset_t din, dout;
-    if (s) din = (sigset_t)(*s & 0xFFFFFFFFu);
+    if (s) din = (sigset_t)kl_sigmask_lx2dw(*s);    // Linux bit numbering -> Darwin
     int r = pthread_sigmask(kl_sigmask_how(how), s ? &din : NULL, o ? &dout : NULL);
-    if (!r && o) *o = dout;
+    if (!r && o) *o = kl_sigmask_dw2lx(dout);
     return r;
 }
 

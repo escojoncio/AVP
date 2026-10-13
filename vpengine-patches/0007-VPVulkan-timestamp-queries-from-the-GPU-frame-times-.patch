@@ -1,0 +1,536 @@
+From fbe0df9ab0bc1e88fa20866b6e8f9aaf1740b017 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 04:50:58 +0000
+Subject: [PATCH 07/10] VPVulkan: timestamp queries from the GPU frame times
+ (occlusion: visible)
+
+New src/queries.cpp. Queries written by a command buffer are stamped at vkQueueSubmit with the
+core frame that executes them. A TOP_OF_PIPE timestamp reads as that frame's GPU start, any later
+stage as its end, in host-clock nanoseconds (timestampPeriod 1); results are available once the
+frame completed (WAIT, WITH_AVAILABILITY, PARTIAL, 32/64-bit honoured). gpu/metal2 reports
+GPUStartTime/GPUEndTime per command buffer through GpuTimings, and vpgpu::Device keeps the last
+512 for lookups (frameTimes). This gives Source 2's adaptive fidelity real GPU frame times
+instead of zeros. Per-pass timings (Metal counter samples at encoder boundaries) are not wired to
+queries. Occlusion queries report 1 (visible). vkCmdCopyQueryPoolResults writes what is
+available when recorded.
+
+Test: gpu_vulkan.sync (timestamps not ready before the frame completes, then start/end).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
+---
+ gpu/core/include/vpgpu/core/backend.h |   2 +
+ gpu/core/include/vpgpu/core/device.h  |   9 ++
+ gpu/core/src/device.cpp               |  20 +++-
+ gpu/core/src/null_backend.cpp         |   2 +
+ gpu/metal2/src/metal_backend.mm       |   2 +
+ gpu/vulkan/CMakeLists.txt             |   2 +-
+ gpu/vulkan/src/commands.h             |  16 +++
+ gpu/vulkan/src/entry.cpp              |   1 +
+ gpu/vulkan/src/pipelines.cpp          |  28 +----
+ gpu/vulkan/src/queries.cpp            | 143 ++++++++++++++++++++++++++
+ gpu/vulkan/src/sync.cpp               |  24 ++++-
+ gpu/vulkan/src/vpvk.h                 |  10 ++
+ gpu/vulkan/tests/vk_tests.cpp         |  27 +++++
+ 13 files changed, 256 insertions(+), 30 deletions(-)
+ create mode 100644 gpu/vulkan/src/queries.cpp
+
+diff --git a/gpu/core/include/vpgpu/core/backend.h b/gpu/core/include/vpgpu/core/backend.h
+index b5207a9..a40af1e 100644
+--- a/gpu/core/include/vpgpu/core/backend.h
++++ b/gpu/core/include/vpgpu/core/backend.h
+@@ -15,6 +15,8 @@ struct PipelineState;
+ // Per-frame GPU timings reported back by the backend (from command buffer / encoder timestamps).
+ struct GpuTimings {
+   double frameMs = 0;
++  // Absolute GPU start / end of the frame in nanoseconds of the host clock (0 = unknown).
++  double startNs = 0, endNs = 0;
+   std::vector<double> encoderMs;  // parallel to CompiledFrame::encoders when available
+ };
+ 
+diff --git a/gpu/core/include/vpgpu/core/device.h b/gpu/core/include/vpgpu/core/device.h
+index 220a8f9..f2e5d1a 100644
+--- a/gpu/core/include/vpgpu/core/device.h
++++ b/gpu/core/include/vpgpu/core/device.h
+@@ -3,6 +3,8 @@
+ #pragma once
+ 
+ #include <deque>
++#include <mutex>
++#include <tuple>
+ #include <functional>
+ #include <string>
+ #include <utility>
+@@ -38,6 +40,9 @@ class Device {
+   void setPassTiming(uint64_t every) { passEvery_ = every; }
+   // Frames with an index below this one have finished on the GPU (see Backend::completedFrames).
+   uint64_t completedFrames() const { return backend_.completedFrames(); }
++  // GPU start / end (host-clock ns) of a finished frame, if the backend reported it and it is
++  // among the last few hundred (timestamp queries). Thread-safe.
++  bool frameTimes(uint64_t frame, double& startNs, double& endNs);
+ 
+  private:
+   Backend& backend_;
+@@ -55,6 +60,10 @@ class Device {
+   double holdTotalMs_ = 0;
+   // Frames waiting for their timings: index + one descriptor per encoder ("pass=i label=.. fmt=.. WxH draws=..").
+   std::deque<std::pair<uint64_t, std::vector<std::string>>> passPending_;
++  // Timings drained from the backend (submit thread and frameTimes callers).
++  void drainTimings();
++  std::mutex timesMutex_;
++  std::deque<std::tuple<uint64_t, double, double>> times_;  // frame, startNs, endNs
+ };
+ 
+ }  // namespace vpgpu
+diff --git a/gpu/core/src/device.cpp b/gpu/core/src/device.cpp
+index 70bd96c..73640d6 100644
+--- a/gpu/core/src/device.cpp
++++ b/gpu/core/src/device.cpp
+@@ -139,9 +139,28 @@ FrameReport Device::submit(const Frame& frame) {
+     }
+   }
+ 
++  drainTimings();
++  return report;
++}
++
++bool Device::frameTimes(uint64_t frame, double& startNs, double& endNs) {
++  drainTimings();
++  std::lock_guard lock(timesMutex_);
++  for (const auto& [f, s, e] : times_)
++    if (f == frame) {
++      startNs = s, endNs = e;
++      return e > 0;
++    }
++  return false;
++}
++
++void Device::drainTimings() {
++  std::lock_guard lock(timesMutex_);
+   uint64_t done;
+   GpuTimings t;
+   while (backend_.takeTimings(done, t)) {
++    times_.emplace_back(done, t.startNs, t.endNs);
++    while (times_.size() > 512) times_.pop_front();
+     while (!passPending_.empty() && passPending_.front().first < done) passPending_.pop_front();
+     if (!passPending_.empty() && passPending_.front().first == done) {
+       const auto& desc = passPending_.front().second;
+@@ -176,7 +195,6 @@ FrameReport Device::submit(const Frame& frame) {
+     }
+     log_(line);
+   }
+-  return report;
+ }
+ 
+ }  // namespace vpgpu
+diff --git a/gpu/core/src/null_backend.cpp b/gpu/core/src/null_backend.cpp
+index adddc58..b79ad32 100644
+--- a/gpu/core/src/null_backend.cpp
++++ b/gpu/core/src/null_backend.cpp
+@@ -37,6 +37,8 @@ bool NullBackend::takeTimings(uint64_t& frameIndex, GpuTimings& out) {
+   frameIndex = p.frame;
+   out.encoderMs.assign(p.encoders, fakeEncoderMs);
+   out.frameMs = fakeEncoderMs * static_cast<double>(p.encoders);
++  out.startNs = double(p.frame) * 1e7;  // frames 10 ms apart
++  out.endNs = out.startNs + out.frameMs * 1e6;
+   return true;
+ }
+ 
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 4abb447..3423b1a 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -2029,6 +2029,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     }
+     Done d{frameIndex, {}};
+     d.timings.frameMs = (finished.GPUEndTime - finished.GPUStartTime) * 1000.0;
++    d.timings.startNs = finished.GPUStartTime * 1e9;  // host time base (seconds), as CACurrentMediaTime
++    d.timings.endNs = finished.GPUEndTime * 1e9;
+     if (finished.status == MTLCommandBufferStatusError) {
+       std::string encs;
+       NSArray* infos = finished.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+diff --git a/gpu/vulkan/CMakeLists.txt b/gpu/vulkan/CMakeLists.txt
+index 6fd25cb..38bfefd 100644
+--- a/gpu/vulkan/CMakeLists.txt
++++ b/gpu/vulkan/CMakeLists.txt
+@@ -2,7 +2,7 @@
+ # MoltenVK by path (Klepton's kl_vulkan.c) load libVPVulkan.dylib instead. Khronos headers only
+ # (Apache-2.0/MIT, third_party/vulkan-headers); no other Vulkan code.
+ set(VPVK_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include)
+-set(VPVK_COMMON src/entry.cpp src/physical_device.cpp src/commands.cpp src/config.cpp src/pipelines.cpp src/recipes.cpp src/precompile.cpp src/sync.cpp src/core13.cpp)
++set(VPVK_COMMON src/entry.cpp src/physical_device.cpp src/commands.cpp src/config.cpp src/pipelines.cpp src/recipes.cpp src/precompile.cpp src/sync.cpp src/core13.cpp src/queries.cpp)
+ # The static gpu/ libraries end up inside a shared library.
+ set_target_properties(vpgpu_core vpir vpmsl vpspirv PROPERTIES POSITION_INDEPENDENT_CODE ON)
+ 
+diff --git a/gpu/vulkan/src/commands.h b/gpu/vulkan/src/commands.h
+index 41f42f5..d6d209d 100644
+--- a/gpu/vulkan/src/commands.h
++++ b/gpu/vulkan/src/commands.h
+@@ -186,15 +186,31 @@ struct BoundState {
+   bool localRead = false;
+ };
+ 
++// A query this command buffer writes (timestamps, occlusion end): stamped with the frame of the
++// submission that executes it (sync.cpp), so results can be read once that frame completes.
++struct QueryWrite {
++  QueryPoolObj* pool = nullptr;
++  uint32_t index = 0;
++  bool top = false;
++};
++struct QueryReset {
++  QueryPoolObj* pool = nullptr;
++  uint32_t first = 0, count = 0;
++};
++
+ struct Recorder {
+   Device* device = nullptr;
+   std::vector<Op> ops;
++  std::vector<QueryReset> queryResets;  // applied at submit, before queryWrites
++  std::vector<QueryWrite> queryWrites;
+   uint32_t barriers = 0;  // vkCmdPipelineBarrier calls dropped (the core derives its own)
+   bool inPass = false;
+   BoundState bound;
+   UploadArena arena;
+   void reset() {
+     ops.clear();
++    queryResets.clear();
++    queryWrites.clear();
+     barriers = 0;
+     inPass = false;
+     bound = BoundState{};
+diff --git a/gpu/vulkan/src/entry.cpp b/gpu/vulkan/src/entry.cpp
+index 93e806a..a005ca9 100644
+--- a/gpu/vulkan/src/entry.cpp
++++ b/gpu/vulkan/src/entry.cpp
+@@ -1346,6 +1346,7 @@ PFN_vkVoidFunction vpvk::lookup(const char* name, bool deviceLevel) {
+   if (PFN_vkVoidFunction f = lookupPhase3(name)) return f;
+   if (PFN_vkVoidFunction f = lookupSync(name)) return f;
+   if (PFN_vkVoidFunction f = lookupCore13(name)) return f;
++  if (PFN_vkVoidFunction f = lookupQueries(name)) return f;
+   {
+     std::lock_guard<std::mutex> lock(gUnimplMutex);
+     if (gUnimpl.insert(name).second) logf("vk.unimpl %s", name);
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index 2af5f02..ebf7485 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -1629,30 +1629,6 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWaitEvents(VkCommandBuffer cb, uint3
+   ++rec(cb).barriers;
+ }
+ 
+-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateQueryPool(VkDevice, const VkQueryPoolCreateInfo* ci,
+-                                                             const VkAllocationCallbacks*, VkQueryPool* out) {
+-  auto* q = new QueryPoolObj;
+-  q->type = ci->queryType, q->count = ci->queryCount;
+-  *out = to<VkQueryPool>(q);
+-  return VK_SUCCESS;
+-}
+-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyQueryPool(VkDevice, VkQueryPool q, const VkAllocationCallbacks*) {
+-  delete from<QueryPoolObj>(q);
+-}
+-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice, VkQueryPool, uint32_t, uint32_t n, size_t size,
+-                                                                 void* data, VkDeviceSize stride, VkQueryResultFlags flags) {
+-  // Timestamps and occlusion read as zero (visible / no time).
+-  std::memset(data, 0, size);
+-  (void)n, (void)stride, (void)flags;
+-  return VK_SUCCESS;
+-}
+-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkResetQueryPool(VkDevice, VkQueryPool, uint32_t, uint32_t) {}
+-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResetQueryPool(VkCommandBuffer, VkQueryPool, uint32_t, uint32_t) {}
+-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginQuery(VkCommandBuffer, VkQueryPool, uint32_t, VkQueryControlFlags) {}
+-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndQuery(VkCommandBuffer, VkQueryPool, uint32_t) {}
+-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWriteTimestamp(VkCommandBuffer, VkPipelineStageFlagBits, VkQueryPool, uint32_t) {}
+-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyQueryPoolResults(VkCommandBuffer, VkQueryPool, uint32_t, uint32_t, VkBuffer,
+-                                                                 VkDeviceSize, VkDeviceSize, VkQueryResultFlags) {}
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkTrimCommandPool(VkDevice, VkCommandPool, VkCommandPoolTrimFlags) {}
+ 
+ // =================================================================================================
+@@ -1686,8 +1662,7 @@ PFN_vkVoidFunction lookupPhase3(const char* name) {
+       F(vkCmdSetRenderingAttachmentLocationsKHR), F(vkCmdSetRenderingInputAttachmentIndicesKHR),
+       F(vkCmdClearDepthStencilImage), F(vkCmdExecuteCommands), F(vkCmdUpdateBuffer), F(vkCmdCopyImageToBuffer),
+       F(vkCmdCopyImage), F(vkCmdBlitImage), F(vkCmdResolveImage), F(vkCmdSetEvent), F(vkCmdResetEvent), F(vkCmdWaitEvents),
+-      F(vkCreateQueryPool), F(vkDestroyQueryPool), F(vkGetQueryPoolResults), F(vkResetQueryPool), F(vkCmdResetQueryPool),
+-      F(vkCmdBeginQuery), F(vkCmdEndQuery), F(vkCmdWriteTimestamp), F(vkCmdCopyQueryPoolResults), F(vkTrimCommandPool),
++      F(vkTrimCommandPool),
+   };
+ #undef F
+   static const std::pair<const char*, const char*> aliases[] = {
+@@ -1699,7 +1674,6 @@ PFN_vkVoidFunction lookupPhase3(const char* name) {
+       {"vkCmdBeginRenderingKHR", "vkCmdBeginRendering"},
+       {"vkCmdEndRenderingKHR", "vkCmdEndRendering"},
+       {"vkCmdBindVertexBuffers2EXT", "vkCmdBindVertexBuffers2"},
+-      {"vkResetQueryPoolEXT", "vkResetQueryPool"},
+       {"vkTrimCommandPoolKHR", "vkTrimCommandPool"},
+       {"vkCmdSetViewportWithCountEXT", "vkCmdSetViewportWithCount"},
+       {"vkCmdSetScissorWithCountEXT", "vkCmdSetScissorWithCount"},
+diff --git a/gpu/vulkan/src/queries.cpp b/gpu/vulkan/src/queries.cpp
+new file mode 100644
+index 0000000..bc955ab
+--- /dev/null
++++ b/gpu/vulkan/src/queries.cpp
+@@ -0,0 +1,143 @@
++// VPVulkan queries. Timestamps are frame-granular: vkCmdWriteTimestamp at TOP_OF_PIPE reads as the
++// GPU start of the frame (vkQueueSubmit) it ran in, any later stage as that frame's GPU end, in
++// nanoseconds of the host clock (timestampPeriod 1). gpu/metal2 reports both from the command
++// buffer (GPUStartTime / GPUEndTime). Enough for engines that time whole frames or their halves
++// (Source 2's adaptive fidelity reads frame GPU time); per-pass timings would need Metal counter
++// sample buffers at encoder boundaries, which the backend already takes for its own diagnostics.
++// Occlusion queries report 1 sample passed (visible): no visibility buffer is bound yet.
++#include <cstring>
++
++#include "commands.h"
++#include "vpvk.h"
++
++#define VPVK_EXPORT extern "C" __attribute__((visibility("default")))
++
++using namespace vpvk;
++
++namespace {
++Recorder& rec(VkCommandBuffer cb) { return *from<CommandBuffer>(cb)->rec; }
++
++// Result of query `q`; false when not available yet.
++bool result(Device& d, const QueryPoolObj& p, uint32_t q, uint64_t& value) {
++  const QueryPoolObj::Query& x = p.queries[q];
++  if (!x.written || !d.frameDone(x.frame)) return false;
++  switch (p.type) {
++    case VK_QUERY_TYPE_TIMESTAMP: {
++      double s = 0, e = 0;
++      if (!d.gpu->frameTimes(x.frame, s, e)) {
++        value = 0;  // the backend gave no time (frame without GPU work): still available
++        return true;
++      }
++      value = uint64_t(x.top ? s : e);
++      return true;
++    }
++    case VK_QUERY_TYPE_OCCLUSION: value = 1; return true;
++    default: value = 0; return true;
++  }
++}
++}  // namespace
++
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateQueryPool(VkDevice, const VkQueryPoolCreateInfo* ci,
++                                                             const VkAllocationCallbacks*, VkQueryPool* out) {
++  auto* q = new QueryPoolObj;
++  q->type = ci->queryType, q->count = ci->queryCount;
++  q->queries.reset(new QueryPoolObj::Query[std::max(1u, ci->queryCount)]);
++  *out = to<VkQueryPool>(q);
++  return VK_SUCCESS;
++}
++
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyQueryPool(VkDevice, VkQueryPool q, const VkAllocationCallbacks*) {
++  delete from<QueryPoolObj>(q);
++}
++
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetQueryPoolResults(VkDevice dv, VkQueryPool pool, uint32_t first, uint32_t n,
++                                                                 size_t size, void* data, VkDeviceSize stride,
++                                                                 VkQueryResultFlags flags) {
++  Device& d = *from<Device>(dv);
++  const QueryPoolObj& p = *from<QueryPoolObj>(pool);
++  const bool wide = flags & VK_QUERY_RESULT_64_BIT, avail = flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT;
++  VkResult res = VK_SUCCESS;
++  auto* out = static_cast<uint8_t*>(data);
++  for (uint32_t i = 0; i < n && first + i < p.count; ++i) {
++    uint8_t* slot = out + i * stride;
++    if (slot + (wide ? 8 : 4) * (avail ? 2 : 1) > out + size) break;
++    uint64_t v = 0;
++    bool ok = result(d, p, first + i, v);
++    if (!ok && (flags & VK_QUERY_RESULT_WAIT_BIT) && p.queries[first + i].written) {
++      d.waitFrame(p.queries[first + i].frame, UINT64_MAX);
++      ok = result(d, p, first + i, v);
++    }
++    if (!ok) res = VK_NOT_READY;
++    if (ok || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
++      if (wide) std::memcpy(slot, &v, 8);
++      else {
++        const uint32_t v32 = uint32_t(v);
++        std::memcpy(slot, &v32, 4);
++      }
++    }
++    if (avail) {
++      const uint64_t a = ok ? 1 : 0;
++      if (wide) std::memcpy(slot + 8, &a, 8);
++      else {
++        const uint32_t a32 = uint32_t(a);
++        std::memcpy(slot + 4, &a32, 4);
++      }
++    }
++  }
++  return res;
++}
++
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkResetQueryPool(VkDevice, VkQueryPool pool, uint32_t first, uint32_t n) {
++  QueryPoolObj& p = *from<QueryPoolObj>(pool);
++  for (uint32_t i = first; i < first + n && i < p.count; ++i) p.queries[i].written = false;
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResetQueryPool(VkCommandBuffer cb, VkQueryPool pool, uint32_t first, uint32_t n) {
++  rec(cb).queryResets.push_back({from<QueryPoolObj>(pool), first, n});
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginQuery(VkCommandBuffer, VkQueryPool, uint32_t, VkQueryControlFlags) {}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndQuery(VkCommandBuffer cb, VkQueryPool pool, uint32_t q) {
++  QueryPoolObj* p = from<QueryPoolObj>(pool);
++  if (q < p->count) rec(cb).queryWrites.push_back({p, q, false});
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWriteTimestamp(VkCommandBuffer cb, VkPipelineStageFlagBits stage, VkQueryPool pool,
++                                                           uint32_t q) {
++  QueryPoolObj* p = from<QueryPoolObj>(pool);
++  if (q < p->count) rec(cb).queryWrites.push_back({p, q, stage == VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT});
++}
++// Results written into a buffer when the copy executes: the frame it runs in is still on the GPU,
++// so only queries of earlier, finished frames have values; the others are written as unavailable.
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyQueryPoolResults(VkCommandBuffer cb, VkQueryPool pool, uint32_t first,
++                                                                 uint32_t n, VkBuffer dst, VkDeviceSize off, VkDeviceSize stride,
++                                                                 VkQueryResultFlags flags) {
++  Recorder& r = rec(cb);
++  const QueryPoolObj& p = *from<QueryPoolObj>(pool);
++  const bool wide = flags & VK_QUERY_RESULT_64_BIT, avail = flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT;
++  const size_t each = (wide ? 8 : 4) * (avail ? 2 : 1);
++  std::vector<uint8_t> bytes(size_t(stride) * (n ? n - 1 : 0) + each, 0);
++  vkGetQueryPoolResults(to<VkDevice>(r.device), pool, first, n, bytes.size(), bytes.data(), stride,
++                        flags & ~VkQueryResultFlags(VK_QUERY_RESULT_WAIT_BIT));
++  (void)p;
++  OpUpload u;
++  u.src = r.arena.put(r.device, bytes.data(), bytes.size(), u.srcOffset);
++  u.dst = from<Buffer>(dst), u.dstOffset = off, u.size = bytes.size();
++  r.ops.emplace_back(u);
++}
++
++namespace vpvk {
++PFN_vkVoidFunction lookupQueries(const char* name) {
++  struct E {
++    const char* name;
++    PFN_vkVoidFunction fn;
++  };
++#define F(f) {#f, reinterpret_cast<PFN_vkVoidFunction>(&f)}
++  static const E table[] = {
++      F(vkCreateQueryPool), F(vkDestroyQueryPool), F(vkGetQueryPoolResults), F(vkResetQueryPool), F(vkCmdResetQueryPool),
++      F(vkCmdBeginQuery), F(vkCmdEndQuery), F(vkCmdWriteTimestamp), F(vkCmdCopyQueryPoolResults),
++  };
++#undef F
++  if (!std::strcmp(name, "vkResetQueryPoolEXT")) name = "vkResetQueryPool";
++  for (const E& e : table)
++    if (!std::strcmp(e.name, name)) return e.fn;
++  return nullptr;
++}
++}  // namespace vpvk
+diff --git a/gpu/vulkan/src/sync.cpp b/gpu/vulkan/src/sync.cpp
+index 3449e99..44973e4 100644
+--- a/gpu/vulkan/src/sync.cpp
++++ b/gpu/vulkan/src/sync.cpp
+@@ -104,6 +104,9 @@ bool waitSemaphore(Device& d, Semaphore& s, uint64_t value, uint64_t timeoutNs)
+   }
+ }
+ 
++struct Batch;
++void stampQueries(const std::vector<Batch>& batches, uint64_t frame);
++
+ struct SemOp {
+   Semaphore* sem = nullptr;
+   uint64_t value = 0;
+@@ -115,6 +118,20 @@ struct Batch {
+   std::vector<const CommandBuffer*> cbs;
+ };
+ 
++void stampQueries(const std::vector<Batch>& batches, uint64_t frame) {
++  for (const Batch& b : batches)
++    for (const CommandBuffer* c : b.cbs) {
++      for (const QueryReset& r : c->rec->queryResets)
++        for (uint32_t i = r.first; i < r.first + r.count && i < r.pool->count; ++i) r.pool->queries[i].written = false;
++      for (const QueryWrite& w : c->rec->queryWrites) {
++        QueryPoolObj::Query& q = w.pool->queries[w.index];
++        q.top = w.top;
++        q.frame = frame;
++        q.written = true;
++      }
++    }
++}
++
+ // Submits batches in order. Timeline waits on values no earlier work promises block here until the
+ // host signals them. Binary waits never block: on this in-order queue a binary semaphore is
+ // signalled by an earlier submission or by the host layer's own swapchain acquire (Klepton
+@@ -142,8 +159,13 @@ VkResult submit(Device& d, std::vector<Batch>& batches, Fence* fence) {
+       barriers += c->rec->barriers;
+       ++cbs;
+     }
+-  if (!frame.commands().empty()) d.lastFrame = d.gpu->submit(frame).frame;
++  // A submission with query writes runs as a frame even without GPU work, so they get a time.
++  bool queries = false;
++  for (Batch& b : batches)
++    for (const CommandBuffer* c : b.cbs) queries = queries || !c->rec->queryWrites.empty();
++  if (!frame.commands().empty() || queries) d.lastFrame = d.gpu->submit(frame).frame;
+   ++d.submits;
++  stampQueries(batches, d.lastFrame);
+   if (st.dropped || st.skippedDraws || st.skippedDispatches || d.submits <= 3 || d.submits % 600 == 0)
+     logf("vk.submit n=%llu cbs=%u passes=%u draws=%u dispatches=%u copies=%u clears=%u vk_barriers=%u "
+          "draws_skipped=%u dispatch_skipped=%u dropped=%u local_reads=%u",
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index 66c3ee2..4d5e6b7 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -249,9 +249,18 @@ struct PipelineObj {
+   }
+ };
+ 
++// Queries (queries.cpp). Timestamps are frame-granular: a timestamp written at TOP_OF_PIPE reads as
++// the GPU start of the frame (vkQueueSubmit) it was submitted in, any later stage as its end, from
++// the backend's command buffer times. Occlusion queries report "visible" (no visibility buffer yet).
+ struct QueryPoolObj {
+   VkQueryType type = VK_QUERY_TYPE_OCCLUSION;
+   uint32_t count = 0;
++  struct Query {
++    std::atomic<uint64_t> frame{kNoFrame};  // frame it was submitted in
++    std::atomic<bool> top{false};           // TOP_OF_PIPE timestamp
++    std::atomic<bool> written{false};       // recorded and submitted since the last reset
++  };
++  std::unique_ptr<Query[]> queries;
+ };
+ 
+ struct Framebuffer {
+@@ -324,6 +333,7 @@ PFN_vkVoidFunction lookup(const char* name, bool deviceLevel);
+ PFN_vkVoidFunction lookupPhase3(const char* name);  // pipelines.cpp
+ PFN_vkVoidFunction lookupSync(const char* name);    // sync.cpp
+ PFN_vkVoidFunction lookupCore13(const char* name);  // core13.cpp
++PFN_vkVoidFunction lookupQueries(const char* name); // queries.cpp
+ 
+ template <class T, class H>
+ T* from(H h) { return reinterpret_cast<T*>(h); }
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index 1c98949..b97ae2a 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -1292,6 +1292,33 @@ void testSync() {
+   for (const char* n : {"vkEnumeratePhysicalDeviceGroups", "vkGetPhysicalDeviceToolProperties",
+                         "vkGetPhysicalDeviceExternalSemaphoreProperties"})
+     CHECK(vkGetInstanceProcAddr(c.inst, n) != nullptr);
++  // Timestamps: top-of-pipe = the frame's GPU start, bottom = its end (null backend: frames 10 ms
++  // apart, 0.1 ms per encoder); not available until the frame completed.
++  {
++    VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
++    qci.queryType = VK_QUERY_TYPE_TIMESTAMP, qci.queryCount = 2;
++    VkQueryPool qp;
++    vkCreateQueryPool(c.dev, &qci, nullptr, &qp);
++    vkBeginCommandBuffer(cb, &bi);
++    vkCmdResetQueryPool(cb, qp, 0, 2);
++    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
++    vkCmdCopyBuffer(cb, a, b, 1, &bc);
++    vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, qp, 1);
++    vkEndCommandBuffer(cb);
++    nb.completedBelow = 0;
++    VkSubmitInfo qs{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++    qs.commandBufferCount = 1, qs.pCommandBuffers = &cb;
++    CHECK(vkQueueSubmit(c.queue, 1, &qs, VK_NULL_HANDLE) == VK_SUCCESS);
++    uint64_t ts[4] = {};
++    CHECK(vkGetQueryPoolResults(c.dev, qp, 0, 2, sizeof ts, ts, 16, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ==
++          VK_NOT_READY);
++    CHECK(ts[1] == 0 && ts[3] == 0);
++    nb.completedBelow = ~uint64_t(0);
++    CHECK(vkGetQueryPoolResults(c.dev, qp, 0, 2, sizeof ts, ts, 16, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ==
++          VK_SUCCESS);
++    CHECK(ts[1] == 1 && ts[3] == 1 && ts[0] > 0 && ts[2] > ts[0] && ts[2] - ts[0] == 100000);  // 0.1 ms
++    vkDestroyQueryPool(c.dev, qp, nullptr);
++  }
+   vkDestroySemaphore(c.dev, bin, nullptr);
+   vkDestroySemaphore(c.dev, tl, nullptr);
+   vkDestroyFence(c.dev, f1, nullptr);
+-- 
+2.43.0
+

@@ -157,6 +157,14 @@ typedef struct {
     uint32_t      fade_on;
     float         fade_scale[4];
     float         fade_offset[4];
+    // ---- the game's depth (KL_CP_DEPTH; kl_reproject_depth_f) ----------------
+    // 1 = this view has a depth copy of the game's picture bound (fragment textures 2/3, by view), so the pass
+    // writes each pixel's REAL depth for visionOS's own reprojection instead of the quad's. The mapping is the
+    // game's, OpenVR row-major: clip.z = depth_m22*z + depth_m23, clip.w = -z, i.e. a stored depth D is the
+    // distance m23 / (D + m22) along the view axis, and a D at or past -m22 is empty background (the quad).
+    // Scalars again, for the layout reason the chroma block gives. kl_reproject_build leaves it off.
+    float         depth_m22, depth_m23;
+    uint32_t      depth_on;
 } kl_reproject_uniforms;
 
 // The blit's uniforms — buffer(0) of its FRAGMENT stage. It carried a bare

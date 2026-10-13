@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>          // task_info(TASK_VM_INFO) — the heartbeat's footprint
+#include <math.h>              // ceil — KL_GUEST_PACE_HZ
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,8 +86,13 @@ int kl_app_target_wants_full(void) {
     // cs1/hl2/portal (SDL2). KL_FULL=0 forces .mixed back for development.
     return g_target && (g_target->kind == KL_GUEST_NATIVE ||
                         g_target->kind == KL_GUEST_GLES3JNI ||
-                        g_target->kind == KL_GUEST_SDL2);
+                        g_target->kind == KL_GUEST_SDL2 ||
+                        g_target->kind == KL_GUEST_LINUX);
 }
+// Half-Life: Alyx: the immersive space is the whole app — once it is open the
+// boot window is dismissed (it sat in front of the game), and leaving the space
+// backgrounds and exits the app, so the icon starts it again cleanly.
+int kl_app_target_is_linux(void) { return g_target && g_target->kind == KL_GUEST_LINUX; }
 int kl_app_target_owns_frame_loop(void) {
     return g_target ? kl_driver_owns_frame_loop() : 0;
 }
@@ -106,6 +112,76 @@ static void app_phase(const char *p);
 
 const char *kl_app_log_path(void) { return g_log; }
 const char *kl_app_status(void)   { return g_status; }
+// ---- Guest-stall watchdog (KL_STALL_DUMP_S, default 5; 0 off) -------------------------------------------------
+// Build 18 (2026-10-03): opening Alyx's in-game menu stopped the game's frames for good on the headset
+// (not on the Mac), and the log could not say where it was stuck. The compositor reports each frame how many
+// pictures in a row it has reused (kl_guest_stall_check); once that has lasted KL_STALL_DUMP_S seconds, every
+// thread's frames are dumped to the log ([stall] lines, runtime/diag/kl_sample.c), and once more 10 s later in the
+// same stall, at most 4 dumps a run. Also logged: whether a merged scene encoder is held (kl_gpu_time.m).
+void kl_sample_dump_all(FILE *out, const char *why);
+int kl_merge_held(unsigned *merged, unsigned *flushed);
+static double g_stall_t0;
+static int g_stall_dumps, g_stall_step;
+static void *stall_dump_thread(void *arg) {
+    double secs = (double)(intptr_t)arg / 10.0;
+    unsigned merged = 0, flushed = 0;
+    int held = kl_merge_held(&merged, &flushed);
+    char why[160];
+    snprintf(why, sizeof why, "the guest sent no new frame for %.1f s; merged scene encoders held %d "
+             "(merges %u, real ends %u)", secs, held, merged, flushed);
+    fprintf(stderr, "[stall] %s\n", why);
+    kl_sample_dump_all(stderr, why);
+    return NULL;
+}
+void kl_guest_stall_check(unsigned stale) {
+    static double limit = -1;
+    if (limit < 0) { const char *e = getenv("KL_STALL_DUMP_S"); limit = e && *e ? atof(e) : 5.0; }
+    if (limit <= 0) return;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = ts.tv_sec + ts.tv_nsec / 1e9;
+    if (!stale) { g_stall_t0 = 0; g_stall_step = 0; return; }
+    if (!g_stall_t0) { g_stall_t0 = now; return; }
+    double held = now - g_stall_t0;
+    double at = g_stall_step == 0 ? limit : limit + 10;
+    if (g_stall_step < 2 && held >= at && g_stall_dumps < 4) {
+        g_stall_step++; g_stall_dumps++;
+        pthread_t th;
+        if (pthread_create(&th, NULL, stall_dump_thread, (void *)(intptr_t)(held * 10)) == 0) pthread_detach(th);
+    }
+}
+
+__attribute__((weak)) int kl_foz_prewarm(const char *info) { (void)info; return -1; }
+__attribute__((weak)) void kl_foz_prewarm_log(double seconds, unsigned pipelines, unsigned slow, int rc) {
+    (void)seconds; (void)pipelines; (void)slow; (void)rc;
+}
+
+int kl_app_configure(const char *resources, const char *container);  // below
+
+#ifdef KL_APP_ALYX
+static char g_alyx_config[1024], g_alyx_data[1024];
+int kl_app_configure_alyx(const char *resources, const char *game, const char *dylibs,
+                          const char *config, const char *data);
+int kl_app_prewarm_alyx(const char *resources, const char *game, const char *dylibs,
+                        const char *config, const char *data) {
+    if (kl_app_configure_alyx(resources, game, dylibs, config, data) != 0) return -1;
+    // The headset's own record of how the game makes its device (written at each game launch), else the app's
+    // (the config folder's device-info.json).
+    char own[1300], shipped[1300];
+    snprintf(own, sizeof own, "%s/klfz/device-info.json", g_alyx_data);
+    snprintf(shipped, sizeof shipped, "%s/device-info.json", g_alyx_config);
+    int rc = kl_foz_prewarm(own);
+    if (rc == -2) rc = kl_foz_prewarm(shipped);
+    if (rc == -2) kl_foz_prewarm_log(0, 0, 0, -2);  // neither copy was usable
+    return rc;
+}
+#endif
+
+__attribute__((weak)) int kl_foz_progress(unsigned *done, unsigned *total, double *elapsed) {
+    if (done) *done = 0;
+    if (total) *total = 0;
+    if (elapsed) *elapsed = 0;
+    return 0;
+}
 
 static int have(const char *p) { struct stat st; return p && *p && stat(p, &st) == 0; }
 
@@ -131,9 +207,36 @@ static int missing(const char *what, const char *path) {
     return 1;
 }
 
+static long long kl_avail_memory(void);
+static char g_memline[160];
+// Once per process: the launcher's "Preparing graphics" (kl_app_prewarm_alyx) configures before boot does, and a
+// second run would find the veneers' TSD slot already taken (kl_x18_init).
+static int g_configured;
+#ifdef KL_APP_ALYX
+// Alyx's fatal error box: onto the window's status line and into a file next
+// to the boot log, where the app keeps it after the guest thread parks.
+static char g_container[1024];
+static void alyx_msgbox(const char *title, const char *msg) {
+    snprintf(g_status, sizeof g_status, "Alyx: %s — %s", title, msg);
+    char p[1100];
+    snprintf(p, sizeof p, "%s/logs/alyx-error.txt", g_container);
+    FILE *f = fopen(p, "w");
+    if (f) { fprintf(f, "%s\n%s\n", title, msg); fclose(f); }
+}
+// AVP: the app's config folder (alyx-env.txt, alyx-convars.lua, video2.txt, the fidelity table), applied and
+// installed at every launch (runtime/linux/kl_alyx_app.c). What was applied goes into the boot log.
+#include "linux/kl_alyx_app.h"
+static char g_envline[2048], g_filesline[512];
+#endif   // configure runs before the log opens; boot prints it
 int kl_app_configure(const char *resources, const char *container) {
+    // Once per process: the launcher's "Preparing graphics" (kl_app_prewarm_alyx) configures before boot does, and a
+    // second run would find the veneers' TSD slot already taken (kl_x18_init below).
+    if (g_configured) return 0;
     if (!resources || !container) return missing("path", "(null)");
 
+#ifdef KL_APP_ALYX
+    snprintf(g_container, sizeof g_container, "%s", container);
+#endif
     const char *want = kl_env_str("KL_TARGET", KL_TARGET_DEFAULT);
     g_target = kl_target_lookup(want);
     if (!g_target) return missing("guest target (KL_TARGET)", want);
@@ -223,6 +326,75 @@ int kl_app_configure_game(const char *name, const char *tree, const char *apk,
     return configure_rest(container);
 }
 
+#ifdef KL_APP_ALYX
+// AVP: Half-Life: Alyx from the four folders of a launch (kl_app.h). See runtime/linux/kl_alyx_app.c for what the
+// config folder holds and what is installed into the game folder.
+int kl_app_configure_alyx(const char *resources, const char *game, const char *dylibs,
+                          const char *config, const char *data) {
+    if (g_configured) return 0;
+    if (!resources || !game || !dylibs || !config || !data) return missing("path", "(null)");
+    if (!have(game)) return missing("game folder", game);
+    if (!have(dylibs)) return missing("converted libraries folder", dylibs);
+    g_target = kl_target_lookup("alyx");
+    if (!g_target) return missing("guest target", "alyx");
+    snprintf(g_container, sizeof g_container, "%s", data);
+    snprintf(g_alyx_config, sizeof g_alyx_config, "%s", config);
+    snprintf(g_alyx_data, sizeof g_alyx_data, "%s", data);
+    char dir[1200];
+    mkdir(data, 0755);
+    snprintf(dir, sizeof dir, "%s/logs", data);   mkdir(dir, 0755);
+    snprintf(dir, sizeof dir, "%s/klfz", data);   mkdir(dir, 0755);
+    snprintf(dir, sizeof dir, "%s/files", data);  mkdir(dir, 0755);
+
+    // The Vulkan driver and SDL ride in the app bundle (Frameworks/); KL_MVK_DYLIB, when the app chose a driver
+    // (VPVulkan by default, MoltenVK as the diagnostic switch), names it and wins. Before the app files: they read
+    // the driver's GPU ids for video2.txt.
+    char fw[1100];
+    snprintf(fw, sizeof fw, "%s/Frameworks", resources);
+    setenv("KL_MVK_DIR", fw, 0);
+    static char sdl2[1200];
+    snprintf(sdl2, sizeof sdl2, "%s/SDL2.framework/SDL2", fw);
+    setenv("KL_SDL2_DYLIB", sdl2, 0);
+    // Pipelines, device info and perf beside each other in <data>/klfz: the recording (KL_VK_FOZ_RECORD=auto ->
+    // <data>/klfz/recorded.foz), the replay of every .foz there (the app's pipeline list and earlier recordings),
+    // and the game's device settings for the launcher's prewarm.
+    snprintf(dir, sizeof dir, "%s/klfz", data);
+    setenv("KL_VK_FOZ_DIR", dir, 0);
+    setenv("KL_VK_FOZ_RECORD", "auto", 0);
+    setenv("KL_VK_FOZ_REPLAY", "auto", 0);
+    setenv("KL_VK_DEVICE_INFO", "auto", 0);
+    // The Vulkan census (kl_vk_census.inc): what the game asks of Vulkan, for VPEngine's gaps.
+    setenv("KL_VK_CENSUS", "1", 0);
+
+    // The app's settings files: the env file first, so everything below defaults only what it left unset.
+    kl_alyx_paths ap = { .game = game, .dylibs = dylibs, .config = config, .data = data };
+    kl_alyx_app_files(&ap, g_envline, sizeof g_envline, g_filesline, sizeof g_filesline);
+
+    if (kl_x18_init() != 0)
+        fprintf(stderr, "  [klepton] x18: TSD slot %d was already taken at "
+                        "configure time — a veneered guest will refuse to load\n",
+                KLX_TSD_SLOT);
+
+    // Library search: the converted dylibs only. g_libdir is the "sysroot" kl_alyx_run adds to the DT_NEEDED
+    // search (the Debian runtime libraries are flat in the dylibs folder too); the game's own bin folders stay the
+    // paths the guest sees, and with KL_DYLIB_ONLY=1 every one of them resolves BY NAME to <dylibs>/<stem>.dylib —
+    // the real ELF files in the game folder are read for their DT_NEEDED at most, never mapped.
+    snprintf(g_libdir, sizeof g_libdir, "%s", dylibs);
+    snprintf(g_dylibs, sizeof g_dylibs, "%s", dylibs);
+    snprintf(g_assets, sizeof g_assets, "%s", game);
+    snprintf(g_apk,    sizeof g_apk,    "%s", game);
+    snprintf(g_files,  sizeof g_files,  "%s/files", data);
+    snprintf(g_log,    sizeof g_log,    "%s/logs/klepton-boot.log", data);
+    static char crash[1100];
+    snprintf(crash, sizeof crash, "%s/logs/klepton-crash.log", data);
+    kl_fault_set_crash_path(crash);
+    setenv("KL_ALYX_GAME", game, 1);
+    // Every library by name from the dylibs folder (configure_rest sets this only when it finds <dylibs>/hlvr.dylib).
+    setenv("KL_DYLIB_DIR", dylibs, 1);
+    return configure_rest(data);
+}
+#endif
+
 static int configure_rest(const char *container) {
     // Check before running, not after failing. A missing asset tree otherwise
     // surfaces three layers up inside Unity as something that reads like a shim
@@ -245,12 +417,75 @@ static int configure_rest(const char *container) {
     // APK/asset path); only the existence check is skipped.
     int folder_fed = g_target->kind == KL_GUEST_NATIVE   ||
                      g_target->kind == KL_GUEST_GLES3JNI ||
-                     g_target->kind == KL_GUEST_SDL2;
+                     g_target->kind == KL_GUEST_SDL2     ||
+                     g_target->kind == KL_GUEST_LINUX;
     if (!folder_fed && !have(g_assets))
         return missing("staged assets (run stage_assets.sh)", g_assets);
     if (!folder_fed && !have(g_apk))
         return missing("staged APK (run stage_assets.sh)", g_apk);
     mkdir(g_files, 0755);
+
+#ifdef KL_APP_ALYX
+    if (g_target->kind == KL_GUEST_LINUX) {
+        // Half-Life: Alyx (runtime/linux). The device's code rules: every guest
+        // library from its signed translation, no JIT anywhere (V8 --jitless is
+        // the default in kl_lua.c; LuaJIT is built without one), SDL2 over SDL3
+        // on the offscreen driver (Compositor Services is the display; the
+        // companion window has nowhere to go). The game folder is staged into
+        // the container (alyx/game); on the simulator KL_ALYX_GAME may point at
+        // the Mac's depot instead.
+        extern int kl_alyx_run(const char *, const char *, int, char **);
+        kl_driver_set_linux_main(kl_alyx_run);
+        setenv("KL_DYLIB_ONLY", "1", 0);
+        setenv("KL_LUA_NOJIT", "1", 0);
+        setenv("SDL_VIDEO_DRIVER", "offscreen", 0);
+        static char sdl2[1200];
+        snprintf(sdl2, sizeof sdl2, "%s/SDL2.framework/SDL2", g_dylibs);
+        setenv("KL_SDL2_DYLIB", sdl2, 0);
+        setenv("KL_ALYX_GAME", g_assets, 0);
+        // A launch from the icon has no environment: bake in what a devicectl
+        // launch passes (the capability dump while the render device is being
+        // brought up), and keep the window on a fatal engine error. No map: with
+        // no KL_ALYX_ARGS the game opens on its own main menu (New Game, Load
+        // Game); the test scripts' env files name their start themselves.
+        setenv("KLVR_TRACE_FRAMES", "1", 0);
+        setenv("KLVR_TRACE_POSE", "1", 0);    // stereo/pose bring-up (shim 1e06cd2+)
+        setenv("KL_MSGBOX_PARK", "1", 0);
+        // Publish frames from the shim's worker thread: the game's queue is no
+        // longer drained at every frame end (KL_VK_FRAME_SYNC off). Mac, device
+        // mode, fidelity 2: 236 -> 468 fps, 5 min without a stall. =0 reverts.
+        setenv("KLVR_ASYNC_FRAMES", "1", 0);
+        extern void (*kl_glibc_msgbox_hook)(const char *, const char *);
+        kl_glibc_msgbox_hook = alyx_msgbox;
+        // Lean profile — automatic when the process's jetsam allowance says the
+        // increased-memory-limit entitlement is absent (a free Personal Team
+        // build), or forced with KL_ALYX_LEAN=1 / off with =0. On the Mac,
+        // VR Chapter 1 peaks at ~6.1 GB phys_footprint by default and ~4.9 GB
+        // with these; the heartbeat logs foot/peak/avail so a device run says
+        // exactly where it stands against the limit.
+        long long avail = kl_avail_memory();
+        int lean = kl_env_str("KL_ALYX_LEAN", NULL) ? kl_env_on("KL_ALYX_LEAN", 0)
+                                                     : (avail > 0 && avail < (6LL << 30));
+        snprintf(g_memline, sizeof g_memline, "  memory    : %lld MB available to this process -> %s profile\n",
+                 avail >> 20, lean ? "LEAN" : "full");
+        // Full profile: pin the fidelity level. Auto-fidelity picked level 7
+        // (4608x2880 per eye, 4xMSAA) on the headset and ran at 30 fps; level 2
+        // is 3264x2016. KL_ALYX_FIDELITY overrides; "auto" restores Valve's.
+        if (!lean) {
+            const char *fl = kl_env_str("KL_ALYX_FIDELITY", "2");
+            static char prof[128];
+            if (strcmp(fl, "auto") != 0)
+                snprintf(prof, sizeof prof, "+vr_fidelity_level_auto 0 +vr_fidelity_level %s", fl);
+            if (prof[0]) setenv("KL_ALYX_PROFILE_ARGS", prof, 0);
+        }
+        if (lean) {
+            setenv("KL_ALYX_PROFILE_ARGS",
+                   "+vr_fidelity_level_auto 0 +vr_fidelity_level 0 "
+                   "+r_texture_stream_max_resolution 512 +r_texture_pool_size 256", 0);
+            setenv("KL_VK_HEAP_MB", "1536", 0);
+        }
+    }
+#endif
 
     if (kl_app_target_is_steamlink()) {
         // Which front door this launch opens. The SHELL is the default because
@@ -422,6 +657,7 @@ static int configure_rest(const char *container) {
     setenv("KL_GLFB", "1", 0);
 
     snprintf(g_status, sizeof g_status, "configured");
+    g_configured = 1;
     return 0;
 }
 
@@ -454,6 +690,11 @@ static int open_log(void) {
         setvbuf(stderr, NULL, _IOLBF, 0);
         return 0;
     }
+    // The last run's log is kept beside it, once: a player who froze and relaunched has just started a new log,
+    // and the freeze's [stall] dump is in the one before it.
+    char prev[1100];
+    snprintf(prev, sizeof prev, "%.*s.prev.log", (int)strlen(g_log) - 4, g_log);
+    (void)rename(g_log, prev);
     if (!freopen(g_log, "w", stdout)) return 1;
     setvbuf(stdout, NULL, _IOLBF, 0);
     dup2(fileno(stdout), STDERR_FILENO);   // the guest's own writes(2) land here too
@@ -512,6 +753,53 @@ static long long kl_phys_footprint(void) {
     return (long long)info.phys_footprint;
 }
 
+// How smoothly the game ran, once a minute while it draws: a line in Documents/klfz/perf.txt that the opt-in stutter
+// reports carry (diagnostics/). No test session here runs past a few minutes, and a player saw the game, the hands
+// most, slow down after 15-20 (Oct 2026). Only how the game ran, as the opt-in card promises: seconds since the game's
+// first frame, game frames per second, display rate (poses offered per second), thermal state (0 nominal .. 3
+// critical, -1 not known), MB left before the memory limit, footprint MB. A minute with no poses offered (the
+// immersive space was down) is not written. The file stops at 1 MB, over 600 hours of play.
+static _Atomic int g_thermal = -1;
+void kl_app_note_thermal(int state) { g_thermal = state; }
+#ifdef KL_APP_ALYX
+unsigned long long kl_vulkan_frame_serial(void);   // kl_vulkan.c: guest frames so far (0 before the first)
+static uint64_t guest_published(void);             // below, beside g_guest
+
+static void perf_tick(void) {
+    static double t_first, last_t;
+    static unsigned long long last_serial;
+    static uint64_t last_pub;
+    static int full;
+    unsigned long long serial = kl_vulkan_frame_serial();
+    if (full || !serial) return;
+    struct timespec m;
+    clock_gettime(CLOCK_MONOTONIC, &m);
+    double t = m.tv_sec + m.tv_nsec * 1e-9;
+    uint64_t pub = guest_published();
+    if (!t_first) t_first = t;
+    else if (t - last_t < 60) return;
+    else if (pub != last_pub) {
+        char path[1100];
+        snprintf(path, sizeof path, "%s/klfz", g_container);
+        mkdir(path, 0755);
+        snprintf(path, sizeof path, "%s/klfz/perf.txt", g_container);
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size > (1 << 20)) { full = 1; return; }
+        FILE *f = fopen(path, "a");
+        if (f) {
+            double dt = t - last_t;
+            fprintf(f, "%.0f %.1f %.1f %d %lld %lld\n", t - t_first,
+                    (double)(serial - last_serial) / dt, (double)(pub - last_pub) / dt, (int)g_thermal,
+                    kl_avail_memory() >> 20, kl_phys_footprint() >> 20);
+            fclose(f);
+        }
+    }
+    last_t = t; last_serial = serial; last_pub = pub;
+}
+#else
+static void perf_tick(void) {}
+#endif
+
 static void *heartbeat(void *arg) {
     (void)arg;
     // Polled faster than it prints, so a phase change is reported when it
@@ -527,12 +815,29 @@ static void *heartbeat(void *arg) {
             clock_gettime(CLOCK_REALTIME, &ts);
             struct tm tm;
             localtime_r(&ts.tv_sec, &tm);
-            fprintf(stderr, "[hb] %02d:%02d:%02d  phase=%s  foot=%lldM avail=%lldM\n",
+            static long long peak;
+            long long foot = kl_phys_footprint();
+            if (foot > peak) peak = foot;
+            long long avail = kl_avail_memory();
+            fprintf(stderr, "[hb] %02d:%02d:%02d  phase=%s  foot=%lldM peak=%lldM avail=%lldM\n",
                     tm.tm_hour, tm.tm_min, tm.tm_sec, phase,
-                    kl_phys_footprint() >> 20, kl_avail_memory() >> 20);
+                    foot >> 20, peak >> 20, avail >> 20);
             fflush(stderr);
+        }
+        {   // Memory guard: the headset ends the game at its limit without a report
+            // (2026-09-29: 43 MB left at the last heartbeat). Every second under 300 MB is logged.
+            long long avail = kl_avail_memory();
+            static int low;
+            if (avail > 0 && avail < (300LL << 20)) {
+                if (low++ % 4 == 0)   // the loop ticks every 250 ms
+                    fprintf(stderr, "[mem] LOW: %lld MB available, footprint %lld MB (phase %s)\n",
+                            avail >> 20, kl_phys_footprint() >> 20, phase);
+            } else {
+                low = 0;
+            }
             last_phase = phase;
         }
+        perf_tick();
         ticks++;
         struct timespec iv = { 0, 250000000 };  // nanosleep: usleep is EINVAL at >= 1e6
         nanosleep(&iv, NULL);
@@ -746,6 +1051,11 @@ int kl_app_boot(void) {
 
     printf("=== Klepton on visionOS ===\n");
     printf("  target    : %s\n", g_target->name);
+    if (g_memline[0]) printf("%s", g_memline);
+#ifdef KL_APP_ALYX
+    if (g_envline[0]) printf("%s", g_envline);
+    if (g_filesline[0]) printf("%s", g_filesline);
+#endif
     // The front door, with the reason. It is chosen from the ENVIRONMENT in
     // kl_app_configure — which runs before the log file is open, so it cannot
     // announce itself there — and an app launched from the Home View has no
@@ -958,6 +1268,15 @@ static struct {
     pthread_t       thread;
 } g_guest = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
 
+#ifdef KL_APP_ALYX
+static uint64_t guest_published(void) {
+    pthread_mutex_lock(&g_guest.mu);
+    uint64_t p = g_guest.published;
+    pthread_mutex_unlock(&g_guest.mu);
+    return p;
+}
+#endif
+
 int kl_app_guest_state(void) {
     pthread_mutex_lock(&g_guest.mu);
     int s = g_guest.state;
@@ -990,12 +1309,111 @@ static void guest_finished(void) {
 // render against the last pose it had, not wedge it. A wedged guest is
 // indistinguishable from a crashed one in a device log, and this is exactly the
 // path a backgrounded app takes.
+//
+// KL_GUEST_PACE_DIV=N starts a guest frame only once N poses have been
+// published since the last one: a fixed 1/N of the display rate (45 fps on a
+// 90 Hz panel with N=2) that the compositor reprojects, instead of an uneven
+// 28-50. A guest already N behind is not held.
+//
+// KL_GUEST_PACE_HZ=F instead picks N from the rate poses actually arrive at, so a
+// panel that visionOS moves between 60, 90 and 120 Hz mid-session keeps the guest
+// at or under F (N = ceil(rate / F), at least 1): 45 on 90 Hz, 40 on 120, 30 on 60.
+// Never above F on purpose: a fixed N=2 on the M5 unit's 120 Hz asked for 60 fps the
+// GPU cannot hold, ran it flat out at ~51 and heated the headset from "nominal" to
+// "fair" in two minutes. The rate is measured over ~1 s of publishes, a new N
+// takes effect after two windows agree, and every change of N is logged.
+// The OpenVR shim's pace governor (klvr_platform_klepton.c) asks for one more
+// divider step when the GPU cannot hold the target even at the lowest fidelity
+// level: 60 -> 40 fps at 120 Hz. Only taken where it keeps 40 fps or more (at
+// 90 Hz the target already paces 45; at 60 Hz it would be 30).
+static _Atomic unsigned g_pace_extra;
+void kl_guest_pace_extra(unsigned extra);
+void kl_guest_pace_extra(unsigned extra) { g_pace_extra = extra; }
+
+// What the pacer holds now, in frames per second (0 when KL_GUEST_PACE_HZ is off or
+// the display rate is not measured yet): the OpenVR shim budgets auto-fidelity for it.
+static _Atomic float g_pace_fps;
+float kl_guest_pace_fps(void);
+float kl_guest_pace_fps(void) { return g_pace_fps; }
+
+unsigned long long kl_vulkan_frame_serial(void);   // kl_vulkan.c: guest frames so far (0 before the first)
 static void guest_pace_wait(void) {
+    static unsigned div;
+    static double pace_hz = -1, win_t0, last_rate;
+    static uint64_t win_p0;
+    if (!div) {
+        div = kl_env_uint("KL_GUEST_PACE_DIV", 1);
+        if (div < 1) div = 1;
+        const char *h = getenv("KL_GUEST_PACE_HZ");
+        pace_hz = h && *h ? atof(h) : 0;
+        if (pace_hz > 0) printf("[guest] frames paced to ~%.0f fps from the measured display rate (KL_GUEST_PACE_HZ)\n", pace_hz);
+        else if (div > 1) printf("[guest] frames paced at 1/%u of the display rate (KL_GUEST_PACE_DIV)\n", div);
+    }
+    if (pace_hz > 0) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double t = now.tv_sec + now.tv_nsec * 1e-9;
+        pthread_mutex_lock(&g_guest.mu);
+        uint64_t p = g_guest.published;
+        pthread_mutex_unlock(&g_guest.mu);
+        // KL_GUEST_PACE_SWITCH="<s>:<hz>": <s> seconds after the first guest frame, pace to <hz> instead (a two-half
+        // run: 45 fps, then 30 with more detail per frame), logged once; the window logic below picks the new N.
+        {
+            static double sw_at = -2, sw_hz, t_first;
+            if (sw_at == -2) {
+                const char *w = getenv("KL_GUEST_PACE_SWITCH");
+                sw_at = w && strchr(w, ':') ? atof(w) : -1;
+                sw_hz = w && strchr(w, ':') ? atof(strchr(w, ':') + 1) : 0;
+            }
+            if (!t_first && kl_vulkan_frame_serial() > 0) t_first = t;
+            if (sw_at >= 0 && sw_hz > 0 && t_first && t - t_first >= sw_at) {
+                printf("[guest] pace switch at %.1f s after the first guest frame: ~%.0f -> ~%.0f fps (KL_GUEST_PACE_SWITCH)\n",
+                       t - t_first, pace_hz, sw_hz);
+                fflush(stdout);
+                pace_hz = sw_hz; sw_at = -1;
+            }
+        }
+        if (!win_t0) { win_t0 = t; win_p0 = p; }
+        else if (t - win_t0 >= 1.0) {
+            double rate = (double)(p - win_p0) / (t - win_t0);
+            last_rate = rate;
+            unsigned want = (unsigned)ceil(rate / pace_hz - 0.05);
+            if (want < 1) want = 1;
+            // Hysteresis: a new N must hold for two windows in a row, so one
+            // window short of publishes (a hitch, a pose gap) does not flip it.
+            static unsigned pending, seen;
+            if (rate > 20 && want != div) {
+                seen = want == pending ? seen + 1 : 1;
+                pending = want;
+                if (seen >= 2) {
+                    printf("[guest] display %.1f Hz: pacing 1/%u (was 1/%u) -> %.1f fps\n", rate, want, div, rate / want);
+                    fflush(stdout);
+                    div = want;
+                    seen = 0;
+                }
+            } else {
+                seen = 0;
+            }
+            win_t0 = t; win_p0 = p;
+        }
+    }
+    unsigned eff = div, ex = g_pace_extra;
+    if (pace_hz > 0 && ex && last_rate > 0 && last_rate / (div + ex) >= 39.0) eff = div + ex;
+    if (pace_hz > 0 && last_rate > 20) g_pace_fps = (float)(last_rate / eff);
+    {
+        static unsigned said_eff;
+        if (pace_hz > 0 && eff != said_eff && last_rate > 0) {
+            printf("[guest] pace governor: 1/%u of %.1f Hz -> %.1f fps%s\n", eff, last_rate, last_rate / eff,
+                   eff > div ? " (the GPU cannot hold the target at the lowest fidelity level)" : "");
+            fflush(stdout);
+            said_eff = eff;
+        }
+    }
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += 1;
     pthread_mutex_lock(&g_guest.mu);
-    while (!g_guest.stop && g_guest.published == g_guest.consumed)
+    while (!g_guest.stop && g_guest.published - g_guest.consumed < eff)
         if (pthread_cond_timedwait(&g_guest.cv, &g_guest.mu, &ts) == ETIMEDOUT) break;
     // Coalesce, do not queue: everything published since the last frame is one
     // turn. A guest that is behind then skips frames — which reprojection covers
@@ -1119,6 +1537,14 @@ int kl_app_guest_start(void) {
     // frame this driver already initiated, so a pacer there would be the
     // compositor waiting on itself.
     if (g_target->kind == KL_GUEST_UE4) kl_ovrp_set_frame_pacer(guest_pace_wait);
+#ifdef KL_APP_ALYX
+    // The OpenVR shim's WaitGetPoses blocks here: one guest frame per pose
+    // the compositor publishes, as the OpenXR guests do.
+    if (g_target->kind == KL_GUEST_LINUX) {
+        extern void klvr_klepton_set_frame_pacer(void (*)(void));
+        klvr_klepton_set_frame_pacer(guest_pace_wait);
+    }
+#endif
 
     // User-interactive, because this thread is now the one producing frames.
     // A plain pthread gets an unspecified QoS, and a guest demoted below the
@@ -1179,4 +1605,59 @@ void kl_app_guest_stop(void) {
         printf("[guest] did not stop within 10 s — carrying on without its report\n");
         fflush(NULL);
     }
+}
+
+#include <sys/mman.h>
+
+static int kl_probe_reserve(size_t bytes) {
+    void *p = mmap(NULL, bytes, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) return 0;
+    munmap(p, bytes);
+    return 1;
+}
+
+static const char *kl_probe_has(const char *prov, size_t n, const char *key) {
+    return prov && memmem(prov, n, key, strlen(key)) ? "yes" : "no";
+}
+
+void kl_app_memprobe(const char *resources, const char *container) {
+    const size_t GB = 1ull << 30;
+    // the largest single reservation, to 1 GB (up to 1 TB)
+    size_t lo = 0, hi = 1024;
+    while (lo < hi) {
+        size_t mid = (lo + hi + 1) / 2;
+        if (kl_probe_reserve(mid * GB)) lo = mid; else hi = mid - 1;
+    }
+    // the total: keep the largest pieces reserved until nothing more fits, then let them all go
+    enum { MAXP = 512 };
+    void *held[MAXP]; size_t sizes[MAXP]; int nheld = 0; size_t total = 0;
+    for (size_t chunk = lo ? lo * GB : GB; chunk >= GB / 4 && nheld < MAXP; ) {
+        void *p = mmap(NULL, chunk, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p == MAP_FAILED) { chunk /= 2; continue; }
+        held[nheld] = p; sizes[nheld++] = chunk; total += chunk;
+    }
+    for (int i = 0; i < nheld; i++) munmap(held[i], sizes[i]);
+    char prov_path[1024], *prov = NULL; size_t provn = 0;
+    snprintf(prov_path, sizeof prov_path, "%s/embedded.mobileprovision", resources);
+    FILE *f = fopen(prov_path, "rb");
+    if (f) {
+        prov = malloc(1 << 20);
+        if (prov) provn = fread(prov, 1, 1 << 20, f);
+        fclose(f);
+    }
+    char line[512];
+    snprintf(line, sizeof line,
+             "memprobe: available %lld MB | increased-memory-limit %s | extended-virtual-addressing %s | "
+             "largest reservation %zu GB | total reservable %.1f GB\n",
+             kl_avail_memory() >> 20,
+             kl_probe_has(prov, provn, "com.apple.developer.kernel.increased-memory-limit"),
+             kl_probe_has(prov, provn, "com.apple.developer.kernel.extended-virtual-addressing"),
+             lo, (double)total / GB);
+    free(prov);
+    fputs(line, stdout);
+    fflush(stdout);
+    char out[1024];
+    snprintf(out, sizeof out, "%s/klepton-memprobe.txt", container);
+    FILE *o = fopen(out, "a");
+    if (o) { fputs(line, o); fclose(o); }
 }

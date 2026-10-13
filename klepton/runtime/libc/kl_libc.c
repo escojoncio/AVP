@@ -635,6 +635,22 @@ static const char *kl_hl2_launcher_graphics_cfg(const char *path, size_t *len) {
 // never an open, so an untraced stat makes a probe for a missing file look
 // like the guest never asked at all. That blind spot read as "the game never
 // checks for settings.cfg" once — it does, it just never opens it.
+// KL_DYLIB_STAT_NEEDS_DIR=1: a translated library answers an existence check
+// only where its directory really exists. Source 2 finds its install root by
+// walking up from the working directory and stat()ing
+// "<dir>/bin/linuxsteamrtarm64/libtier0.so" at each level; answering by file
+// name alone made the first probe succeed one level too deep, and the engine
+// looked for gameinfo.gi under bin/. (Off by default: the Android guests' lib
+// directories deliberately do not exist on device.)
+static int kl_dylib_stat_ok(const char *path) {
+    if (!kl_env_on("KL_DYLIB_STAT_NEEDS_DIR", 0)) return 1;
+    const char *sl = strrchr(path, '/');
+    if (!sl) return 1;
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%.*s", (int)(sl - path), path);
+    struct stat d;
+    return stat(dir[0] ? dir : "/", &d) == 0 && S_ISDIR(d.st_mode);
+}
 int klb_stat(const char *p, bionic_stat *b)  { char kp[1024]; const char *q = kl_guest_path(p, kp, sizeof kp);
                                                struct stat s; int r = stat(q, &s);
                                                long long osz;
@@ -651,7 +667,7 @@ int klb_stat(const char *p, bionic_stat *b)  { char kp[1024]; const char *q = kl
                                                    memset(&s, 0, sizeof s); s.st_mode = S_IFDIR | 0755;
                                                    r = 0;
                                                }
-                                               if (r != 0 && errno == ENOENT && kl_can_dlopen(q)) {
+                                               if (r != 0 && errno == ENOENT && kl_can_dlopen(q) && kl_dylib_stat_ok(q)) {
                                                    // A guest shared library with no file on disk: only its
                                                    // translated framework is in the bundle (the ELF tree is
                                                    // deliberately absent). An existence check on the guest's
@@ -1237,6 +1253,8 @@ static void proc_refresh_mem(void) {
     proc_put("/proc/self/status", buf);
 }
 
+char kl_proc_exe_target[1024];
+
 static void proc_build(void) {
     // TMPDIR, not /tmp: on visionOS the process is sandboxed into a container
     // and /tmp is not writable, while TMPDIR always names the container's own
@@ -1323,8 +1341,53 @@ static void proc_build(void) {
     // loop's upper bound and the nodes that exist agree.
     snprintf(buf, sizeof buf, "%ld\n", nfreq - 1);
     proc_put("/sys/devices/system/cpu/kernel_max", buf);
+    // Topology, as ARM64 Linux has it for every online core: one package, a
+    // distinct core per CPU (Apple silicon has no SMT). Valve's tier0 counts
+    // physical cores from core_id + physical_package_id (and /proc/cpuinfo's
+    // "physical id"/"core id", which aarch64 Linux does not emit); without these
+    // nodes Half-Life: Alyx counted 3 or fewer and showed "Your CPU is below
+    // minimum requirements" on its main menu at every launch.
+    {
+        char sib[64];
+        if (ncpu > 1) snprintf(sib, sizeof sib, "0-%ld\n", ncpu - 1);
+        else          snprintf(sib, sizeof sib, "0\n");
+        for (long i = 0; i < ncpu; i++) {
+            char rel[256], val[32];
+            snprintf(val, sizeof val, "%ld\n", i);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/core_id", i);
+            proc_put(rel, val);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/thread_siblings_list", i);
+            proc_put(rel, val);
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/physical_package_id", i);
+            proc_put(rel, "0\n");
+            snprintf(rel, sizeof rel, "/sys/devices/system/cpu/cpu%ld/topology/core_siblings_list", i);
+            proc_put(rel, sib);
+        }
+    }
+    // /proc/self/exe as a real symlink, when a host driver named the guest
+    // executable: Source 2's Plat_GetExecutablePathUTF8 lstat()s it for the
+    // link length and then readlink()s it, and fails fatally if either misses.
+    if (kl_proc_exe_target[0]) {
+        char lnk[1024];
+        snprintf(lnk, sizeof lnk, "%s/proc/self/exe", g_procroot);
+        proc_put("/proc/self/.keep", "");
+        (void)symlink(kl_proc_exe_target, lnk);
+    }
     fprintf(stderr, "[proc] synthetic /proc and /sys at %s (%ld cpus, %llu MB budget)\n",
             g_procroot, ncpu, (unsigned long long)(kl_mem_total() >> 20));
+}
+
+// Name the guest executable for /proc/self/exe. The tree is built once, on
+// the first /proc access — which in the app happens before the Linux door
+// knows the launcher's path — so a late name makes its link directly.
+void kl_proc_set_exe(const char *path) {
+    snprintf(kl_proc_exe_target, sizeof kl_proc_exe_target, "%s", path ? path : "");
+    if (!g_procroot[0] || !kl_proc_exe_target[0]) return;
+    char lnk[1024];
+    snprintf(lnk, sizeof lnk, "%s/proc/self/exe", g_procroot);
+    proc_put("/proc/self/.keep", "");
+    unlink(lnk);
+    (void)symlink(kl_proc_exe_target, lnk);
 }
 
 // Rewrite a guest path into the synthetic tree when we serve it. Returns `path`
@@ -1977,7 +2040,7 @@ int klb_access(const char *path, int mode) {
     // A guest shared library with no file on disk (translated framework only):
     // answer the existence check the way dlopen would. The Source launcher
     // access()/stat()s "<libdir>/filesystem_stdio.so" before loading it.
-    if (r != 0 && errno == ENOENT && (mode == F_OK || mode == R_OK) && kl_can_dlopen(_p)) r = 0;
+    if (r != 0 && errno == ENOENT && (mode == F_OK || mode == R_OK) && kl_can_dlopen(_p) && kl_dylib_stat_ok(_p)) r = 0;
     kl_fs_trace("access", path, NULL, r != 0);
     kl_media_probe_log("access", path, _p, r != 0);
     return r;
@@ -2245,6 +2308,37 @@ static uint32_t kl_sa_flags_back(int darwin_flags) {
     return f;
 }
 
+// ---------- Linux <-> Darwin signal numbers ----------
+// Linux (arm64, generic numbering) and Darwin agree on 1-6, 8, 9, 11, 13-15 and
+// 21-22, 24-28 and differ on the rest: Linux SIGBUS is 7 (Darwin 10), SIGUSR1
+// is 10 (Darwin SIGBUS!), SIGUSR2 12 (Darwin SIGSYS), SIGCHLD 17, and so on.
+// Forwarding the number unchanged let a guest's SIGUSR1 handler replace
+// Darwin's SIGBUS disposition — every later bus error then killed the process
+// with no report (Source 2's tier0 does exactly this at load).
+int kl_sig_lx2dw(int s) {
+    static const signed char m[33] = { 0,
+        1, 2, 3, 4, 5, 6, SIGBUS, 8, 9, SIGUSR1, 11, SIGUSR2, 13, 14, 15,
+        -1 /*STKFLT*/, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, 21, 22, SIGURG, 24, 25, 26, 27, 28,
+        SIGIO, -1 /*PWR*/, SIGSYS, -1 };
+    return (s > 0 && s < 33) ? m[s] : -1;
+}
+int kl_sig_dw2lx(int d) {
+    for (int s = 1; s < 32; s++) if (kl_sig_lx2dw(s) == d) return s;
+    return -1;
+}
+uint32_t kl_sigmask_lx2dw(uint64_t m) {
+    uint32_t d = 0;
+    for (int s = 1; s < 32; s++) if (m & (1ull << (s - 1))) { int x = kl_sig_lx2dw(s); if (x > 0) d |= 1u << (x - 1); }
+    return d;
+}
+uint64_t kl_sigmask_dw2lx(uint32_t d) {
+    uint64_t m = 0;
+    for (int x = 1; x < 32; x++) if (d & (1u << (x - 1))) { int s = kl_sig_dw2lx(x); if (s > 0) m |= 1ull << (s - 1); }
+    return m;
+}
+int klb_raise(int s) { int d = kl_sig_lx2dw(s); if (d <= 0) { errno = EINVAL; return -1; } return raise(d); }
+int klb_kill(pid_t p, int s) { int d = s ? kl_sig_lx2dw(s) : 0; if (d < 0) { errno = EINVAL; return -1; } return kill(p, d); }
+
 // A guest handler for a *fatal* signal cannot work here, and that is structural
 // rather than a bug we might fix: it expects a Linux ucontext_t, and Darwin's
 // _sigtramp hands it a __darwin_mcontext64 instead. IL2CPP's handler then walks
@@ -2289,11 +2383,12 @@ static struct { void *handler; int siginfo; } g_guest_sig[KL_NSIG];
 static void kl_sig_x18_tramp(int sig, siginfo_t *info, void *uctx) {
     void *h  = (sig > 0 && sig < KL_NSIG) ? g_guest_sig[sig].handler : NULL;
     int   si = (sig > 0 && sig < KL_NSIG) ? g_guest_sig[sig].siginfo : 0;
+    int   lsig = kl_sig_dw2lx(sig);              // the guest numbers signals the Linux way
     if (h) {
-        if (si) ((void (*)(int, siginfo_t *, void *))h)(sig, info, uctx);
-        else    ((void (*)(int))h)(sig);
+        if (si) ((void (*)(int, siginfo_t *, void *))h)(lsig, info, uctx);
+        else    ((void (*)(int))h)(lsig);
     }
-    if (uctx) {
+    if (uctx && kl_sig_x18_repair_on()) {
         ucontext_t *uc = (ucontext_t *)uctx;
         void *tgt = pthread_getspecific(KLX_TSD_SLOT);
         // Restore a zeroed x18 only. (An earlier PC-redirect variant that read the
@@ -2312,8 +2407,13 @@ static void kl_sig_x18_tramp(int sig, siginfo_t *info, void *uctx) {
     }
 }
 
-int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
+int klb_sigaction(int lsig, const bionic_sigaction *in, bionic_sigaction *old) {
     struct sigaction d, o;
+    int sig = kl_sig_lx2dw(lsig);                // Linux number in, Darwin number below
+    if (sig <= 0) {                              // STKFLT/PWR: no Darwin equivalent
+        if (old) memset(old, 0, sizeof *old);
+        return 0;
+    }
     if (kl_env_on("KL_TRACE_SIG", 0))
         fprintf(stderr, "  [sig] sigaction(%d, handler=%p)\n", sig,
                 in ? in->handler : NULL);
@@ -2330,17 +2430,18 @@ int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
         memset(&d, 0, sizeof d);
         int is_guest = in->handler && in->handler != (void *)SIG_DFL &&
                        in->handler != (void *)SIG_IGN;
-        if (is_guest && !klb_fatal_signal(sig) && sig > 0 && sig < KL_NSIG &&
-            kl_sig_x18_repair_on()) {
+        // Every guest handler goes through the trampoline, which hands it the
+        // LINUX signal number (and repairs x18 where that is enabled).
+        if (is_guest && !klb_fatal_signal(sig) && sig > 0 && sig < KL_NSIG) {
             g_guest_sig[sig].handler = (void *)in->handler;
             g_guest_sig[sig].siginfo = (in->flags & KL_SA_SIGINFO) ? 1 : 0;
             d.sa_sigaction = kl_sig_x18_tramp;
             d.sa_flags     = kl_sa_flags((uint32_t)in->flags) | SA_SIGINFO;
-            d.sa_mask      = (sigset_t)(in->mask & 0xFFFFFFFFu);
+            d.sa_mask      = (sigset_t)kl_sigmask_lx2dw(in->mask);
         } else {
             d.sa_handler = (void (*)(int))in->handler;
             d.sa_flags   = kl_sa_flags((uint32_t)in->flags);
-            d.sa_mask    = (sigset_t)(in->mask & 0xFFFFFFFFu);
+            d.sa_mask    = (sigset_t)kl_sigmask_lx2dw(in->mask);
         }
     }
     int r = sigaction(sig, in ? &d : NULL, old ? &o : NULL);
@@ -2351,7 +2452,7 @@ int klb_sigaction(int sig, const bionic_sigaction *in, bionic_sigaction *old) {
             oh = g_guest_sig[sig].handler;      // unwrap our trampoline
         old->handler = oh;
         old->flags   = (int32_t)kl_sa_flags_back(o.sa_flags);
-        old->mask    = o.sa_mask;
+        old->mask    = kl_sigmask_dw2lx(o.sa_mask);
     }
     return r;
 }
@@ -2927,6 +3028,9 @@ void *klb_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     if (df & MAP_ANON) fd = -1;                  // Darwin insists on -1 for anonymous
     if (klb_refuse_exec("mmap", (df & MAP_ANON) != 0, prot)) return MAP_FAILED;
     void *p = mmap(addr, len, prot, df, fd, off); // PROT_* match on both sides
+    if (kl_env_on("KL_TRACE_MMAP", 0))
+        fprintf(stderr, "  [mmap] mmap(%p, %#zx, prot %#x, lxflags %#x -> %#x, fd %d) -> %p%s\n", addr, len, prot,
+                flags, df, fd, p, p == MAP_FAILED ? strerror(errno) : "");
     // __builtin_return_address(0) is the GUEST here: mmap is not variadic, so
     // nothing of ours sits between this frame and the caller's.
     if (kl_file_watch && p != MAP_FAILED && fd >= 0)
@@ -3065,7 +3169,10 @@ int kl_fcntl(int fd, int cmd, uintptr_t arg) {
     switch (cmd) {
     case LX_F_SETFL:
         // The only translated-argument case, and the one that bit.
-        return fcntl(fd, F_SETFL, kl_open_flags((int)arg));
+        { extern void kl_eventfd_setfl(int, int);
+          int r = fcntl(fd, F_SETFL, kl_open_flags((int)arg));
+          if (r == 0) kl_eventfd_setfl(fd, (kl_open_flags((int)arg) & O_NONBLOCK) != 0);
+          return r; }
     case LX_F_GETFL: {
         int d = fcntl(fd, F_GETFL);
         return d < 0 ? d : open_flags_to_linux(d);
@@ -3078,13 +3185,29 @@ int kl_fcntl(int fd, int cmd, uintptr_t arg) {
     case LX_F_SETOWN:        return fcntl(fd, F_SETOWN, (int)arg);
     case LX_F_GETOWN:        return fcntl(fd, F_GETOWN);
     // struct flock is laid out differently on the two platforms (Linux leads
-    // with l_type/l_whence, Darwin with l_start/l_len), so forwarding the
-    // pointer would silently lock a different range. Refused by name until
-    // something needs it — no guest has yet.
-    case LX_F_GETLK: case LX_F_SETLK: case LX_F_SETLKW:
-        warn_once("fcntl file locking (struct flock layout differs) — refused");
-        errno = EINVAL;
-        return -1;
+    // with l_type/l_whence, Darwin with l_start/l_len) and the l_type values
+    // differ too, so it is translated field by field both ways. Source 2 takes
+    // its single-instance lock (source_engine_<hash>.lock) this way at boot.
+    case LX_F_GETLK: case LX_F_SETLK: case LX_F_SETLKW: {
+        struct lx_flock { short l_type, l_whence; int pad; int64_t l_start, l_len; int l_pid; int pad2; };
+        struct lx_flock *lf = (struct lx_flock *)arg;
+        if (!lf) { errno = EFAULT; return -1; }
+        struct flock df = {0};
+        df.l_type = lf->l_type == 0 ? F_RDLCK : lf->l_type == 1 ? F_WRLCK : F_UNLCK;
+        df.l_whence = lf->l_whence;
+        df.l_start = lf->l_start;
+        df.l_len = lf->l_len;
+        int dcmd = cmd == LX_F_GETLK ? F_GETLK : cmd == LX_F_SETLK ? F_SETLK : F_SETLKW;
+        int r = fcntl(fd, dcmd, &df);
+        if (r == 0 && cmd == LX_F_GETLK) {
+            lf->l_type = df.l_type == F_RDLCK ? 0 : df.l_type == F_WRLCK ? 1 : 2;
+            lf->l_whence = df.l_whence;
+            lf->l_start = df.l_start;
+            lf->l_len = df.l_len;
+            lf->l_pid = df.l_pid;
+        }
+        return r;
+    }
     default:
         fcntl_warn_once("fcntl", cmd);
         errno = EINVAL;

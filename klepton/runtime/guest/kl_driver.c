@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <time.h>
 
 #include "klepton.h"
 #include "kl_driver.h"
@@ -153,7 +155,8 @@ int kl_driver_owns_frame_loop(void) {
     case KL_GUEST_JKXR:
     case KL_GUEST_NATIVE:
     case KL_GUEST_SDL2:
-    case KL_GUEST_GLES3JNI: return 1;
+    case KL_GUEST_GLES3JNI:
+    case KL_GUEST_LINUX:    return 1;
     default:            return 0;
     }
 }
@@ -403,6 +406,86 @@ static int boot_gles3jni(FILE *out) {
     return 0;
 }
 
+// ---- the Linux (glibc) door: Half-Life: Alyx ---------------------------------
+// The personality and the boot sequence live in runtime/linux, which only an
+// app built for a Linux guest links; this door reaches them through a hook the
+// app installs (kl_driver_set_linux_main), so every other app still links
+// without them. The guest's main() never returns: it runs on a thread of its
+// own with a Linux-sized stack and paces itself on the OpenVR shim.
+static int (*g_linux_main)(const char *game, const char *sysroot, int argc, char **argv);
+void kl_driver_set_linux_main(int (*fn)(const char *, const char *, int, char **)) { g_linux_main = fn; }
+static char g_linux_game[1024];
+static volatile int g_linux_state;   // 0 not started, 1 running, 2 returned (failed to start)
+static int g_linux_rc;
+
+static int boot_linux(FILE *out) {
+    phase("linux configure");
+    if (!g_linux_main) return fail("this app was built without the Linux guest runtime (kl_driver_set_linux_main)");
+    const char *game = kl_env_str("KL_ALYX_GAME", NULL);
+    if (!game || !*game) return fail("KL_ALYX_GAME is not set (the game/ folder of the depot)");
+    snprintf(g_linux_game, sizeof g_linux_game, "%s", game);
+    char gi[1200];
+    snprintf(gi, sizeof gi, "%s/hlvr/gameinfo.gi", g_linux_game);
+    if (access(gi, R_OK) != 0) return fail("no hlvr/gameinfo.gi under KL_ALYX_GAME — stage the game folder first");
+    P(out, "  game      : %s\n", g_linux_game);
+    P(out, "\n=== EXIT CRITERION MET: the Linux guest is configured ===\n");
+    return 0;
+}
+
+static void *linux_guest_thread(void *unused) {
+    (void)unused;
+    kl_thread_init();
+    // Valve's launcher argv: VR, the engine console to the log, and the one
+    // Vulkan feature MoltenVK lacks. KL_ALYX_ARGS appends (e.g. "+map a1_intro_world").
+    static char *argv[40];
+    static char extra[1024];
+    int n = 0;
+    argv[n++] = "-vr"; argv[n++] = "-console"; argv[n++] = "-condebug";
+    argv[n++] = "-vulkan_disable_ext_dynamic_state_3";
+    // The app's profile (KL_ALYX_PROFILE_ARGS, e.g. the lean one) first, then
+    // KL_ALYX_ARGS, so a hand-given convar still wins.
+    const char *prof = kl_env_str("KL_ALYX_PROFILE_ARGS", NULL);
+    const char *more = kl_env_str("KL_ALYX_ARGS", NULL);
+    snprintf(extra, sizeof extra, "%s %s", prof ? prof : "", more ? more : "");
+    char *save = NULL;
+    for (char *t = strtok_r(extra, " ", &save); t && n < 39; t = strtok_r(NULL, " ", &save)) argv[n++] = t;
+    argv[n] = NULL;
+    g_linux_state = 1;
+    g_linux_rc = g_linux_main(g_linux_game, g_libdir, n, argv);
+    g_linux_state = 2;
+    return NULL;
+}
+
+static int begin_linux(FILE *out) {
+    phase("linux launcher");
+    P(out, "\n=== Valve's launcher (e_entry -> __libc_start_main -> Source2Main) ===\n");
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, 16u << 20);   // Linux's main thread gets 8 MB; Source 2 uses it
+    pthread_t t;
+    int rc = pthread_create(&t, &a, linux_guest_thread, NULL);
+    pthread_attr_destroy(&a);
+    if (rc != 0) return fail("could not start the guest thread");
+    pthread_detach(t);
+    phase("looper pump");
+    return 0;
+}
+
+static double linux_pump(double seconds, const volatile int *quit) {
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        if (g_linux_state == 2) {
+            char m[96]; snprintf(m, sizeof m, "the launcher returned %d before its main loop", g_linux_rc);
+            fail(m);
+            return -1.0;
+        }
+        struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+        double el = (double)(t.tv_sec - t0.tv_sec) + (double)(t.tv_nsec - t0.tv_nsec) * 1e-9;
+        if ((quit && *quit) || (seconds > 0 && el >= seconds)) return el;
+        usleep(100000);
+    }
+}
+
 int kl_driver_boot(FILE *out) {
     if (!g_target) return fail("kl_driver_init was not called");
     g_gap_only = kl_env_on("KL_GAP_ONLY", 0);
@@ -414,6 +497,7 @@ int kl_driver_boot(FILE *out) {
     case KL_GUEST_NATIVE:    rc = boot_native(out);    break;
     case KL_GUEST_SDL2:      rc = boot_sdl2(out);      break;
     case KL_GUEST_GLES3JNI:  rc = boot_gles3jni(out);  break;
+    case KL_GUEST_LINUX:     rc = boot_linux(out);     break;
     default:                 rc = boot_unity(out);     break;
     }
     if (rc == 0 && g_gap_only)
@@ -626,6 +710,7 @@ int kl_driver_lifecycle_begin(FILE *out) {
     case KL_GUEST_NATIVE:    return begin_native(out);
     case KL_GUEST_SDL2:      return begin_sdl2(out);
     case KL_GUEST_GLES3JNI:  return begin_gles3jni(out);
+    case KL_GUEST_LINUX:     return begin_linux(out);
     default:                 return begin_unity(out);
     }
 }
@@ -672,6 +757,7 @@ double kl_driver_pump(double seconds, const volatile int *quit) {
     case KL_GUEST_NATIVE: return kl_native_pump(seconds, quit);
     case KL_GUEST_SDL2: return kl_sdl2_pump(seconds, quit);
     case KL_GUEST_GLES3JNI: return kl_gles3jni_pump(seconds, quit);
+    case KL_GUEST_LINUX: return linux_pump(seconds, quit);
     default:            return 0.0;
     }
 }
@@ -724,6 +810,10 @@ void kl_driver_report(FILE *out) {
     case KL_GUEST_GLES3JNI:
         fprintf(out, "\n=== the GLES3JNILib run ===\n");
         kl_gles3jni_report(out);
+        return;
+    case KL_GUEST_LINUX:
+        fprintf(out, "\n=== the Linux guest run ===\n  launcher %s\n",
+                g_linux_state == 1 ? "running" : g_linux_state == 2 ? "returned" : "not started");
         return;
     default: break;
     }

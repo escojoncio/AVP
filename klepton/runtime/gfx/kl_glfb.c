@@ -8813,3 +8813,11 @@ static unsigned glfb_capture_now(const char *dir) {
     free(px); free(raw); free(cb);
     return ++g_presented;
 }
+
+// The Vulkan path's foveation (kl_gpu_time.m, KL_VRR=1) rasterizes the guest's scene passes through its own
+// map and only has to tell the compositor which map its eye image is squeezed by. No ANGLE involved.
+void kl_glfb_publish_eye_rate_map(void *rate_map, int zones_x, int zones_y) {
+    g_eye_rate_map = rate_map;
+    g_eye_rate_zx  = rate_map ? zones_x : 0;
+    g_eye_rate_zy  = rate_map ? zones_y : 0;
+}

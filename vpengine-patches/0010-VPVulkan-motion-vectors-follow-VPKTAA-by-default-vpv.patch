@@ -1,0 +1,110 @@
+From 9934adf7135e98c65c5ad9c4f0ba6fd3c764e92f Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 06:16:42 +0000
+Subject: [PATCH 10/10] VPVulkan: motion vectors follow VPKTAA by default;
+ vpvk_motion_recording_serial
+
+vpvk_config_set_motion_vectors overrides; otherwise motion vectors are on when the app enabled
+VPKTAA (vpvk_config_set_vpktaa) before vkCreateDevice. vpvk_motion_recording_serial() gives the
+eye frame being recorded, so the host can tag its frame record and later ask vpvk_motion_get for
+exactly that frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
+---
+ gpu/vulkan/include/vpvk/motion.h |  7 +++++--
+ gpu/vulkan/src/config.cpp        |  4 ++++
+ gpu/vulkan/src/motion.cpp        | 15 +++++++++++++--
+ gpu/vulkan/src/vpvk.h            |  1 +
+ 4 files changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/gpu/vulkan/include/vpvk/motion.h b/gpu/vulkan/include/vpvk/motion.h
+index 898caaa..5055cb1 100644
+--- a/gpu/vulkan/include/vpvk/motion.h
++++ b/gpu/vulkan/include/vpvk/motion.h
+@@ -31,9 +31,12 @@ typedef struct vpvk_motion_info {
+   int includes_camera;      // 1: always (full motion: camera + objects)
+ } vpvk_motion_info;
+ 
+-// On/off; read at vkCreateDevice (pipelines created while off get no motion variant). Env
+-// VPVK_MOTION=0/1 overrides.
++// On/off; read at vkCreateDevice (pipelines created while off get no motion variant). Default:
++// follows vpvk_config_set_vpktaa's `enabled`. Env VPVK_MOTION=0/1 overrides both.
+ void vpvk_config_set_motion_vectors(int on);
++// Serial of the eye frame being recorded now (0 = none yet). A host that knows which of its frames
++// is being drawn (Klepton at the guest's frame end) records it to ask for exactly that frame later.
++uint64_t vpvk_motion_recording_serial(void);
+ // The newest complete motion frame (serial = 0) or exactly `serial`. 1 = *out filled.
+ // Frames rotate through 4 textures: a consumer must be done with one within 3 eye frames.
+ int vpvk_motion_get(uint64_t serial, vpvk_motion_info* out);
+diff --git a/gpu/vulkan/src/config.cpp b/gpu/vulkan/src/config.cpp
+index 37f4213..7de645b 100644
+--- a/gpu/vulkan/src/config.cpp
++++ b/gpu/vulkan/src/config.cpp
+@@ -51,6 +51,10 @@ void logConfig() {
+              c.vpktaa.percent, c.vpktaa.sharpness, c.render_scale, c.asw_disabled, c.quest3_profile,
+              anisotropyForced(), gPrewarm.load(), forceSingleSample() ? 1 : 0, gGen.load() ? "yes" : "no(defaults)");
+ }
++bool vpktaaEnabled() {
++  std::lock_guard<std::mutex> l(gMutex);
++  return gCfg.vpktaa.enabled != 0;
++}
+ bool forceSingleSample() {
+   if (const char* e = getenv("VPVK_FORCE_1X"); e && (*e == '0' || *e == '1')) return *e == '1';
+   const int f = gForce1x.load();
+diff --git a/gpu/vulkan/src/motion.cpp b/gpu/vulkan/src/motion.cpp
+index 834dfe0..572bd0a 100644
+--- a/gpu/vulkan/src/motion.cpp
++++ b/gpu/vulkan/src/motion.cpp
+@@ -26,16 +26,19 @@
+ 
+ namespace vpvk {
+ namespace {
+-std::atomic<int> gMotionOn{-1};  // -1: env / default (off)
++std::atomic<int> gMotionOn{-1};  // -1: follow vpktaa.enabled
+ constexpr int kRing = 4;
+ constexpr float kInvalid = 60000.0f;
+ }  // namespace
+ 
+ bool motionVectorsEnabled() {
+   if (const char* e = std::getenv("VPVK_MOTION"); e && (*e == '0' || *e == '1')) return *e == '1';
+-  return gMotionOn.load() == 1;
++  const int on = gMotionOn.load();
++  return on >= 0 ? on == 1 : vpktaaEnabled();
+ }
+ 
++
++
+ struct MotionState {
+   std::mutex m;
+   // Rotating motion targets, recreated when the eye size changes.
+@@ -265,6 +268,14 @@ extern "C" __attribute__((visibility("default"))) void vpvk_config_set_motion_ve
+   vpvk::logf("vk.cfg motion_vectors=%d", on ? 1 : 0);
+ }
+ 
++extern "C" __attribute__((visibility("default"))) uint64_t vpvk_motion_recording_serial(void) {
++  std::lock_guard<std::mutex> l(gDevMutex);
++  vpvk::Device* d = gDevice;
++  if (!d || !d->motion) return 0;
++  std::lock_guard<std::mutex> lock(d->motion->m);
++  return d->motion->serial;
++}
++
+ extern "C" __attribute__((visibility("default"))) int vpvk_motion_get(uint64_t serial, vpvk_motion_info* out) {
+   if (!out) return 0;
+   std::lock_guard<std::mutex> l(gDevMutex);
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index 9e9e5de..9841264 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -31,6 +31,7 @@ void logConfig();  // config.cpp: "vk.cfg effective ..." (called from vkCreateDe
+ void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+ bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
+ bool forceSingleSample();  // config.cpp: vpvk_config_set_force_single_sample
++bool vpktaaEnabled();      // config.cpp: vpvk_config_set_vpktaa
+ 
+ // Dispatchable handles start with the loader word (vk_icd.h): harmless without a loader and
+ // required if one is ever put in front of the driver.
+-- 
+2.43.0
+

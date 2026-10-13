@@ -9,7 +9,10 @@
 //     tangents, Halton jitter, per-eye viewport crop), the eye offsets the guest was told
 //     (kl_ovrp_eye_local), the eye DEPTH kl_vulkan picked for that very frame
 //     (kl_vulkan_eye_depth_get, tagged with the record serial) and the AppSW motion vectors
-//     when the guest wrote them this frame (rendered.asw & KL_OVRP_ASW_MV);
+//     when the guest wrote them this frame (rendered.asw & KL_OVRP_ASW_MV), or VPEngine's own
+//     motion vectors (vpvk/motion.h, found with dlsym: the driver generates them for games that
+//     render none, e.g. Source 2) — preferred when present, KL_VPKTAA_MV_SRC = auto | appsw |
+//     vpengine;
 //   * conventions: reversed-Z from kl_vulkan (eye-pass clear 0.0 / compare-op census), near
 //     from the submit (KL_VPKTAA_NEARFAR_OFF) else KL_VPKTAA_NEAR (0.05 m), far
 //     KL_VPKTAA_FAR (0 = infinite); MV scale KL_VPKTAA_MV_SCALE (0.5: NDC delta -> uv) with the
@@ -47,6 +50,26 @@ final class KleptonTAA {
     private let mvMap = KleptonTAA.envS("KL_VPKTAA_MV_MAP") ?? "auto"
     private let depthMap = KleptonTAA.envS("KL_VPKTAA_DEPTH_MAP") ?? "auto"
     private let depthWaitMs = Double(KleptonTAA.envF("KL_VPKTAA_DEPTH_WAIT_MS", 25))
+    private let mvSource = KleptonTAA.envS("KL_VPKTAA_MV_SRC") ?? "auto"
+
+    /// VPEngine's motion vectors (vpvk/motion.h, plain C; layout kept in step with it). Resolved
+    /// with dlsym so Klepton builds and runs on any Vulkan driver (absent: AppSW path only).
+    private struct VPMotionInfo {
+        var texture: UnsafeMutableRawPointer? = nil
+        var width: UInt32 = 0, height: UInt32 = 0, layers: UInt32 = 0
+        var scaleX: Float = 0, scaleY: Float = 0
+        var invalidThreshold: Float = 0
+        var serial: UInt64 = 0
+        var complete: Int32 = 0
+        var includesCamera: Int32 = 0
+    }
+    private typealias VPMotionGet = @convention(c) (UInt64, UnsafeMutableRawPointer) -> Int32
+    private static let vpMotionGet: VPMotionGet? = {
+        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "vpvk_motion_get") else { return nil }
+        return unsafeBitCast(sym, to: VPMotionGet.self)
+    }()
+    private var prevJitter: [SIMD2<Float>?] = [nil, nil]
+    private var vpMotionSerialUsed: UInt64 = 0
 
     private let device: MTLDevice
     private let core: VPKTAACore
@@ -175,9 +198,49 @@ final class KleptonTAA {
                 desc, true)
     }
 
-    /// AppSW motion vectors of `eye` when the guest wrote them for this frame.
-    private func motionInput(_ eye: Int, _ r: kl_ovrp_render_pose) -> (VPKTAAMotionInput?, String) {
+    /// VPEngine's motion vectors of `eye`: the newest complete motion frame (whole screen motion,
+    /// camera included). Its jitter is the game's: the delta to the previous frame's jitter is
+    /// removed in the resolve (VPKTAAMotionInput.jitterDelta).
+    private func vpengineMotion(_ eye: Int, _ r: kl_ovrp_render_pose, flipY: Bool) -> (VPKTAAMotionInput?, String) {
+        guard let get = KleptonTAA.vpMotionGet else { return (nil, "no-vpengine") }
+        var info = VPMotionInfo()
+        let ok = withUnsafeMutablePointer(to: &info) { get(0, UnsafeMutableRawPointer($0)) }
+        guard ok != 0, info.complete != 0, let p = info.texture, Int(info.layers) > eye else { return (nil, "vpengine-none") }
+        let tex = Unmanaged<MTLTexture>.fromOpaque(p).takeUnretainedValue() as MTLTexture
+        // Vulkan NDC difference, +y down = texture row 0 at the top (flipY); a bottom-up source flips y.
+        let scale = SIMD2<Float>(info.scaleX, flipY ? info.scaleY : -info.scaleY)
+        let t = r.tangents
+        let tan: SIMD4<Float> = eye == 0 ? SIMD4(t.0.0, t.0.1, t.0.2, t.0.3) : SIMD4(t.1.0, t.1.1, t.1.2, t.1.3)
+        let j = r.jitter
+        let jit: SIMD2<Float> = r.jitter_mode == 1 ? (eye == 0 ? SIMD2(j.0.0, j.0.1) : SIMD2(j.1.0, j.1.1)) : .zero
+        // A frustum shifted by +dx moves a static point by -dx/(l+r) in uv (+dy: +dy/(t+b) down).
+        var jd = SIMD2<Float>(0, 0)
+        if let pj = prevJitter[eye] {
+            let d = jit - pj
+            jd = SIMD2(-d.x / max(tan.x + tan.y, 1e-6), (flipY ? 1 : -1) * d.y / max(tan.z + tan.w, 1e-6))
+        }
+        prevJitter[eye] = jit
+        if eye == 1 { vpMotionSerialUsed = info.serial }
+        var m = VPKTAAMotionInput(texture: tex, slice: eye, scale: scale)
+        m.fullMotion = info.includesCamera != 0
+        m.invalidAbove = info.invalidThreshold
+        m.jitterDelta = jd
+        return (m, "vpengine \(info.width)x\(info.height) f\(info.serial)")
+    }
+
+    /// Motion vectors of `eye`: VPEngine's (preferred when the driver makes them) or the AppSW
+    /// ones the guest wrote for this frame.
+    private func motionInput(_ eye: Int, _ r: kl_ovrp_render_pose, flipY: Bool) -> (VPKTAAMotionInput?, String) {
         guard useMV else { return (nil, "off(KL_VPKTAA_MV=0)") }
+        if mvSource != "appsw" {
+            let (m, d) = vpengineMotion(eye, r, flipY: flipY)
+            if m != nil || mvSource == "vpengine" { return (m, d) }
+        }
+        return appswMotion(eye, r)
+    }
+
+    /// AppSW motion vectors of `eye` when the guest wrote them for this frame.
+    private func appswMotion(_ eye: Int, _ r: kl_ovrp_render_pose) -> (VPKTAAMotionInput?, String) {
         guard (r.asw & Int32(KL_OVRP_ASW_STORAGE)) != 0 else { return (nil, "none") }
         guard (r.asw & Int32(KL_OVRP_ASW_MV)) != 0 else { return (nil, "not-written") }
         var w: Int32 = 0, h: Int32 = 0, sl: Int32 = 0
@@ -294,7 +357,7 @@ final class KleptonTAA {
         for eye in 0..<2 {
             let (src, slice, flip) = srcList[eye]
             guard let outView = writeViews[ObjectIdentifier(outs[eye])] else { ok = false; break }
-            let (m, md) = motionInput(eye, rendered)
+            let (m, md) = motionInput(eye, rendered, flipY: flip)
             mDesc[eye] = md
             guard let input = makeInput(eye: eye, color: src, slice: slice, flipY: flip,
                                         rendered: rendered, depth: dIn[eye], motion: m) else { ok = false; break }

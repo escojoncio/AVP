@@ -587,6 +587,7 @@ void kl_ovrp_association_stats(uint64_t *dropped, uint64_t *multi,
 // 1 = right. Takes effect on the next frame the guest asks about, and is
 // recorded per frame in the render-pose ring, so a frustum that changes
 // mid-run stays consistent with the pictures rendered under it.
+int  kl_ovrp_eye_frustum_ready(void);
 void kl_ovrp_set_eye_frustum(int eye, float left, float right, float top, float bottom);
 
 // The head->eye offset seam — i.e. the IPD, and the only place the guest can
@@ -848,6 +849,19 @@ void kl_ovrp_haptics_stop(int hand);
 
 // Compositor → shim: 1 while the VPKTAA resolve runs (gates projection jitter).
 void kl_ovrp_set_taa_active(int on);
+
+// VPKTAA for an OpenVR guest (runtime/openvr): this frame's sub-pixel Halton(2,3) offset for `eye` in tangent units
+// (dx right, dy up), to add to the projection the guest is told (GetProjectionRaw): x in [-l+dx, r+dx], y in
+// [-b+dy, t+dy]. Returns 1 when it applies: KL_VPKTAA=1, the resolve is live, and the guest has been seen
+// re-reading its projection every frame (the probe ovrp_GetNodeFrustum2 uses). The render pose of the frame records
+// the jitter served, with its tangents kept UNjittered.
+int  kl_vpktaa_jitter_tangents(int eye, float *dx, float *dy);
+// The offset the guest holds for `eye` now (the last served), 0 when none.
+int  kl_vpktaa_jitter_served(int eye, float *dx, float *dy);
+// The render size the jitter is a sub-pixel of, for a guest without an OVRPlugin eye swapchain.
+void kl_vpktaa_set_render_size(int w, int h);
+// Near/far of the guest's projection this frame (render pose depth_near/depth_far); 0 = unknown.
+void kl_ovrp_set_depth_range(float znear, float zfar);
 
 // VPKTAA per-pixel reprojection: the eye's pose RELATIVE TO THE HEAD exactly as
 // the guest was told it (ovrp_GetNodePoseState nodes 0/1): `off` = head-local

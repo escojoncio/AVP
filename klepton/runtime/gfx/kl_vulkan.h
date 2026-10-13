@@ -53,6 +53,9 @@ void *kl_vulkan_lookup(const char *name);
 // reported once, by name, at the point the guest asks — rather than as a NULL
 // symbol somewhere inside Unity's device selection.
 int   kl_vulkan_available(void);
+// The path of the Vulkan driver the layer loaded (KL_MVK_DYLIB: VPVulkan.framework or MoltenVK; else the
+// KL_MVK_DIR search), or NULL when none loaded. Anything else that loads a Vulkan driver uses this one.
+const char *kl_vulkan_driver_path(void);
 
 // ---------------------------------------------------------------------------
 // The eye-texture seam, for kl_ovrp.c
@@ -79,6 +82,9 @@ int kl_vulkan_guest_active(void);
 // instance exists and reports a valid LUID; returns 0 (out untouched) otherwise —
 // a GLES guest, where the adapter id must stay empty.
 int kl_vulkan_display_luid(uint8_t out[8]);
+// The GPU's Vulkan vendor and device ids, from a throwaway instance (usable before the guest makes its own): 1 and
+// both filled, or 0 without MoltenVK. For Alyx's video settings file (kl_alyx_app.c).
+int kl_vulkan_gpu_ids(unsigned *vendor, unsigned *device);
 
 // Create (or return) the eye image for a swapchain stage and eye. The returned
 // value is the VkImage handle widened to 64 bits, which is exactly what
@@ -108,6 +114,20 @@ unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, un
 // is what every compositor samples. A size that differs from the cached one
 // re-allocates rather than answering with storage of the wrong shape.
 #define KLVK_EYE_LAYER (-1)
+// The game's DEPTH for an eye (KL_CP_DEPTH, the reprojection-depth prototype): an R32_SFLOAT copy of the
+// depth it submits with Submit_TextureWithDepth, one image per stage/eye, in the same crop as the colour, so
+// the compositor can hand visionOS real per-pixel depth. Allocated through kl_vulkan_layer_image like any layer.
+#define KLVK_DEPTH_LAYER (-2)
+unsigned long long kl_vulkan_eye_depth_image(int stage, int eye, unsigned w, unsigned h);
+unsigned long long kl_vulkan_eye_depth_half(int eye, unsigned w, unsigned h);
+// A host-visible staging buffer (depth aspect -> buffer -> the R32F image), and its mapped bytes for a readback.
+unsigned long long kl_vulkan_eye_depth_staging(int stage, int eye, unsigned long long bytes, void **mapped);
+// The game's depth mapping for that stage/eye, OpenVR row-major terms: clip.z = m22*z + m23, clip.w = -z.
+// ...plus where the copy left the depth: w x h texels, `pitch` texels per row in the staging buffer (0 = it went
+// on into the R32F layer image instead).
+void kl_vulkan_set_eye_depth_map(int stage, int eye, float m22, float m23, unsigned w, unsigned h, unsigned pitch);
+// For the compositor: the depth texture (NULL = none this stage) and its mapping.
+void *kl_vulkan_eye_depth_mtl(int stage, int eye, int *w, int *h, float *m22, float *m23);
 unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
                                          unsigned w, unsigned h, int srgb, int layers);
 
@@ -213,7 +233,7 @@ typedef struct {
 int  kl_vulkan_eye_depth_get(int stage, int eye, unsigned long long want_tag,
                              kl_vulkan_eye_depth *out);
 // The short form: the MTLTexture of `stage`'s eye depth (NULL = none filed).
-void *kl_vulkan_eye_depth_mtl(int stage, int *w, int *h, int *layers, int *fmt);
+void *kl_vulkan_taa_depth_mtl(int stage, int *w, int *h, int *layers, int *fmt);
 // Called by kl_ovrp right after kl_vulkan_frame_done(stage) with the serial of
 // the frame record it filed for that frame.
 void kl_vulkan_eye_depth_tag(int stage, unsigned long long serial);

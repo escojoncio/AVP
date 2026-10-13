@@ -46,6 +46,7 @@ import CoreHaptics
 import GameController
 import SwiftUI
 import simd
+import QuartzCore
 
 /// One hand's worth of state, in the guest's own units.
 struct KleptonHandState {
@@ -972,6 +973,13 @@ final class KleptonControllers {
     // hand — so a stick held near the on/off threshold does not chatter the
     // GetDown/GetUp edges that snap turn keys on. Touched only from pollButtons.
     private static var lStickDir = (up: false, down: false, left: false, right: false)
+    private static var lastAttached = [false, false]
+    private static var lastSpatialCount = -1
+    private static var lastBits: [UInt32] = [0, 0]
+    private static var lastTouch: [UInt32] = [0, 0]
+    private static var lastState: [Double] = [CACurrentMediaTime(), CACurrentMediaTime()]
+    private static var stallSaid = [false, false]
+    private static let ctrlTrace = ProcessInfo.processInfo.environment["KL_CTRL_TRACE"] != "0"
     private static var rStickDir = (up: false, down: false, left: false, right: false)
 
     // MARK: - Polling
@@ -1018,6 +1026,12 @@ final class KleptonControllers {
             .filter { $0.productCategory == GCProductCategorySpatialController }
         var attached = [false, false]
         for c in spatial { attached[Self.hand(of: c)] = true }
+        // Every change in which hands have a controller, and how many spatial
+        // controllers the system lists (two for one hand = a duplicate).
+        if attached != Self.lastAttached || spatial.count != Self.lastSpatialCount {
+            NSLog("[ctrl] attached L=\(attached[0]) R=\(attached[1]) (\(spatial.count) spatial controller(s): \(spatial.map { $0.vendorName ?? "?" }))")
+            Self.lastAttached = attached; Self.lastSpatialCount = spatial.count
+        }
 
         lock.lock()
         for i in 0...1 where !attached[i] {
@@ -1044,10 +1058,23 @@ final class KleptonControllers {
             // nil is "nothing new since you last asked", NOT "everything is
             // released". Leave this hand's last sample standing — see the
             // clear-on-attachment note above, which is the other half of this.
+            let now = CACurrentMediaTime()
             guard let s = c.input.nextInputState() else {
                 if hand == 1 { Self.rightPSHold(nil) }
+                // A controller that stays attached but stops delivering states
+                // reads as "every button dead"; say so once per stall.
+                if now - Self.lastState[hand] > 2.0 && !Self.stallSaid[hand] {
+                    NSLog(String(format: "[ctrl] %@ controller attached but no new input state for %.1f s",
+                                 hand == 0 ? "L" : "R", now - Self.lastState[hand]))
+                    Self.stallSaid[hand] = true
+                }
                 continue
             }
+            if Self.stallSaid[hand] {
+                NSLog(String(format: "[ctrl] %@ input states resumed after %.1f s", hand == 0 ? "L" : "R", now - Self.lastState[hand]))
+                Self.stallSaid[hand] = false
+            }
+            Self.lastState[hand] = now
             let b = s.buttons, ax = s.axes, dp = s.dpads
 
             // The PSVR2 Sense element names, per controller. Both controllers
@@ -1277,6 +1304,14 @@ final class KleptonControllers {
             // reads as a hardware fault.
             st.buttons = bits
             st.touches = touch | bits
+            // Every change of this hand's raw words (KL_CTRL_TRACE=1, on by
+            // default while input is being debugged): presses shorter than the
+            // shim's once-a-second sample still show up.
+            if Self.ctrlTrace && (bits != Self.lastBits[hand] || touch != Self.lastTouch[hand]) {
+                NSLog(String(format: "[ctrl] %@ buttons %#x touches %#x trigger %.2f grip %.0f stick (%.2f %.2f)",
+                             hand == 0 ? "L" : "R", bits, touch, st.indexTrigger, st.handTrigger, st.stick.x, st.stick.y))
+                Self.lastBits[hand] = bits; Self.lastTouch[hand] = touch
+            }
 
             // Buttons only. The pose is resolved in update(), where the frame's
             // presentation time is known and the anchor can be predicted to it.
@@ -1764,6 +1799,28 @@ final class KleptonControllers {
     }
     private var loggedNoChirality = false
 
+    /// The [throw] line: per hand, whether the grip was held last frame and the speeds published over the last
+    /// 300 ms. Render thread only.
+    private var gripHeld = [false, false]
+    private var recentSpeed: [[(t: Double, v: Float)]] = [[], []]
+
+    /// One line in the headset's own log (never in a stutter report) each time a grip opens, which is when the game
+    /// throws what the hand held: the speed handed to the game at that moment, the fastest in the 300 ms before it
+    /// and how long before, and where the pose came from. A thrown object that drops straight then reads as either
+    /// "no speed reached the game" or "the grip opened after the hand had stopped" (GitHub #3).
+    private func noteGripRelease(hand: Int, _ st: KleptonHandState, sense: Bool, at t: Double) {
+        let v = simd_length(st.linearVelocity)
+        recentSpeed[hand].append((t, v))
+        recentSpeed[hand].removeAll { t - $0.t > 0.3 }
+        let held = st.handTrigger > 0.5
+        defer { gripHeld[hand] = held }
+        guard gripHeld[hand], !held else { return }
+        let peak = recentSpeed[hand].max { $0.v < $1.v } ?? (t: t, v: v)
+        NSLog(String(format: "[throw] %@ grip opened: speed %.2f m/s (fastest %.2f m/s, %.0f ms before), spin %.1f rad/s, pose from %@",
+                     hand == 0 ? "L" : "R", v, peak.v, (t - peak.t) * 1000, simd_length(st.angularVelocity),
+                     sense ? "the controller" : "the hand"))
+    }
+
     /// Merge every source and push the result across to kl_ovrp.
     ///
     /// The hand anchors are the fallback: used for a hand's *pose* and its
@@ -1852,6 +1909,7 @@ final class KleptonControllers {
                 continue
             }
 
+            noteGripRelease(hand: hand, st, sense: accPose != nil, at: presentationTime)
             if let p = st.position, let q = st.orientation {
                 kl_ovrp_set_hand_motion(Int32(hand), p.x, p.y, p.z,
                                         q.imag.x, q.imag.y, q.imag.z, q.real,

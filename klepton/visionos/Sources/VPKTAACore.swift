@@ -20,10 +20,15 @@
 //                  `color`, any resolution; .depth16Unorm/.depth32Float/.depth32Float_stencil8,
 //                  single-sample, 2D or 2D array) + reversedZ + near/far of the projection
 //                  (far 0 = infinite). Vulkan clip z ∈ [0,1].
-//     motion       optional: OBJECT motion vectors (camera motion excluded, as Meta AppSW),
-//                  .xy of a float texture, same uv layout as `color`; `scale` maps a texel to
-//                  (current − previous) in crop-uv units (Unity AppSW curNDC−prevNDC: 0.5, 0.5;
-//                  a negative component flips that axis).
+//     motion       optional: motion vectors, .xy of a float texture, same uv layout as `color`;
+//                  `scale` maps a texel to (current − previous) in crop-uv units (Unity AppSW
+//                  curNDC−prevNDC: 0.5, 0.5; a negative component flips that axis).
+//                  fullMotion = false: OBJECT motion (camera excluded, as Meta AppSW), applied
+//                  before the depth/pose reprojection. fullMotion = true: the whole screen motion
+//                  (camera included, VPEngine's own vectors): previous uv = uv − mv directly, the
+//                  reprojection is used only where a texel holds |x| >= invalidAbove (nothing drew
+//                  motion there: sky, blended effects); `jitterDelta` (crop-uv, current − previous
+//                  frame's jitter) is removed from it, since the game's matrices carry the jitter.
 //   encode(cmd:eye:input:output:)  writes `output` (an rgba8Unorm-writable 2D-array texture of
 //   the colour's size: the caller's view of an rgba8Unorm_srgb texture; the kernel encodes sRGB)
 //   on the colour's grid, UNjittered. Keeps its own history per eye (rgba16f + r16f distance).
@@ -70,6 +75,9 @@ struct VPKTAAMotionInput {
     /// true: the texture covers the crop rect only (Meta AppSW: motion vectors are rendered at
     /// MotionVectorTextureSize with the eye's own viewport); false: the colour's layout.
     var mapsCrop: Bool = true
+    var fullMotion: Bool = false
+    var invalidAbove: Float = 1000
+    var jitterDelta: SIMD2<Float> = .zero
 }
 
 struct VPKTAAEyeInput {
@@ -95,7 +103,7 @@ struct VPKTAAStats {
     var meanMvPx: Double { moving > 0 ? Double(mvSum16) / 16 / Double(moving) : 0 }
 }
 
-/// Layout shared with the MSL `Params` below (272 bytes; keep the order).
+/// Layout shared with the MSL `Params` below (keep the order).
 struct VPKTAAParams {
     var tanCur: SIMD4<Float>
     var tanPrev: SIMD4<Float>
@@ -121,7 +129,8 @@ struct VPKTAAParams {
     var flipY: UInt32
     var reset: UInt32
     var writeOut: UInt32
-    var pad: UInt32
+    var fullMotion: UInt32          // 1: mv is the whole screen motion (VPKTAAMotionInput.fullMotion)
+    var mvFull: SIMD4<Float>        // xy: jitter delta to remove (crop-uv), z: invalid threshold
 }
 
 final class VPKTAACore {
@@ -357,7 +366,10 @@ final class VPKTAACore {
             w8: wts[8], historyWeight: hw, gamma: jitterOn ? 1.25 : 1.0,
             sharpness: min(max(sharpness, 0), 1), disocc: max(disocclusion, 0.01),
             slice: UInt32(input.slice), depthSlice: UInt32(depthSlice), mvSlice: UInt32(mvSlice),
-            flipY: input.flipY ? 1 : 0, reset: reset ? 1 : 0, writeOut: sharpOn ? 0 : 1, pad: 0)
+            flipY: input.flipY ? 1 : 0, reset: reset ? 1 : 0, writeOut: sharpOn ? 0 : 1,
+            fullMotion: (mvOn && input.motion?.fullMotion == true) ? 1 : 0,
+            mvFull: SIMD4<Float>(input.motion?.jitterDelta.x ?? 0, input.motion?.jitterDelta.y ?? 0,
+                                 input.motion?.invalidAbove ?? 1000, 0))
 
         let prevH = st.hist[st.cur], nextH = st.hist[st.cur ^ 1]
         let prevD = st.dist[st.cur], nextD = st.dist[st.cur ^ 1]
@@ -418,7 +430,7 @@ final class VPKTAACore {
         float4 depthP; float4 mvP; float4 depthAB; float4 mvAB; float2 crop; float2 cropOff;
         int2 shiftInt; float w8; float historyWeight; float gamma;
         float sharpness; float disocc; uint slice; uint depthSlice; uint mvSlice; uint flipY;
-        uint reset; uint writeOut; uint pad;
+        uint reset; uint writeOut; uint fullMotion; float4 mvFull;
     };
     constant float kSky = 60000.0;          // distance stored for the far plane (r16f-safe)
     static float3 toYCoCg(float3 c) {
@@ -569,19 +581,32 @@ final class VPKTAACore {
                 else { dist = L; sDep = 1; }
             }
 
-            // Object motion (sampled at the closest-depth texel), applied before the camera.
+            // Object motion (sampled at the closest-depth texel), applied before the camera; or
+            // the full screen motion (fullMotion), which replaces the reprojection where valid.
             float2 mv = float2(0.0), cuvObj = cuv;
-            bool mvOn = p.mvP.z > 0.5;
+            bool mvOn = p.mvP.z > 0.5, full = false;
+            float2 fullPuv = float2(0.0);
             if (mvOn) {
                 float2 cpos = float2(ip + p.shiftInt) + 0.5 + bestOff / max(p.depthAB.xy, float2(1e-4));
                 int2 mc = int2(floor(cpos * p.mvAB.xy + p.mvAB.zw));
                 int2 mmx = int2(int(mvTex.get_width()) - 1, int(mvTex.get_height()) - 1);
                 mv = mvTex.read(uint2(clamp(mc, int2(0), mmx)), p.mvSlice).xy;
                 if (any(kbad(float3(mv, 0.0)))) mv = float2(0.0);
-                float2 mvd = mv * p.mvP.xy;          // (current - previous), crop-uv
-                cuvObj = cuv - mvd;
-                float mvpx = length(mvd * p.crop * size);
-                if (mvpx > 0.5) { sMov = 1; sMvSum = uint(min(mvpx * 16.0, 65535.0)); }
+                if (p.fullMotion != 0u) {
+                    if (abs(mv.x) < p.mvFull.z && abs(mv.y) < p.mvFull.z) {
+                        float2 mvd = mv * p.mvP.xy - p.mvFull.xy;
+                        fullPuv = cuv - mvd;
+                        full = true;
+                        float mvpx = length(mvd * p.crop * size);
+                        if (mvpx > 0.5) { sMov = 1; sMvSum = uint(min(mvpx * 16.0, 65535.0)); }
+                    }
+                    mv = float2(0.0);  // no object term: the reprojection fallback is camera-only
+                } else {
+                    float2 mvd = mv * p.mvP.xy;          // (current - previous), crop-uv
+                    cuvObj = cuv - mvd;
+                    float mvpx = length(mvd * p.crop * size);
+                    if (mvpx > 0.5) { sMov = 1; sMvSum = uint(min(mvpx * 16.0, 65535.0)); }
+                }
             }
 
             float3 res = c;
@@ -591,6 +616,10 @@ final class VPKTAACore {
                 float2 puv = float2(0.0);
                 float pd = 0.0;
                 bool hit = reproject(cuvObj, dist, p, puv, pd) && all(puv >= 0.0) && all(puv <= 1.0);
+                if (full) {  // the whole motion is known: previous uv directly (pd from the pose path)
+                    puv = fullPuv;
+                    hit = all(puv >= 0.0) && all(puv <= 1.0);
+                }
                 if (hit) {
                     float2 huv = puv * p.crop + p.cropOff;
                     float4 hist4 = sampleCR(histIn, lin, huv, size);
@@ -630,7 +659,7 @@ final class VPKTAACore {
 
                 // Motion-vector sign vote (stat pixels that move): which of the 4 sign
                 // variants reprojects onto history that matches the current colour best.
-                if (statPx && mvOn && p.mvP.w > 0.5 && sMov != 0u) {
+                if (statPx && mvOn && p.fullMotion == 0u && p.mvP.w > 0.5 && sMov != 0u) {
                     float best = 1e30;
                     float lc = luma(c);
                     for (uint k = 0; k < 4u; ++k) {

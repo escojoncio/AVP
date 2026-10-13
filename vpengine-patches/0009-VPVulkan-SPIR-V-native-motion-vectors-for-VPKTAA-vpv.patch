@@ -1,0 +1,1579 @@
+From 3f8e5f8d48b03fe3479bd199522354ad5cf50791 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 06:13:29 +0000
+Subject: [PATCH 09/10] VPVulkan + SPIR-V: native motion vectors for VPKTAA
+ (vpvk/motion.h)
+
+Source 2 never renders motion vectors; VPEngine generates them.
+
+Translator (SpirvLowerOptions::motion): the vertex entry point is lowered twice into one shader,
+first with every constant buffer (uniform blocks, push constants) and, optionally, read-only
+storage buffer (bone palettes) read from "slot + base" where the driver binds the previous
+frame's bytes, then normally; both clip positions leave at locations 30/31. Side effects in the
+first run (memory or image writes, atomics) refuse the variant. The fragment variant reads them
+and writes cur - prev Vulkan NDC to an extra RG16F colour output.
+
+Driver: with vpvk_config_set_motion_vectors(1) (or VPVK_MOTION=1) before vkCreateDevice:
+- multiview pipelines with depth, single sample and a free trailing colour slot get a
+  format-only variant (motion attachment declared, not written) and, when opaque (depth test +
+  write, no blend), a motion variant; dynamic colour write masks apply to both;
+- every multiview pass whose draws all have variants gets the motion target (RG16F 2D array,
+  pass size, 4 rotating textures) as one more colour attachment: cleared to 60000 (invalid) by
+  the eye frame's first pass (depth cleared) and loaded by the rest;
+- a motion draw binds, next to its current buffers, the bytes the same draw (pipeline + vertex/
+  index buffers + ranges + occurrence in the frame) read the previous eye frame; the bytes of
+  this frame, read from unified memory at vkQueueSubmit, are kept for the next (two arenas,
+  swapped per eye frame). First sighting: current bytes (zero motion that frame).
+- vpvk_motion_get(serial, &info): newest complete frame (or one serial): id<MTLTexture>, size,
+  layers, scale (0.5, 0.5: NDC -> uv), invalid threshold, serial, completion.
+Motion includes camera motion (the game's own matrices).
+
+Tests: gpu_spirv.motion (variant lowering), gpu_vulkan.motion (pass gets the target, variants,
+previous bytes bound, vpvk_motion_get).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
+---
+ gpu/shader/spirv/CMakeLists.txt          |   2 +-
+ gpu/shader/spirv/src/lower.cpp           | 136 +++++++++--
+ gpu/shader/spirv/tests/spirv_tests.cpp   |  56 +++++
+ gpu/vulkan/CMakeLists.txt                |   4 +-
+ gpu/vulkan/include/vpvk/motion.h         |  43 ++++
+ gpu/vulkan/include/vpvk/spirv_frontend.h |  20 ++
+ gpu/vulkan/src/commands.cpp              |  63 ++++-
+ gpu/vulkan/src/commands.h                |  18 ++
+ gpu/vulkan/src/entry.cpp                 |   5 +
+ gpu/vulkan/src/motion.cpp                | 291 +++++++++++++++++++++++
+ gpu/vulkan/src/pipelines.cpp             | 138 ++++++++++-
+ gpu/vulkan/src/recipes.cpp               |   9 +-
+ gpu/vulkan/src/sync.cpp                  |   5 +-
+ gpu/vulkan/src/vpvk.h                    |  32 +++
+ gpu/vulkan/tests/vk_tests.cpp            | 196 ++++++++++++++-
+ 15 files changed, 980 insertions(+), 38 deletions(-)
+ create mode 100644 gpu/vulkan/include/vpvk/motion.h
+ create mode 100644 gpu/vulkan/src/motion.cpp
+
+diff --git a/gpu/shader/spirv/CMakeLists.txt b/gpu/shader/spirv/CMakeLists.txt
+index 0ac5d37..86f9c27 100644
+--- a/gpu/shader/spirv/CMakeLists.txt
++++ b/gpu/shader/spirv/CMakeLists.txt
+@@ -11,7 +11,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
+     add_executable(vpspirv_tests tests/spirv_tests.cpp)
+     target_link_libraries(vpspirv_tests PRIVATE vpspirv vpmsl)
+     target_compile_options(vpspirv_tests PRIVATE -Wall -Wextra)
+-    foreach(t mesh_multiview lit cull subpass)
++    foreach(t mesh_multiview lit cull subpass motion)
+       foreach(v plain opt)
+         add_test(NAME gpu_spirv.${t}.${v} COMMAND vpspirv_tests ${t} ${v} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+       endforeach()
+diff --git a/gpu/shader/spirv/src/lower.cpp b/gpu/shader/spirv/src/lower.cpp
+index 720ffd3..8c3cd20 100644
+--- a/gpu/shader/spirv/src/lower.cpp
++++ b/gpu/shader/spirv/src/lower.cpp
+@@ -171,6 +171,12 @@ private:
+     int positionInput_ = -1, layerInput_ = -1, instanceInput_ = -1, vertexInput_ = -1;
+     int layerOutput_ = -1;
+     bool writesLayer_ = false;
++    // Motion variant (SpirvLowerOptions::motion).
++    bool prev_ = false;                 // lowering the previous-frame run of the vertex entry point
++    uint32_t prevPosVar_ = UINT32_MAX;  // its clip position
++    int positionOutput_ = -1, mvCurOut_ = -1, mvPrevOut_ = -1, mvColorOut_ = -1;
++    int mvCurIn_ = -1, mvPrevIn_ = -1;
++    Scope* entryScope_ = nullptr;
+     std::unordered_map<uint32_t, uint64_t> specValue_;
+ 
+     // ---- types ---------------------------------------------------------------------------------
+@@ -625,21 +631,39 @@ private:
+         }
+     }
+ 
++    // ConstantBuffer slot `slot` as the motion variant's previous-frame run reads it.
++    uint32_t prevSlot(uint32_t slot) {
++        if (!prev_) return slot;
++        auto& v = iface_.motionPrevSlots;
++        if (std::find(v.begin(), v.end(), uint16_t(slot)) == v.end()) v.push_back(uint16_t(slot));
++        return slot + o_.motion.prevSlotBase;
++    }
++
+     // Buffer-backed global (Uniform/StorageBuffer/PushConstant) -> resource index.
+     int bufferResource(uint32_t global, uint32_t element, bool write) {
+         const GlobalVar& g = m_.globals.at(global);
+         if (g.storage == Storage::PushConstant) {
+             if (o_.pushConstantSlot < 0) fail("push constants used but the layout has none");
+             iface_.usesPushConstants = true;
+-            return resource(vpir::ResourceKind::ConstantBuffer, uint32_t(o_.pushConstantSlot), [](vpir::Resource& r) {
+-                r.access = vpir::Access::Read;
+-            });
++            return resource(vpir::ResourceKind::ConstantBuffer, prevSlot(uint32_t(o_.pushConstantSlot)),
++                            [](vpir::Resource& r) { r.access = vpir::Access::Read; });
+         }
+         const SpirvBinding& sb = *binding(global);
+         if (element >= sb.arraySize) fail("descriptor index out of range for " + m_.nameOf(global));
+         report(sb, write);
+         bool constant = sb.kind == vpgpu::BindKind::ConstantBuffer;
+         if (constant && write) fail("store to the uniform block " + m_.nameOf(global));
++        if (prev_ && write) fail("motion: the vertex shader writes memory");
++        if (constant && prev_)
++            return resource(vpir::ResourceKind::ConstantBuffer, prevSlot(sb.slot + element),
++                            [](vpir::Resource& r) { r.access = vpir::Access::Read; });
++        if (!constant && prev_ && o_.motion.prevBufferBase) {
++            auto& v = iface_.motionPrevBuffers;
++            const uint16_t slot = uint16_t(sb.slot + element);
++            if (std::find(v.begin(), v.end(), slot) == v.end()) v.push_back(slot);
++            return resource(vpir::ResourceKind::Buffer, slot + o_.motion.prevBufferBase,
++                            [](vpir::Resource& r) { r.access = vpir::Access::Read; });
++        }
+         int r = resource(constant ? vpir::ResourceKind::ConstantBuffer : vpir::ResourceKind::Buffer, sb.slot + element,
+                          [&](vpir::Resource& res) { res.access = constant ? vpir::Access::Read : vpir::Access::ReadWrite; });
+         if (write) written_.insert(r);
+@@ -978,6 +1002,8 @@ private:
+         }
+     }
+     void storeScalarVec(const RPtr& p, ValueId x) {
++        if (prev_ && (p.target < out_.resources.size() || p.target == vpir::kTargetShared))
++            fail("motion: the vertex shader writes memory");
+         Type t = typeOfValue(x);
+         if (t.isBool()) x = cast(x, vpir::kU32.withWidth(t.width));
+         else if (t.scalar == Scalar::F16) x = un(Op::Convert, x, vpir::kF32.withWidth(t.width));
+@@ -1003,9 +1029,16 @@ private:
+         }
+         return r;
+     }
++    // The variable an output leaf is shadowed in; in the motion variant's previous-frame run only
++    // the clip position is kept (UINT32_MAX: dropped).
++    uint32_t shadowOf(const IoLeaf& leaf) const {
++        if (!prev_) return outputShadow_.at(leaf.index);
++        return int(leaf.index) == positionOutput_ ? prevPosVar_ : UINT32_MAX;
++    }
+     ValueId outputValue(const IoLeaf& leaf) {
+         if (leaf.kind != IoLeaf::Io) return zeroOf(vt(leaf.type));
+-        return loadVar(outputShadow_.at(leaf.index));
++        uint32_t var = shadowOf(leaf);
++        return var == UINT32_MAX ? zeroOf(vt(leaf.type)) : loadVar(var);
+     }
+     void storeIo(const RPtr& p, const Val& v) {
+         if (p.kind != RPtr::Output) fail("store to an input");
+@@ -1013,7 +1046,8 @@ private:
+         if (p.element) {
+             const IoLeaf& leaf = io.leaves.at(p.leaf);
+             if (leaf.kind != IoLeaf::Io) return;
+-            uint32_t var = outputShadow_.at(leaf.index);
++            uint32_t var = shadowOf(leaf);
++            if (var == UINT32_MAX) return;
+             ValueId cur = loadVar(var);
+             Inst in;
+             in.op = Op::Insert;
+@@ -1026,7 +1060,8 @@ private:
+         for (size_t i = 0; i < v.v.size(); ++i) {
+             const IoLeaf& leaf = io.leaves.at(p.leaf + i);
+             if (leaf.kind != IoLeaf::Io) continue;
+-            uint32_t var = outputShadow_.at(leaf.index);
++            uint32_t var = shadowOf(leaf);
++            if (var == UINT32_MAX) continue;
+             b_->storeVar(var, cast(v.v[i], b_fn().vars[var].type));
+         }
+     }
+@@ -1229,11 +1264,42 @@ private:
+             v.interp = vpir::Interp::Flat;
+             layerInput_ = addInput(v);
+         }
++        for (size_t i = 0; i < out_.outputs.size(); ++i)
++            if (out_.outputs[i].builtin == vpir::Builtin::Position) positionOutput_ = int(i);
++        if (o_.motion.vertex && stage_ == vpir::Stage::Vertex) {
++            if (positionOutput_ < 0) fail("motion: the vertex shader writes no position");
++            for (int k = 0; k < 2; ++k) {
++                vpir::IoVar v;
++                v.name = k ? "vp_mv_prev" : "vp_mv_cur", v.type = vpir::kF32.withWidth(4);
++                v.location = o_.motion.location + uint32_t(k);
++                for (const vpir::IoVar& o : out_.outputs)
++                    if (o.builtin == vpir::Builtin::None && o.location == v.location) fail("motion: varying location taken");
++                (k ? mvPrevOut_ : mvCurOut_) = addOutput(v);
++            }
++        }
++        if (o_.motion.fragment && stage_ == vpir::Stage::Fragment) {
++            for (int k = 0; k < 2; ++k) {
++                vpir::IoVar v;
++                v.name = k ? "vp_mv_prev" : "vp_mv_cur", v.type = vpir::kF32.withWidth(4);
++                v.location = o_.motion.location + uint32_t(k);
++                (k ? mvPrevIn_ : mvCurIn_) = addInput(v);
++            }
++            if (o_.motion.colorSlot > 7 || (iface_.colorOutputs >> o_.motion.colorSlot & 1))
++                fail("motion: colour output " + std::to_string(o_.motion.colorSlot) + " taken");
++            vpir::IoVar v;
++            v.name = "vp_motion", v.type = vpir::kF32.withWidth(4), v.location = o_.motion.colorSlot;
++            mvColorOut_ = addOutput(v);
++            iface_.colorOutputs |= uint8_t(1u << o_.motion.colorSlot);
++        }
+         for (size_t i = 0; i < out_.outputs.size(); ++i) {
+             uint32_t var = newVar(out_.outputs[i].type);
+             outputShadow_[i] = var;
+             b_->storeVar(var, zeroOf(out_.outputs[i].type));
+         }
++        if (mvCurOut_ >= 0) {
++            prevPosVar_ = newVar(vpir::kF32.withWidth(4));
++            b_->storeVar(prevPosVar_, zeroOf(vpir::kF32.withWidth(4)));
++        }
+     }
+     bool hasVertexAttributes() const { return !o_.vertexAttributes.empty(); }
+     bool hasInstanceAttributes() const {
+@@ -1256,8 +1322,22 @@ private:
+ 
+     // Writes the shadowed outputs (at every return of main).
+     void flushOutputs() {
++        if (mvColorOut_ >= 0) {  // motion fragment: Vulkan NDC of this point now minus before
++            ValueId cur = b_->loadInput(uint32_t(mvCurIn_), vpir::kF32.withWidth(4));
++            ValueId prv = b_->loadInput(uint32_t(mvPrevIn_), vpir::kF32.withWidth(4));
++            auto ndc = [&](ValueId c) {
++                ValueId w = ext(c, 3);
++                ValueId safe = select(bin(Op::Gt, un(Op::Abs, w, vpir::kF32), f32(1e-6f), vpir::kBool), w, f32(1e-6f));
++                ValueId xy = vecOf({ext(c, 0), ext(c, 1)}, vpir::kF32.withWidth(2));
++                return bin(Op::Div, xy, vecOf({safe, safe}, vpir::kF32.withWidth(2)), vpir::kF32.withWidth(2));
++            };
++            ValueId d = bin(Op::Sub, ndc(cur), ndc(prv), vpir::kF32.withWidth(2));
++            b_->storeVar(outputShadow_[size_t(mvColorOut_)], vecOf({ext(d, 0), ext(d, 1), f32(0), f32(0)}, vpir::kF32.withWidth(4)));
++        }
+         for (size_t i = 0; i < out_.outputs.size(); ++i) {
+             ValueId v = loadVar(outputShadow_[i]);
++            if (int(i) == mvCurOut_) v = loadVar(outputShadow_[size_t(positionOutput_)]);
++            if (int(i) == mvPrevOut_) v = loadVar(prevPosVar_);
+             const vpir::IoVar& o = out_.outputs[i];
+             if (o.builtin == vpir::Builtin::Position && stage_ == vpir::Stage::Vertex) {
+                 ValueId y = un(Op::Neg, ext(v, 1), vpir::kF32);
+@@ -1608,7 +1688,7 @@ private:
+             default: fail("block without a known terminator");
+         }
+     }
+-    bool isEntryScope() const { return scope_ == scopes_.front().get(); }
++    bool isEntryScope() const { return scope_ == entryScope_; }
+ 
+     void arm(uint32_t from, uint32_t to, uint32_t stop) {
+         if (jump(from, to, stop) == Jump::Next) flow(to, stop);
+@@ -2533,6 +2613,7 @@ private:
+         return vecOf(comps, rt);
+     }
+     void imageWrite(const Instr& in) {
++        if (prev_) fail("motion: the vertex shader writes images");
+         Handle h = handle(w(in, 1));
+         ValueId value = get1(w(in, 3));
+         if (h.buffer >= 0) {
+@@ -2575,6 +2656,7 @@ private:
+         b_->imageStore(uint32_t(h.texture), coord, v4);
+     }
+     ValueId atomic(const Instr& in) {
++        if (prev_) fail("motion: the vertex shader uses atomics");
+         Type rt = vt(w(in, 1));
+         uint32_t ptrId = w(in, 3);
+         auto tp = scope_->texelPointers.find(ptrId);
+@@ -3060,18 +3142,38 @@ void Lowering::run() {
+     }
+     auto fit = m_.functions.find(entry_->function);
+     if (fit == m_.functions.end()) fail("entry function missing");
+-    scope_ = newScope(fit->second);
+-    // Private globals with initializers.
+-    for (uint32_t id : m_.globalOrder) {
+-        const GlobalVar& g = m_.globals.at(id);
+-        if (g.storage == Storage::Private && g.initializer) {
+-            RPtr p;
+-            p.target = privateGlobal_[id], p.off = 0, p.type = T(g.type).elem;
+-            size_t at = 0;
+-            Val v = get(g.initializer);
+-            storeMem(p, v, at);
++    // Private globals with initializers (again after the motion variant's first run).
++    auto initPrivates = [&] {
++        for (uint32_t id : m_.globalOrder) {
++            const GlobalVar& g = m_.globals.at(id);
++            if (g.storage == Storage::Private && g.initializer) {
++                RPtr p;
++                p.target = privateGlobal_[id], p.off = 0, p.type = T(g.type).elem;
++                size_t at = 0;
++                Val v = get(g.initializer);
++                storeMem(p, v, at);
++            }
+         }
++    };
++    if (mvCurOut_ >= 0) {
++        // The previous-frame run, inlined like a call (its returns leave the once-loop).
++        prev_ = true;
++        Scope* s = newScope(fit->second);
++        scope_ = s;
++        initPrivates();
++        Ctx c;
++        c.kind = Ctx::Func, c.scope = s;
++        ctx_.push_back(c);
++        b_->beginLoop();
++        flow(fit->second.blocks.front().label, 0);
++        b_->breakLoop();
++        b_->end();
++        popCtx();
++        prev_ = false;
+     }
++    scope_ = newScope(fit->second);
++    entryScope_ = scope_;
++    initPrivates();
+     flow(fit->second.blocks.front().label, 0);
+     b_->finish();
+ 
+diff --git a/gpu/shader/spirv/tests/spirv_tests.cpp b/gpu/shader/spirv/tests/spirv_tests.cpp
+index ded4481..971976e 100644
+--- a/gpu/shader/spirv/tests/spirv_tests.cpp
++++ b/gpu/shader/spirv/tests/spirv_tests.cpp
+@@ -6,6 +6,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <map>
++#include <set>
+ #include <fstream>
+ #include <string>
+ #include <vector>
+@@ -118,6 +119,60 @@ void meshMultiview(const std::string& dir, const std::string& v) {
+     CHECK(r.msl.source.find("render_target_array_index") != std::string::npos);
+ }
+ 
++// Motion variant (VPKTAA): the vertex shader runs twice, the first run with every constant
++// buffer (uniform blocks and push constants) redirected to its previous-frame slot; both clip
++// positions leave at locations 30/31. The fragment shader adds the motion output.
++void motion(const std::string& dir, const std::string& v) {
++    spirv::SpirvLowerOptions o;
++    o.entry = "main";
++    o.stage = vpir::Stage::Vertex;
++    o.viewCount = 2;
++    o.layout = {bind(0, 0, vpgpu::BindKind::ConstantBuffer, 0), bind(1, 0, vpgpu::BindKind::ConstantBuffer, 1)};
++    o.pushConstantSlot = 2;
++    o.vertexBuffers = {{0, 32, false, 3}, {1, 16, true, 4}};
++    o.vertexAttributes = {{0, 0, 0, vpgpu::Format::RGBA32Float}, {1, 0, 12, vpgpu::Format::RGBA8Snorm},
++                          {2, 0, 16, vpgpu::Format::RG16Float}, {3, 1, 0, vpgpu::Format::RGBA32Float}};
++    o.motion.vertex = true;
++    o.motion.prevSlotBase = 16;
++    Result r = run(dir + "/mesh_multiview.vert" + (v.empty() ? "" : ".opt") + ".spv", o);
++    CHECK(r.ok);
++    if (!r.ok) return;
++    // Every constant buffer the shader reads, once more at slot + 16.
++    std::set<uint32_t> cb;
++    for (auto& res : r.module.resources)
++        if (res.kind == vpir::ResourceKind::ConstantBuffer) cb.insert(res.index);
++    CHECK(cb == (std::set<uint32_t>{0, 1, 2, 16, 17, 18}));
++    CHECK(r.iface.motionPrevSlots.size() == 3);
++    int mv = 0;
++    for (auto& out : r.module.outputs) mv += out.location >= 30 && out.builtin == vpir::Builtin::None;
++    CHECK(mv == 2);
++    CHECK(r.msl.source.find("user(loc30)") != std::string::npos && r.msl.source.find("user(loc31)") != std::string::npos);
++    // No motion without a constant buffer to read the previous frame from is still a valid shader.
++    spirv::SpirvLowerOptions f;
++    f.entry = "main";
++    f.stage = vpir::Stage::Fragment;
++    f.viewCount = 2;
++    f.layout = {bind(0, 1, vpgpu::BindKind::Texture, 0, 0), bind(0, 2, vpgpu::BindKind::Texture, 1),
++                bind(0, 3, vpgpu::BindKind::Sampler, 1), bind(0, 4, vpgpu::BindKind::Texture, 2, 2),
++                bind(0, 5, vpgpu::BindKind::Buffer, 0), bind(0, 6, vpgpu::BindKind::ConstantBuffer, 1)};
++    f.motion.fragment = true;
++    f.motion.colorSlot = 1;
++    Result rf = run(dir + "/lit.frag" + (v.empty() ? "" : ".opt") + ".spv", f);
++    CHECK(rf.ok);
++    if (!rf.ok) return;
++    CHECK(rf.iface.colorOutputs == 3 && rf.msl.colorOutputs == 3);
++    CHECK(rf.msl.source.find("[[color(1)]]") != std::string::npos && rf.msl.source.find("user(loc31)") != std::string::npos);
++    // Colour slot taken by the shader itself: refused.
++    f.motion.colorSlot = 0;
++    std::vector<uint32_t> words = readWords(dir + "/lit.frag.spv");
++    std::string error;
++    spirv::SpirvModule* m = spirv::parse(words.data(), words.size(), error);
++    vpir::Module out;
++    spirv::SpirvInterface iface;
++    CHECK(m && !spirv::lower(*m, f, out, iface, error) && error.find("motion") != std::string::npos);
++    spirv::release(m);
++}
++
+ void lit(const std::string& dir, const std::string& v) {
+     spirv::SpirvLowerOptions o;
+     o.entry = "main";
+@@ -182,6 +237,7 @@ int main(int argc, char** argv) {
+     else if (c == "lit") lit(dir, v);
+     else if (c == "cull") cull(dir, v);
+     else if (c == "subpass") subpass(dir, v);
++    else if (c == "motion") motion(dir, v);
+     else {
+         std::fprintf(stderr, "unknown case %s\n", c.c_str());
+         return 2;
+diff --git a/gpu/vulkan/CMakeLists.txt b/gpu/vulkan/CMakeLists.txt
+index 38bfefd..4499d83 100644
+--- a/gpu/vulkan/CMakeLists.txt
++++ b/gpu/vulkan/CMakeLists.txt
+@@ -2,7 +2,7 @@
+ # MoltenVK by path (Klepton's kl_vulkan.c) load libVPVulkan.dylib instead. Khronos headers only
+ # (Apache-2.0/MIT, third_party/vulkan-headers); no other Vulkan code.
+ set(VPVK_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include)
+-set(VPVK_COMMON src/entry.cpp src/physical_device.cpp src/commands.cpp src/config.cpp src/pipelines.cpp src/recipes.cpp src/precompile.cpp src/sync.cpp src/core13.cpp src/queries.cpp)
++set(VPVK_COMMON src/entry.cpp src/physical_device.cpp src/commands.cpp src/config.cpp src/pipelines.cpp src/recipes.cpp src/precompile.cpp src/sync.cpp src/core13.cpp src/queries.cpp src/motion.cpp)
+ # The static gpu/ libraries end up inside a shared library.
+ set_target_properties(vpgpu_core vpir vpmsl vpspirv PROPERTIES POSITION_INDEPENDENT_CODE ON)
+ 
+@@ -34,7 +34,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
+     target_compile_definitions(vpvk_tests PRIVATE VPVK_SPIRV_TESTS="${CMAKE_CURRENT_SOURCE_DIR}/../shader/spirv/tests")
+     add_dependencies(vpvk_tests VPVulkan)
+     target_compile_options(vpvk_tests PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+-    foreach(t exports physical memory passes submit pipeline recipes alyx depth_resolve local_read sync host_image_copy)
++    foreach(t exports physical memory passes submit pipeline recipes alyx depth_resolve local_read sync host_image_copy motion)
+       add_test(NAME gpu_vulkan.${t} COMMAND vpvk_tests ${t} $<TARGET_FILE:VPVulkan>)
+     endforeach()
+   endif()
+diff --git a/gpu/vulkan/include/vpvk/motion.h b/gpu/vulkan/include/vpvk/motion.h
+new file mode 100644
+index 0000000..898caaa
+--- /dev/null
++++ b/gpu/vulkan/include/vpvk/motion.h
+@@ -0,0 +1,43 @@
++// VPEngine motion vectors for VPKTAA (VPVulkan). Plain C: Klepton (C) and Swift call it.
++//
++// When enabled (before vkCreateDevice), every multiview eye pass with a depth attachment and a free
++// colour slot gets one more colour attachment, an RG16Float 2D-array texture of the pass's size
++// (layer = view = eye). Opaque draws in those passes run a variant of their pipeline whose vertex
++// shader computes the position twice, once with the previous frame's copy of every uniform block and
++// push constant range it reads (same draw: same geometry, same occurrence in the frame), and whose
++// fragment shader writes (current - previous) Vulkan NDC there. Blended and depth-write-off draws
++// leave it alone; pixels no opaque motion draw covered keep the clear value (invalid).
++//
++// Values: texel.xy * scale = (current - previous) in uv units of the pass's viewport (+x right,
++// +y down, the texture's row 0 is the top). Camera motion INCLUDED (the game's own matrices), and
++// so is any projection jitter difference between the two frames. |texel.x| >= invalid_threshold:
++// no motion known there (use depth + poses). A draw seen for the first time gets zero motion for
++// that frame (its previous data does not exist yet).
++#pragma once
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct vpvk_motion_info {
++  void* texture;            // id<MTLTexture> (unretained; valid while the device lives): 2D array, RG16Float
++  uint32_t width, height, layers;
++  float scale_x, scale_y;   // 0.5, 0.5: NDC difference -> uv difference
++  float invalid_threshold;  // 1000: the clear value is 60000
++  uint64_t serial;          // motion frame (one per eye frame: begins at an eye pass that clears depth)
++  int complete;             // 1: the GPU finished every pass of that frame
++  int includes_camera;      // 1: always (full motion: camera + objects)
++} vpvk_motion_info;
++
++// On/off; read at vkCreateDevice (pipelines created while off get no motion variant). Env
++// VPVK_MOTION=0/1 overrides.
++void vpvk_config_set_motion_vectors(int on);
++// The newest complete motion frame (serial = 0) or exactly `serial`. 1 = *out filled.
++// Frames rotate through 4 textures: a consumer must be done with one within 3 eye frames.
++int vpvk_motion_get(uint64_t serial, vpvk_motion_info* out);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/gpu/vulkan/include/vpvk/spirv_frontend.h b/gpu/vulkan/include/vpvk/spirv_frontend.h
+index 6163c54..e06b8f3 100644
+--- a/gpu/vulkan/include/vpvk/spirv_frontend.h
++++ b/gpu/vulkan/include/vpvk/spirv_frontend.h
+@@ -68,6 +68,23 @@ struct VertexBufferBinding {
+   uint16_t slot = 0;  // Buffer slot assigned by the driver
+ };
+ 
++// Motion vectors (VPKTAA). Vertex: the entry point runs twice, first with every ConstantBuffer
++// (uniform blocks, push constants) read from slot `prevSlotBase + slot` (the driver binds the
++// previous frame's copy of the same data there), then normally; the clip position of both runs
++// leaves as two extra outputs at `location` (current) and `location + 1` (previous), in Vulkan
++// clip space (+y down). The first run has no side effects allowed (a vertex shader that writes
++// memory fails the motion variant). Fragment: reads those two inputs and writes
++// (cur.xy / cur.w - prev.xy / prev.w), Vulkan NDC, to colour output `colorSlot` (.xy; .zw = 0).
++struct MotionOptions {
++  bool vertex = false, fragment = false;
++  uint32_t prevSlotBase = 0;  // vertex: ConstantBuffer slot offset of the previous-frame copies
++  // vertex: Buffer slot offset of previous-frame copies of read-only storage buffers (bone
++  // palettes); 0 = storage buffers are read as they are now.
++  uint32_t prevBufferBase = 0;
++  uint32_t colorSlot = 0;     // fragment: colour attachment of the motion target
++  uint32_t location = 30;     // varying locations used: location, location + 1
++};
++
+ struct SpirvLowerOptions {
+   std::string entry;  // OpEntryPoint name
+   vpir::Stage stage = vpir::Stage::Vertex;
+@@ -77,6 +94,7 @@ struct SpirvLowerOptions {
+   int pushConstantSlot = -1;                                  // ConstantBuffer slot, -1 = none
+   std::vector<VertexAttribute> vertexAttributes;              // vertex stage only
+   std::vector<VertexBufferBinding> vertexBuffers;             // vertex stage only
++  MotionOptions motion;                                       // VPKTAA motion-vector variant
+ };
+ 
+ struct SpirvInterface {
+@@ -84,6 +102,8 @@ struct SpirvInterface {
+   bool usesPushConstants = false;
+   uint8_t colorOutputs = 0;            // fragment: bit n = writes Location n
+   std::array<uint32_t, 3> localSize{1, 1, 1};  // compute
++  std::vector<uint16_t> motionPrevSlots;       // motion vertex: ConstantBuffer slots read previous
++  std::vector<uint16_t> motionPrevBuffers;     // motion vertex: Buffer slots read previous
+ };
+ 
+ bool lower(const SpirvModule&, const SpirvLowerOptions&, vpir::Module& out, SpirvInterface& iface,
+diff --git a/gpu/vulkan/src/commands.cpp b/gpu/vulkan/src/commands.cpp
+index 125d446..fa2e0da 100644
+--- a/gpu/vulkan/src/commands.cpp
++++ b/gpu/vulkan/src/commands.cpp
+@@ -1,6 +1,7 @@
+ #include "commands.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ 
+ #include <bit>
+ #include <cstring>
+@@ -154,6 +155,7 @@ struct Translator {
+   vpgpu::Frame& frame;
+   TranslateStats& st;
+   Device* device = nullptr;
++  int motionSlot = -1;  // colour slot of the motion target in the open pass (-1: none)
+   // Attachments of the open pass read by draws after an in-pass barrier: image -> its copy.
+   std::vector<std::pair<vpgpu::TextureId, vpgpu::TextureId>> localCopies;
+   bool passOpen = false;
+@@ -163,6 +165,35 @@ struct Translator {
+   bool keepAll = false;  // the current pass has in-pass clears: no attachment may be dropped
+   std::vector<vpgpu::Copy> pendingResolves;  // forced-1x resolves of the open (sub)pass
+ 
++  // Every draw of the pass starting after `at` has a pipeline variant for the motion attachment
++  // (otherwise the pass is left as the game made it: adding an attachment some pipeline does not
++  // declare would make that draw invalid).
++  bool passTakesMotion(const Recorder& rec, const Op* at) const {
++    if (!device || !device->motion) return false;
++    int slot = -2;
++    for (const Op* o = at + 1; o < rec.ops.data() + rec.ops.size(); ++o) {
++      if (std::holds_alternative<OpEndPass>(*o) || std::holds_alternative<OpNextSubpass>(*o)) break;
++      if (const auto* e = std::get_if<OpExecute>(o)) {
++        if (e->secondary)
++          for (const Op& so : e->secondary->ops)
++            if (const auto* d = std::get_if<OpDraw>(&so); d && d->ok) {
++              if (!d->pipe || !d->pipe->mv || (slot != -2 && d->pipe->mv->slot != slot)) return false;
++              slot = d->pipe->mv->slot;
++            }
++        continue;
++      }
++      const auto* d = std::get_if<OpDraw>(o);
++      if (!d || !d->ok) continue;
++      if (!d->pipe || !d->pipe->mv || (slot != -2 && d->pipe->mv->slot != slot)) return false;
++      slot = d->pipe->mv->slot;
++    }
++    return slot >= 0;
++  }
++
++  static bool subpassMultiview(const OpBeginPass& b, uint32_t sub) {
++    return b.pass && sub < b.pass->subpasses.size() && b.pass->subpasses[sub].viewMask != 0;
++  }
++
+   void flushResolves() {
+     for (vpgpu::Copy& c : pendingResolves) {
+       frame.copy(std::move(c));
+@@ -171,7 +202,15 @@ struct Translator {
+     pendingResolves.clear();
+   }
+ 
+-  void open(vpgpu::RenderPassDesc d) {
++  // `multiview`: a fresh multiview pass (eye pass candidate for the motion target); reopened passes
++  // keep the attachments they had.
++  void open(vpgpu::RenderPassDesc d, bool multiview = false, bool fresh = true, const Op* at = nullptr,
++            const Recorder* rec = nullptr) {
++    if (fresh) {
++      motionSlot = -1;
++      if (multiview && rec && at && passTakesMotion(*rec, at))
++        motionSlot = motionPassBegin(device, d, device ? device->lastFrame : kNoFrame);
++    }
+     current = d;
+     // A pass that is split later (vkCmdClearAttachments) is first opened with these stores; the
+     // core only learns of the split when the next pass comes, so keep contents conservatively when
+@@ -199,7 +238,7 @@ struct Translator {
+     for (auto& c : d.colors)
+       if (c.texture) c.load = vpgpu::LoadAction::Load;
+     if (d.depth.texture) d.depth.load = vpgpu::LoadAction::Load;
+-    open(d);
++    open(d, false, false);
+   }
+ 
+   void clearTarget(const vpgpu::Attachment& a, bool depth, const vpgpu::ClearValue& v) {
+@@ -225,13 +264,13 @@ struct Translator {
+         keepAll = hasInPassClear(rec, &op);
+         vpgpu::RenderPassDesc desc;
+         pendingResolves.clear();
+-        if (beginPass(*b, 0, desc, &pendingResolves)) open(std::move(desc));
++        if (beginPass(*b, 0, desc, &pendingResolves)) open(std::move(desc), subpassMultiview(*b, 0), true, &op, &rec);
+         else ++st.dropped;
+       } else if (const auto* br = std::get_if<OpBeginRendering>(&op)) {
+         pass = nullptr;
+         keepAll = hasInPassClear(rec, &op);
+         pendingResolves = br->resolveCopies;
+-        open(br->desc);
++        open(br->desc, br->multiview, true, &op, &rec);
+       } else if (std::holds_alternative<OpLocalRead>(op)) {
+         localRead(rec, &op);
+       } else if (std::holds_alternative<OpNextSubpass>(op)) {
+@@ -240,7 +279,8 @@ struct Translator {
+         flushResolves();
+         ++subpass;
+         vpgpu::RenderPassDesc desc;
+-        if (pass && beginPass(*pass, subpass, desc, &pendingResolves)) open(std::move(desc));
++        if (pass && beginPass(*pass, subpass, desc, &pendingResolves))
++          open(std::move(desc), subpassMultiview(*pass, subpass), true, &op, &rec);
+         else ++st.dropped;
+       } else if (std::holds_alternative<OpEndPass>(op)) {
+         localCopies.clear();
+@@ -486,6 +526,19 @@ struct Translator {
+       ++st.skippedDraws;
+       return;
+     }
++    if (motionSlot >= 0) {
++      OpDraw copy = d;
++      copy.images.clear();
++      if (!localCopies.empty()) rebindLocalReads(copy.draw);
++      if (!motionDraw(device, copy, motionSlot)) {  // no variant with the motion attachment
++        static std::atomic<unsigned> n{0};
++        if (n.fetch_add(1) < 16) logf("vk.motion skip draw pipeline=%s (no variant for slot %d)",
++                                      copy.pipe ? copy.pipe->state.label.c_str() : "none", motionSlot);
++        ++st.skippedDraws;
++        return;
++      }
++      return drawResolved(copy);
++    }
+     if (!localCopies.empty()) {
+       OpDraw copy = d;
+       copy.images.clear();
+diff --git a/gpu/vulkan/src/commands.h b/gpu/vulkan/src/commands.h
+index 008a594..6f0643c 100644
+--- a/gpu/vulkan/src/commands.h
++++ b/gpu/vulkan/src/commands.h
+@@ -29,6 +29,7 @@ vpgpu::Copy forcedResolveCopy(const ImageView* src, const ImageView* dst, uint16
+ 
+ struct OpBeginRendering {
+   vpgpu::RenderPassDesc desc;
++  bool multiview = false;  // viewMask != 0 (motion vectors: eye passes only)
+   // Game MSAA forced to 1x: copies standing in for the resolves, emitted after the pass.
+   std::vector<vpgpu::Copy> resolveCopies;
+ };
+@@ -96,8 +97,22 @@ struct OpBlitImage {
+ struct OpResolve {
+   vpgpu::RenderPassDesc desc;
+ };
++// Data a motion-vector draw needs at translation (motion.cpp): where the bytes of every constant
++// buffer / storage buffer its vertex shader reads live in host memory (read at vkQueueSubmit, when
++// the game has written them), and what identifies the draw from one frame to the next.
++struct MotionSrc {
++  uint16_t slot = 0;
++  bool buffer = false;  // Buffer slot (storage) instead of ConstantBuffer
++  const uint8_t* host = nullptr;
++  uint32_t size = 0;
++};
+ struct OpDraw {
+   vpgpu::Draw draw;
++  const PipelineObj* pipe = nullptr;  // motion: the pipeline (variants)
++  std::vector<MotionSrc> motionSrc;
++  uint64_t geometry = 0;              // motion: draw identity (pipeline, buffers, ranges)
++  bool dynMasks = false;              // dynamic colour write masks in `masks`
++  std::array<uint8_t, 8> masks{};
+   // Indirect draws: arguments read from the buffer at submit (unified memory).
+   const Buffer* indirect = nullptr;
+   VkDeviceSize indirectOffset = 0;
+@@ -137,6 +152,9 @@ struct UploadArena {
+   size_t current = 0;
+   // Copies `size` bytes, 256-aligned (constant buffers need 16). Returns the chunk's buffer.
+   vpgpu::BufferId put(Device* d, const void* data, VkDeviceSize size, VkDeviceSize& offset);
++  // Host address of the bytes the last put() stored.
++  const uint8_t* lastHost() const { return chunks[current].host + chunks[current].used - lastSize; }
++  VkDeviceSize lastSize = 0;
+   void reset() {
+     for (auto& c : chunks) c.used = 0;
+     current = 0;
+diff --git a/gpu/vulkan/src/entry.cpp b/gpu/vulkan/src/entry.cpp
+index a005ca9..2994bb6 100644
+--- a/gpu/vulkan/src/entry.cpp
++++ b/gpu/vulkan/src/entry.cpp
+@@ -488,6 +488,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
+   logUnsupportedFeatures(*ci);
+   d->platform = createPlatform();
+   if (d->physical->instance) d->physical->instance->device = d;
++  motionDeviceCreated(*d);
++  motionSetCurrentDevice(d, true);
+   // Pipeline compiles run on background workers (never the submit thread); leave the game's
+   // render/main threads two cores.
+   const unsigned workers = std::clamp(std::thread::hardware_concurrency(), 4u, 8u) - 2u;
+@@ -509,6 +511,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
+   if (!dv) return;
+   Device* d = from<Device>(dv);
+   if (d->physical && d->physical->instance && d->physical->instance->device == d) d->physical->instance->device = nullptr;
++  motionSetCurrentDevice(d, false);
++  if (d->gpu) d->platform->waitIdle();
++  if (d->gpu) motionDeviceDestroyed(*d);
+   d->platform->waitIdle();
+   d->gpu.reset();
+   delete d;
+diff --git a/gpu/vulkan/src/motion.cpp b/gpu/vulkan/src/motion.cpp
+new file mode 100644
+index 0000000..834dfe0
+--- /dev/null
++++ b/gpu/vulkan/src/motion.cpp
+@@ -0,0 +1,291 @@
++// VPKTAA motion vectors (vpvk/motion.h). VPEngine generates them because Source 2 (and most PC VR
++// titles) never render any.
++//
++// Per eye frame (it begins at an eye pass whose depth attachment is cleared):
++//  * every multiview pass with a depth attachment and a free colour slot gets the motion target
++//    (an RG16Float 2D array of the pass's size, one of kRing rotating textures) as one more colour
++//    attachment, cleared to "invalid" by the frame's first pass and loaded by the rest;
++//  * draws in those passes switch to their pipeline's variants (pipelines.cpp buildMotionVariants):
++//    opaque draws to the motion variant, the others to the format-only one;
++//  * a motion draw binds, next to its current constant / storage buffers, the copies those same
++//    bytes had the previous time this draw (same geometry, same occurrence in the frame) was
++//    submitted; the bytes of this frame become the copies for the next. A draw with no history
++//    binds its current data as previous (zero motion for that one frame).
++// Copies live in device-wide upload buffers (unified memory, written by the CPU at vkQueueSubmit),
++// two frames' worth, swapped per eye frame.
++#include <algorithm>
++#include <atomic>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <unordered_map>
++
++#include "commands.h"
++#include "vpvk.h"
++#include "vpvk/motion.h"
++
++namespace vpvk {
++namespace {
++std::atomic<int> gMotionOn{-1};  // -1: env / default (off)
++constexpr int kRing = 4;
++constexpr float kInvalid = 60000.0f;
++}  // namespace
++
++bool motionVectorsEnabled() {
++  if (const char* e = std::getenv("VPVK_MOTION"); e && (*e == '0' || *e == '1')) return *e == '1';
++  return gMotionOn.load() == 1;
++}
++
++struct MotionState {
++  std::mutex m;
++  // Rotating motion targets, recreated when the eye size changes.
++  struct Target {
++    vpgpu::TextureId tex;
++    uint32_t w = 0, h = 0, layers = 0;
++    uint64_t serial = 0, frame = kNoFrame;  // eye frame drawn into it, and the last core frame that did
++  };
++  Target ring[kRing];
++  int cur = -1;            // ring index of the eye frame being recorded
++  uint64_t serial = 0;     // eye frames begun
++  bool clearedThisFrame = false;
++
++  // Previous-frame data: per draw (geometry hash + occurrence), the byte ranges it read.
++  struct Copy {
++    uint32_t offset = 0, size = 0;  // in the generation's arena
++  };
++  struct Arena {
++    uint8_t* host = nullptr;
++    vpgpu::BufferId id;
++    uint32_t size = 0, used = 0;
++  };
++  Arena arenas[2];
++  int gen = 0;  // arena being written this eye frame; the other holds the previous one
++  std::unordered_map<uint64_t, std::vector<Copy>> prev, next;
++  std::unordered_map<uint64_t, uint32_t> occurrences;
++  uint64_t motionDraws = 0, firstSeen = 0, formatDraws = 0, frames = 0;
++
++  vpgpu::TextureId target(Device& d, uint32_t w, uint32_t h, uint32_t layers) {
++    Target& t = ring[cur];
++    if (t.tex && t.w == w && t.h == h && t.layers == layers) return t.tex;
++    if (t.tex) {
++      std::lock_guard<std::mutex> l(d.resourceMutex);
++      d.gpu->destroy(t.tex);
++    }
++    vpgpu::TextureDesc td;
++    td.type = vpgpu::TextureType::Tex2D;
++    td.format = vpgpu::Format::RG16Float;
++    td.width = w, td.height = h, td.layers = uint16_t(layers);
++    td.usage = vpgpu::usage::colorTarget | vpgpu::usage::sampled;
++    td.persistent = true;  // read by VPKTAA after the frame
++    td.label = "vk.motion";
++    {
++      std::lock_guard<std::mutex> l(d.resourceMutex);
++      t.tex = d.gpu->createTexture(td);
++    }
++    t.w = w, t.h = h, t.layers = layers;
++    return t.tex;
++  }
++
++  // Bytes for the next generation's copy; offset in its arena (UINT32_MAX = full).
++  uint32_t store(Device& d, const uint8_t* src, uint32_t size) {
++    Arena& a = arenas[gen];
++    const uint32_t need = (size + 255) & ~255u;
++    if (a.used + need > a.size) {
++      if (a.size >= (64u << 20)) return UINT32_MAX;  // 64 MiB per frame is plenty; beyond, no motion
++      // Grow: a fresh buffer (the old one may still be read by the GPU; it is released with the
++      // generation two eye frames later, see beginFrame).
++      Arena n;
++      n.size = std::max<uint32_t>(a.size * 2, 4u << 20);
++      n.host = static_cast<uint8_t*>(std::aligned_alloc(16384, n.size));
++      vpgpu::BufferDesc bd;
++      bd.size = n.size, bd.guestMemory = n.host, bd.label = "vk.motion_prev";
++      {
++        std::lock_guard<std::mutex> l(d.resourceMutex);
++        n.id = d.gpu->createBuffer(bd);
++      }
++      // Copies made into the old arena this frame stay readable through `retired` until reuse.
++      retired.push_back(a);
++      std::memcpy(n.host, a.host, a.used);
++      n.used = a.used;
++      for (auto& [k, v] : next) (void)k, (void)v;  // offsets are unchanged: same layout
++      a = n;
++    }
++    const uint32_t off = a.used;
++    std::memcpy(a.host + off, src, size);
++    a.used += need;
++    return off;
++  }
++  std::vector<Arena> retired;
++
++  void beginFrame(Device& d, uint64_t lastSubmitted) {
++    ++serial;
++    ++frames;
++    cur = (cur + 1) % kRing;
++    ring[cur].serial = serial;
++    ring[cur].frame = kNoFrame;
++    clearedThisFrame = false;
++    // The arena written last frame becomes "previous"; the one before is overwritten. It was read
++    // by draws of two eye frames ago: wait for them (normally long finished).
++    prev.swap(next);
++    next.clear();
++    occurrences.clear();
++    gen ^= 1;
++    d.waitFrame(lastSubmitted == kNoFrame ? kNoFrame : lastSubmitted, UINT64_MAX);
++    arenas[gen].used = 0;
++    for (Arena& a : retired) {
++      std::lock_guard<std::mutex> l(d.resourceMutex);
++      if (a.id) d.gpu->destroy(a.id);
++      std::free(a.host);
++    }
++    retired.clear();
++    if (frames <= 3 || frames % 600 == 0)
++      logf("vk.motion frame=%llu draws motion=%llu first_seen=%llu format_only=%llu prev_mb=%.1f",
++           (unsigned long long)serial, (unsigned long long)motionDraws, (unsigned long long)firstSeen,
++           (unsigned long long)formatDraws, arenas[gen ^ 1].used / 1048576.0);
++  }
++
++  ~MotionState() {
++    for (Arena& a : arenas) std::free(a.host);
++    for (Arena& a : retired) std::free(a.host);
++  }
++};
++
++void MotionStateDelete::operator()(MotionState* m) const { delete m; }
++
++void motionDeviceCreated(Device& d) {
++  if (!motionVectorsEnabled()) return;
++  d.motion.reset(new MotionState);
++  logf("vk.motion enabled (eye passes get an RG16F motion target; VPKTAA reads it with vpvk_motion_get)");
++}
++void motionDeviceDestroyed(Device& d) {
++  if (!d.motion) return;
++  for (auto& t : d.motion->ring)
++    if (t.tex) d.gpu->destroy(t.tex);
++  for (auto& a : d.motion->arenas)
++    if (a.id) d.gpu->destroy(a.id);
++  d.motion.reset();
++}
++
++// ---- translation hooks (commands.cpp) -------------------------------------------------------------
++// A pass about to open: if it is an eye pass the motion target joins it. Returns the slot used, -1 none.
++int motionPassBegin(Device* d, vpgpu::RenderPassDesc& desc, uint64_t lastSubmitted) {
++  if (!d || !d->motion || desc.layerCount < 2 || !desc.depth.texture) return -1;
++  const vpgpu::TextureDesc* td = d->gpu->resources().get(desc.depth.texture);
++  if (!td || td->samples != 1) return -1;
++  int slot = -1;
++  for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
++    if (!desc.colors[c].texture) {
++      slot = c;
++      break;
++    }
++  for (int c = slot + 1; slot >= 0 && c < vpgpu::kMaxColorAttachments; ++c)
++    if (desc.colors[c].texture) slot = -1;
++  if (slot < 0) return -1;
++  MotionState& m = *d->motion;
++  std::lock_guard<std::mutex> lock(m.m);
++  const bool newFrame = desc.depth.load == vpgpu::LoadAction::Clear || m.cur < 0;
++  if (newFrame) m.beginFrame(*d, lastSubmitted);
++  const uint32_t w = std::max(1u, td->width >> desc.depth.mip), h = std::max(1u, td->height >> desc.depth.mip);
++  vpgpu::Attachment& a = desc.colors[slot];
++  a.texture = m.target(*d, w, h, desc.layerCount);
++  a.layer = desc.depth.layer;
++  a.load = m.clearedThisFrame ? vpgpu::LoadAction::Load : vpgpu::LoadAction::Clear;
++  a.clear.color = {kInvalid, kInvalid, 0, 0};
++  a.store = vpgpu::StoreAction::Store;
++  m.clearedThisFrame = true;
++  return slot;
++}
++
++// A draw in a pass that has the motion target at `slot`: switch it to its variant and, for motion
++// draws, bind the previous-frame copies. Returns false when the pipeline has no variant for this
++// slot (the draw is skipped: its pipeline would not match the pass).
++bool motionDraw(Device* d, OpDraw& op, int slot) {
++  const PipelineObj* p = op.pipe;
++  if (!p || !p->mv || p->mv->slot != slot) return false;
++  MotionState& m = *d->motion;
++  const MotionVariants& mv = *p->mv;
++  const std::array<uint8_t, 8>* masks = op.dynMasks ? &op.masks : nullptr;
++  if (!mv.hasMotion || op.motionSrc.empty()) {
++    op.draw.pipeline = p->derived(1, masks);
++    ++m.formatDraws;
++    return true;
++  }
++  std::lock_guard<std::mutex> lock(m.m);
++  const uint64_t key = op.geometry ^ (uint64_t(m.occurrences[op.geometry]++) * 0x9E3779B97F4A7C15ull);
++  auto prevIt = m.prev.find(key);
++  const bool have = prevIt != m.prev.end() && prevIt->second.size() == op.motionSrc.size();
++  std::vector<MotionState::Copy> copies;
++  copies.reserve(op.motionSrc.size());
++  bool stored = true;
++  for (size_t i = 0; i < op.motionSrc.size(); ++i) {
++    const MotionSrc& s = op.motionSrc[i];
++    const uint32_t off = m.store(*d, s.host, s.size);
++    if (off == UINT32_MAX) stored = false;
++    copies.push_back({off, s.size});
++    // Previous copy: last frame's bytes, or (first time) this frame's (zero motion).
++    const MotionState::Arena& src = have ? m.arenas[m.gen ^ 1] : m.arenas[m.gen];
++    const uint32_t poff = have ? prevIt->second[i].offset : off;
++    if (poff == UINT32_MAX || !src.id) continue;
++    vpgpu::Access a{vpgpu::ResourceRange::bytes(src.id, poff, s.size), vpgpu::stage::vertex, false};
++    a.kind = s.buffer ? vpgpu::BindKind::Buffer : vpgpu::BindKind::ConstantBuffer;
++    a.slot = uint16_t(s.slot + (s.buffer ? mv.prevBufferBase : mv.prevSlotBase));
++    op.draw.bindings.push_back(a);
++  }
++  if (stored) m.next[key] = std::move(copies);
++  if (!have) ++m.firstSeen;
++  ++m.motionDraws;
++  op.draw.pipeline = p->derived(2, masks);
++  return true;
++}
++
++void motionFrameSubmitted(Device* d, uint64_t frame) {
++  if (!d || !d->motion) return;
++  MotionState& m = *d->motion;
++  std::lock_guard<std::mutex> lock(m.m);
++  if (m.cur >= 0 && m.clearedThisFrame) m.ring[m.cur].frame = frame;
++}
++
++}  // namespace vpvk
++
++// ---- C API ----------------------------------------------------------------------------------------
++namespace {
++std::mutex gDevMutex;
++vpvk::Device* gDevice = nullptr;  // the device whose motion vpvk_motion_get reports
++}  // namespace
++namespace vpvk {
++void motionSetCurrentDevice(Device* d, bool add) {
++  std::lock_guard<std::mutex> l(gDevMutex);
++  if (add && d->motion) gDevice = d;
++  if (!add && gDevice == d) gDevice = nullptr;
++}
++}  // namespace vpvk
++
++extern "C" __attribute__((visibility("default"))) void vpvk_config_set_motion_vectors(int on) {
++  vpvk::gMotionOn.store(on ? 1 : 0);
++  vpvk::logf("vk.cfg motion_vectors=%d", on ? 1 : 0);
++}
++
++extern "C" __attribute__((visibility("default"))) int vpvk_motion_get(uint64_t serial, vpvk_motion_info* out) {
++  if (!out) return 0;
++  std::lock_guard<std::mutex> l(gDevMutex);
++  vpvk::Device* d = gDevice;
++  if (!d || !d->motion) return 0;
++  vpvk::MotionState& m = *d->motion;
++  std::lock_guard<std::mutex> lock(m.m);
++  const vpvk::MotionState::Target* best = nullptr;
++  for (const auto& t : m.ring) {
++    if (!t.tex || t.frame == vpvk::kNoFrame) continue;
++    const bool done = d->frameDone(t.frame);
++    if (serial ? t.serial == serial : (done && (!best || t.serial > best->serial))) best = &t;
++  }
++  if (!best) return 0;
++  *out = {};
++  out->texture = d->platform->nativeTexture(best->tex);
++  out->width = best->w, out->height = best->h, out->layers = best->layers;
++  out->scale_x = 0.5f, out->scale_y = 0.5f;
++  out->invalid_threshold = 1000.0f;
++  out->serial = best->serial;
++  out->complete = d->frameDone(best->frame) ? 1 : 0;
++  out->includes_camera = 1;
++  return out->texture || !d->platform->nativeDevice() ? 1 : 0;
++}
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index 14d4433..5881ef8 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -50,6 +50,7 @@ vpgpu::BufferId UploadArena::put(Device* d, const void* data, VkDeviceSize size,
+   offset = c.used;
+   std::memcpy(c.host + c.used, data, size);
+   c.used += need;
++  lastSize = need;
+   return c.id;
+ }
+ 
+@@ -578,7 +579,8 @@ ShaderBlob blobOf(const vpmsl::MslShader& msl) {
+ 
+ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, const PipelineLayoutObj& pl,
+                         uint32_t viewCount, const std::vector<spirv::VertexAttribute>& attrs,
+-                        const std::vector<spirv::VertexBufferBinding>& vbs, const std::string& label) {
++                        const std::vector<spirv::VertexBufferBinding>& vbs, const std::string& label,
++                        const spirv::MotionOptions* motion = nullptr, bool quiet = false) {
+   StageOut o;
+   const ShaderModuleObj* sm = from<ShaderModuleObj>(st.module);
+   if (!sm || !sm->module) {
+@@ -596,6 +598,7 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
+     opt.layout.push_back(b);
+   }
+   opt.pushConstantSlot = pl.pushSlot;
++  if (motion) opt.motion = *motion;
+   if (opt.stage == vpir::Stage::Vertex) {
+     opt.vertexAttributes = attrs;
+     opt.vertexBuffers = vbs;
+@@ -605,7 +608,8 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
+   std::vector<std::string> errors;
+   switch (lowerAndEmit(*sm->module, opt, mod, o.iface, o.msl, o.id, errors)) {
+     case TranslateFail::Lower:
+-      logf("vk.err what=shader pipeline=%s stage=%s error=\"%s\"", label.c_str(), vpir::toString(opt.stage), errors[0].c_str());
++      if (quiet) logf("vk.motion no_variant pipeline=%s stage=%s why=\"%s\"", label.c_str(), vpir::toString(opt.stage), errors[0].c_str());
++      else logf("vk.err what=shader pipeline=%s stage=%s error=\"%s\"", label.c_str(), vpir::toString(opt.stage), errors[0].c_str());
+       return o;
+     case TranslateFail::Msl: {
+       std::lock_guard<std::mutex> lock(gTranslateLog);
+@@ -685,6 +689,64 @@ void targetFormats(const VkGraphicsPipelineCreateInfo& ci, vpgpu::PipelineState&
+     }
+ }
+ 
++// VPKTAA motion vectors: multiview pipelines with a depth format and a free colour slot get a
++// format-only variant (the extra attachment declared, never written) and, for opaque draws (depth
++// test + write, no blending on attachment 0), a motion variant whose vertex shader also computes the
++// previous frame's position and whose fragment shader writes the motion. A shader the motion
++// lowering refuses (it writes memory, no position...) keeps the format-only variant.
++void buildMotionVariants(Device* d, const VkGraphicsPipelineCreateInfo& ci, PipelineObj& p,
++                         const std::vector<spirv::VertexAttribute>& attrs) {
++  const vpgpu::PipelineState& st = p.state;
++  if (!vpgpu::formatInfo(st.depthFormat).depth() || st.samples != 1) return;  // MSAA eye passes: no motion
++  int slot = -1;
++  for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
++    if (st.colorFormats[c] == vpgpu::Format::Undefined) {
++      slot = c;
++      break;
++    }
++  // The added attachment must be the next one after the game's (dynamic rendering passes declare
++  // them in order; a gap would be a slot the pass may still fill).
++  for (int c = slot + 1; slot >= 0 && c < vpgpu::kMaxColorAttachments; ++c)
++    if (st.colorFormats[c] != vpgpu::Format::Undefined) slot = -1;
++  if (slot < 0) return;
++  auto mv = std::make_unique<MotionVariants>();
++  mv->slot = slot;
++  mv->formatOnly = st;
++  mv->formatOnly.colorFormats[slot] = vpgpu::Format::RG16Float;
++  mv->formatOnly.blend[slot] = vpgpu::BlendState{};
++  mv->formatOnly.blend[slot].writeMask = 0;
++  mv->formatOnly.label += ".mvfmt";
++  const bool opaque = st.depthTest && st.depthWrite && !st.blend[0].enabled && st.fragmentShader;
++  if (opaque) {
++    spirv::MotionOptions mo;
++    mo.prevSlotBase = 64;    // previous-frame constant buffers: slot + 64
++    mo.prevBufferBase = 64;  // previous-frame storage buffers (skinning palettes): slot + 64
++    mo.colorSlot = uint32_t(slot);
++    VkPipelineShaderStageCreateInfo vs{}, fs{};
++    for (uint32_t i = 0; i < ci.stageCount; ++i)
++      (ci.pStages[i].stage == VK_SHADER_STAGE_VERTEX_BIT ? vs : fs) = ci.pStages[i];
++    spirv::MotionOptions mv1 = mo, mf = mo;
++    mv1.vertex = true, mf.fragment = true;
++    // Vertex buffer slots sit after the layout's buffers: the previous copies go past both.
++    mv1.prevBufferBase = std::max<uint32_t>(64, uint32_t(p.layout->nextBuffer) + 16 + 32);
++    StageOut o1 = translateStage(d, vs, *p.layout, p.viewCount, attrs, p.vertexBuffers, st.label + ".mv", &mv1, true);
++    StageOut o2 = o1.ok ? translateStage(d, fs, *p.layout, p.viewCount, {}, {}, st.label + ".mv", &mf, true) : StageOut{};
++    if (o1.ok && o2.ok) {
++      mv->motion = mv->formatOnly;
++      mv->motion.vertexShader = o1.id, mv->motion.fragmentShader = o2.id;
++      mv->motion.blend[slot].writeMask = 0x3;  // rg
++      mv->motion.label = st.label + ".mv";
++      mv->prevSlots = o1.iface.motionPrevSlots, mv->prevBuffers = o1.iface.motionPrevBuffers;
++      mv->prevSlotBase = mo.prevSlotBase, mv->prevBufferBase = mv1.prevBufferBase;
++      mv->motionInputs = {o1.input, o2.input, 0};
++      mv->hasMotion = true;
++    }
++  }
++  p.mv = std::move(mv);
++  d->gpu->pipelines().request(p.mv->formatOnly, p.mv->formatOnly.key(), vpgpu::Priority::Prefetch);
++  if (p.mv->hasMotion) d->gpu->pipelines().request(p.mv->motion, p.mv->motion.key(), vpgpu::Priority::Prefetch);
++}
++
+ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
+   auto* p = new PipelineObj;
+   p->device = d;
+@@ -789,6 +851,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
+   p->ok = ok;
+   p->key = st.key();
+   p->recipeInputs = inputs;
++  if (ok && d->motion && p->viewCount > 1) buildMotionVariants(d, ci, *p, attrs);
+   if (ok) {
+     d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Blocking);
+     if (d->recipes) d->recipes->addPipeline(st, inputs);
+@@ -1178,29 +1241,78 @@ void logSkip(const char* why, const PipelineObj* p) {
+ 
+ }  // namespace
+ 
+-vpgpu::PipelineKey PipelineObj::withWriteMasks(const std::array<uint8_t, 8>& masks) const {
++vpgpu::PipelineKey PipelineObj::withWriteMasks(const std::array<uint8_t, 8>& masks) const { return derived(0, &masks); }
++
++vpgpu::PipelineKey PipelineObj::derived(int which, const std::array<uint8_t, 8>* masks) const {
++  const vpgpu::PipelineState& base = which == 0 ? state : which == 1 ? mv->formatOnly : mv->motion;
++  const std::array<uint64_t, 3>& inputs = which == 2 ? mv->motionInputs : recipeInputs;
+   uint64_t packed = 0;
+   bool same = true;
+   for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) {
+-    const uint8_t m = (fragmentOutputs >> c & 1) ? uint8_t(masks[c] & 0xF) : 0;
++    // The motion attachment keeps its own mask; the game's attachments follow the dynamic masks.
++    const bool own = which != 0 && c == mv->slot;
++    const uint8_t m = own || !masks ? base.blend[c].writeMask
++                                    : (fragmentOutputs >> c & 1) ? uint8_t((*masks)[c] & 0xF) : 0;
+     packed |= uint64_t(m) << (4 * c);
+-    same = same && m == state.blend[c].writeMask;
++    same = same && m == base.blend[c].writeMask;
+   }
+-  if (same) return key;
++  if (same && which == 0) return key;
++  packed |= uint64_t(which) << 40;
+   std::lock_guard<std::mutex> lock(variantMutex);
+   auto it = variants.find(packed);
+   if (it != variants.end()) return it->second;
+-  vpgpu::PipelineState v = state;
++  vpgpu::PipelineState v = base;
+   for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) v.blend[c].writeMask = uint8_t(packed >> (4 * c) & 0xF);
+-  v.label += ".wm" + std::to_string(packed);
++  if (!same) v.label += ".wm" + std::to_string(packed & 0xFFFFFFFFull);
+   const vpgpu::PipelineKey k = v.key();
+   device->gpu->pipelines().request(v, k, vpgpu::Priority::Blocking);
+-  if (device->recipes) device->recipes->addPipeline(v, recipeInputs);
++  if (device->recipes) device->recipes->addPipeline(v, inputs);
+   variants.emplace(packed, k);
+   return k;
+ }
+ 
+ namespace {
++// Host bytes behind every constant buffer (and, with prevBufferBase, storage buffer) the motion
++// variant's vertex shader reads previous: unified memory, read again at vkQueueSubmit when the game
++// has written this frame's values. Also the draw's identity across frames (geometry, not data).
++void recordMotionSources(Recorder& r, const PipelineObj& p, OpDraw& op) {
++  const MotionVariants& mv = *p.mv;
++  auto want = [&](const std::vector<uint16_t>& v, uint16_t s) { return std::find(v.begin(), v.end(), s) != v.end(); };
++  for (const vpgpu::Access& a : op.draw.bindings) {
++    const bool cb = a.kind == vpgpu::BindKind::ConstantBuffer && want(mv.prevSlots, a.slot);
++    const bool sb = a.kind == vpgpu::BindKind::Buffer && want(mv.prevBuffers, a.slot);
++    if (!cb && !sb) continue;
++    const uint8_t* host = nullptr;
++    if (cb && a.slot == p.layout->pushSlot) {
++      host = r.arena.lastHost();  // resolveBindings put the push constants last
++    } else {
++      // Find the Buffer object behind the BufferId (descriptor sets of this draw).
++      for (const PipelineObj::Used& u : p.used) {
++        if (u.slot.kind != a.kind || a.slot < u.slot.slot || a.slot >= u.slot.slot + u.slot.count) continue;
++        const DescriptorSetObj* set = r.bound.graphicsSets[u.slot.set].set;
++        if (!set) break;
++        for (size_t k = 0; k < set->layout->bindings.size(); ++k)
++          if (set->layout->bindings[k].binding == u.slot.binding && size_t(a.slot - u.slot.slot) < set->slots[k].size()) {
++            const Descriptor& dsc = set->slots[k][a.slot - u.slot.slot];
++            if (dsc.buffer && dsc.buffer->memory && dsc.buffer->memory->host)
++              host = dsc.buffer->memory->host + dsc.buffer->offset + a.range.begin;
++          }
++      }
++    }
++    if (!host) continue;
++    op.motionSrc.push_back({a.slot, sb, host, uint32_t(std::min<uint64_t>(a.range.end - a.range.begin, 1u << 24))});
++  }
++  uint64_t h = 0xcbf29ce484222325ull;
++  auto mix = [&](uint64_t v) { h = (h ^ v) * 0x100000001b3ull; };
++  mix(p.key.value);
++  for (const vpgpu::Access& a : op.draw.bindings)
++    if (a.kind == vpgpu::BindKind::Buffer && a.slot >= p.layout->nextBuffer)  // vertex buffers
++      mix(uint64_t(a.range.index) << 32 | a.range.generation), mix(a.range.begin);
++  if (op.draw.index) mix(uint64_t(op.draw.index->buffer.index)), mix(op.draw.index->offset);
++  mix(op.draw.first), mix(op.draw.count), mix(uint64_t(uint32_t(op.draw.baseVertex))), mix(op.draw.instances);
++  op.geometry = h;
++}
++
+ uint8_t stencilOp(VkStencilOp o) { return uint8_t(o); }  // same order as vpgpu::StencilOp / MTLStencilOperation
+ 
+ // Dynamic state the pipeline declares (Vulkan 1.3 core / extended_dynamic_state 1-3 subset Source 2
+@@ -1232,7 +1344,10 @@ void applyDynamicState(const BoundState& b, const PipelineObj& p, vpgpu::Draw& d
+   if (p.isDynamic(VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE) && y.depthBiasEnable)
+     d.depthBias = b.depthBias[0], d.depthBiasClamp = b.depthBias[1], d.depthBiasSlope = b.depthBias[2];
+   if (p.isDynamic(VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE) && y.rasterizerDiscard) op.ok = false;
+-  if (p.isDynamic(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT) && p.device) d.pipeline = p.withWriteMasks(y.colorWriteMask);
++  if (p.isDynamic(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT) && p.device) {
++    d.pipeline = p.withWriteMasks(y.colorWriteMask);
++    op.dynMasks = true, op.masks = y.colorWriteMask;
++  }
+   const bool dsDyn = p.isDynamic(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE) || p.isDynamic(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE) ||
+                      p.isDynamic(VK_DYNAMIC_STATE_DEPTH_COMPARE_OP) || p.isDynamic(VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE) ||
+                      p.isDynamic(VK_DYNAMIC_STATE_STENCIL_OP) || p.isDynamic(VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK) ||
+@@ -1284,6 +1399,8 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
+     logSkip("unbound_descriptor", p);
+     return op;
+   }
++  op.pipe = p;
++  if (p->mv && p->mv->hasMotion) recordMotionSources(r, *p, op);
+   if (r.bound.localRead)  // attachments read after an in-pass barrier (commands.cpp localRead)
+     for (const vpgpu::Access& a : d.bindings)
+       for (const Image* im : r.bound.passImages)
+@@ -1464,6 +1581,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
+     fill(*ri->pStencilAttachment, d.depth, true);
+   }
+   d.layerCount = ri->viewMask ? uint16_t(std::popcount(ri->viewMask)) : uint16_t(std::max<uint32_t>(1, ri->layerCount));
++  op.multiview = ri->viewMask != 0;
+   d.label = "vk.rendering";
+   for (const auto& [src, dst] : forcedPairs) op.resolveCopies.push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(d.layerCount, 1)));
+   r.bound.targetWidth = uint32_t(ri->renderArea.offset.x) + ri->renderArea.extent.width;
+diff --git a/gpu/vulkan/src/recipes.cpp b/gpu/vulkan/src/recipes.cpp
+index d9584d0..46e8de5 100644
+--- a/gpu/vulkan/src/recipes.cpp
++++ b/gpu/vulkan/src/recipes.cpp
+@@ -18,7 +18,7 @@ namespace {
+ constexpr char kMagic[4] = {'V', 'Q', 'R', 'C'};
+ // File format. v3: stage inputs ('W' SPIR-V, 'I' input), pipelines with their inputs ('Q'), drift
+ // marker ('D'); MSL blobs ('S') as before. Translator changes bump kTranslatorVersion, not this.
+-constexpr uint32_t kRecipeVersion = 3;
++constexpr uint32_t kRecipeVersion = 4;  // 4: stage inputs carry the motion-vector options
+ constexpr uint8_t kTagShader = 'S', kTagSpirv = 'W', kTagInput = 'I', kTagPipeline = 'Q', kTagDrift = 'D';
+ constexpr size_t kHeaderBytes = 12;
+ constexpr size_t kRecordHeader = 5;  // tag + length
+@@ -125,6 +125,9 @@ void encodeInput(Writer& w, const StageInput& in) {
+   w.pod(uint32_t(o.vertexBuffers.size()));
+   for (const spirv::VertexBufferBinding& v : o.vertexBuffers)
+     w.pod(uint32_t(v.binding)), w.pod(uint32_t(v.stride)), w.pod(uint8_t(v.perInstance)), w.pod(uint16_t(v.slot));
++  const spirv::MotionOptions& m = o.motion;
++  w.pod(uint8_t(m.vertex | m.fragment << 1)), w.pod(uint32_t(m.prevSlotBase)), w.pod(uint32_t(m.prevBufferBase));
++  w.pod(uint32_t(m.colorSlot)), w.pod(uint32_t(m.location));
+ }
+ 
+ bool decodeInput(Reader& r, StageInput& in) {
+@@ -161,6 +164,10 @@ bool decodeInput(Reader& r, StageInput& in) {
+     v.slot = r.pod<uint16_t>();
+     o.vertexBuffers.push_back(v);
+   }
++  const uint8_t mf = r.pod<uint8_t>();
++  o.motion.vertex = mf & 1, o.motion.fragment = (mf >> 1) & 1;
++  o.motion.prevSlotBase = r.pod<uint32_t>(), o.motion.prevBufferBase = r.pod<uint32_t>();
++  o.motion.colorSlot = r.pod<uint32_t>(), o.motion.location = r.pod<uint32_t>();
+   return r.ok && in.spirv != 0;
+ }
+ 
+diff --git a/gpu/vulkan/src/sync.cpp b/gpu/vulkan/src/sync.cpp
+index 44973e4..d93c6d7 100644
+--- a/gpu/vulkan/src/sync.cpp
++++ b/gpu/vulkan/src/sync.cpp
+@@ -163,7 +163,10 @@ VkResult submit(Device& d, std::vector<Batch>& batches, Fence* fence) {
+   bool queries = false;
+   for (Batch& b : batches)
+     for (const CommandBuffer* c : b.cbs) queries = queries || !c->rec->queryWrites.empty();
+-  if (!frame.commands().empty() || queries) d.lastFrame = d.gpu->submit(frame).frame;
++  if (!frame.commands().empty() || queries) {
++    d.lastFrame = d.gpu->submit(frame).frame;
++    motionFrameSubmitted(&d, d.lastFrame);
++  }
+   ++d.submits;
+   stampQueries(batches, d.lastFrame);
+   if (st.dropped || st.skippedDraws || st.skippedDispatches || d.submits <= 3 || d.submits % 600 == 0)
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index 4d5e6b7..9e9e5de 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -208,6 +208,18 @@ struct DescriptorUpdateTemplateObj {
+   std::vector<VkDescriptorUpdateTemplateEntry> entries;
+ };
+ 
++// VPKTAA motion vectors (motion.cpp): pipeline variants of a multiview eye-pass pipeline. `slot` is
++// the colour attachment the driver adds to eye passes (the first one the pipeline leaves unused).
++struct MotionVariants {
++  int slot = -1;
++  vpgpu::PipelineState formatOnly;  // same shaders, the motion attachment declared and not written
++  vpgpu::PipelineState motion;      // motion shaders (valid when hasMotion)
++  bool hasMotion = false;
++  std::array<uint64_t, 3> motionInputs{};
++  std::vector<uint16_t> prevSlots, prevBuffers;  // ConstantBuffer / Buffer slots read previous
++  uint32_t prevSlotBase = 0, prevBufferBase = 0;  // where the previous copies are bound (slot + base)
++};
++
+ struct PipelineObj {
+   bool compute = false;
+   bool ok = false;  // shaders translated; draws with a failed pipeline are skipped
+@@ -242,6 +254,10 @@ struct PipelineObj {
+   mutable std::mutex variantMutex;
+   mutable std::unordered_map<uint64_t, vpgpu::PipelineKey> variants;
+   vpgpu::PipelineKey withWriteMasks(const std::array<uint8_t, 8>& masks) const;
++  std::unique_ptr<MotionVariants> mv;
++  // Key of `state` (the base, or one of mv's) with the dynamic write masks applied, requested on
++  // first use. which: 0 base, 1 mv->formatOnly, 2 mv->motion. masks null: the state's own.
++  vpgpu::PipelineKey derived(int which, const std::array<uint8_t, 8>* masks) const;
+   bool isDynamic(VkDynamicState s) const {
+     for (auto d : dynamic)
+       if (d == s) return true;
+@@ -286,6 +302,10 @@ struct CommandPool {
+   std::vector<CommandBuffer*> buffers;
+ };
+ 
++struct MotionState;
++struct MotionStateDelete {
++  void operator()(MotionState*) const;  // motion.cpp
++};
+ struct Device : Dispatchable {
+   PhysicalDevice* physical = nullptr;
+   std::unique_ptr<Platform> platform;
+@@ -304,8 +324,18 @@ struct Device : Dispatchable {
+   bool waitFrame(uint64_t frame, uint64_t timeoutNs);  // false on timeout
+   std::mutex doneMutex;
+   std::condition_variable doneCv;
++  std::unique_ptr<MotionState, MotionStateDelete> motion;  // motion.cpp; null = motion vectors off
+ };
+ 
++// motion.cpp
++void motionDeviceCreated(Device&);
++void motionDeviceDestroyed(Device&);
++void motionSetCurrentDevice(Device*, bool add);
++int motionPassBegin(Device*, vpgpu::RenderPassDesc&, uint64_t lastSubmitted);
++struct OpDraw;
++bool motionDraw(Device*, OpDraw&, int slot);
++void motionFrameSubmitted(Device*, uint64_t frame);
++
+ // VkResolveModeFlagBits of a depth resolve -> the core's filter (min/max; anything else sample 0).
+ inline vpgpu::Attachment::DepthResolve depthResolveOf(VkResolveModeFlagBits m) {
+   return m == VK_RESOLVE_MODE_MIN_BIT   ? vpgpu::Attachment::DepthResolve::Min
+@@ -313,6 +343,8 @@ inline vpgpu::Attachment::DepthResolve depthResolveOf(VkResolveModeFlagBits m) {
+                                         : vpgpu::Attachment::DepthResolve::Sample0;
+ }
+ 
++bool motionVectorsEnabled();  // motion.cpp: vpvk_config_set_motion_vectors / VPVK_MOTION
++
+ // Physical device model (physical_device.cpp).
+ const VkPhysicalDeviceProperties& deviceProperties();
+ const VkPhysicalDeviceMemoryProperties& memoryProperties();
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index 80a285b..98636ed 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -1,5 +1,6 @@
+ // VPVulkan tests on the null backend. Usage: vpvk_tests <group> <path to libVPVulkan>.
+ #include "vpvk/config.h"
++#include "vpvk/motion.h"
+ #include <dlfcn.h>
+ 
+ #include <cstdio>
+@@ -1386,6 +1387,199 @@ void testHostImageCopy() {
+   vkFreeMemory(c.dev, m, nullptr);
+ }
+ 
++// VPKTAA motion vectors: a multiview dynamic-rendering eye pass (depth cleared, one colour) with an
++// opaque draw. The pass gets the RG16F motion target at colour 1, the draw runs the motion variant
++// with the previous frame's constant buffers bound at slot + 64: frame 1 binds this frame's bytes
++// (no history), frame 2 the bytes frame 1 had. vpvk_motion_get reports the finished frame.
++void testMotion() {
++  setenv("VPVK_MOTION", "1", 1);
++  Ctx c({VK_KHR_MULTIVIEW_EXTENSION_NAME});
++  unsetenv("VPVK_MOTION");
++  CHECK(from<Device>(c.dev)->motion != nullptr);
++  VkDeviceMemory m = alloc(c, 32 << 20, 1);
++  VkImage color = image(c, VK_FORMAT_B10G11R11_UFLOAT_PACK32, 128, 2, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, m);
++  VkImage depth = image(c, VK_FORMAT_D32_SFLOAT_S8_UINT, 128, 2, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, m);
++  VkBuffer ubo = buffer(c, 4096, m, 1 << 20), vb = buffer(c, 4096, m, 2 << 20);
++  VkImageView cv, dv;
++  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++  vi.image = color, vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY, vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
++  vkCreateImageView(c.dev, &vi, nullptr, &cv);
++  vi.image = depth, vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
++  vkCreateImageView(c.dev, &vi, nullptr, &dv);
++  // Layout of mesh_multiview.vert: camera (set 0), object (set 1), push constants.
++  VkDescriptorSetLayoutBinding b0 = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
++  VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
++  lci.bindingCount = 1, lci.pBindings = &b0;
++  VkDescriptorSetLayout sl[2];
++  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl[0]);
++  vkCreateDescriptorSetLayout(c.dev, &lci, nullptr, &sl[1]);
++  VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT, 0, 20};
++  VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++  plci.setLayoutCount = 2, plci.pSetLayouts = sl, plci.pushConstantRangeCount = 1, plci.pPushConstantRanges = &pcr;
++  VkPipelineLayout pl;
++  vkCreatePipelineLayout(c.dev, &plci, nullptr, &pl);
++  VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
++  VkDescriptorPool pool;
++  vkCreateDescriptorPool(c.dev, &dpci, nullptr, &pool);
++  VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
++  dai.descriptorPool = pool, dai.descriptorSetCount = 2, dai.pSetLayouts = sl;
++  VkDescriptorSet sets[2];
++  vkAllocateDescriptorSets(c.dev, &dai, sets);
++  VkDescriptorBufferInfo cam{ubo, 0, 256}, obj{ubo, 256, 256};
++  VkWriteDescriptorSet w[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
++  w[0].dstSet = sets[0], w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, w[0].pBufferInfo = &cam;
++  w[1] = w[0], w[1].dstSet = sets[1], w[1].pBufferInfo = &obj;
++  vkUpdateDescriptorSets(c.dev, 2, w, 0, nullptr);
++  // Pipeline: dynamic rendering, multiview, opaque.
++  VkShaderModule vs = module(c, "mesh_multiview.vert.opt.spv"), fs = module(c, "subpass.frag.spv");
++  // A trivial fragment shader is enough: use the multiview one's partner from the pipeline test.
++  vkDestroyShaderModule(c.dev, fs, nullptr);
++  fs = module(c, "lit.frag.opt.spv");
++  (void)fs;
++  // lit.frag needs a fragment layout; give the pipeline a fragment-less (depth-only) variant
++  // instead: depth-only draws are opaque too, but have no fragment shader to write motion, so
++  // the test uses a vertex + fragment pair whose fragment reads nothing.
++  vkDestroyShaderModule(c.dev, fs, nullptr);
++  fs = VK_NULL_HANDLE;
++  VkPipelineShaderStageCreateInfo stages[1] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
++  stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT, stages[0].module = vs, stages[0].pName = "main";
++  VkVertexInputBindingDescription vbd[2] = {{0, 32, VK_VERTEX_INPUT_RATE_VERTEX}, {1, 16, VK_VERTEX_INPUT_RATE_INSTANCE}};
++  VkVertexInputAttributeDescription vad[4] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 0, VK_FORMAT_R8G8B8A8_SNORM, 12},
++                                              {2, 0, VK_FORMAT_R16G16_SFLOAT, 16}, {3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 0}};
++  VkPipelineVertexInputStateCreateInfo vis{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++  vis.vertexBindingDescriptionCount = 2, vis.pVertexBindingDescriptions = vbd;
++  vis.vertexAttributeDescriptionCount = 4, vis.pVertexAttributeDescriptions = vad;
++  VkPipelineInputAssemblyStateCreateInfo ias{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++  ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++  VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++  VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++  VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
++  dss.depthTestEnable = dss.depthWriteEnable = VK_TRUE, dss.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
++  VkPipelineColorBlendAttachmentState cba{};
++  cba.colorWriteMask = 0xF;
++  VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++  cbs.attachmentCount = 1, cbs.pAttachments = &cba;
++  VkFormat cf = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
++  VkPipelineRenderingCreateInfo prc{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++  prc.viewMask = 3, prc.colorAttachmentCount = 1, prc.pColorAttachmentFormats = &cf;
++  prc.depthAttachmentFormat = prc.stencilAttachmentFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
++  VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &prc};
++  gp.stageCount = 1, gp.pStages = stages, gp.pVertexInputState = &vis, gp.pInputAssemblyState = &ias;
++  gp.pRasterizationState = &rs, gp.pMultisampleState = &ms, gp.pDepthStencilState = &dss, gp.pColorBlendState = &cbs;
++  gp.layout = pl;
++  VkPipeline depthOnly;
++  vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &gp, nullptr, &depthOnly);
++  const PipelineObj* po = from<PipelineObj>(depthOnly);
++  CHECK(po->ok && po->mv && po->mv->slot == 1 && !po->mv->hasMotion);  // no fragment shader: format-only
++  CHECK(po->mv && po->mv->formatOnly.colorFormats[1] == vpgpu::Format::RG16Float);
++
++  // The motion path itself, through translation: a pipeline object with motion variants made
++  // from the format-only one (the shader-level variant is covered by gpu_spirv.motion).
++  auto* mp = new PipelineObj;
++  mp->ok = true, mp->device = from<Device>(c.dev), mp->viewCount = 2, mp->layout = po->layout;
++  mp->state = po->state, mp->key = po->key, mp->fragmentOutputs = 1;
++  mp->mv = std::make_unique<MotionVariants>(*po->mv);
++  mp->mv->hasMotion = true;
++  mp->mv->motion = mp->mv->formatOnly;
++  mp->mv->motion.label += ".motion";
++  mp->mv->prevSlots = {0, 1, 2};
++  mp->mv->prevSlotBase = 64;
++  mp->used = po->used;
++  VkPipeline motionPipe = to<VkPipeline>(mp);
++
++  VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++  VkCommandPool cp;
++  vkCreateCommandPool(c.dev, &cpi, nullptr, &cp);
++  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++  ai.commandPool = cp, ai.commandBufferCount = 1;
++  VkCommandBuffer cb;
++  vkAllocateCommandBuffers(c.dev, &ai, &cb);
++  float* camData = nullptr;
++  vkMapMemory(c.dev, m, 1 << 20, 4096, 0, reinterpret_cast<void**>(&camData));
++  std::function<float(const vpgpu::Frame&)> prevCam;
++  float seenPrev = -1;
++  // Each frame is translated here (inspected at once: the previous-data arenas rotate per eye frame)
++  // and then submitted, which translates it again as the next eye frame.
++  auto frame = [&](float camValue, vpgpu::Frame& out) {
++    camData[0] = camValue;  // what the game writes before submitting the frame
++    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++    vkBeginCommandBuffer(cb, &bi);
++    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++    ca.imageView = cv, ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    da.imageView = dv, da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
++    ri.renderArea = {{0, 0}, {128, 128}}, ri.viewMask = 3, ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca;
++    ri.pDepthAttachment = ri.pStencilAttachment = &da;
++    vkCmdBeginRendering(cb, &ri);
++    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, motionPipe);
++    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 2, sets, 0, nullptr);
++    float push[5] = {1, 2, 3, 4, 0};
++    vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_VERTEX_BIT, 0, 20, push);
++    VkBuffer vbs[2] = {vb, vb};
++    VkDeviceSize offs[2] = {0, 1024};
++    vkCmdBindVertexBuffers(cb, 0, 2, vbs, offs);
++    vkCmdDraw(cb, 36, 1, 0, 0);
++    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, depthOnly);
++    vkCmdDraw(cb, 3, 1, 0, 0);
++    vkCmdEndRendering(cb);
++    vkEndCommandBuffer(cb);
++    TranslateStats st;
++    translate(*from<CommandBuffer>(cb)->rec, out, st, from<Device>(c.dev));
++    CHECK(st.draws == 2 && st.skippedDraws == 0);
++    seenPrev = prevCam(out);
++    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++    si.commandBufferCount = 1, si.pCommandBuffers = &cb;
++    vkQueueSubmit(c.queue, 1, &si, VK_NULL_HANDLE);  // translates once more: the frame vpvk_motion_get reports
++  };
++  // Previous-frame camera value bound at slot 64 for draw 0 of a frame.
++  prevCam = [&](const vpgpu::Frame& f) -> float {
++    const auto* p = f.commands().empty() ? nullptr : std::get_if<vpgpu::RenderPass>(&f.commands()[0]);
++    if (!p || p->draws.empty()) return -1;
++    auto& nb = dynamic_cast<vpgpu::NullBackend&>(from<Device>(c.dev)->platform->backend());
++    (void)nb;
++    for (const vpgpu::Access& a : p->draws[0].bindings)
++      if (a.kind == vpgpu::BindKind::ConstantBuffer && a.slot == 64) {
++        const vpgpu::BufferDesc* bd = from<Device>(c.dev)->gpu->resources().get(vpgpu::BufferId{a.range.index, a.range.generation});
++        if (!bd || !bd->guestMemory) return -2;
++        float v;
++        std::memcpy(&v, static_cast<const uint8_t*>(bd->guestMemory) + a.range.begin, 4);
++        return v;
++      }
++    return -3;
++  };
++  vpgpu::Frame f1, f2;
++  frame(10.0f, f1);
++  const auto* p1 = f1.commands().empty() ? nullptr : std::get_if<vpgpu::RenderPass>(&f1.commands()[0]);
++  CHECK(p1 && p1->desc.colors[1].texture && p1->desc.colors[1].load == vpgpu::LoadAction::Clear);
++  if (p1 && p1->draws.size() == 2) {
++    CHECK(p1->draws[0].pipeline == mp->derived(2, nullptr));  // motion variant
++    CHECK(p1->draws[1].pipeline == po->derived(1, nullptr));  // format-only variant
++  }
++  CHECK(seenPrev == 10.0f);  // no history: this frame's data, zero motion
++  frame(20.0f, f2);
++  CHECK(seenPrev == 10.0f);  // the bytes the draw had the eye frame before (the submit of frame 1)
++  vpvk_motion_info info{};
++  CHECK(vpvk_motion_get(0, &info) == 1);
++  CHECK(info.width == 128 && info.height == 128 && info.layers == 2 && info.serial >= 2 && info.complete == 1 &&
++        info.scale_x == 0.5f && info.includes_camera == 1);
++  vkUnmapMemory(c.dev, m);
++  vkDestroyCommandPool(c.dev, cp, nullptr);
++  delete mp;
++  vkDestroyPipeline(c.dev, depthOnly, nullptr);
++  vkDestroyShaderModule(c.dev, vs, nullptr);
++  vkDestroyDescriptorPool(c.dev, pool, nullptr);
++  vkDestroyPipelineLayout(c.dev, pl, nullptr);
++  for (auto l : sl) vkDestroyDescriptorSetLayout(c.dev, l, nullptr);
++  vkDestroyImageView(c.dev, cv, nullptr);
++  vkDestroyImageView(c.dev, dv, nullptr);
++  vkDestroyImage(c.dev, color, nullptr);
++  vkDestroyImage(c.dev, depth, nullptr);
++  vkDestroyBuffer(c.dev, ubo, nullptr);
++  vkDestroyBuffer(c.dev, vb, nullptr);
++  vkFreeMemory(c.dev, m, nullptr);
++}
++
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+@@ -1395,7 +1589,7 @@ int main(int argc, char** argv) {
+       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
+       {"recipes", testRecipes}, {"alyx", testAlyxSurface}, {"depth_resolve", testDepthResolve},
+       {"local_read", testLocalRead}, {"sync", testSync},
+-      {"host_image_copy", testHostImageCopy}};
++      {"host_image_copy", testHostImageCopy}, {"motion", testMotion}};
+   bool ran = false;
+   for (const auto& [name, fn] : groups) {
+     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
+-- 
+2.43.0
+

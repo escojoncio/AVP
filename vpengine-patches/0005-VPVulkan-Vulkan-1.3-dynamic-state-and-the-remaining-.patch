@@ -1,0 +1,840 @@
+From 1a4203ab0e8d1a24477c3739e009b90ffb6d0d1c Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 04:44:37 +0000
+Subject: [PATCH 05/10] VPVulkan: Vulkan 1.3 dynamic state and the remaining
+ 1.1-1.3 core commands
+
+Dynamic state (Vulkan 1.3 / extended_dynamic_state, and the extended_dynamic_state3 subset in
+every Alyx pipeline): viewport/scissor with count, cull mode, front face, topology (same class),
+depth test/write/compare, stencil test/op/compare mask/write mask, depth bias enable, rasterizer
+discard, primitive restart. Depth/stencil and cull reach Metal per draw (Draw::depthStencil /
+Draw::cull; gpu/metal2 caches one MTLDepthStencilState per combination). Stencil compare/write
+masks were ignored before. VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT (2550 of Alyx's 3030 recorded
+pipelines): Metal bakes write masks, so each mask combination is a pipeline variant requested on
+first use (also recorded as a recipe); the pipeline's own mask uses the base pipeline.
+
+New src/core13.cpp: vkCmd*2 copy commands, draw indirect count (count read at submit),
+dispatch base, device groups of one, private data, external capability queries, tool properties,
+maintenance4 requirement queries; promoted KHR/EXT/AMD names. VK_EXT_extended_dynamic_state
+advertised. Every 1.1-1.3 command resolves except YCbCr conversion and buffer device address
+(features reported unsupported).
+
+Tests: gpu_vulkan.pipeline (Alyx dynamic set, write-mask variant, cull FRONT_AND_BACK),
+gpu_vulkan.sync (1.3 entry points resolve).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
+---
+ gpu/core/include/vpgpu/core/commands.h |  16 ++
+ gpu/metal2/src/metal_backend.mm        |  37 +++-
+ gpu/vulkan/CMakeLists.txt              |   2 +-
+ gpu/vulkan/src/commands.cpp            |   9 +-
+ gpu/vulkan/src/commands.h              |  18 ++
+ gpu/vulkan/src/core13.cpp              | 248 +++++++++++++++++++++++++
+ gpu/vulkan/src/entry.cpp               |   1 +
+ gpu/vulkan/src/physical_device.cpp     |   1 +
+ gpu/vulkan/src/pipelines.cpp           | 163 +++++++++++++++-
+ gpu/vulkan/src/vpvk.h                  |  11 ++
+ gpu/vulkan/tests/vk_tests.cpp          |  65 +++++++
+ 11 files changed, 562 insertions(+), 9 deletions(-)
+ create mode 100644 gpu/vulkan/src/core13.cpp
+
+diff --git a/gpu/core/include/vpgpu/core/commands.h b/gpu/core/include/vpgpu/core/commands.h
+index 820dea7..ade3b8a 100644
+--- a/gpu/core/include/vpgpu/core/commands.h
++++ b/gpu/core/include/vpgpu/core/commands.h
+@@ -146,8 +146,24 @@ struct Indirect {
+   uint64_t offset = 0;
+ };
+ 
++// Depth/stencil state set per draw (Vulkan dynamic state) instead of the pipeline's. Same
++// enums as PipelineState (pipeline_cache.h); the backend caches one native object per value.
++struct DepthStencilDynamic {
++  bool depthTest = false, depthWrite = false;
++  uint8_t depthCompare = 7;  // CompareOp
++  bool stencilTest = false;
++  struct Face {
++    uint8_t fail = 0, depthFail = 0, pass = 0, compare = 7;  // StencilOp x3, CompareOp
++    uint8_t readMask = 0xFF, writeMask = 0xFF;
++  } front, back;
++  bool operator==(const DepthStencilDynamic&) const = default;
++};
++
+ struct Draw {
+   PipelineKey pipeline;
++  // Vulkan dynamic state overriding what the pipeline baked in (unset = the pipeline's).
++  std::optional<DepthStencilDynamic> depthStencil;
++  std::optional<uint8_t> cull;  // CullMode
+   std::vector<Access> bindings;  // vertex buffers, constants, textures, storage
+   Primitive primitive = Primitive::Triangles;
+   uint32_t first = 0, count = 0, instances = 1;  // first/count are indices when indexed
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 1860689..4abb447 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -452,6 +452,36 @@ struct MetalBackend::Impl {
+   bool saveArchiveLocked();
+   void maybeSaveArchive();
+ 
++  // Depth-stencil states of draws with dynamic depth/stencil state (submit thread only).
++  std::unordered_map<uint64_t, id<MTLDepthStencilState>> dynamicDepth;
++  id<MTLDepthStencilState> dynamicDepthStencil(const DepthStencilDynamic& s) {
++    uint64_t h = 1469598103934665603ull;
++    const uint8_t* b = reinterpret_cast<const uint8_t*>(&s);
++    for (size_t i = 0; i < sizeof s; ++i) h = (h ^ b[i]) * 1099511628211ull;
++    auto it = dynamicDepth.find(h);
++    if (it != dynamicDepth.end()) return it->second;
++    MTLDepthStencilDescriptor* ds = [MTLDepthStencilDescriptor new];
++    ds.depthCompareFunction = s.depthTest ? MTLCompareFunction(s.depthCompare) : MTLCompareFunctionAlways;
++    ds.depthWriteEnabled = s.depthTest && s.depthWrite;
++    if (s.stencilTest) {
++      auto face = [](const DepthStencilDynamic::Face& f) {
++        MTLStencilDescriptor* d = [MTLStencilDescriptor new];
++        d.stencilCompareFunction = MTLCompareFunction(f.compare);
++        d.stencilFailureOperation = MTLStencilOperation(f.fail);
++        d.depthFailureOperation = MTLStencilOperation(f.depthFail);
++        d.depthStencilPassOperation = MTLStencilOperation(f.pass);
++        d.readMask = f.readMask;
++        d.writeMask = f.writeMask;
++        return d;
++      };
++      ds.frontFaceStencil = face(s.front);
++      ds.backFaceStencil = face(s.back);
++    }
++    id<MTLDepthStencilState> st = [device newDepthStencilStateWithDescriptor:ds];
++    dynamicDepth[h] = st;
++    return st;
++  }
++
+   std::mutex doneMutex;
+   std::deque<Done> done;
+   // Frames submitted to Metal and not completed yet, and the next frame index expected (guarded by
+@@ -1750,8 +1780,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+           }
+           useBound();
+           [open.render setRenderPipelineState:p->render];
+-          [open.render setDepthStencilState:p->depth];
+-          [open.render setCullMode:p->cull];
++          [open.render setDepthStencilState:d.depthStencil ? dynamicDepthStencil(*d.depthStencil) : p->depth];
++          [open.render setCullMode:d.cull ? (*d.cull == uint8_t(CullMode::Front) ? MTLCullModeFront
++                                             : *d.cull == uint8_t(CullMode::Back) ? MTLCullModeBack
++                                                                                   : MTLCullModeNone)
++                                          : p->cull];
+           [open.render setStencilReferenceValue:d.stencilRef];
+           [open.render setFrontFacingWinding:d.frontFace == Winding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+           [open.render setDepthBias:d.depthBias slopeScale:d.depthBiasSlope clamp:d.depthBiasClamp];
+diff --git a/gpu/vulkan/CMakeLists.txt b/gpu/vulkan/CMakeLists.txt
+index ad8d68f..6fd25cb 100644
+--- a/gpu/vulkan/CMakeLists.txt
++++ b/gpu/vulkan/CMakeLists.txt
+@@ -2,7 +2,7 @@
+ # MoltenVK by path (Klepton's kl_vulkan.c) load libVPVulkan.dylib instead. Khronos headers only
+ # (Apache-2.0/MIT, third_party/vulkan-headers); no other Vulkan code.
+ set(VPVK_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include)
+-set(VPVK_COMMON src/entry.cpp src/physical_device.cpp src/commands.cpp src/config.cpp src/pipelines.cpp src/recipes.cpp src/precompile.cpp src/sync.cpp)
++set(VPVK_COMMON src/entry.cpp src/physical_device.cpp src/commands.cpp src/config.cpp src/pipelines.cpp src/recipes.cpp src/precompile.cpp src/sync.cpp src/core13.cpp)
+ # The static gpu/ libraries end up inside a shared library.
+ set_target_properties(vpgpu_core vpir vpmsl vpspirv PROPERTIES POSITION_INDEPENDENT_CODE ON)
+ 
+diff --git a/gpu/vulkan/src/commands.cpp b/gpu/vulkan/src/commands.cpp
+index 8b88226..ebe3eee 100644
+--- a/gpu/vulkan/src/commands.cpp
++++ b/gpu/vulkan/src/commands.cpp
+@@ -499,7 +499,14 @@ struct Translator {
+     }
+     const bool indexed = d.draw.index.has_value();
+     const uint32_t size = indexed ? 20 : 16;
+-    for (uint32_t i = 0; i < d.indirectCount; ++i) {
++    uint32_t count = d.indirectCount;
++    if (d.countBuffer) {  // read at submit like the arguments (unified memory, in-order queue)
++      const uint8_t* c = indirectData(d.countBuffer, d.countOffset, 4);
++      uint32_t n = 0;
++      if (c) std::memcpy(&n, c, 4);
++      count = std::min(count, n);
++    }
++    for (uint32_t i = 0; i < count; ++i) {
+       const uint8_t* p = indirectData(d.indirect, d.indirectOffset + VkDeviceSize(i) * d.indirectStride, size);
+       if (!p) {
+         ++st.skippedDraws;
+diff --git a/gpu/vulkan/src/commands.h b/gpu/vulkan/src/commands.h
+index 4c36af7..41f42f5 100644
+--- a/gpu/vulkan/src/commands.h
++++ b/gpu/vulkan/src/commands.h
+@@ -97,6 +97,9 @@ struct OpDraw {
+   const Buffer* indirect = nullptr;
+   VkDeviceSize indirectOffset = 0;
+   uint32_t indirectCount = 0, indirectStride = 0;
++  // vkCmdDraw*IndirectCount: the draw count is read from this buffer (capped by indirectCount).
++  const Buffer* countBuffer = nullptr;
++  VkDeviceSize countOffset = 0;
+   uint32_t viewCount = 1;
+   bool ok = true;  // false: the pipeline or a binding was missing (counted as skipped)
+   // After an in-pass barrier only: attachments of the open pass this draw reads as textures.
+@@ -163,6 +166,21 @@ struct BoundState {
+   uint32_t targetWidth = 0, targetHeight = 0;  // render area of the open pass (scissor clamp)
+   uint32_t subpass = 0;
+   const RenderPassObj* pass = nullptr;
++  // Vulkan 1.3 / extended dynamic state set with vkCmdSet* (applied when the pipeline lists it).
++  struct Dyn {
++    VkCullModeFlags cull = VK_CULL_MODE_NONE;
++    VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++    bool depthTest = false, depthWrite = false, depthBiasEnable = false, stencilTest = false;
++    VkCompareOp depthCompare = VK_COMPARE_OP_ALWAYS;
++    struct StencilOps {
++      VkStencilOp fail = VK_STENCIL_OP_KEEP, pass = VK_STENCIL_OP_KEEP, depthFail = VK_STENCIL_OP_KEEP;
++      VkCompareOp compare = VK_COMPARE_OP_ALWAYS;
++      uint8_t compareMask = 0xFF, writeMask = 0xFF;
++    } front, back;
++    bool rasterizerDiscard = false;
++    std::array<uint8_t, 8> colorWriteMask{0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF};
++  } dyn;
+   // Images attached to the open pass, and whether an in-pass barrier was recorded in it.
+   std::vector<const Image*> passImages;
+   bool localRead = false;
+diff --git a/gpu/vulkan/src/core13.cpp b/gpu/vulkan/src/core13.cpp
+new file mode 100644
+index 0000000..5097315
+--- /dev/null
++++ b/gpu/vulkan/src/core13.cpp
+@@ -0,0 +1,248 @@
++// VPVulkan: the rest of the Vulkan 1.1-1.3 core commands (copy commands 2, indirect count, device
++// groups of one, private data, external capability queries, maintenance4 requirement queries,
++// tool properties). Each maps onto the 1.0 path the driver already has.
++#include <algorithm>
++#include <atomic>
++#include <string>
++#include <cstring>
++#include <mutex>
++#include <unordered_map>
++
++#include "commands.h"
++#include "vpvk.h"
++
++#define VPVK_EXPORT extern "C" __attribute__((visibility("default")))
++
++using namespace vpvk;
++
++extern "C" {
++void vkCmdCopyBuffer(VkCommandBuffer, VkBuffer, VkBuffer, uint32_t, const VkBufferCopy*);
++void vkCmdCopyImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout, uint32_t, const VkImageCopy*);
++void vkCmdCopyBufferToImage(VkCommandBuffer, VkBuffer, VkImage, VkImageLayout, uint32_t, const VkBufferImageCopy*);
++void vkCmdCopyImageToBuffer(VkCommandBuffer, VkImage, VkImageLayout, VkBuffer, uint32_t, const VkBufferImageCopy*);
++void vkCmdBlitImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout, uint32_t, const VkImageBlit*, VkFilter);
++void vkCmdResolveImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout, uint32_t, const VkImageResolve*);
++void vkCmdDispatch(VkCommandBuffer, uint32_t, uint32_t, uint32_t);
++void vkGetBufferMemoryRequirements2(VkDevice, const VkBufferMemoryRequirementsInfo2*, VkMemoryRequirements2*);
++void vkGetImageMemoryRequirements2(VkDevice, const VkImageMemoryRequirementsInfo2*, VkMemoryRequirements2*);
++VkResult vkCreateBuffer(VkDevice, const VkBufferCreateInfo*, const VkAllocationCallbacks*, VkBuffer*);
++void vkDestroyBuffer(VkDevice, VkBuffer, const VkAllocationCallbacks*);
++VkResult vkCreateImage(VkDevice, const VkImageCreateInfo*, const VkAllocationCallbacks*, VkImage*);
++void vkDestroyImage(VkDevice, VkImage, const VkAllocationCallbacks*);
++VkResult vkEnumeratePhysicalDevices(VkInstance, uint32_t*, VkPhysicalDevice*);
++}
++
++// ---- copy commands 2 --------------------------------------------------------------------------
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyBuffer2(VkCommandBuffer cb, const VkCopyBufferInfo2* i) {
++  for (uint32_t k = 0; k < i->regionCount; ++k) {
++    const VkBufferCopy r{i->pRegions[k].srcOffset, i->pRegions[k].dstOffset, i->pRegions[k].size};
++    vkCmdCopyBuffer(cb, i->srcBuffer, i->dstBuffer, 1, &r);
++  }
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage2(VkCommandBuffer cb, const VkCopyImageInfo2* i) {
++  for (uint32_t k = 0; k < i->regionCount; ++k) {
++    const VkImageCopy2& x = i->pRegions[k];
++    const VkImageCopy r{x.srcSubresource, x.srcOffset, x.dstSubresource, x.dstOffset, x.extent};
++    vkCmdCopyImage(cb, i->srcImage, i->srcImageLayout, i->dstImage, i->dstImageLayout, 1, &r);
++  }
++}
++namespace {
++VkBufferImageCopy bic(const VkBufferImageCopy2& x) {
++  return {x.bufferOffset, x.bufferRowLength, x.bufferImageHeight, x.imageSubresource, x.imageOffset, x.imageExtent};
++}
++}  // namespace
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage2(VkCommandBuffer cb, const VkCopyBufferToImageInfo2* i) {
++  for (uint32_t k = 0; k < i->regionCount; ++k) {
++    const VkBufferImageCopy r = bic(i->pRegions[k]);
++    vkCmdCopyBufferToImage(cb, i->srcBuffer, i->dstImage, i->dstImageLayout, 1, &r);
++  }
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyImageToBuffer2(VkCommandBuffer cb, const VkCopyImageToBufferInfo2* i) {
++  for (uint32_t k = 0; k < i->regionCount; ++k) {
++    const VkBufferImageCopy r = bic(i->pRegions[k]);
++    vkCmdCopyImageToBuffer(cb, i->srcImage, i->srcImageLayout, i->dstBuffer, 1, &r);
++  }
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage2(VkCommandBuffer cb, const VkBlitImageInfo2* i) {
++  for (uint32_t k = 0; k < i->regionCount; ++k) {
++    const VkImageBlit2& x = i->pRegions[k];
++    VkImageBlit r{x.srcSubresource, {x.srcOffsets[0], x.srcOffsets[1]}, x.dstSubresource, {x.dstOffsets[0], x.dstOffsets[1]}};
++    vkCmdBlitImage(cb, i->srcImage, i->srcImageLayout, i->dstImage, i->dstImageLayout, 1, &r, i->filter);
++  }
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResolveImage2(VkCommandBuffer cb, const VkResolveImageInfo2* i) {
++  for (uint32_t k = 0; k < i->regionCount; ++k) {
++    const VkImageResolve2& x = i->pRegions[k];
++    const VkImageResolve r{x.srcSubresource, x.srcOffset, x.dstSubresource, x.dstOffset, x.extent};
++    vkCmdResolveImage(cb, i->srcImage, i->srcImageLayout, i->dstImage, i->dstImageLayout, 1, &r);
++  }
++}
++
++// ---- draw indirect count, dispatch base, device groups of one ----------------------------------
++namespace {
++void indirectCount(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, VkBuffer countBuf, VkDeviceSize countOff,
++                   uint32_t maxDraws, uint32_t stride, bool indexed) {
++  Recorder& r = *from<CommandBuffer>(cb)->rec;
++  OpDraw op = makeDraw(r, 0, 1, 1, 0, 0, indexed);
++  op.indirect = from<Buffer>(buf), op.indirectOffset = off, op.indirectCount = maxDraws;
++  op.indirectStride = stride ? stride : (indexed ? 20 : 16);
++  op.countBuffer = from<Buffer>(countBuf), op.countOffset = countOff;
++  r.ops.emplace_back(std::move(op));
++}
++}  // namespace
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndirectCount(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkBuffer cbuf,
++                                                              VkDeviceSize co, uint32_t maxDraws, uint32_t stride) {
++  indirectCount(cb, b, o, cbuf, co, maxDraws, stride, false);
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexedIndirectCount(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o,
++                                                                     VkBuffer cbuf, VkDeviceSize co, uint32_t maxDraws,
++                                                                     uint32_t stride) {
++  indirectCount(cb, b, o, cbuf, co, maxDraws, stride, true);
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdDispatchBase(VkCommandBuffer cb, uint32_t bx, uint32_t by, uint32_t bz, uint32_t x,
++                                                         uint32_t y, uint32_t z) {
++  if (bx || by || bz) {
++    static std::atomic<unsigned> n{0};
++    if (n.fetch_add(1) < 4) logf("vk.unimpl dispatch_base base=%u,%u,%u (dispatched from 0)", bx, by, bz);
++  }
++  vkCmdDispatch(cb, x, y, z);
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDeviceMask(VkCommandBuffer, uint32_t) {}
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumeratePhysicalDeviceGroups(VkInstance inst, uint32_t* count,
++                                                                           VkPhysicalDeviceGroupProperties* out) {
++  if (!out) {
++    *count = 1;
++    return VK_SUCCESS;
++  }
++  if (*count < 1) return VK_INCOMPLETE;
++  *count = 1;
++  uint32_t one = 1;
++  vkEnumeratePhysicalDevices(inst, &one, out[0].physicalDevices);
++  out[0].physicalDeviceCount = 1;
++  out[0].subsetAllocation = VK_FALSE;
++  return VK_SUCCESS;
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceGroupPeerMemoryFeatures(VkDevice, uint32_t, uint32_t, uint32_t,
++                                                                          VkPeerMemoryFeatureFlags* f) {
++  *f = VK_PEER_MEMORY_FEATURE_COPY_SRC_BIT | VK_PEER_MEMORY_FEATURE_COPY_DST_BIT | VK_PEER_MEMORY_FEATURE_GENERIC_SRC_BIT |
++       VK_PEER_MEMORY_FEATURE_GENERIC_DST_BIT;
++}
++
++// ---- sparse (none), external capabilities (none exportable), tools ------------------------------
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageSparseMemoryRequirements2(VkDevice, const VkImageSparseMemoryRequirementsInfo2*,
++                                                                           uint32_t* count, VkSparseImageMemoryRequirements2*) {
++  *count = 0;
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceSparseImageFormatProperties2(
++    VkPhysicalDevice, const VkPhysicalDeviceSparseImageFormatInfo2*, uint32_t* count, VkSparseImageFormatProperties2*) {
++  *count = 0;
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice,
++                                                                                   const VkPhysicalDeviceExternalBufferInfo*,
++                                                                                   VkExternalBufferProperties* p) {
++  p->externalMemoryProperties = {};
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice,
++                                                                                  const VkPhysicalDeviceExternalFenceInfo*,
++                                                                                  VkExternalFenceProperties* p) {
++  p->exportFromImportedHandleTypes = p->compatibleHandleTypes = 0;
++  p->externalFenceFeatures = 0;
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceExternalSemaphoreProperties(
++    VkPhysicalDevice, const VkPhysicalDeviceExternalSemaphoreInfo*, VkExternalSemaphoreProperties* p) {
++  p->exportFromImportedHandleTypes = p->compatibleHandleTypes = 0;
++  p->externalSemaphoreFeatures = 0;
++}
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceToolProperties(VkPhysicalDevice, uint32_t* count,
++                                                                             VkPhysicalDeviceToolProperties*) {
++  *count = 0;
++  return VK_SUCCESS;
++}
++
++// ---- private data (VK_EXT_private_data / 1.3) ----------------------------------------------------
++namespace {
++struct PrivateSlot {
++  std::mutex m;
++  std::unordered_map<uint64_t, uint64_t> data;  // (objectType << 56 ^ handle) -> value
++};
++uint64_t pkey(VkObjectType t, uint64_t h) { return h ^ (uint64_t(t) << 56); }
++}  // namespace
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreatePrivateDataSlot(VkDevice, const VkPrivateDataSlotCreateInfo*,
++                                                                   const VkAllocationCallbacks*, VkPrivateDataSlot* out) {
++  *out = reinterpret_cast<VkPrivateDataSlot>(new PrivateSlot);
++  return VK_SUCCESS;
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyPrivateDataSlot(VkDevice, VkPrivateDataSlot s, const VkAllocationCallbacks*) {
++  delete reinterpret_cast<PrivateSlot*>(s);
++}
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkSetPrivateData(VkDevice, VkObjectType t, uint64_t h, VkPrivateDataSlot s, uint64_t v) {
++  auto* p = reinterpret_cast<PrivateSlot*>(s);
++  std::lock_guard<std::mutex> lock(p->m);
++  p->data[pkey(t, h)] = v;
++  return VK_SUCCESS;
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPrivateData(VkDevice, VkObjectType t, uint64_t h, VkPrivateDataSlot s, uint64_t* v) {
++  auto* p = reinterpret_cast<PrivateSlot*>(s);
++  std::lock_guard<std::mutex> lock(p->m);
++  auto it = p->data.find(pkey(t, h));
++  *v = it == p->data.end() ? 0 : it->second;
++}
++
++// ---- maintenance4: requirements without an object ------------------------------------------------
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceBufferMemoryRequirements(VkDevice dv, const VkDeviceBufferMemoryRequirements* i,
++                                                                           VkMemoryRequirements2* out) {
++  VkBuffer b;
++  vkCreateBuffer(dv, i->pCreateInfo, nullptr, &b);
++  VkBufferMemoryRequirementsInfo2 ri{VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2};
++  ri.buffer = b;
++  vkGetBufferMemoryRequirements2(dv, &ri, out);
++  vkDestroyBuffer(dv, b, nullptr);
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceImageMemoryRequirements(VkDevice dv, const VkDeviceImageMemoryRequirements* i,
++                                                                          VkMemoryRequirements2* out) {
++  VkImage im = VK_NULL_HANDLE;
++  if (vkCreateImage(dv, i->pCreateInfo, nullptr, &im) != VK_SUCCESS) {
++    out->memoryRequirements = {};
++    return;
++  }
++  VkImageMemoryRequirementsInfo2 ri{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2};
++  ri.image = im;
++  vkGetImageMemoryRequirements2(dv, &ri, out);
++  vkDestroyImage(dv, im, nullptr);
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceImageSparseMemoryRequirements(VkDevice, const VkDeviceImageMemoryRequirements*,
++                                                                                uint32_t* count, VkSparseImageMemoryRequirements2*) {
++  *count = 0;
++}
++
++namespace vpvk {
++PFN_vkVoidFunction lookupCore13(const char* name) {
++  struct E {
++    const char* name;
++    PFN_vkVoidFunction fn;
++  };
++#define F(f) {#f, reinterpret_cast<PFN_vkVoidFunction>(&f)}
++  static const E table[] = {
++      F(vkCmdCopyBuffer2), F(vkCmdCopyImage2), F(vkCmdCopyBufferToImage2), F(vkCmdCopyImageToBuffer2), F(vkCmdBlitImage2),
++      F(vkCmdResolveImage2), F(vkCmdDrawIndirectCount), F(vkCmdDrawIndexedIndirectCount), F(vkCmdDispatchBase),
++      F(vkCmdSetDeviceMask), F(vkEnumeratePhysicalDeviceGroups), F(vkGetDeviceGroupPeerMemoryFeatures),
++      F(vkGetImageSparseMemoryRequirements2), F(vkGetPhysicalDeviceSparseImageFormatProperties2),
++      F(vkGetPhysicalDeviceExternalBufferProperties), F(vkGetPhysicalDeviceExternalFenceProperties),
++      F(vkGetPhysicalDeviceExternalSemaphoreProperties), F(vkGetPhysicalDeviceToolProperties), F(vkCreatePrivateDataSlot),
++      F(vkDestroyPrivateDataSlot), F(vkSetPrivateData), F(vkGetPrivateData), F(vkGetDeviceBufferMemoryRequirements),
++      F(vkGetDeviceImageMemoryRequirements), F(vkGetDeviceImageSparseMemoryRequirements),
++  };
++#undef F
++  // Promoted names: the KHR/EXT/AMD forms of everything above.
++  static const char* const suffixes[] = {"KHR", "EXT", "AMD"};
++  std::string base = name;
++  for (const char* s : suffixes)
++    if (base.size() > std::strlen(s) && base.compare(base.size() - std::strlen(s), std::string::npos, s) == 0) {
++      base.resize(base.size() - std::strlen(s));
++      break;
++    }
++  for (const E& e : table)
++    if (base == e.name) return e.fn;
++  return nullptr;
++}
++}  // namespace vpvk
+diff --git a/gpu/vulkan/src/entry.cpp b/gpu/vulkan/src/entry.cpp
+index c93ca91..d89a413 100644
+--- a/gpu/vulkan/src/entry.cpp
++++ b/gpu/vulkan/src/entry.cpp
+@@ -1322,6 +1322,7 @@ PFN_vkVoidFunction vpvk::lookup(const char* name, bool deviceLevel) {
+     if (!std::strcmp(e.name, name)) return deviceLevel && !e.device ? nullptr : e.fn;
+   if (PFN_vkVoidFunction f = lookupPhase3(name)) return f;
+   if (PFN_vkVoidFunction f = lookupSync(name)) return f;
++  if (PFN_vkVoidFunction f = lookupCore13(name)) return f;
+   {
+     std::lock_guard<std::mutex> lock(gUnimplMutex);
+     if (gUnimpl.insert(name).second) logf("vk.unimpl %s", name);
+diff --git a/gpu/vulkan/src/physical_device.cpp b/gpu/vulkan/src/physical_device.cpp
+index 3eb29ee..0c2ada3 100644
+--- a/gpu/vulkan/src/physical_device.cpp
++++ b/gpu/vulkan/src/physical_device.cpp
+@@ -272,6 +272,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
+           {VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, 2},
+           {VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, 1},
+           {VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME, 1},
++          {VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, 1},
+           {VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME, 1},
+           {VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, 1},
+           {VK_KHR_SHADER_TERMINATE_INVOCATION_EXTENSION_NAME, 1},
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index b1c306b..2af5f02 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -687,10 +687,12 @@ void targetFormats(const VkGraphicsPipelineCreateInfo& ci, vpgpu::PipelineState&
+ 
+ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
+   auto* p = new PipelineObj;
++  p->device = d;
+   p->layout = layoutOf(ci.layout);
+   if (!p->layout) p->layout = std::make_shared<PipelineLayoutObj>();
+   vpgpu::PipelineState& st = p->state;
+   targetFormats(ci, st, p->viewCount);
++  if (const auto* dy = ci.pDynamicState) p->dynamic.assign(dy->pDynamicStates, dy->pDynamicStates + dy->dynamicStateCount);
+   static std::atomic<unsigned> counter{0};
+   st.label = "vk.pipe" + std::to_string(counter++);
+ 
+@@ -754,7 +756,6 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
+     if (vp->pViewports && vp->viewportCount) p->hasViewport = true, p->viewport = vp->pViewports[0];
+     if (vp->pScissors && vp->scissorCount) p->hasScissor = true, p->scissor = vp->pScissors[0];
+   }
+-  if (const auto* dy = ci.pDynamicState) p->dynamic.assign(dy->pDynamicStates, dy->pDynamicStates + dy->dynamicStateCount);
+ 
+   bool ok = true;
+   std::array<uint64_t, 3> inputs{};  // recipe stage inputs: vertex, fragment, compute
+@@ -779,6 +780,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
+       inputs[1] = o.input;
+       collectUsed(*p, o, vpgpu::stage::fragment);
+       // Outputs the shader does not write keep their contents (no blend, write mask none).
++      p->fragmentOutputs = o.msl.colorOutputs;
+       for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
+         if (!(o.msl.colorOutputs & (1u << c))) st.blend[c].writeMask = 0;
+     }
+@@ -786,6 +788,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
+   if (!st.vertexShader) ok = false;
+   p->ok = ok;
+   p->key = st.key();
++  p->recipeInputs = inputs;
+   if (ok) {
+     d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Blocking);
+     if (d->recipes) d->recipes->addPipeline(st, inputs);
+@@ -1029,15 +1032,63 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilReference(VkCommandBuffer
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetBlendConstants(VkCommandBuffer cb, const float c[4]) {
+   std::memcpy(rec(cb).bound.blend, c, sizeof(float) * 4);
+ }
+-// Baked into the pipeline by the core (masks, bias) or not expressible: accepted and ignored.
++// Vulkan 1.3 dynamic state (extended_dynamic_state 1/2). Recorded; applied to draws whose pipeline
++// declares the state dynamic (applyDynamicState). Topology stays within the class the pipeline was
++// built with (Metal bakes the class).
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetViewportWithCount(VkCommandBuffer cb, uint32_t n, const VkViewport* v) {
++  vkCmdSetViewport(cb, 0, n, v);
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetScissorWithCount(VkCommandBuffer cb, uint32_t n, const VkRect2D* r) {
++  vkCmdSetScissor(cb, 0, n, r);
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetCullMode(VkCommandBuffer cb, VkCullModeFlags m) { rec(cb).bound.dyn.cull = m; }
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetFrontFace(VkCommandBuffer cb, VkFrontFace f) { rec(cb).bound.dyn.frontFace = f; }
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetPrimitiveTopology(VkCommandBuffer cb, VkPrimitiveTopology t) {
++  rec(cb).bound.dyn.topology = t;
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthTestEnable(VkCommandBuffer cb, VkBool32 e) { rec(cb).bound.dyn.depthTest = e; }
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthWriteEnable(VkCommandBuffer cb, VkBool32 e) { rec(cb).bound.dyn.depthWrite = e; }
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthCompareOp(VkCommandBuffer cb, VkCompareOp o) { rec(cb).bound.dyn.depthCompare = o; }
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthBoundsTestEnable(VkCommandBuffer, VkBool32) {}  // no depth bounds in Metal
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilTestEnable(VkCommandBuffer cb, VkBool32 e) { rec(cb).bound.dyn.stencilTest = e; }
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilOp(VkCommandBuffer cb, VkStencilFaceFlags faces, VkStencilOp fail,
++                                                         VkStencilOp pass, VkStencilOp depthFail, VkCompareOp cmp) {
++  BoundState::Dyn& y = rec(cb).bound.dyn;
++  for (auto [bit, f] : {std::pair{VK_STENCIL_FACE_FRONT_BIT, &y.front}, std::pair{VK_STENCIL_FACE_BACK_BIT, &y.back}})
++    if (faces & bit) f->fail = fail, f->pass = pass, f->depthFail = depthFail, f->compare = cmp;
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetRasterizerDiscardEnable(VkCommandBuffer cb, VkBool32 e) {
++  rec(cb).bound.dyn.rasterizerDiscard = e;
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthBiasEnable(VkCommandBuffer cb, VkBool32 e) { rec(cb).bound.dyn.depthBiasEnable = e; }
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetPrimitiveRestartEnable(VkCommandBuffer, VkBool32) {}  // Metal always restarts strips
++
++// Baked into the pipeline by the core or not expressible: accepted and ignored.
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetLineWidth(VkCommandBuffer, float) {}
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthBias(VkCommandBuffer cb, float constant, float clamp, float slope) {
+   float* d = rec(cb).bound.depthBias;
+   d[0] = constant, d[1] = clamp, d[2] = slope;
+ }
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetDepthBounds(VkCommandBuffer, float, float) {}
+-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilCompareMask(VkCommandBuffer, VkStencilFaceFlags, uint32_t) {}
+-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilWriteMask(VkCommandBuffer, VkStencilFaceFlags, uint32_t) {}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilCompareMask(VkCommandBuffer cb, VkStencilFaceFlags faces, uint32_t m) {
++  BoundState::Dyn& y = rec(cb).bound.dyn;
++  if (faces & VK_STENCIL_FACE_FRONT_BIT) y.front.compareMask = uint8_t(m);
++  if (faces & VK_STENCIL_FACE_BACK_BIT) y.back.compareMask = uint8_t(m);
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetStencilWriteMask(VkCommandBuffer cb, VkStencilFaceFlags faces, uint32_t m) {
++  BoundState::Dyn& y = rec(cb).bound.dyn;
++  if (faces & VK_STENCIL_FACE_FRONT_BIT) y.front.writeMask = uint8_t(m);
++  if (faces & VK_STENCIL_FACE_BACK_BIT) y.back.writeMask = uint8_t(m);
++}
++// VK_EXT_extended_dynamic_state3 subset Alyx's pipelines declare: colour write mask (pipeline
++// variants, see PipelineObj::withWriteMasks) and sample locations (Metal uses the standard ones).
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetColorWriteMaskEXT(VkCommandBuffer cb, uint32_t first, uint32_t n,
++                                                                  const VkColorComponentFlags* m) {
++  BoundState::Dyn& y = rec(cb).bound.dyn;
++  for (uint32_t i = 0; i < n && first + i < y.colorWriteMask.size(); ++i) y.colorWriteMask[first + i] = uint8_t(m[i] & 0xF);
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetSampleLocationsEnableEXT(VkCommandBuffer, VkBool32) {}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetSampleLocationsEXT(VkCommandBuffer, const VkSampleLocationsInfoEXT*) {}
+ 
+ // =================================================================================================
+ // Draws and dispatches
+@@ -1127,6 +1178,90 @@ void logSkip(const char* why, const PipelineObj* p) {
+ 
+ }  // namespace
+ 
++vpgpu::PipelineKey PipelineObj::withWriteMasks(const std::array<uint8_t, 8>& masks) const {
++  uint64_t packed = 0;
++  bool same = true;
++  for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) {
++    const uint8_t m = (fragmentOutputs >> c & 1) ? uint8_t(masks[c] & 0xF) : 0;
++    packed |= uint64_t(m) << (4 * c);
++    same = same && m == state.blend[c].writeMask;
++  }
++  if (same) return key;
++  std::lock_guard<std::mutex> lock(variantMutex);
++  auto it = variants.find(packed);
++  if (it != variants.end()) return it->second;
++  vpgpu::PipelineState v = state;
++  for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) v.blend[c].writeMask = uint8_t(packed >> (4 * c) & 0xF);
++  v.label += ".wm" + std::to_string(packed);
++  const vpgpu::PipelineKey k = v.key();
++  device->gpu->pipelines().request(v, k, vpgpu::Priority::Blocking);
++  if (device->recipes) device->recipes->addPipeline(v, recipeInputs);
++  variants.emplace(packed, k);
++  return k;
++}
++
++namespace {
++uint8_t stencilOp(VkStencilOp o) { return uint8_t(o); }  // same order as vpgpu::StencilOp / MTLStencilOperation
++
++// Dynamic state the pipeline declares (Vulkan 1.3 core / extended_dynamic_state 1-3 subset Source 2
++// uses) replaces what it baked in. Cull and depth/stencil go through Draw overrides; front face,
++// topology and depth bias enable are plain draw fields; rasterizer discard drops the draw.
++void applyDynamicState(const BoundState& b, const PipelineObj& p, vpgpu::Draw& d, OpDraw& op) {
++  const BoundState::Dyn& y = b.dyn;
++  if (p.isDynamic(VK_DYNAMIC_STATE_CULL_MODE)) {
++    if (y.cull == VK_CULL_MODE_FRONT_AND_BACK) op.ok = false;
++    d.cull = uint8_t(y.cull == VK_CULL_MODE_FRONT_BIT  ? vpgpu::CullMode::Front
++                     : y.cull == VK_CULL_MODE_BACK_BIT ? vpgpu::CullMode::Back
++                                                       : vpgpu::CullMode::None);
++  }
++  if (p.isDynamic(VK_DYNAMIC_STATE_FRONT_FACE))
++    d.frontFace = y.frontFace == VK_FRONT_FACE_CLOCKWISE ? vpgpu::Winding::Clockwise : vpgpu::Winding::CounterClockwise;
++  if (p.isDynamic(VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY)) {
++    bool ok;
++    switch (y.topology) {
++      case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: d.primitive = vpgpu::Primitive::Points; ok = true; break;
++      case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: d.primitive = vpgpu::Primitive::Lines; ok = true; break;
++      case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: d.primitive = vpgpu::Primitive::LineStrip; ok = true; break;
++      case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP: d.primitive = vpgpu::Primitive::TriangleStrip; ok = true; break;
++      case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: d.primitive = vpgpu::Primitive::Triangles; ok = true; break;
++      default: ok = false;
++    }
++    if (!ok) op.ok = false;
++  }
++  if (p.isDynamic(VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE) && !y.depthBiasEnable) d.depthBias = d.depthBiasClamp = d.depthBiasSlope = 0;
++  if (p.isDynamic(VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE) && y.depthBiasEnable)
++    d.depthBias = b.depthBias[0], d.depthBiasClamp = b.depthBias[1], d.depthBiasSlope = b.depthBias[2];
++  if (p.isDynamic(VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE) && y.rasterizerDiscard) op.ok = false;
++  if (p.isDynamic(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT) && p.device) d.pipeline = p.withWriteMasks(y.colorWriteMask);
++  const bool dsDyn = p.isDynamic(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE) || p.isDynamic(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE) ||
++                     p.isDynamic(VK_DYNAMIC_STATE_DEPTH_COMPARE_OP) || p.isDynamic(VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE) ||
++                     p.isDynamic(VK_DYNAMIC_STATE_STENCIL_OP) || p.isDynamic(VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK) ||
++                     p.isDynamic(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK);
++  if (!dsDyn) return;
++  const vpgpu::PipelineState& st = p.state;
++  vpgpu::DepthStencilDynamic ds;
++  const bool hasDepth = vpgpu::formatInfo(st.depthFormat).depth(), hasStencil = vpgpu::formatInfo(st.depthFormat).stencil();
++  ds.depthTest = hasDepth && (p.isDynamic(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE) ? y.depthTest : st.depthTest);
++  ds.depthWrite = p.isDynamic(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE) ? y.depthWrite : st.depthWrite;
++  ds.depthCompare = uint8_t(p.isDynamic(VK_DYNAMIC_STATE_DEPTH_COMPARE_OP) ? vpgpu::CompareOp(y.depthCompare) : st.depthCompare);
++  ds.stencilTest = hasStencil && (p.isDynamic(VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE) ? y.stencilTest : st.stencilTest);
++  auto face = [&](const vpgpu::StencilFace& baked, const BoundState::Dyn::StencilOps& dy) {
++    vpgpu::DepthStencilDynamic::Face f;
++    const bool ops = p.isDynamic(VK_DYNAMIC_STATE_STENCIL_OP);
++    f.fail = ops ? stencilOp(dy.fail) : uint8_t(baked.fail);
++    f.depthFail = ops ? stencilOp(dy.depthFail) : uint8_t(baked.depthFail);
++    f.pass = ops ? stencilOp(dy.pass) : uint8_t(baked.pass);
++    f.compare = ops ? uint8_t(dy.compare) : uint8_t(baked.compare);
++    f.readMask = p.isDynamic(VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK) ? dy.compareMask : baked.readMask;
++    f.writeMask = p.isDynamic(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK) ? dy.writeMask : baked.writeMask;
++    return f;
++  };
++  ds.front = face(st.stencilFront, y.front);
++  ds.back = face(st.stencilBack, y.back);
++  d.depthStencil = ds;
++}
++}  // namespace
++
+ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,
+                 int32_t baseVertex, bool indexed) {
+   OpDraw op;
+@@ -1198,7 +1333,8 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
+   }
+   if (p->depthBiasEnable) d.depthBias = r.bound.depthBias[0], d.depthBiasClamp = r.bound.depthBias[1], d.depthBiasSlope = r.bound.depthBias[2];
+   d.depthClamp = p->depthClamp;
+-  if (p->cullBoth) op.ok = false;
++  applyDynamicState(r.bound, *p, d, op);
++  if (p->cullBoth && !p->isDynamic(VK_DYNAMIC_STATE_CULL_MODE)) op.ok = false;
+   d.stencilRef = static_cast<uint8_t>(r.bound.stencilRef);
+   std::memcpy(d.blendColor.data(), r.bound.blend, sizeof r.bound.blend);
+   d.frontFace = p->frontFace == VK_FRONT_FACE_CLOCKWISE ? vpgpu::Winding::Clockwise : vpgpu::Winding::CounterClockwise;
+@@ -1540,6 +1676,11 @@ PFN_vkVoidFunction lookupPhase3(const char* name) {
+       F(vkCmdBindVertexBuffers2), F(vkCmdBindIndexBuffer), F(vkCmdSetViewport), F(vkCmdSetScissor),
+       F(vkCmdSetStencilReference), F(vkCmdSetBlendConstants), F(vkCmdSetLineWidth), F(vkCmdSetDepthBias),
+       F(vkCmdSetDepthBounds), F(vkCmdSetStencilCompareMask), F(vkCmdSetStencilWriteMask), F(vkCmdDraw), F(vkCmdDrawIndexed),
++      F(vkCmdSetViewportWithCount), F(vkCmdSetScissorWithCount), F(vkCmdSetCullMode), F(vkCmdSetFrontFace),
++      F(vkCmdSetPrimitiveTopology), F(vkCmdSetDepthTestEnable), F(vkCmdSetDepthWriteEnable), F(vkCmdSetDepthCompareOp),
++      F(vkCmdSetDepthBoundsTestEnable), F(vkCmdSetStencilTestEnable), F(vkCmdSetStencilOp),
++      F(vkCmdSetRasterizerDiscardEnable), F(vkCmdSetDepthBiasEnable), F(vkCmdSetPrimitiveRestartEnable),
++      F(vkCmdSetColorWriteMaskEXT), F(vkCmdSetSampleLocationsEnableEXT), F(vkCmdSetSampleLocationsEXT),
+       F(vkCmdDrawIndirect), F(vkCmdDrawIndexedIndirect), F(vkCmdDispatch), F(vkCmdDispatchIndirect), F(vkCmdNextSubpass),
+       F(vkCmdNextSubpass2), F(vkCmdBeginRendering), F(vkCmdEndRendering), F(vkCmdClearAttachments),
+       F(vkCmdSetRenderingAttachmentLocationsKHR), F(vkCmdSetRenderingInputAttachmentIndicesKHR),
+@@ -1560,6 +1701,18 @@ PFN_vkVoidFunction lookupPhase3(const char* name) {
+       {"vkCmdBindVertexBuffers2EXT", "vkCmdBindVertexBuffers2"},
+       {"vkResetQueryPoolEXT", "vkResetQueryPool"},
+       {"vkTrimCommandPoolKHR", "vkTrimCommandPool"},
++      {"vkCmdSetViewportWithCountEXT", "vkCmdSetViewportWithCount"},
++      {"vkCmdSetScissorWithCountEXT", "vkCmdSetScissorWithCount"},
++      {"vkCmdSetCullModeEXT", "vkCmdSetCullMode"}, {"vkCmdSetFrontFaceEXT", "vkCmdSetFrontFace"},
++      {"vkCmdSetPrimitiveTopologyEXT", "vkCmdSetPrimitiveTopology"},
++      {"vkCmdSetDepthTestEnableEXT", "vkCmdSetDepthTestEnable"},
++      {"vkCmdSetDepthWriteEnableEXT", "vkCmdSetDepthWriteEnable"},
++      {"vkCmdSetDepthCompareOpEXT", "vkCmdSetDepthCompareOp"},
++      {"vkCmdSetDepthBoundsTestEnableEXT", "vkCmdSetDepthBoundsTestEnable"},
++      {"vkCmdSetStencilTestEnableEXT", "vkCmdSetStencilTestEnable"}, {"vkCmdSetStencilOpEXT", "vkCmdSetStencilOp"},
++      {"vkCmdSetRasterizerDiscardEnableEXT", "vkCmdSetRasterizerDiscardEnable"},
++      {"vkCmdSetDepthBiasEnableEXT", "vkCmdSetDepthBiasEnable"},
++      {"vkCmdSetPrimitiveRestartEnableEXT", "vkCmdSetPrimitiveRestartEnable"},
+   };
+   for (const auto& [alias, real] : aliases)
+     if (!std::strcmp(name, alias)) name = real;
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index 75cdbba..0d0ef11 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -6,12 +6,14 @@
+ #include <vulkan/vulkan_metal.h>
+ #include <vulkan/vk_icd.h>
+ 
++#include <array>
+ #include <atomic>
+ #include <condition_variable>
+ #include <cstdint>
+ #include <memory>
+ #include <mutex>
+ #include <string>
++#include <unordered_map>
+ #include <vector>
+ 
+ #include "vpgpu/core/device.h"
+@@ -228,6 +230,14 @@ struct PipelineObj {
+   bool depthBiasEnable = false, depthClamp = false;
+   bool cullBoth = false;  // VK_CULL_MODE_FRONT_AND_BACK: every triangle is culled
+   float depthBias[3] = {0, 0, 0};  // constant, clamp, slope
++  uint8_t fragmentOutputs = 0xFF;  // colour attachments the fragment shader writes
++  Device* device = nullptr;
++  std::array<uint64_t, 3> recipeInputs{};  // recipe stage inputs (vertex, fragment, compute)
++  // VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT: Metal bakes write masks, so each mask combination is a
++  // variant of this pipeline (requested on first use; the core holds the frame while it compiles).
++  mutable std::mutex variantMutex;
++  mutable std::unordered_map<uint64_t, vpgpu::PipelineKey> variants;
++  vpgpu::PipelineKey withWriteMasks(const std::array<uint8_t, 8>& masks) const;
+   bool isDynamic(VkDynamicState s) const {
+     for (auto d : dynamic)
+       if (d == s) return true;
+@@ -309,6 +319,7 @@ void fillProperties2(void* chain);
+ PFN_vkVoidFunction lookup(const char* name, bool deviceLevel);
+ PFN_vkVoidFunction lookupPhase3(const char* name);  // pipelines.cpp
+ PFN_vkVoidFunction lookupSync(const char* name);    // sync.cpp
++PFN_vkVoidFunction lookupCore13(const char* name);  // core13.cpp
+ 
+ template <class T, class H>
+ T* from(H h) { return reinterpret_cast<T*>(h); }
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index fde8cf8..d7a7507 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -685,6 +685,59 @@ void testPipeline() {
+     CHECK(cbufs == 4 && bufs == 3 && texs == 3 && smps == 3);
+     CHECK(dynamicApplied);
+   }
++
++  // Alyx's dynamic state set (every recorded pipeline: viewport/scissor with count, stencil masks
++  // and reference, colour write mask, sample locations) plus Vulkan 1.3 cull / depth state.
++  {
++    VkDynamicState ad[] = {VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
++                           VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
++                           VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT,
++                           VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT, VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_ENABLE_EXT,
++                           VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE};
++    VkPipelineDynamicStateCreateInfo ads{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++    ads.dynamicStateCount = sizeof ad / sizeof *ad, ads.pDynamicStates = ad;
++    VkGraphicsPipelineCreateInfo g2 = gp;
++    g2.pDynamicState = &ads;
++    VkPipeline p2;
++    vkCreateGraphicsPipelines(c.dev, VK_NULL_HANDLE, 1, &g2, nullptr, &p2);
++    const PipelineObj* po2 = from<PipelineObj>(p2);
++    CHECK(po2->ok);
++    vkBeginCommandBuffer(cb, &bi);
++    vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
++    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p2);
++    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 2, sets, 1, &dynOff);
++    vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_VERTEX_BIT, 0, 20, push);
++    vkCmdBindVertexBuffers(cb, 0, 2, vbs, offs);
++    vkCmdBindIndexBuffer(cb, ib, 0, VK_INDEX_TYPE_UINT16);
++    vkCmdSetViewportWithCount(cb, 1, &vp);
++    vkCmdSetScissorWithCount(cb, 1, &sc);
++    vkCmdSetCullMode(cb, VK_CULL_MODE_FRONT_BIT);
++    VkColorComponentFlags rgb = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
++    vkCmdSetColorWriteMaskEXT(cb, 0, 1, &rgb);
++    vkCmdDrawIndexed(cb, 36, 1, 0, 0, 0);
++    VkColorComponentFlags all = rgb | VK_COLOR_COMPONENT_A_BIT;
++    vkCmdSetColorWriteMaskEXT(cb, 0, 1, &all);  // the pipeline's own mask: no variant
++    vkCmdSetCullMode(cb, VK_CULL_MODE_FRONT_AND_BACK);
++    vkCmdDrawIndexed(cb, 36, 1, 0, 0, 0);
++    vkCmdSetCullMode(cb, VK_CULL_MODE_NONE);
++    vkCmdDrawIndexed(cb, 36, 1, 0, 0, 0);
++    vkCmdEndRenderPass(cb);
++    vkEndCommandBuffer(cb);
++    vpgpu::Frame f2;
++    TranslateStats s2;
++    translate(*from<CommandBuffer>(cb)->rec, f2, s2);
++    CHECK(s2.draws == 2 && s2.skippedDraws == 1);  // FRONT_AND_BACK culls everything
++    const auto* pass2 = f2.commands().empty() ? nullptr : std::get_if<vpgpu::RenderPass>(&f2.commands()[0]);
++    CHECK(pass2 && pass2->draws.size() == 2);
++    if (pass2 && pass2->draws.size() == 2) {
++      const vpgpu::Draw &a = pass2->draws[0], &b = pass2->draws[1];
++      CHECK(a.viewport.width == 128 && a.scissor.width == 128);
++      CHECK(a.cull && *a.cull == uint8_t(vpgpu::CullMode::Front) && b.cull && *b.cull == uint8_t(vpgpu::CullMode::None));
++      CHECK(a.pipeline != po2->key && b.pipeline == po2->key);  // write-mask variant, then the base
++      CHECK(c.gpu().pipelines().status(a.pipeline) != vpgpu::PipelineCache::Status::Missing);
++    }
++    vkDestroyPipeline(c.dev, p2, nullptr);
++  }
+   vkDestroyPipeline(c.dev, pipe, nullptr);
+   vkDestroyShaderModule(c.dev, vs, nullptr);
+   vkDestroyShaderModule(c.dev, fs, nullptr);
+@@ -1218,6 +1271,18 @@ void testSync() {
+   // ... and a wait on one only the host layer's swapchain acquire signalled does not block.
+   CHECK(vkQueueSubmit(c.queue, 1, &s3, VK_NULL_HANDLE) == VK_SUCCESS);
+   CHECK(vkGetDeviceProcAddr(c.dev, "vkQueueSubmit2KHR") && vkGetDeviceProcAddr(c.dev, "vkWaitSemaphoresKHR"));
++  // Every Vulkan 1.1-1.3 command of a feature the driver reports resolves (YCbCr conversion and
++  // buffer device address are features it reports as unsupported).
++  for (const char* n : {"vkCmdCopyBuffer2", "vkCmdBlitImage2KHR", "vkCmdResolveImage2", "vkCmdDrawIndexedIndirectCount",
++                        "vkCmdDrawIndirectCountKHR", "vkCmdSetCullMode", "vkCmdSetDepthCompareOpEXT", "vkCmdSetStencilOp",
++                        "vkCmdSetViewportWithCount", "vkCreatePrivateDataSlot", "vkGetDeviceImageMemoryRequirements",
++                        "vkGetDeviceBufferMemoryRequirementsKHR", "vkCmdDispatchBase", "vkTrimCommandPool"}) {
++    if (!vkGetDeviceProcAddr(c.dev, n)) std::printf("  missing %s\n", n);
++    CHECK(vkGetDeviceProcAddr(c.dev, n) != nullptr);
++  }
++  for (const char* n : {"vkEnumeratePhysicalDeviceGroups", "vkGetPhysicalDeviceToolProperties",
++                        "vkGetPhysicalDeviceExternalSemaphoreProperties"})
++    CHECK(vkGetInstanceProcAddr(c.inst, n) != nullptr);
+   vkDestroySemaphore(c.dev, bin, nullptr);
+   vkDestroySemaphore(c.dev, tl, nullptr);
+   vkDestroyFence(c.dev, f1, nullptr);
+-- 
+2.43.0
+

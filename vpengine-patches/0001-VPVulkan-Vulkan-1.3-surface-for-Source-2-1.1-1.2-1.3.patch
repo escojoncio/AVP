@@ -1,0 +1,1090 @@
+From 95d34e7aedddce40db7f7d220c1137bf1b363731 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 04:17:26 +0000
+Subject: [PATCH 01/10] VPVulkan: Vulkan 1.3 surface for Source 2 (1.1/1.2/1.3
+ feature and property structs, depth/stencil resolve, image format list,
+ separate stencil usage, swapchain mutable format)
+
+apiVersion and vkEnumerateInstanceVersion report 1.3. vkGetPhysicalDeviceFeatures2/Properties2
+fill the Vulkan11/12/13 structs and their extension forms from one description of what the
+driver really does. vkCreateDevice accepts the 1.x feature structs and logs (vk.feature) every
+enabled feature the driver lacks instead of refusing the device (Alyx enables tessellation,
+depthBounds, shaderInt64... without using them on this path).
+
+New extensions: maintenance2/3, image_format_list, separate_stencil_usage,
+swapchain_mutable_format, depth_stencil_resolve, driver_properties, and the promoted names
+Source 2 enables. Depth resolve (render pass 2 and dynamic rendering) reaches Metal's
+depthResolveFilter (sample 0 / min / max). Mutable-format images get PixelFormatView.
+maxPerStageDescriptorSamplers 64 (argument tables; Alyx sets hold 17).
+
+Tests: gpu_vulkan.alyx (Alyx's captured device), gpu_vulkan.depth_resolve.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
+---
+ gpu/core/include/vpgpu/core/commands.h  |   2 +
+ gpu/core/include/vpgpu/core/resources.h |   2 +
+ gpu/metal2/src/metal_backend.mm         |   6 +
+ gpu/vulkan/CMakeLists.txt               |   2 +-
+ gpu/vulkan/src/commands.cpp             |   6 +-
+ gpu/vulkan/src/entry.cpp                | 184 ++++++++----
+ gpu/vulkan/src/physical_device.cpp      | 377 +++++++++++++++++++++++-
+ gpu/vulkan/src/pipelines.cpp            |  13 +-
+ gpu/vulkan/src/vpvk.h                   |  16 +
+ gpu/vulkan/tests/vk_tests.cpp           | 199 ++++++++++++-
+ 10 files changed, 741 insertions(+), 66 deletions(-)
+
+diff --git a/gpu/core/include/vpgpu/core/commands.h b/gpu/core/include/vpgpu/core/commands.h
+index 10d0fe0..820dea7 100644
+--- a/gpu/core/include/vpgpu/core/commands.h
++++ b/gpu/core/include/vpgpu/core/commands.h
+@@ -97,6 +97,8 @@ struct Attachment {
+   ClearValue clear;
+   TextureId resolve;  // target of a Resolve / StoreAndResolve store
+   uint16_t resolveMip = 0, resolveLayer = 0;
++  // Depth attachments: how samples combine when resolved (stencil always takes sample 0).
++  enum class DepthResolve : uint8_t { Sample0, Min, Max } depthResolve = DepthResolve::Sample0;
+   bool sameTarget(const Attachment& o) const {
+     return texture == o.texture && mip == o.mip && layer == o.layer;
+   }
+diff --git a/gpu/core/include/vpgpu/core/resources.h b/gpu/core/include/vpgpu/core/resources.h
+index 6f8dedb..5e58823 100644
+--- a/gpu/core/include/vpgpu/core/resources.h
++++ b/gpu/core/include/vpgpu/core/resources.h
+@@ -103,6 +103,8 @@ struct TextureDesc {
+   // Opt-in: contents are never needed after the frame, so an explicit Store on it may be dropped
+   // when the frame compiler keeps it on tile. Without it only DontCare/Resolve stores are released.
+   bool transient = false;
++  // Views with another pixel format of the same size class will be made (Vulkan MUTABLE_FORMAT).
++  bool mutableFormat = false;
+   std::string label;
+ };
+ bool validate(const TextureDesc&);
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 01bc1f2..da9b06c 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -258,6 +258,7 @@ MTLTextureDescriptor* textureDescriptor(const TextureDesc& d) {
+     const FormatInfo& fi = formatInfo(d.format);
+     if ((d.usage & usage::sampled) && fi.blockSize == 1 && fi.bytesPerBlock <= 2 && !fi.depth() && !fi.stencil())
+       u |= MTLTextureUsagePixelFormatView;
++    if (d.mutableFormat) u |= MTLTextureUsagePixelFormatView;
+   }
+   if (d.usage & usage::storage) u |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+   if (d.usage & (usage::colorTarget | usage::depthTarget)) u |= MTLTextureUsageRenderTarget;
+@@ -1659,6 +1660,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         if (pf != MTLPixelFormatStencil8) {
+           attach(rp.depthAttachment, d, t);
+           rp.depthAttachment.clearDepth = d.clear.depth;
++          rp.depthAttachment.depthResolveFilter = d.depthResolve == Attachment::DepthResolve::Min
++                                                      ? MTLMultisampleDepthResolveFilterMin
++                                                  : d.depthResolve == Attachment::DepthResolve::Max
++                                                      ? MTLMultisampleDepthResolveFilterMax
++                                                      : MTLMultisampleDepthResolveFilterSample0;
+         }
+         if (hasStencil) {
+           attach(rp.stencilAttachment, d, t);
+diff --git a/gpu/vulkan/CMakeLists.txt b/gpu/vulkan/CMakeLists.txt
+index b9cb9b2..6b448fc 100644
+--- a/gpu/vulkan/CMakeLists.txt
++++ b/gpu/vulkan/CMakeLists.txt
+@@ -33,7 +33,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
+     target_compile_definitions(vpvk_tests PRIVATE VPVK_SPIRV_TESTS="${CMAKE_CURRENT_SOURCE_DIR}/../shader/spirv/tests")
+     add_dependencies(vpvk_tests VPVulkan)
+     target_compile_options(vpvk_tests PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+-    foreach(t exports physical memory passes submit pipeline recipes)
++    foreach(t exports physical memory passes submit pipeline recipes alyx depth_resolve)
+       add_test(NAME gpu_vulkan.${t} COMMAND vpvk_tests ${t} $<TARGET_FILE:VPVulkan>)
+     endforeach()
+   endif()
+diff --git a/gpu/vulkan/src/commands.cpp b/gpu/vulkan/src/commands.cpp
+index c9e138a..725a515 100644
+--- a/gpu/vulkan/src/commands.cpp
++++ b/gpu/vulkan/src/commands.cpp
+@@ -67,6 +67,7 @@ UseRange uses(const RenderPassObj& rp, uint32_t index) {
+     for (auto& c : sp.colors) used |= c.attachment == index;
+     for (auto& c : sp.resolves) used |= c.attachment == index;
+     for (auto& c : sp.inputs) used |= c.attachment == index;
++    used |= sp.depthResolve == index;
+     if (used) {
+       if (u.first < 0) u.first = int(s);
+       u.last = int(s);
+@@ -127,9 +128,12 @@ bool beginPass(const OpBeginPass& b, uint32_t sub, vpgpu::RenderPassDesc& desc,
+     const uint32_t r = i < sp.resolves.size() ? sp.resolves[i].attachment : VK_ATTACHMENT_UNUSED;
+     if (!attach(b, sub, a, r, desc.colors[slot], &forced)) return false;
+   }
++  const bool dsResolve = sp.depthResolve != VK_ATTACHMENT_UNUSED &&
++                         (sp.depthResolveMode != VK_RESOLVE_MODE_NONE || sp.stencilResolveMode != VK_RESOLVE_MODE_NONE);
+   if (sp.hasDepth && sp.depth.attachment != VK_ATTACHMENT_UNUSED &&
+-      !attach(b, sub, sp.depth.attachment, VK_ATTACHMENT_UNUSED, desc.depth))
++      !attach(b, sub, sp.depth.attachment, dsResolve ? sp.depthResolve : VK_ATTACHMENT_UNUSED, desc.depth, &forced))
+     return false;
++  desc.depth.depthResolve = depthResolveOf(sp.depthResolveMode);
+   // Multiview: one layer per view bit (the draws are instanced once per view).
+   desc.layerCount = sp.viewMask ? static_cast<uint16_t>(std::popcount(sp.viewMask))
+                                 : static_cast<uint16_t>(b.framebuffer ? b.framebuffer->layers : 1);
+diff --git a/gpu/vulkan/src/entry.cpp b/gpu/vulkan/src/entry.cpp
+index 30b391c..45e5e31 100644
+--- a/gpu/vulkan/src/entry.cpp
++++ b/gpu/vulkan/src/entry.cpp
+@@ -6,6 +6,7 @@
+ #include <atomic>
+ #include <algorithm>
+ #include <cstdarg>
++#include <cstddef>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -113,6 +114,18 @@ vpgpu::TextureDesc imageDesc(const VkImageCreateInfo& ci) {
+       d.usage |= vpgpu::usage::colorTarget;
+   }
+   if (!d.usage) d.usage = vpgpu::usage::sampled;
++  // VK_KHR_image_format_list / swapchain_mutable_format: views in another format. A list that names
++  // only the image's own format needs nothing (Metal then keeps lossless compression).
++  if (ci.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
++    d.mutableFormat = true;
++    if (const auto* fl = static_cast<const VkImageFormatListCreateInfo*>(
++            findNext(ci.pNext, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO));
++        fl && fl->viewFormatCount) {
++      d.mutableFormat = false;
++      for (uint32_t i = 0; i < fl->viewFormatCount; ++i)
++        if (fl->pViewFormats[i] != ci.format) d.mutableFormat = true;
++    }
++  }
+   // Transient attachments never need memory: the core keeps them on tile when it can.
+   d.transient = (ci.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0;
+   // Anything sampled may be read in a later frame (Vulkan gives no frame boundary).
+@@ -134,6 +147,70 @@ uint64_t imageBytes(const vpgpu::TextureDesc& d) {
+ std::mutex gUnimplMutex;
+ std::set<std::string> gUnimpl;
+ 
++// Features a game enables that the driver does not have. Vulkan says vkCreateDevice fails then;
++// games built against desktop drivers enable what they saw on the capture machine without checking
++// (Alyx: tessellationShader, depthBounds, multiViewport, shaderInt64...), so they are logged, one
++// line per name, and the device is created: what the game then really uses fails visibly at
++// pipeline creation (vk.err what=shader / what=stage) instead of the whole game refusing to start.
++// VkPhysicalDeviceFeatures members in declaration order (log names).
++const char* const kCoreFeatureNames[] = {
++    "robustBufferAccess", "fullDrawIndexUint32", "imageCubeArray", "independentBlend", "geometryShader",
++    "tessellationShader", "sampleRateShading", "dualSrcBlend", "logicOp", "multiDrawIndirect",
++    "drawIndirectFirstInstance", "depthClamp", "depthBiasClamp", "fillModeNonSolid", "depthBounds", "wideLines",
++    "largePoints", "alphaToOne", "multiViewport", "samplerAnisotropy", "textureCompressionETC2",
++    "textureCompressionASTC_LDR", "textureCompressionBC", "occlusionQueryPrecise", "pipelineStatisticsQuery",
++    "vertexPipelineStoresAndAtomics", "fragmentStoresAndAtomics", "shaderTessellationAndGeometryPointSize",
++    "shaderImageGatherExtended", "shaderStorageImageExtendedFormats", "shaderStorageImageMultisample",
++    "shaderStorageImageReadWithoutFormat", "shaderStorageImageWriteWithoutFormat",
++    "shaderUniformBufferArrayDynamicIndexing", "shaderSampledImageArrayDynamicIndexing",
++    "shaderStorageBufferArrayDynamicIndexing", "shaderStorageImageArrayDynamicIndexing", "shaderClipDistance",
++    "shaderCullDistance", "shaderFloat64", "shaderInt64", "shaderInt16", "shaderResourceResidency",
++    "shaderResourceMinLod", "sparseBinding", "sparseResidencyBuffer", "sparseResidencyImage2D",
++    "sparseResidencyImage3D", "sparseResidency2Samples", "sparseResidency4Samples", "sparseResidency8Samples",
++    "sparseResidency16Samples", "sparseResidencyAliased", "variableMultisampleRate", "inheritedQueries"};
++static_assert(sizeof kCoreFeatureNames / sizeof *kCoreFeatureNames == sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32));
++
++template <class T>
++void diffBools(const char* group, const T& want, const T& have, size_t firstBool) {
++  const auto* w = reinterpret_cast<const VkBool32*>(reinterpret_cast<const uint8_t*>(&want) + firstBool);
++  const auto* h = reinterpret_cast<const VkBool32*>(reinterpret_cast<const uint8_t*>(&have) + firstBool);
++  const size_t n = (sizeof(T) - firstBool) / sizeof(VkBool32);
++  for (size_t i = 0; i < n; ++i)
++    if (w[i] && !h[i]) {
++      if (!std::strcmp(group, "core")) logf("vk.feature unsupported_enabled=%s", kCoreFeatureNames[i]);
++      else logf("vk.feature unsupported_enabled=%s[%zu]", group, i);
++    }
++}
++
++void logUnsupportedFeatures(const VkDeviceCreateInfo& ci) {
++  VkPhysicalDeviceFeatures have;
++  haveFeatures(&have);
++  if (ci.pEnabledFeatures) diffBools("core", *ci.pEnabledFeatures, have, 0);
++  VkPhysicalDeviceVulkan11Features h11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
++  VkPhysicalDeviceVulkan12Features h12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
++  VkPhysicalDeviceVulkan13Features h13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++  h11.pNext = &h12, h12.pNext = &h13;
++  fillFeatures2(&h11);
++  constexpr size_t head = offsetof(VkPhysicalDeviceVulkan11Features, storageBuffer16BitAccess);
++  for (auto* s = static_cast<const VkBaseInStructure*>(ci.pNext); s; s = s->pNext) {
++    switch (s->sType) {
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
++        diffBools("core", reinterpret_cast<const VkPhysicalDeviceFeatures2*>(s)->features, have, 0);
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
++        diffBools("v11", *reinterpret_cast<const VkPhysicalDeviceVulkan11Features*>(s), h11, head);
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
++        diffBools("v12", *reinterpret_cast<const VkPhysicalDeviceVulkan12Features*>(s), h12, head);
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:
++        diffBools("v13", *reinterpret_cast<const VkPhysicalDeviceVulkan13Features*>(s), h13, head);
++        break;
++      default: break;  // per-extension feature structs: every one listed by fillFeatures2 is honoured
++    }
++  }
++}
++
+ }  // namespace
+ }  // namespace vpvk
+ 
+@@ -143,7 +220,7 @@ using namespace vpvk;
+ // Instance
+ // ---------------------------------------------------------------------------------------------
+ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceVersion(uint32_t* v) {
+-  *v = VK_API_VERSION_1_1;
++  *v = VK_API_VERSION_1_3;
+   return VK_SUCCESS;
+ }
+ 
+@@ -203,53 +280,15 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties(VkPhysicalD
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysicalDevice pd,
+                                                                       VkPhysicalDeviceProperties2* p) {
+   vkGetPhysicalDeviceProperties(pd, &p->properties);
+-  for (auto* s = static_cast<VkBaseOutStructure*>(p->pNext); s; s = s->pNext) {
+-    switch (s->sType) {
+-      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES: {
+-        auto* m = reinterpret_cast<VkPhysicalDeviceMultiviewProperties*>(s);
+-        m->maxMultiviewViewCount = 2;  // Metal vertex amplification: 2 on Apple GPUs
+-        m->maxMultiviewInstanceIndex = (1u << 27) - 1;
+-        break;
+-      }
+-      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_PROPERTIES_EXT: {
+-        auto* f = reinterpret_cast<VkPhysicalDeviceFragmentDensityMapPropertiesEXT*>(s);
+-        f->minFragmentDensityTexelSize = {32, 32};
+-        f->maxFragmentDensityTexelSize = {32, 32};
+-        f->fragmentDensityInvocations = VK_FALSE;
+-        break;
+-      }
+-      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES: {
+-        auto* id = reinterpret_cast<VkPhysicalDeviceIDProperties*>(s);
+-        std::memcpy(id->deviceUUID, deviceProperties().pipelineCacheUUID, VK_UUID_SIZE);
+-        std::memcpy(id->driverUUID, deviceProperties().pipelineCacheUUID, VK_UUID_SIZE);
+-        static const uint8_t luid[VK_LUID_SIZE] = {'V', 'P', 'V', 'K', 0, 0, 0, 1};
+-        std::memcpy(id->deviceLUID, luid, VK_LUID_SIZE);
+-        id->deviceNodeMask = 1;
+-        id->deviceLUIDValid = VK_TRUE;
+-        break;
+-      }
+-      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES: {
+-        auto* m = reinterpret_cast<VkPhysicalDeviceMaintenance3Properties*>(s);
+-        m->maxPerSetDescriptors = 1024;
+-        m->maxMemoryAllocationSize = 1ull << 32;
+-        break;
+-      }
+-      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES: {
+-        auto* sg = reinterpret_cast<VkPhysicalDeviceSubgroupProperties*>(s);
+-        sg->subgroupSize = 32;  // Apple SIMD-group width
+-        sg->supportedStages = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+-        sg->supportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
+-                                  VK_SUBGROUP_FEATURE_BALLOT_BIT;
+-        sg->quadOperationsInAllStages = VK_FALSE;
+-        break;
+-      }
+-      default: break;
+-    }
+-  }
++  fillProperties2(p->pNext);
+ }
+ 
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDevice,
+                                                                    VkPhysicalDeviceFeatures* f) {
++  vpvk::haveFeatures(f);
++}
++
++void vpvk::haveFeatures(VkPhysicalDeviceFeatures* f) {
+   *f = {};
+   f->robustBufferAccess = VK_TRUE;
+   f->fullDrawIndexUint32 = VK_TRUE;
+@@ -277,19 +316,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures(VkPhysicalDev
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDevice pd,
+                                                                     VkPhysicalDeviceFeatures2* f) {
+   vkGetPhysicalDeviceFeatures(pd, &f->features);
+-  for (auto* s = static_cast<VkBaseOutStructure*>(f->pNext); s; s = s->pNext) {
+-    if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES) {
+-      auto* m = reinterpret_cast<VkPhysicalDeviceMultiviewFeatures*>(s);
+-      m->multiview = VK_TRUE;
+-      m->multiviewGeometryShader = VK_FALSE;
+-      m->multiviewTessellationShader = VK_FALSE;
+-    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT) {
+-      auto* d = reinterpret_cast<VkPhysicalDeviceFragmentDensityMapFeaturesEXT*>(s);
+-      d->fragmentDensityMap = VK_FALSE;  // not advertised: foveation is VPEngine's (vpvk/config.h)
+-      d->fragmentDensityMapDynamic = VK_FALSE;
+-      d->fragmentDensityMapNonSubsampledImages = VK_FALSE;
+-    }
+-  }
++  fillFeatures2(f->pNext);
+ }
+ 
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties(
+@@ -333,6 +360,20 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties2(VkPh
+                                                                             VkFormat f,
+                                                                             VkFormatProperties2* p) {
+   vkGetPhysicalDeviceFormatProperties(pd, f, &p->formatProperties);
++  if (auto* p3 = static_cast<VkFormatProperties3*>(findNextOut(p->pNext, VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3))) {
++    const VkFormatProperties& fp = p->formatProperties;
++    p3->linearTilingFeatures = fp.linearTilingFeatures;
++    p3->optimalTilingFeatures = fp.optimalTilingFeatures;
++    p3->bufferFeatures = fp.bufferFeatures;
++    // Storage images are read and written without a declared format (the MSL type comes from the
++    // SPIR-V sampled type); depth formats can be sampled with comparison.
++    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
++      p3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT | VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
++    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
++      p3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
++    if (hasDeviceExtension(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) && fp.optimalTilingFeatures)
++      p3->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
++  }
+ }
+ 
+ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(
+@@ -364,8 +405,19 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatPropert
+ 
+ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties2(
+     VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2* in, VkImageFormatProperties2* out) {
+-  return vkGetPhysicalDeviceImageFormatProperties(pd, in->format, in->type, in->tiling, in->usage,
+-                                                  in->flags, &out->imageFormatProperties);
++  VkImageUsageFlags usage = in->usage;
++  if (const auto* su = static_cast<const VkImageStencilUsageCreateInfo*>(
++          findNext(in->pNext, VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO)))
++    usage |= su->stencilUsage;
++  usage &= ~VkImageUsageFlags(VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT);  // any image (vkCopyMemoryToImageEXT)
++  const VkResult r = vkGetPhysicalDeviceImageFormatProperties(pd, in->format, in->type, in->tiling, usage, in->flags,
++                                                              &out->imageFormatProperties);
++  if (auto* q = static_cast<VkHostImageCopyDevicePerformanceQueryEXT*>(
++          findNextOut(out->pNext, VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY_EXT))) {
++    q->optimalDeviceAccess = VK_TRUE;  // Metal textures keep their layout; nothing is degraded
++    q->identicalMemoryLayout = VK_FALSE;
++  }
++  return r;
+ }
+ 
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceSparseImageFormatProperties(
+@@ -414,6 +466,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
+     if (!std::strcmp(e, VK_KHR_MULTIVIEW_EXTENSION_NAME)) d->multiview = true;
+     if (!std::strcmp(e, VK_EXT_METAL_OBJECTS_EXTENSION_NAME)) d->metalObjects = true;
+   }
++  logUnsupportedFeatures(*ci);
+   d->platform = createPlatform();
+   // Pipeline compiles run on background workers (never the submit thread); leave the game's
+   // render/main threads two cores.
+@@ -600,6 +653,12 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyBufferView(VkDevice, VkBufferVie
+ // ---------------------------------------------------------------------------------------------
+ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice, const VkImageCreateInfo* ci,
+                                                          const VkAllocationCallbacks*, VkImage* out) {
++  // VK_EXT_separate_stencil_usage: one Metal texture holds both aspects, so it gets both usages.
++  VkImageCreateInfo merged = *ci;
++  if (const auto* su = static_cast<const VkImageStencilUsageCreateInfo*>(
++          findNext(ci->pNext, VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO)))
++    merged.usage |= su->stencilUsage;
++  ci = &merged;
+   vpgpu::TextureDesc desc = imageDesc(*ci);
+   uint8_t forcedFrom = 0;
+   if (desc.samples > 1 && forceSingleSample()) {
+@@ -957,6 +1016,13 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass2(VkDevice, const V
+       sp.hasDepth = true;
+     }
+     sp.viewMask = sd.viewMask;
++    if (const auto* dr = static_cast<const VkSubpassDescriptionDepthStencilResolve*>(
++            findNext(sd.pNext, VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE));
++        dr && dr->pDepthStencilResolveAttachment) {
++      sp.depthResolve = dr->pDepthStencilResolveAttachment->attachment;
++      sp.depthResolveMode = dr->depthResolveMode;
++      sp.stencilResolveMode = dr->stencilResolveMode;
++    }
+     rp->subpasses.push_back(std::move(sp));
+   }
+   if (const auto* fdm = static_cast<const VkRenderPassFragmentDensityMapCreateInfoEXT*>(
+diff --git a/gpu/vulkan/src/physical_device.cpp b/gpu/vulkan/src/physical_device.cpp
+index 1fb4aa4..cd5edb1 100644
+--- a/gpu/vulkan/src/physical_device.cpp
++++ b/gpu/vulkan/src/physical_device.cpp
+@@ -11,7 +11,7 @@ namespace {
+ 
+ VkPhysicalDeviceProperties makeProps() {
+   VkPhysicalDeviceProperties p{};
+-  p.apiVersion = VK_API_VERSION_1_1;
++  p.apiVersion = VK_API_VERSION_1_3;  // see fillFeatures2 for what each 1.x feature really does
+   p.driverVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
+   p.vendorID = 0x5143;      // Qualcomm: engines key their mobile paths off it
+   p.deviceID = 0x43051401;  // Adreno 740 (the id Quest 3 titles check)
+@@ -35,7 +35,9 @@ VkPhysicalDeviceProperties makeProps() {
+   l.bufferImageGranularity = 1;  // unified memory, no linear/optimal aliasing hazard
+   l.sparseAddressSpaceSize = 0;
+   l.maxBoundDescriptorSets = 4;
+-  l.maxPerStageDescriptorSamplers = 16;
++  // Argument tables, not Metal's 16 sampler slots: Source 2 sets hold up to 17 samplers and 32
++  // combined image samplers (Alyx's recorded layouts).
++  l.maxPerStageDescriptorSamplers = 64;
+   l.maxPerStageDescriptorUniformBuffers = 15;
+   l.maxPerStageDescriptorStorageBuffers = 24;
+   l.maxPerStageDescriptorSampledImages = 128;
+@@ -244,15 +246,386 @@ std::vector<VkExtensionProperties> instanceExtensions() {
+ 
+ // VK_EXT_fragment_density_map(_2) is NOT advertised: the game's own (Quest) foveation stays off and
+ // foveation is VPEngine's, driven by vpvk/config.h (see docs/VULKAN.md, "Foveado y VPKTAA").
++// Everything listed is implemented; extensions promoted to 1.1-1.3 are listed too because engines
++// still look for the names (Source 2 enables the KHR forms on a 1.3 device).
+ std::vector<VkExtensionProperties> deviceExtensions() {
+   return {{VK_KHR_MULTIVIEW_EXTENSION_NAME, 1},
+           {VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME, 1},
+           {VK_KHR_MAINTENANCE1_EXTENSION_NAME, 2},
++          {VK_KHR_MAINTENANCE_2_EXTENSION_NAME, 1},
++          {VK_KHR_MAINTENANCE_3_EXTENSION_NAME, 1},
+           {VK_KHR_BIND_MEMORY_2_EXTENSION_NAME, 1},
+           {VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, 1},
+           {VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME, 3},
+           {VK_KHR_DESCRIPTOR_UPDATE_TEMPLATE_EXTENSION_NAME, 1},
++          {VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME, 1},
++          {VK_EXT_SEPARATE_STENCIL_USAGE_EXTENSION_NAME, 1},
++          // Swapchains are the host layer's (Klepton synthesizes them on top of this driver's
++          // images); the extension only adds a create flag whose images are MUTABLE_FORMAT images
++          // with a format list, which vkCreateImage handles.
++          {VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME, 1},
++          {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, 1},
++          {VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, 1},
++          {VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME, 1},
++          {VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME, 1},
++          {VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, 1},
++          {VK_KHR_SHADER_TERMINATE_INVOCATION_EXTENSION_NAME, 1},
++          {VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME, 1},
++          {VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME, 1},
++          {VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME, 1},
++          {VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME, 3},
+           {VK_EXT_METAL_OBJECTS_EXTENSION_NAME, 2}};
+ }
+ 
++namespace {
++VkBool32 b(bool v) { return v ? VK_TRUE : VK_FALSE; }
++}  // namespace
++
++void fillExtensionProperties(VkBaseOutStructure*);
++
++// What the driver really does, per Vulkan 1.1/1.2/1.3 feature (VK_FALSE = not implemented; a 1.3
++// device is expected to have some of these, which is noted where they are missing).
++void fillFeatures11(VkPhysicalDeviceVulkan11Features& f) {
++  f.storageBuffer16BitAccess = f.uniformAndStorageBuffer16BitAccess = f.storagePushConstant16 = VK_FALSE;
++  f.storageInputOutput16 = VK_FALSE;
++  f.multiview = VK_TRUE;
++  f.multiviewGeometryShader = f.multiviewTessellationShader = VK_FALSE;
++  f.variablePointersStorageBuffer = f.variablePointers = VK_FALSE;
++  f.protectedMemory = VK_FALSE;
++  f.samplerYcbcrConversion = VK_FALSE;
++  f.shaderDrawParameters = VK_FALSE;  // BaseVertex/BaseInstance/DrawIndex builtins: not lowered
++}
++
++void fillFeatures12(VkPhysicalDeviceVulkan12Features& f) {
++  void* next = f.pNext;
++  const VkStructureType t = f.sType;
++  f = {};
++  f.sType = t, f.pNext = next;
++  f.samplerMirrorClampToEdge = VK_TRUE;
++  f.descriptorIndexing = VK_FALSE;  // dynamically indexed descriptor arrays: not lowered yet
++  f.scalarBlockLayout = VK_TRUE;    // the translator honours every explicit Offset/ArrayStride
++  f.imagelessFramebuffer = VK_TRUE;
++  f.uniformBufferStandardLayout = VK_TRUE;
++  f.separateDepthStencilLayouts = VK_TRUE;  // layouts are not tracked at all
++  f.hostQueryReset = VK_TRUE;
++  f.timelineSemaphore = VK_TRUE;
++  f.shaderOutputLayer = VK_FALSE;
++  f.subgroupBroadcastDynamicId = VK_TRUE;
++}
++
++void fillFeatures13(VkPhysicalDeviceVulkan13Features& f) {
++  void* next = f.pNext;
++  const VkStructureType t = f.sType;
++  f = {};
++  f.sType = t, f.pNext = next;
++  f.pipelineCreationCacheControl = VK_TRUE;
++  f.privateData = VK_TRUE;
++  f.shaderDemoteToHelperInvocation = VK_TRUE;
++  f.shaderTerminateInvocation = VK_TRUE;
++  f.subgroupSizeControl = VK_TRUE;  // one size: 32
++  f.computeFullSubgroups = VK_TRUE;
++  f.synchronization2 = VK_TRUE;
++  f.dynamicRendering = VK_TRUE;
++  f.maintenance4 = VK_TRUE;
++  // Not implemented: robustImageAccess, inlineUniformBlock, textureCompressionASTC_HDR,
++  // shaderZeroInitializeWorkgroupMemory, shaderIntegerDotProduct.
++}
++
++void fillProperties11(VkPhysicalDeviceVulkan11Properties& p) {
++  const VkPhysicalDeviceProperties& d = deviceProperties();
++  std::memcpy(p.deviceUUID, d.pipelineCacheUUID, VK_UUID_SIZE);
++  std::memcpy(p.driverUUID, d.pipelineCacheUUID, VK_UUID_SIZE);
++  static const uint8_t luid[VK_LUID_SIZE] = {'V', 'P', 'V', 'K', 0, 0, 0, 1};
++  std::memcpy(p.deviceLUID, luid, VK_LUID_SIZE);
++  p.deviceNodeMask = 1;
++  p.deviceLUIDValid = VK_TRUE;
++  p.subgroupSize = 32;  // Apple SIMD-group width
++  p.subgroupSupportedStages = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
++  p.subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT;
++  p.subgroupQuadOperationsInAllStages = VK_FALSE;
++  p.pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES;
++  p.maxMultiviewViewCount = 2;  // Metal vertex amplification: 2 on Apple GPUs
++  p.maxMultiviewInstanceIndex = (1u << 27) - 1;
++  p.protectedNoFault = VK_FALSE;
++  p.maxPerSetDescriptors = 1024;
++  p.maxMemoryAllocationSize = 1ull << 32;
++}
++
++void fillProperties12(VkPhysicalDeviceVulkan12Properties& p) {
++  p.driverID = VK_DRIVER_ID_QUALCOMM_PROPRIETARY;  // matches the Adreno identity of the device
++  std::strncpy(p.driverName, "VPVulkan", VK_MAX_DRIVER_NAME_SIZE - 1);
++  std::strncpy(p.driverInfo, "VPEngine Vulkan on Metal", VK_MAX_DRIVER_INFO_SIZE - 1);
++  p.conformanceVersion = {1, 3, 0, 0};
++  p.denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
++  p.roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
++  p.shaderSignedZeroInfNanPreserveFloat32 = VK_FALSE;  // fast math
++  p.shaderRoundingModeRTEFloat32 = VK_TRUE;
++  p.shaderRoundingModeRTEFloat16 = VK_TRUE;
++  const VkPhysicalDeviceLimits& l = deviceProperties().limits;
++  p.maxUpdateAfterBindDescriptorsInAllPools = 0;
++  p.maxPerStageDescriptorUpdateAfterBindSamplers = l.maxPerStageDescriptorSamplers;
++  p.maxPerStageDescriptorUpdateAfterBindUniformBuffers = l.maxPerStageDescriptorUniformBuffers;
++  p.maxPerStageDescriptorUpdateAfterBindStorageBuffers = l.maxPerStageDescriptorStorageBuffers;
++  p.maxPerStageDescriptorUpdateAfterBindSampledImages = l.maxPerStageDescriptorSampledImages;
++  p.maxPerStageDescriptorUpdateAfterBindStorageImages = l.maxPerStageDescriptorStorageImages;
++  p.maxPerStageDescriptorUpdateAfterBindInputAttachments = l.maxPerStageDescriptorInputAttachments;
++  p.maxPerStageUpdateAfterBindResources = l.maxPerStageResources;
++  p.maxDescriptorSetUpdateAfterBindSamplers = l.maxDescriptorSetSamplers;
++  p.maxDescriptorSetUpdateAfterBindUniformBuffers = l.maxDescriptorSetUniformBuffers;
++  p.maxDescriptorSetUpdateAfterBindUniformBuffersDynamic = l.maxDescriptorSetUniformBuffersDynamic;
++  p.maxDescriptorSetUpdateAfterBindStorageBuffers = l.maxDescriptorSetStorageBuffers;
++  p.maxDescriptorSetUpdateAfterBindStorageBuffersDynamic = l.maxDescriptorSetStorageBuffersDynamic;
++  p.maxDescriptorSetUpdateAfterBindSampledImages = l.maxDescriptorSetSampledImages;
++  p.maxDescriptorSetUpdateAfterBindStorageImages = l.maxDescriptorSetStorageImages;
++  p.maxDescriptorSetUpdateAfterBindInputAttachments = l.maxDescriptorSetInputAttachments;
++  // Metal resolves depth with sample 0, min or max, and stencil with sample 0.
++  p.supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT | VK_RESOLVE_MODE_MIN_BIT | VK_RESOLVE_MODE_MAX_BIT;
++  p.supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
++  p.independentResolveNone = VK_TRUE;
++  p.independentResolve = VK_TRUE;
++  p.maxTimelineSemaphoreValueDifference = ~0ull >> 1;
++  p.framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
++}
++
++void fillProperties13(VkPhysicalDeviceVulkan13Properties& p) {
++  p.minSubgroupSize = p.maxSubgroupSize = 32;
++  p.maxComputeWorkgroupSubgroups = 32;
++  p.requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT;
++  p.storageTexelBufferOffsetAlignmentBytes = 64;
++  p.uniformTexelBufferOffsetAlignmentBytes = 64;
++  p.storageTexelBufferOffsetSingleTexelAlignment = VK_FALSE;
++  p.uniformTexelBufferOffsetSingleTexelAlignment = VK_FALSE;
++  p.maxBufferSize = 1ull << 32;
++}
++
++// Fills every feature structure of a vkGetPhysicalDeviceFeatures2 chain this driver knows.
++void fillFeatures2(void* chain) {
++  VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
++  VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
++  VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++  fillFeatures11(f11), fillFeatures12(f12), fillFeatures13(f13);
++  for (auto* s = static_cast<VkBaseOutStructure*>(chain); s; s = s->pNext) {
++    switch (s->sType) {
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES: {
++        auto* x = reinterpret_cast<VkPhysicalDeviceVulkan11Features*>(s);
++        void* n = x->pNext;
++        *x = f11, x->pNext = n;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: {
++        auto* x = reinterpret_cast<VkPhysicalDeviceVulkan12Features*>(s);
++        void* n = x->pNext;
++        *x = f12, x->pNext = n;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: {
++        auto* x = reinterpret_cast<VkPhysicalDeviceVulkan13Features*>(s);
++        void* n = x->pNext;
++        *x = f13, x->pNext = n;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES: {
++        auto* m = reinterpret_cast<VkPhysicalDeviceMultiviewFeatures*>(s);
++        m->multiview = f11.multiview, m->multiviewGeometryShader = m->multiviewTessellationShader = VK_FALSE;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES: {
++        auto* x = reinterpret_cast<VkPhysicalDevice16BitStorageFeatures*>(s);
++        x->storageBuffer16BitAccess = f11.storageBuffer16BitAccess;
++        x->uniformAndStorageBuffer16BitAccess = f11.uniformAndStorageBuffer16BitAccess;
++        x->storagePushConstant16 = f11.storagePushConstant16;
++        x->storageInputOutput16 = f11.storageInputOutput16;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES: {
++        auto* x = reinterpret_cast<VkPhysicalDeviceShaderFloat16Int8Features*>(s);
++        x->shaderFloat16 = f12.shaderFloat16, x->shaderInt8 = f12.shaderInt8;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_FEATURES_EXT: {
++        auto* d = reinterpret_cast<VkPhysicalDeviceFragmentDensityMapFeaturesEXT*>(s);
++        d->fragmentDensityMap = VK_FALSE;  // not advertised: foveation is VPEngine's (vpvk/config.h)
++        d->fragmentDensityMapDynamic = VK_FALSE;
++        d->fragmentDensityMapNonSubsampledImages = VK_FALSE;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
++        reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreFeatures*>(s)->timelineSemaphore = f12.timelineSemaphore;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES:
++        reinterpret_cast<VkPhysicalDeviceSynchronization2Features*>(s)->synchronization2 = f13.synchronization2;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES:
++        reinterpret_cast<VkPhysicalDeviceDynamicRenderingFeatures*>(s)->dynamicRendering = f13.dynamicRendering;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES:
++        reinterpret_cast<VkPhysicalDeviceMaintenance4Features*>(s)->maintenance4 = f13.maintenance4;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES:
++        reinterpret_cast<VkPhysicalDeviceImagelessFramebufferFeatures*>(s)->imagelessFramebuffer = f12.imagelessFramebuffer;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES:
++        reinterpret_cast<VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures*>(s)->separateDepthStencilLayouts =
++            f12.separateDepthStencilLayouts;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES:
++        reinterpret_cast<VkPhysicalDeviceUniformBufferStandardLayoutFeatures*>(s)->uniformBufferStandardLayout =
++            f12.uniformBufferStandardLayout;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES:
++        reinterpret_cast<VkPhysicalDeviceScalarBlockLayoutFeatures*>(s)->scalarBlockLayout = f12.scalarBlockLayout;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES:
++        reinterpret_cast<VkPhysicalDeviceHostQueryResetFeatures*>(s)->hostQueryReset = f12.hostQueryReset;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES:
++        reinterpret_cast<VkPhysicalDeviceShaderTerminateInvocationFeatures*>(s)->shaderTerminateInvocation =
++            f13.shaderTerminateInvocation;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES:
++        reinterpret_cast<VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures*>(s)->shaderDemoteToHelperInvocation =
++            f13.shaderDemoteToHelperInvocation;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES:
++        reinterpret_cast<VkPhysicalDevicePipelineCreationCacheControlFeatures*>(s)->pipelineCreationCacheControl =
++            f13.pipelineCreationCacheControl;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES:
++        reinterpret_cast<VkPhysicalDevicePrivateDataFeatures*>(s)->privateData = f13.privateData;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES: {
++        auto* x = reinterpret_cast<VkPhysicalDeviceSubgroupSizeControlFeatures*>(s);
++        x->subgroupSizeControl = f13.subgroupSizeControl, x->computeFullSubgroups = f13.computeFullSubgroups;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR:
++        reinterpret_cast<VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR*>(s)->dynamicRenderingLocalRead =
++            b(hasDeviceExtension(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME));
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT:
++        reinterpret_cast<VkPhysicalDeviceHostImageCopyFeaturesEXT*>(s)->hostImageCopy =
++            b(hasDeviceExtension(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME));
++        break;
++      default: break;
++    }
++  }
++}
++
++// Fills every property structure of a vkGetPhysicalDeviceProperties2 chain this driver knows.
++void fillProperties2(void* chain) {
++  VkPhysicalDeviceVulkan11Properties p11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
++  VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
++  VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
++  fillProperties11(p11), fillProperties12(p12), fillProperties13(p13);
++  for (auto* s = static_cast<VkBaseOutStructure*>(chain); s; s = s->pNext) {
++    switch (s->sType) {
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES: {
++        auto* x = reinterpret_cast<VkPhysicalDeviceVulkan11Properties*>(s);
++        void* n = x->pNext;
++        *x = p11, x->pNext = n;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES: {
++        auto* x = reinterpret_cast<VkPhysicalDeviceVulkan12Properties*>(s);
++        void* n = x->pNext;
++        *x = p12, x->pNext = n;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES: {
++        auto* x = reinterpret_cast<VkPhysicalDeviceVulkan13Properties*>(s);
++        void* n = x->pNext;
++        *x = p13, x->pNext = n;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PROPERTIES: {
++        auto* m = reinterpret_cast<VkPhysicalDeviceMultiviewProperties*>(s);
++        m->maxMultiviewViewCount = p11.maxMultiviewViewCount;
++        m->maxMultiviewInstanceIndex = p11.maxMultiviewInstanceIndex;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_DENSITY_MAP_PROPERTIES_EXT: {
++        auto* f = reinterpret_cast<VkPhysicalDeviceFragmentDensityMapPropertiesEXT*>(s);
++        f->minFragmentDensityTexelSize = {32, 32};
++        f->maxFragmentDensityTexelSize = {32, 32};
++        f->fragmentDensityInvocations = VK_FALSE;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES: {
++        auto* id = reinterpret_cast<VkPhysicalDeviceIDProperties*>(s);
++        std::memcpy(id->deviceUUID, p11.deviceUUID, VK_UUID_SIZE);
++        std::memcpy(id->driverUUID, p11.driverUUID, VK_UUID_SIZE);
++        std::memcpy(id->deviceLUID, p11.deviceLUID, VK_LUID_SIZE);
++        id->deviceNodeMask = p11.deviceNodeMask;
++        id->deviceLUIDValid = p11.deviceLUIDValid;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES: {
++        auto* m = reinterpret_cast<VkPhysicalDeviceMaintenance3Properties*>(s);
++        m->maxPerSetDescriptors = p11.maxPerSetDescriptors;
++        m->maxMemoryAllocationSize = p11.maxMemoryAllocationSize;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES:
++        reinterpret_cast<VkPhysicalDeviceMaintenance4Properties*>(s)->maxBufferSize = p13.maxBufferSize;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES: {
++        auto* sg = reinterpret_cast<VkPhysicalDeviceSubgroupProperties*>(s);
++        sg->subgroupSize = p11.subgroupSize;
++        sg->supportedStages = p11.subgroupSupportedStages;
++        sg->supportedOperations = p11.subgroupSupportedOperations;
++        sg->quadOperationsInAllStages = p11.subgroupQuadOperationsInAllStages;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_POINT_CLIPPING_PROPERTIES:
++        reinterpret_cast<VkPhysicalDevicePointClippingProperties*>(s)->pointClippingBehavior = p11.pointClippingBehavior;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES: {
++        auto* x = reinterpret_cast<VkPhysicalDeviceDriverProperties*>(s);
++        x->driverID = p12.driverID;
++        std::memcpy(x->driverName, p12.driverName, sizeof x->driverName);
++        std::memcpy(x->driverInfo, p12.driverInfo, sizeof x->driverInfo);
++        x->conformanceVersion = p12.conformanceVersion;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES: {
++        auto* x = reinterpret_cast<VkPhysicalDeviceDepthStencilResolveProperties*>(s);
++        x->supportedDepthResolveModes = p12.supportedDepthResolveModes;
++        x->supportedStencilResolveModes = p12.supportedStencilResolveModes;
++        x->independentResolveNone = p12.independentResolveNone;
++        x->independentResolve = p12.independentResolve;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_PROPERTIES:
++        reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreProperties*>(s)->maxTimelineSemaphoreValueDifference =
++            p12.maxTimelineSemaphoreValueDifference;
++        break;
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES: {
++        auto* x = reinterpret_cast<VkPhysicalDeviceSubgroupSizeControlProperties*>(s);
++        x->minSubgroupSize = p13.minSubgroupSize, x->maxSubgroupSize = p13.maxSubgroupSize;
++        x->maxComputeWorkgroupSubgroups = p13.maxComputeWorkgroupSubgroups;
++        x->requiredSubgroupSizeStages = p13.requiredSubgroupSizeStages;
++        break;
++      }
++      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES: {
++        auto* x = reinterpret_cast<VkPhysicalDeviceFloatControlsProperties*>(s);
++        x->denormBehaviorIndependence = p12.denormBehaviorIndependence;
++        x->roundingModeIndependence = p12.roundingModeIndependence;
++        x->shaderRoundingModeRTEFloat32 = p12.shaderRoundingModeRTEFloat32;
++        x->shaderRoundingModeRTEFloat16 = p12.shaderRoundingModeRTEFloat16;
++        break;
++      }
++      default: fillExtensionProperties(s); break;
++    }
++  }
++}
++
++// Property structures of extensions outside core 1.3.
++void fillExtensionProperties(VkBaseOutStructure*) {}
++
++bool hasDeviceExtension(const char* name) {
++  for (const VkExtensionProperties& e : deviceExtensions())
++    if (!std::strcmp(e.extensionName, name)) return true;
++  return false;
++}
++
+ }  // namespace vpvk
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index dbe49a8..832a9ba 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -1308,8 +1308,17 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
+   };
+   for (uint32_t i = 0; i < ri->colorAttachmentCount && i < vpgpu::kMaxColorAttachments; ++i)
+     fill(ri->pColorAttachments[i], d.colors[i], false);
+-  if (ri->pDepthAttachment) fill(*ri->pDepthAttachment, d.depth, true);
+-  else if (ri->pStencilAttachment) fill(*ri->pStencilAttachment, d.depth, true);
++  // One Metal depth/stencil attachment for both aspects (same view: Vulkan requires it when both
++  // are given). A resolve on either aspect resolves the attachment.
++  if (ri->pDepthAttachment && ri->pDepthAttachment->imageView) {
++    VkRenderingAttachmentInfo a = *ri->pDepthAttachment;
++    if (a.resolveMode == VK_RESOLVE_MODE_NONE && ri->pStencilAttachment && ri->pStencilAttachment->resolveMode)
++      a.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT, a.resolveImageView = ri->pStencilAttachment->resolveImageView;
++    fill(a, d.depth, true);
++    d.depth.depthResolve = depthResolveOf(ri->pDepthAttachment->resolveMode);
++  } else if (ri->pStencilAttachment) {
++    fill(*ri->pStencilAttachment, d.depth, true);
++  }
+   d.layerCount = ri->viewMask ? uint16_t(std::popcount(ri->viewMask)) : uint16_t(std::max<uint32_t>(1, ri->layerCount));
+   d.label = "vk.rendering";
+   for (const auto& [src, dst] : forcedPairs) op.resolveCopies.push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(d.layerCount, 1)));
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index 049bcb0..1766703 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -113,6 +113,9 @@ struct RenderPassObj {
+     std::vector<VkAttachmentReference2> colors, resolves, inputs;
+     VkAttachmentReference2 depth{};
+     bool hasDepth = false;
++    // VK_KHR_depth_stencil_resolve: the single-sample target of the depth/stencil attachment.
++    uint32_t depthResolve = VK_ATTACHMENT_UNUSED;
++    VkResolveModeFlagBits depthResolveMode = VK_RESOLVE_MODE_NONE, stencilResolveMode = VK_RESOLVE_MODE_NONE;
+     uint32_t viewMask = 0;
+   };
+   std::vector<Subpass> subpasses;
+@@ -258,6 +261,13 @@ struct Device : Dispatchable {
+   uint64_t submits = 0;
+ };
+ 
++// VkResolveModeFlagBits of a depth resolve -> the core's filter (min/max; anything else sample 0).
++inline vpgpu::Attachment::DepthResolve depthResolveOf(VkResolveModeFlagBits m) {
++  return m == VK_RESOLVE_MODE_MIN_BIT   ? vpgpu::Attachment::DepthResolve::Min
++         : m == VK_RESOLVE_MODE_MAX_BIT ? vpgpu::Attachment::DepthResolve::Max
++                                        : vpgpu::Attachment::DepthResolve::Sample0;
++}
++
+ // Physical device model (physical_device.cpp).
+ const VkPhysicalDeviceProperties& deviceProperties();
+ const VkPhysicalDeviceMemoryProperties& memoryProperties();
+@@ -266,6 +276,12 @@ VkFormatFeatureFlags formatFeatures(VkFormat, bool buffer);
+ vpgpu::Format toCoreFormat(VkFormat);
+ std::vector<VkExtensionProperties> instanceExtensions();
+ std::vector<VkExtensionProperties> deviceExtensions();
++bool hasDeviceExtension(const char* name);
++// vkGetPhysicalDeviceFeatures2 / Properties2 pNext chains (core 1.1-1.3 structures, their
++// extension forms, and the extensions the driver advertises).
++void fillFeatures2(void* chain);
++void haveFeatures(VkPhysicalDeviceFeatures*);  // entry.cpp: vkGetPhysicalDeviceFeatures
++void fillProperties2(void* chain);
+ 
+ // Entry points (entry.cpp): null for names the driver does not implement (logged once).
+ PFN_vkVoidFunction lookup(const char* name, bool deviceLevel);
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index f9c2068..462235d 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -825,6 +825,203 @@ void testRecipes() {
+   std::filesystem::remove_all(dir, ec);
+ }
+ 
++// ---- Source 2 (Half-Life: Alyx) surface ----------------------------------------------------------
++// The device Alyx creates (its own capture on Apple silicon: extensions, features, Vulkan 1.1-1.3
++// feature structs) must be accepted, and what it reads back must be the 1.3 the driver implements.
++const char* const kAlyxExts[] = {
++    "VK_KHR_descriptor_update_template", "VK_KHR_image_format_list", "VK_KHR_maintenance1", "VK_KHR_maintenance2",
++    "VK_EXT_separate_stencil_usage", "VK_KHR_swapchain_mutable_format", "VK_KHR_dynamic_rendering",
++    "VK_KHR_dynamic_rendering_local_read", "VK_KHR_depth_stencil_resolve", "VK_KHR_create_renderpass2",
++    "VK_EXT_host_image_copy", "VK_KHR_multiview"};
++
++// Extensions of the capture not implemented yet (emptied as they land).
++const std::vector<std::string> kAlyxPending = {"VK_KHR_dynamic_rendering_local_read", "VK_EXT_host_image_copy"};
++bool pending(const char* e) {
++  for (const auto& p : kAlyxPending)
++    if (p == e) return true;
++  return false;
++}
++
++VkDevice alyxDevice(VkPhysicalDevice pd, uint32_t nExt) {
++  VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
++  f2.features.tessellationShader = VK_TRUE;  // enabled by Alyx, not supported: logged, not refused
++  f2.features.shaderInt64 = VK_TRUE;
++  VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
++  f11.multiview = VK_TRUE;
++  VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
++  f12.timelineSemaphore = VK_TRUE;
++  VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
++  f13.dynamicRendering = f13.synchronization2 = VK_TRUE;
++  f2.pNext = &f11, f11.pNext = &f12, f12.pNext = &f13;
++  float prio = 1;
++  VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++  q.queueCount = 1;
++  q.pQueuePriorities = &prio;
++  VkDeviceCreateInfo d{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f2};
++  d.queueCreateInfoCount = 1;
++  d.pQueueCreateInfos = &q;
++  std::vector<const char*> exts;
++  for (uint32_t i = 0; i < nExt; ++i)
++    if (!pending(kAlyxExts[i])) exts.push_back(kAlyxExts[i]);
++  d.enabledExtensionCount = uint32_t(exts.size());
++  d.ppEnabledExtensionNames = exts.data();
++  VkDevice dev = nullptr;
++  return vkCreateDevice(pd, &d, nullptr, &dev) == VK_SUCCESS ? dev : nullptr;
++}
++
++void testAlyxSurface() {
++  Ctx c;
++  uint32_t v = 0;
++  vkEnumerateInstanceVersion(&v);
++  CHECK(v >= VK_API_VERSION_1_3);
++  VkPhysicalDeviceProperties p;
++  vkGetPhysicalDeviceProperties(c.pd, &p);
++  CHECK(VK_API_VERSION_MINOR(p.apiVersion) == 3);
++  CHECK(p.limits.maxPerStageDescriptorSamplers >= 17);  // Alyx's largest set
++  VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
++  VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f11};
++  VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &f12};
++  VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, &f13};
++  VkPhysicalDeviceHostImageCopyFeaturesEXT hic{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT, &lr};
++  VkPhysicalDeviceFeatures2 f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &hic};
++  vkGetPhysicalDeviceFeatures2(c.pd, &f);
++  CHECK(f11.multiview && f13.dynamicRendering && f12.timelineSemaphore && f13.synchronization2);
++  CHECK(f13.pNext == &f12 && f12.pNext == &f11);  // chain left intact
++  VkPhysicalDeviceDepthStencilResolveProperties dsr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
++  VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES, &dsr};
++  VkPhysicalDeviceVulkan11Properties p11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, &p12};
++  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p11};
++  vkGetPhysicalDeviceProperties2(c.pd, &p2);
++  CHECK(p11.maxMultiviewViewCount == 2 && p11.subgroupSize == 32);
++  CHECK(dsr.supportedDepthResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT);
++  CHECK(p12.supportedDepthResolveModes == dsr.supportedDepthResolveModes && std::strlen(p12.driverName) > 0);
++  // Every extension of the capture is advertised; the swapchain itself stays the host layer's.
++  uint32_t n = 0;
++  vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &n, nullptr);
++  std::vector<VkExtensionProperties> e(n);
++  vkEnumerateDeviceExtensionProperties(c.pd, nullptr, &n, e.data());
++  for (const char* want : kAlyxExts) {
++    if (pending(want)) continue;
++    bool found = false;
++    for (const auto& x : e) found |= !std::strcmp(x.extensionName, want);
++    if (!found) std::printf("  not advertised: %s\n", want);
++    CHECK(found);
++  }
++  VkDevice dev = alyxDevice(c.pd, sizeof kAlyxExts / sizeof *kAlyxExts);
++  CHECK(dev != nullptr);
++  if (dev) vkDestroyDevice(dev, nullptr);
++  // Format list + mutable format: views in the listed format; stencil usage merged in.
++  VkFormat list[2] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB};
++  VkImageFormatListCreateInfo fl{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
++  fl.viewFormatCount = 2, fl.pViewFormats = list;
++  VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &fl};
++  ii.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
++  ii.imageType = VK_IMAGE_TYPE_2D, ii.format = VK_FORMAT_R8G8B8A8_UNORM, ii.extent = {64, 64, 1};
++  ii.mipLevels = ii.arrayLayers = 1, ii.samples = VK_SAMPLE_COUNT_1_BIT;
++  ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++  VkImage im;
++  CHECK(vkCreateImage(c.dev, &ii, nullptr, &im) == VK_SUCCESS && from<Image>(im)->desc.mutableFormat);
++  vkDestroyImage(c.dev, im, nullptr);
++  VkImageStencilUsageCreateInfo su{VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO};
++  su.stencilUsage = VK_IMAGE_USAGE_SAMPLED_BIT;
++  ii.pNext = &su, ii.flags = 0, ii.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
++  ii.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
++  CHECK(vkCreateImage(c.dev, &ii, nullptr, &im) == VK_SUCCESS);
++  CHECK(from<Image>(im)->desc.usage & vpgpu::usage::sampled);
++  vkDestroyImage(c.dev, im, nullptr);
++  VkFormatProperties3 fp3{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
++  VkFormatProperties2 fp2{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &fp3};
++  vkGetPhysicalDeviceFormatProperties2(c.pd, VK_FORMAT_D32_SFLOAT_S8_UINT, &fp2);
++  CHECK(fp3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT);
++}
++
++// Depth/stencil resolve: render pass 2 (VkSubpassDescriptionDepthStencilResolve) and dynamic
++// rendering both resolve the 4x depth attachment into the 1x target with the requested filter.
++void testDepthResolve() {
++  Ctx c;
++  VkDeviceMemory m = alloc(c, 32 << 20, 0);
++  auto make = [&](VkFormat f, VkSampleCountFlagBits s, VkImageUsageFlags u) {
++    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
++    ii.imageType = VK_IMAGE_TYPE_2D, ii.format = f, ii.extent = {128, 128, 1};
++    ii.mipLevels = ii.arrayLayers = 1, ii.samples = s, ii.usage = u;
++    VkImage i;
++    vkCreateImage(c.dev, &ii, nullptr, &i);
++    vkBindImageMemory(c.dev, i, m, 0);
++    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++    vi.image = i, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = f;
++    vi.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
++    VkImageView v;
++    vkCreateImageView(c.dev, &vi, nullptr, &v);
++    return std::make_pair(i, v);
++  };
++  auto [ms, msv] = make(VK_FORMAT_D32_SFLOAT, VK_SAMPLE_COUNT_4_BIT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
++  auto [ss, ssv] = make(VK_FORMAT_D32_SFLOAT, VK_SAMPLE_COUNT_1_BIT,
++                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
++  VkAttachmentDescription2 att[2]{{VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2}, {VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2}};
++  att[0].format = att[1].format = VK_FORMAT_D32_SFLOAT;
++  att[0].samples = VK_SAMPLE_COUNT_4_BIT, att[1].samples = VK_SAMPLE_COUNT_1_BIT;
++  att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, att[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++  att[1].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, att[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++  VkAttachmentReference2 dref{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2}, rref{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2};
++  dref.attachment = 0, rref.attachment = 1;
++  VkSubpassDescriptionDepthStencilResolve dr{VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE};
++  dr.depthResolveMode = VK_RESOLVE_MODE_MAX_BIT;
++  dr.pDepthStencilResolveAttachment = &rref;
++  VkSubpassDescription2 sp{VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2, &dr};
++  sp.pDepthStencilAttachment = &dref;
++  VkRenderPassCreateInfo2 rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2};
++  rpi.attachmentCount = 2, rpi.pAttachments = att, rpi.subpassCount = 1, rpi.pSubpasses = &sp;
++  VkRenderPass rp;
++  vkCreateRenderPass2(c.dev, &rpi, nullptr, &rp);
++  VkImageView fbv[2] = {msv, ssv};
++  VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
++  fi.renderPass = rp, fi.attachmentCount = 2, fi.pAttachments = fbv, fi.width = fi.height = 128, fi.layers = 1;
++  VkFramebuffer fb;
++  vkCreateFramebuffer(c.dev, &fi, nullptr, &fb);
++  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++  VkCommandPool pool;
++  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
++  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++  ai.commandPool = pool, ai.commandBufferCount = 1;
++  VkCommandBuffer cb;
++  vkAllocateCommandBuffers(c.dev, &ai, &cb);
++  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++  vkBeginCommandBuffer(cb, &bi);
++  VkClearValue cv{};
++  VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
++  rb.renderPass = rp, rb.framebuffer = fb, rb.renderArea = {{0, 0}, {128, 128}}, rb.clearValueCount = 1, rb.pClearValues = &cv;
++  vkCmdBeginRenderPass(cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
++  vkCmdEndRenderPass(cb);
++  // Same through dynamic rendering, MIN filter.
++  VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++  da.imageView = msv, da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++  da.resolveMode = VK_RESOLVE_MODE_MIN_BIT, da.resolveImageView = ssv;
++  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
++  ri.renderArea = {{0, 0}, {128, 128}}, ri.layerCount = 1, ri.pDepthAttachment = &da;
++  vkCmdBeginRendering(cb, &ri);
++  vkCmdEndRendering(cb);
++  vkEndCommandBuffer(cb);
++  vpgpu::Frame frame;
++  TranslateStats st;
++  translate(*from<CommandBuffer>(cb)->rec, frame, st);
++  CHECK(frame.commands().size() == 2 && st.dropped == 0);
++  if (frame.commands().size() == 2) {
++    const auto& a = std::get<vpgpu::RenderPass>(frame.commands()[0]).desc.depth;
++    CHECK(a.resolve == from<Image>(ss)->id && a.store == vpgpu::StoreAction::Resolve &&
++          a.depthResolve == vpgpu::Attachment::DepthResolve::Max);
++    const auto& b = std::get<vpgpu::RenderPass>(frame.commands()[1]).desc.depth;
++    CHECK(b.resolve == from<Image>(ss)->id && b.store == vpgpu::StoreAction::Resolve &&
++          b.depthResolve == vpgpu::Attachment::DepthResolve::Min);
++  }
++  vkDestroyCommandPool(c.dev, pool, nullptr);
++  vkDestroyFramebuffer(c.dev, fb, nullptr);
++  vkDestroyRenderPass(c.dev, rp, nullptr);
++  for (VkImageView v : fbv) vkDestroyImageView(c.dev, v, nullptr);
++  vkDestroyImage(c.dev, ms, nullptr);
++  vkDestroyImage(c.dev, ss, nullptr);
++  vkFreeMemory(c.dev, m, nullptr);
++}
++
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+@@ -832,7 +1029,7 @@ int main(int argc, char** argv) {
+   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
+       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
+       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
+-      {"recipes", testRecipes}};
++      {"recipes", testRecipes}, {"alyx", testAlyxSurface}, {"depth_resolve", testDepthResolve}};
+   bool ran = false;
+   for (const auto& [name, fn] : groups) {
+     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
+-- 
+2.43.0
+

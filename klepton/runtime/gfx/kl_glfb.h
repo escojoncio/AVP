@@ -502,6 +502,9 @@ void kl_glfb_eye_rate_zones(int *zones_x, int *zones_y);
 // coordinate conversion from, and how a readback path knows the eye texture is
 // not an ordinary image.
 void *kl_glfb_eye_rate_map(void);
+// The Vulkan path's equivalent of kl_glfb_set_eye_rate_map: publish the map a guest's eye image was
+// rasterized through (kl_gpu_time.m, KL_VRR=1), so the compositor's unwarp grid uses it. No ANGLE.
+void kl_glfb_publish_eye_rate_map(void *rate_map, int zones_x, int zones_y);
 
 // The foveation POLICY — how many zones and how hard the periphery falls off —
 // held here rather than in either builder, because there are two of them

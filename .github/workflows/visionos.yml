@@ -1,9 +1,10 @@
-# VisionQuestPro for Apple Vision Pro: Klepton's runtime + the launcher, VPEngine's Vulkan driver
-# (VPVulkan.framework, the default) and MoltenVK v1.4.2 (selectable in the app), VPEngine's
-# signature code. Unsigned IPA, published as the release "visionos" (VisionQuestPro.ipa).
+# AVP for Apple Vision Pro: Klepton's runtime + the launcher, VPEngine's Vulkan driver
+# (VPVulkan.framework, the default) and MoltenVK v1.4.2 (diagnostic engine), VPEngine's signature
+# code, LuaJIT / SDL3 + sdl2-compat / Fossilize. Unsigned IPA, published as the release "visionos"
+# (AVP.ipa). Nothing from Valve is built in or shipped: the game is downloaded by the app.
 #
 # Only when asked for: by hand (Actions > visionos > Run workflow) or a push whose commit message
-# has [build] in it. Klepton's runtime and MoltenVK are cached while their sources do not change.
+# has [build] in it. Everything whose inputs did not change is cached.
 name: visionos
 on:
   push:
@@ -18,32 +19,38 @@ jobs:
       group: visionos
       cancel-in-progress: true
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-      - name: VPEngine (the signature code and the GPU layer)
+      - name: VPEngine commit (vpengine.ref)
+        id: vpref
+        run: echo "sha=$(tr -d ' \n' < vpengine.ref)" >> "$GITHUB_OUTPUT"
+      - name: VPEngine (the signature code and the GPU layer), pinned
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/VPEngine
+          ref: ${{ steps.vpref.outputs.sha }}
           path: vpengine
           fetch-depth: 1
-          sparse-checkout: |
-            runtime
-            gpu
-          sparse-checkout-cone-mode: true
+      - name: AVP's VPEngine patches
+        run: |
+          git -C vpengine config user.email ci@localhost
+          git -C vpengine config user.name ci
+          bash scripts/apply-vpengine-patches.sh vpengine vpengine-patches
       - name: Xcode
         run: |
           XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
           [ -n "$XCODE" ] && sudo xcode-select -s "$XCODE/Contents/Developer"
           xcodebuild -version && cmake --version | head -1 && xcrun --sdk xros --show-sdk-version
+          command -v ninja || brew install ninja
 
       - uses: actions/cache@v4
         id: vpvk
         with:
           path: build/VPVulkan.framework
-          key: vpvulkan-xros-${{ hashFiles('vpengine/gpu/**', 'scripts/build-vpvulkan.sh') }}
+          key: vpvulkan-xros-${{ hashFiles('vpengine.ref', 'vpengine-patches/**', 'scripts/build-vpvulkan.sh', 'scripts/apply-vpengine-patches.sh') }}
       - name: VPVulkan.framework (VPEngine's Vulkan driver for visionOS)
         if: steps.vpvk.outputs.cache-hit != 'true'
         run: |
@@ -65,10 +72,51 @@ jobs:
           rm -rf vendor-moltenvk/dist vendor-moltenvk/*.tar
 
       - uses: actions/cache@v4
+        id: luajit
+        with:
+          path: |
+            build/deps/lib/libluajit.a
+            build/deps/include/luajit
+          key: luajit-xros-${{ hashFiles('scripts/build-luajit.sh', 'scripts/deps/luajit/**') }}
+      - name: LuaJIT (GC64, interpreter only)
+        if: steps.luajit.outputs.cache-hit != 'true'
+        run: |
+          set -o pipefail
+          bash scripts/build-luajit.sh build/deps 2>&1 | tee luajit.log
+
+      - uses: actions/cache@v4
+        id: sdl
+        with:
+          path: |
+            build/deps/Frameworks/SDL3.framework
+            build/deps/Frameworks/SDL2.framework
+            build/deps/include/SDL3
+            build/deps/include/SDL2
+          key: sdl-xros-${{ hashFiles('scripts/build-sdl.sh', 'scripts/deps/sdl/**', 'scripts/deps/sdl2-compat/**') }}
+      - name: SDL3 + sdl2-compat
+        if: steps.sdl.outputs.cache-hit != 'true'
+        run: |
+          set -o pipefail
+          bash scripts/build-sdl.sh build/deps 2>&1 | tee sdl.log
+
+      - uses: actions/cache@v4
+        id: fossilize
+        with:
+          path: |
+            build/deps/lib/libfossilize.a
+            build/deps/include/fossilize
+          key: fossilize-xros-${{ hashFiles('scripts/build-fossilize.sh', 'scripts/deps/fossilize/**') }}
+      - name: Fossilize
+        if: steps.fossilize.outputs.cache-hit != 'true'
+        run: |
+          set -o pipefail
+          bash scripts/build-fossilize.sh build/deps 2>&1 | tee fossilize.log
+
+      - uses: actions/cache@v4
         id: rt
         with:
           path: klepton/build/xros/libklepton.a
-          key: libklepton-xros-${{ hashFiles('klepton/runtime/**', 'klepton/Makefile') }}-mvk142
+          key: libklepton-xros-${{ hashFiles('klepton/runtime/**', 'klepton/Makefile', 'scripts/build-luajit.sh', 'scripts/build-sdl.sh', 'scripts/build-fossilize.sh', 'scripts/deps/**') }}-mvk142
       - name: Klepton runtime (libklepton.a for visionOS)
         if: steps.rt.outputs.cache-hit != 'true'
         run: |
@@ -76,7 +124,13 @@ jobs:
           cd klepton
           make -j1 build/xros/libklepton.a XROS_PLATFORMS=xros 2>&1 | tee ../runtime.log
 
+      - uses: actions/cache@v4
+        id: certs
+        with:
+          path: build/VPEngineCertificates
+          key: apple-certificates-v1
       - name: Apple's certificates (the chain a signed library carries)
+        if: steps.certs.outputs.cache-hit != 'true'
         run: |
           mkdir -p build/VPEngineCertificates
           for C in AppleWWDRCAG3 AppleWWDRCAG4 AppleWWDRCAG5 AppleWWDRCAG6; do
@@ -89,25 +143,25 @@ jobs:
       - name: The app
         run: |
           set -o pipefail
-          brew install xcodegen || true
+          command -v xcodegen || brew install xcodegen
           xcodegen generate --spec project.yml
-          xcodebuild -project VisionQuestPro.xcodeproj -scheme VisionQuestPro \
+          xcodebuild -project AVP.xcodeproj -scheme AVP \
             -sdk xros -configuration Release -destination 'generic/platform=visionOS' \
             -derivedDataPath build/dd \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build > app.log 2>&1 || true
           grep -E 'error:|BUILD (SUCCEEDED|FAILED)' app.log | head -60 || true
           grep -q 'BUILD SUCCEEDED' app.log
-          APP=$(find build/dd/Build/Products -name 'VisionQuestPro.app' -maxdepth 3 | head -n 1)
+          APP=$(find build/dd/Build/Products -name 'AVP.app' -maxdepth 3 | head -n 1)
           ls -la "$APP" "$APP/Frameworks" | tee -a app.log
-          mkdir -p build/ipa/Payload
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
           cp -R "$APP" build/ipa/Payload/
-          (cd build/ipa && zip -qry ../VisionQuestPro.ipa Payload)
-          ls -la build/VisionQuestPro.ipa
+          (cd build/ipa && zip -qry ../AVP.ipa Payload)
+          ls -la build/AVP.ipa
 
       - name: Publish the logs (branch ci-logs, visionos.txt)
         if: always()
-        run: bash scripts/ci-publish-log.sh visionos vpvulkan.log runtime.log app.log
+        run: bash scripts/ci-publish-log.sh visionos vpvulkan.log luajit.log sdl.log fossilize.log runtime.log app.log
 
       - name: Publish the app as a release
         if: success() && github.ref == 'refs/heads/main'
@@ -115,7 +169,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete visionos --yes --cleanup-tag || true
-          gh release create visionos build/VisionQuestPro.ipa \
+          gh release create visionos build/AVP.ipa \
             --target "$GITHUB_SHA" --prerelease \
-            --title "VisionQuestPro para Apple Vision Pro" \
-            --notes "App sin firmar, compilada de ${GITHUB_SHA::7}. Klepton + launcher con conversión en el visor; Vulkan con VPEngine (VPVulkan) por defecto, MoltenVK seleccionable en ajustes."
+            --title "AVP para Apple Vision Pro" \
+            --notes "App sin firmar, compilada de ${GITHUB_SHA::7}. Half-Life: Alyx en Apple Vision Pro: descarga desde tu cuenta de Steam, conversión y firma en el visor; gráficos con VPEngine (VPVulkan), MoltenVK solo como motor de diagnóstico. No incluye nada de Valve: necesitas tu propia copia del juego."

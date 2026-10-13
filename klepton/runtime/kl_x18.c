@@ -157,6 +157,24 @@ static int ldst(uint32_t w, klx_info *o) {
         if (post) addfld(o, w, KLX_RM, KLX_R);   // Rm == 31 selects the immediate form
         return 1;
     }
+    // Compare-and-swap PAIR: casp{,a,l,al} Rs, Rs+1, Rt, Rt+1, [Rn]. Both pairs
+    // are even-based and each names TWO registers, so x18 appears as the base
+    // of the x18:x19 pair. Rs pair receives the old memory value; Rt pair is
+    // read only. The odd partner is recorded in gp_used so scratch never
+    // collides with it.
+    if ((w & 0xBFA07C00u) == 0x08207C00u) {
+        // Only a PAIR naming x18 needs the pair veneer; x18 as the base
+        // address (Rn) is an ordinary single-register substitution.
+        if (((w >> 16) & 31) == 18 || (w & 31) == 18) o->hazard = KLX_HZ_CASP;
+        addfld(o, w, KLX_RN, KLX_R);
+        addfld(o, w, KLX_RM, KLX_R | KLX_W);
+        addfld(o, w, KLX_RD, KLX_R);
+        unsigned rs = (w >> 16) & 31, rt = w & 31;
+        if (rs != 31) o->gp_used |= 1u << (rs + 1);
+        if (rt != 31) o->gp_used |= 1u << (rt + 1);
+        if (rs & 1 || rt & 1) return 0;          // odd base is unallocated
+        return 1;
+    }
     // Load/store exclusive
     if ((w & 0x3F000000) == 0x08000000) {
         unsigned L = (w >> 22) & 1, o2 = (w >> 23) & 1;
@@ -333,9 +351,12 @@ int klx_decode(uint32_t w, klx_info *o) {
 }
 
 uint32_t klx_substitute(uint32_t w, const klx_info *info, unsigned reg) {
+    // A pair base must stay even: casp substitutes the whole x18:x19 pair.
     for (unsigned i = 0; i < info->nfields; i++) {
         unsigned sh = info->x18[i].shift;
-        w = (w & ~(31u << sh)) | ((reg & 31u) << sh);
+        unsigned r = reg;
+        if (info->hazard == KLX_HZ_CASP && sh != KLX_RN) r &= ~1u;
+        w = (w & ~(31u << sh)) | ((r & 31u) << sh);
     }
     return w;
 }
@@ -578,6 +599,27 @@ static uint32_t enc_str(unsigned t, unsigned n, unsigned off) {
     return 0xF9000000u | ((off / 8) << 10) | (n << 5) | t;
 }
 static uint32_t enc_mrs_tpidrro(unsigned t) { return 0xD53BD060u | t; }
+static uint32_t enc_stur(unsigned t, int off) {       // stur xT, [sp, #off]
+    return 0xF8000000u | (((uint32_t)off & 0x1ffu) << 12) | (31u << 5) | t;
+}
+static uint32_t enc_ldur(unsigned t, int off) {       // ldur xT, [sp, #off]
+    return 0xF8400000u | (((uint32_t)off & 0x1ffu) << 12) | (31u << 5) | t;
+}
+static uint32_t enc_mov_reg(unsigned d, unsigned m) { // orr xD, xzr, xM
+    return 0xAA0003E0u | (m << 16) | d;
+}
+static uint32_t enc_br(unsigned n) { return 0xD61F0000u | (n << 5); }
+// adrp xD, <page of target> as seen from pc, and the add that completes it.
+static int enc_adrp_abs(unsigned d, uint64_t pc, uint64_t target, uint32_t *out) {
+    int64_t delta = (int64_t)(target >> 12) - (int64_t)(pc >> 12);
+    if (delta < -(1LL << 20) || delta >= (1LL << 20)) return 0;
+    uint32_t v = (uint32_t)((uint64_t)delta & 0x1fffff);
+    *out = 0x90000000u | ((v & 3) << 29) | ((v >> 2) << 5) | d;
+    return 1;
+}
+static uint32_t enc_add_lo12(unsigned d, unsigned n, uint64_t target) {
+    return 0x91000000u | ((uint32_t)(target & 0xfff) << 10) | (n << 5) | d;
+}
 static uint32_t enc_movz(unsigned t, uint16_t imm, unsigned shift16) {  // movz xT, #imm, lsl #(16*s)
     return 0xD2800000u | ((uint32_t)shift16 << 21) | ((uint32_t)imm << 5) | t;
 }
@@ -828,6 +870,154 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
             continue;
         }
 
+        // `blr x18`: an indirect CALL. Load the target into x16 (IP0 — AAPCS64
+        // lets any call clobber it, which is what PLT stubs and linker veneers
+        // do), point x30 at site+4 so the callee returns straight into the
+        // original code (and unwinders see the real call site), then br.
+        //
+        //      mrs  x16, tpidrro_el0
+        //      ldr  x16, [x16, #slot*8]
+        //      adrp x30, site+4 ; add x30, x30, :lo12:site+4
+        //      br   x16
+        if (in.hazard == KLX_HZ_NOFALL && (word & 0xFFFFFC1Fu) == 0xD63F0000u &&
+            ((word >> 5) & 31) == 18) {
+            if (out + VEN_MAX_INSN > pool_end) { note_refusal(word); st->refused++; continue; }
+            uint32_t body[VEN_MAX_INSN], patch;
+            unsigned k = 0;
+            int ok = 1;
+            body[k++] = enc_mrs_tpidrro(16);
+            body[k++] = enc_ldr(16, 16, (unsigned)KLX_TSD_SLOT * 8);
+            ok &= enc_adrp_abs(30, vpc + k * 4, spc + 4, &body[k]); k++;
+            body[k++] = enc_add_lo12(30, 30, spc + 4);
+            body[k++] = enc_br(16);
+            ok &= enc_b(spc, vpc, &patch);
+            if (!ok) {
+                note_refusal(word); st->refused++;
+                if (out_of_reach(spc, vpc)) st->far_refused++;
+                continue;
+            }
+            memcpy(out, body, k * 4);
+            out += k;
+            w[i] = patch;
+            st->patched++;
+            continue;
+        }
+
+        // `adr x18, label`: the only operand is the destination, so the veneer
+        // computes the same absolute address with adrp+add from its own pc and
+        // stores it to the shadow slot.
+        if (in.pcrel == KLX_PC_ADR && !in.hazard && in.nfields == 1 && (in.roles == KLX_W)) {
+            if (out + VEN_MAX_INSN > pool_end) { note_refusal(word); st->refused++; continue; }
+            int64_t imm = (int64_t)((((word >> 5) & 0x7ffff) << 2) | ((word >> 29) & 3));
+            imm = (imm << 43) >> 43;
+            uint64_t target = spc + (uint64_t)imm;
+            unsigned a, b;
+            pick_scratch(in.gp_used, &a, &b);
+            uint32_t body[VEN_MAX_INSN], patch;
+            unsigned k = 0;
+            int ok = 1;
+            body[k++] = enc_stp(a, b, -16);
+            body[k++] = enc_mrs_tpidrro(a);
+            ok &= enc_adrp_abs(b, vpc + k * 4, target, &body[k]); k++;
+            body[k++] = enc_add_lo12(b, b, target);
+            body[k++] = enc_str(b, a, (unsigned)KLX_TSD_SLOT * 8);
+            body[k++] = enc_ldp(a, b, -16);
+            ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
+            ok &= enc_b(spc, vpc, &patch);
+            if (!ok) {
+                note_refusal(word); st->refused++;
+                if (out_of_reach(spc, vpc)) st->far_refused++;
+                continue;
+            }
+            memcpy(out, body, k * 4);
+            out += k;
+            w[i] = patch;
+            st->patched++;
+            continue;
+        }
+
+        // casp with x18:x19 as its Rs or Rt pair. Move that pair into a free
+        // even pair p:p+1 (x18's value from the slot, x19 copied), run the casp
+        // on it, and for Rs (which receives the old memory value) write both
+        // halves back. Needs three scratch registers, so `a` spills separately.
+        //
+        //      stp  p, p+1, [sp, #-16]
+        //      stur a, [sp, #-24]
+        //      mrs  a, tpidrro_el0
+        //      ldr  p, [a, #slot*8]
+        //      mov  p+1, x19
+        //      casp ..., p, p+1, ...
+        //      str  p, [a, #slot*8]   ; Rs pair only
+        //      mov  x19, p+1          ; Rs pair only
+        //      ldur a, [sp, #-24]
+        //      ldp  p, p+1, [sp, #-16]
+        //      b    site+4
+        if (in.hazard == KLX_HZ_CASP) {
+            unsigned rs = (word >> 16) & 31, rt = word & 31, rn = (word >> 5) & 31;
+            int rs18 = rs == 18, rt18 = rt == 18;
+            if (rn == 18 || (rs18 && rt18) || out + VEN_MAX_INSN > pool_end) {
+                note_refusal(word); st->refused++; continue;
+            }
+            uint32_t used = in.gp_used | (1u << 18) | (1u << 19);
+            static const unsigned pairs[] = {8, 10, 12, 14, 16, 6, 4, 2, 0};
+            static const unsigned singles[] = {17, 9, 11, 13, 15, 16, 10, 12, 14, 7, 5, 3, 1};
+            unsigned p = 99, a = 99;
+            for (unsigned j = 0; j < sizeof pairs / sizeof pairs[0] && p == 99; j++)
+                if (!(used & (3u << pairs[j]))) p = pairs[j];
+            if (p != 99) used |= 3u << p;
+            for (unsigned j = 0; j < sizeof singles / sizeof singles[0] && a == 99; j++)
+                if (!(used & (1u << singles[j]))) a = singles[j];
+            if (p == 99 || a == 99) { note_refusal(word); st->refused++; continue; }
+            uint32_t body[VEN_MAX_INSN], patch;
+            unsigned k = 0;
+            int ok = 1;
+            body[k++] = enc_stp(p, p + 1, -16);
+            body[k++] = enc_stur(a, -24);
+            body[k++] = enc_mrs_tpidrro(a);
+            body[k++] = enc_ldr(p, a, (unsigned)KLX_TSD_SLOT * 8);
+            body[k++] = enc_mov_reg(p + 1, 19);
+            body[k++] = klx_substitute(word, &in, p);
+            if (rs18) {
+                body[k++] = enc_str(p, a, (unsigned)KLX_TSD_SLOT * 8);
+                body[k++] = enc_mov_reg(19, p + 1);
+            }
+            body[k++] = enc_ldur(a, -24);
+            body[k++] = enc_ldp(p, p + 1, -16);
+            ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
+            ok &= enc_b(spc, vpc, &patch);
+            if (!ok) {
+                note_refusal(word); st->refused++;
+                if (out_of_reach(spc, vpc)) st->far_refused++;
+                continue;
+            }
+            memcpy(out, body, k * 4);
+            out += k;
+            w[i] = patch;
+            st->patched++;
+            continue;
+        }
+
+        // `stp xA, x18, [sp, #-16]!` / `ldp xA, x18, [sp], #16` — x18 saved and
+        // restored around hand-written assembly (OpenSSL's aarch64 code). The
+        // writeback moves sp, which the generic veneer's red-zone spill cannot
+        // follow, so split it: adjust sp as its own instruction (before for
+        // pre-index, after for post-index) and veneer the pair in plain
+        // signed-offset form with offset 0.
+        uint32_t sp_pre = 0, sp_post = 0;
+        if (in.hazard == KLX_HZ_SPWRITE && (word & 0x3A000000u) == 0x28000000u &&
+            ((word >> 26) & 1) == 0 && ((word >> 30) & 3) == 2 && ((word >> 5) & 31) == 31) {
+            unsigned mode = (word >> 23) & 3;
+            int imm = (int)(((word >> 15) & 0x7f) << 25) >> 25;
+            imm *= 8;
+            if (mode == 1 || mode == 3) {
+                uint32_t adj = imm < 0 ? (0xD10003FFu | ((uint32_t)(-imm) << 10))
+                                       : (0x910003FFu | ((uint32_t)imm << 10));
+                if (mode == 3) sp_pre = adj; else sp_post = adj;
+                word = (word & ~(3u << 23) & ~(0x7fu << 15)) | (2u << 23);
+                klx_decode(word, &in);
+            }
+        }
+
         if (in.hazard || in.pcrel == KLX_PC_ADR || in.pcrel == KLX_PC_LITERAL ||
             out + VEN_MAX_INSN > pool_end) { note_refusal(word); st->refused++; continue; }
 
@@ -838,6 +1028,7 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
         unsigned k = 0;
         int      ok = 1;
 
+        if (sp_pre) body[k++] = sp_pre;
         body[k++] = enc_stp(a, b, -16);
         body[k++] = enc_mrs_tpidrro(a);
 
@@ -864,6 +1055,7 @@ int kl_x18_emit(void *code, size_t size, uint64_t code_va,
             body[k++] = sub;
             if (in.roles & KLX_W) body[k++] = enc_str(b, a, (unsigned)KLX_TSD_SLOT * 8);
             body[k++] = enc_ldp(a, b, -16);
+            if (sp_post) body[k++] = sp_post;
             ok &= enc_b(vpc + k * 4, spc + 4, &body[k]); k++;
         }
 

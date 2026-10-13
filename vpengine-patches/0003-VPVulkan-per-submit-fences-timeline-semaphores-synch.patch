@@ -1,0 +1,919 @@
+From 3228507b235aed4bdcf79beebbff47ae04a69a9d Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 04:32:09 +0000
+Subject: [PATCH 03/10] VPVulkan: per-submit fences, timeline semaphores,
+ synchronization2 (no device-wide waits)
+
+New src/sync.cpp. Every vkQueueSubmit/vkQueueSubmit2 is one core frame; its fence and semaphore
+signals complete when the backend reports that frame finished. gpu/metal2 now implements
+Backend::completedFrames (lowest frame still in flight, updated by the command buffer completion
+handlers), so vkWaitForFences / vkGetFenceStatus / vkQueueWaitIdle / vkDeviceWaitIdle wait for
+exactly the frames involved, honour timeouts and waitAll=false.
+
+VK_KHR_timeline_semaphore: VkSemaphoreTypeCreateInfo, VkTimelineSemaphoreSubmitInfo,
+vkGetSemaphoreCounterValue, vkWaitSemaphores (all/any, timeout), vkSignalSemaphore. A timeline
+wait on a value no submission promised blocks the submitting thread until the host signals it
+(wait-before-signal); binary waits never block (in-order queue; the host layer's synthesized
+swapchain acquire never signals this driver's semaphores).
+VK_KHR_synchronization2: vkQueueSubmit2, vkCmdPipelineBarrier2 (in-pass barriers feed local
+read), vkCmdSet/Reset/WaitEvents2, vkCmdWriteTimestamp2. KHR aliases resolved.
+
+Test: gpu_vulkan.sync (null backend holds frames unfinished).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
+---
+ .../include/vpgpu/metal2/metal_backend.h      |   2 +
+ gpu/metal2/src/metal_backend.mm               |  16 +
+ gpu/vulkan/CMakeLists.txt                     |   7 +-
+ gpu/vulkan/src/entry.cpp                      |  98 +----
+ gpu/vulkan/src/physical_device.cpp            |   2 +
+ gpu/vulkan/src/platform_null.cpp              |   2 +
+ gpu/vulkan/src/sync.cpp                       | 403 ++++++++++++++++++
+ gpu/vulkan/src/vpvk.h                         |  22 +-
+ gpu/vulkan/tests/vk_tests.cpp                 | 117 ++++-
+ 9 files changed, 569 insertions(+), 100 deletions(-)
+ create mode 100644 gpu/vulkan/src/sync.cpp
+
+diff --git a/gpu/metal2/include/vpgpu/metal2/metal_backend.h b/gpu/metal2/include/vpgpu/metal2/metal_backend.h
+index 8e92912..084be1b 100644
+--- a/gpu/metal2/include/vpgpu/metal2/metal_backend.h
++++ b/gpu/metal2/include/vpgpu/metal2/metal_backend.h
+@@ -120,6 +120,8 @@ class MetalBackend final : public Backend {
+   bool compilePipeline(const PipelineState&, std::string& error) override;
+   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&) override;
+   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;
++  // Frames below this index finished on the GPU (their completion handlers ran).
++  uint64_t completedFrames() const override;
+ 
+   // Blocks until every submitted frame has finished on the GPU.
+   void waitIdle();
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index da9b06c..1860689 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -28,6 +28,7 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <map>
++#include <set>
+ #include <condition_variable>
+ #include <mutex>
+ #include <string>
+@@ -453,6 +454,10 @@ struct MetalBackend::Impl {
+ 
+   std::mutex doneMutex;
+   std::deque<Done> done;
++  // Frames submitted to Metal and not completed yet, and the next frame index expected (guarded by
++  // doneMutex): completedFrames() is the lowest in flight, or that index when none is.
++  std::set<uint64_t> inFlightFrames;
++  uint64_t nextFrame = 0;
+ 
+   // Fences of encoders not yet ordered before any later encoder. A barrier waits on all of them
+   // and leaves only itself, so ordering is transitive and each barrier costs few waits. It carries
+@@ -1228,6 +1233,11 @@ std::string dumpWrite(const DumpItem& it, uint64_t frame, const std::string& dir
+ }  // namespace
+ 
+ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
++  {
++    std::lock_guard lock(doneMutex);
++    nextFrame = std::max(nextFrame, frameIndex + 1);
++    if (!compiled.encoders.empty()) inFlightFrames.insert(frameIndex);
++  }
+   if (compiled.encoders.empty()) {  // nothing for the GPU; keeps the frontier's fences out of reuse
+     std::lock_guard lock(doneMutex);
+     done.push_back({frameIndex, {}});
+@@ -2009,6 +2019,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     {
+       std::lock_guard lock(impl->doneMutex);
+       impl->done.push_back(std::move(d));
++      impl->inFlightFrames.erase(frameIndex);
+     }
+     dispatch_semaphore_signal(sem);
+   }];
+@@ -2164,6 +2175,11 @@ bool MetalBackend::takeTimings(uint64_t& frameIndex, GpuTimings& out) {
+   return true;
+ }
+ 
++uint64_t MetalBackend::completedFrames() const {
++  std::lock_guard lock(impl_->doneMutex);
++  return impl_->inFlightFrames.empty() ? impl_->nextFrame : *impl_->inFlightFrames.begin();
++}
++
+ void MetalBackend::waitIdle() {
+   // Holding every slot means every completion handler has run (not only that the GPU finished).
+   for (size_t i = 0; i < impl_->slots.size(); ++i) dispatch_semaphore_wait(impl_->inFlight, DISPATCH_TIME_FOREVER);
+diff --git a/gpu/vulkan/CMakeLists.txt b/gpu/vulkan/CMakeLists.txt
+index 021ddcb..2a1b125 100644
+--- a/gpu/vulkan/CMakeLists.txt
++++ b/gpu/vulkan/CMakeLists.txt
+@@ -2,7 +2,7 @@
+ # MoltenVK by path (Klepton's kl_vulkan.c) load libVPVulkan.dylib instead. Khronos headers only
+ # (Apache-2.0/MIT, third_party/vulkan-headers); no other Vulkan code.
+ set(VPVK_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan-headers/include)
+-set(VPVK_COMMON src/entry.cpp src/physical_device.cpp src/commands.cpp src/config.cpp src/pipelines.cpp src/recipes.cpp src/precompile.cpp)
++set(VPVK_COMMON src/entry.cpp src/physical_device.cpp src/commands.cpp src/config.cpp src/pipelines.cpp src/recipes.cpp src/precompile.cpp src/sync.cpp)
+ # The static gpu/ libraries end up inside a shared library.
+ set_target_properties(vpgpu_core vpir vpmsl vpspirv PROPERTIES POSITION_INDEPENDENT_CODE ON)
+ 
+@@ -27,13 +27,14 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
+   if(NOT CMAKE_SYSTEM_NAME STREQUAL "visionOS")
+     # The driver sources are compiled into the test too, so internals (translate) are testable;
+     # the `exports` group dlopens the real libVPVulkan.so the way kl_vulkan.c dlopens a driver.
++    find_package(Threads REQUIRED)
+     add_executable(vpvk_tests tests/vk_tests.cpp ${VPVK_COMMON} src/platform_null.cpp)
+-    target_link_libraries(vpvk_tests PRIVATE vpgpu_core vpspirv vpmsl ${CMAKE_DL_LIBS})
++    target_link_libraries(vpvk_tests PRIVATE vpgpu_core vpspirv vpmsl ${CMAKE_DL_LIBS} Threads::Threads)
+     target_include_directories(vpvk_tests PRIVATE include src ${VPVK_HEADERS})
+     target_compile_definitions(vpvk_tests PRIVATE VPVK_SPIRV_TESTS="${CMAKE_CURRENT_SOURCE_DIR}/../shader/spirv/tests")
+     add_dependencies(vpvk_tests VPVulkan)
+     target_compile_options(vpvk_tests PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+-    foreach(t exports physical memory passes submit pipeline recipes alyx depth_resolve local_read)
++    foreach(t exports physical memory passes submit pipeline recipes alyx depth_resolve local_read sync)
+       add_test(NAME gpu_vulkan.${t} COMMAND vpvk_tests ${t} $<TARGET_FILE:VPVulkan>)
+     endforeach()
+   endif()
+diff --git a/gpu/vulkan/src/entry.cpp b/gpu/vulkan/src/entry.cpp
+index 44c2027..c93ca91 100644
+--- a/gpu/vulkan/src/entry.cpp
++++ b/gpu/vulkan/src/entry.cpp
+@@ -506,15 +506,6 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue2(VkDevice dv, const VkDe
+   vkGetDeviceQueue(dv, i->queueFamilyIndex, i->queueIndex, out);
+ }
+ 
+-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkDeviceWaitIdle(VkDevice dv) {
+-  from<Device>(dv)->platform->waitIdle();
+-  return VK_SUCCESS;
+-}
+-
+-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue q) {
+-  from<Queue>(q)->device->platform->waitIdle();
+-  return VK_SUCCESS;
+-}
+ 
+ // ---------------------------------------------------------------------------------------------
+ // Memory
+@@ -1236,56 +1227,6 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer cb
+ // ---------------------------------------------------------------------------------------------
+ // Synchronisation and submission
+ // ---------------------------------------------------------------------------------------------
+-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateFence(VkDevice, const VkFenceCreateInfo* ci,
+-                                                         const VkAllocationCallbacks*, VkFence* out) {
+-  auto* f = new Fence;
+-  f->signaled = (ci->flags & VK_FENCE_CREATE_SIGNALED_BIT) != 0;
+-  *out = to<VkFence>(f);
+-  return VK_SUCCESS;
+-}
+-
+-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyFence(VkDevice, VkFence f, const VkAllocationCallbacks*) {
+-  delete from<Fence>(f);
+-}
+-
+-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkResetFences(VkDevice, uint32_t n, const VkFence* fs) {
+-  for (uint32_t i = 0; i < n; ++i) from<Fence>(fs[i])->signaled = false;
+-  return VK_SUCCESS;
+-}
+-
+-// A fence is signaled when its submission's GPU work is done. Until the backend reports completion
+-// per submission, a submitted fence is waited for with a full waitIdle (correct, coarse).
+-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetFenceStatus(VkDevice dv, VkFence f) {
+-  Fence* fe = from<Fence>(f);
+-  if (!fe->signaled) return VK_NOT_READY;
+-  // Signaled by a submission whose GPU work may still run: the client would reuse its command
+-  // buffers (upload memory, descriptors) as soon as this says done, so it waits first.
+-  if (fe->submitted) {
+-    from<Device>(dv)->platform->waitIdle();
+-    fe->submitted = false;
+-  }
+-  return VK_SUCCESS;
+-}
+-
+-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dv, uint32_t n, const VkFence* fs,
+-                                                           VkBool32, uint64_t) {
+-  from<Device>(dv)->platform->waitIdle();
+-  for (uint32_t i = 0; i < n; ++i)
+-    if (!from<Fence>(fs[i])->signaled) return VK_TIMEOUT;  // never submitted
+-  return VK_SUCCESS;
+-}
+-
+-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSemaphore(VkDevice, const VkSemaphoreCreateInfo*,
+-                                                             const VkAllocationCallbacks*, VkSemaphore* out) {
+-  *out = to<VkSemaphore>(new Semaphore);
+-  return VK_SUCCESS;
+-}
+-
+-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroySemaphore(VkDevice, VkSemaphore s,
+-                                                          const VkAllocationCallbacks*) {
+-  delete from<Semaphore>(s);
+-}
+-
+ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateEvent(VkDevice, const VkEventCreateInfo*,
+                                                          const VkAllocationCallbacks*, VkEvent* out) {
+   *out = to<VkEvent>(new Event);
+@@ -1306,37 +1247,6 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkResetEvent(VkDevice, VkEvent e) {
+   return VK_SUCCESS;
+ }
+ 
+-// One queue, executed in order: semaphores between submissions of this queue are already satisfied
+-// by submission order, so they need no GPU work. All command buffers of one vkQueueSubmit become one
+-// core frame, which lets the frame compiler merge passes across command-buffer boundaries.
+-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* si,
+-                                                         VkFence fence) {
+-  Device* d = from<Queue>(q)->device;
+-  std::lock_guard<std::mutex> lock(d->submitMutex);
+-  vpgpu::Frame frame;
+-  TranslateStats st;
+-  uint32_t barriers = 0, cbs = 0;
+-  for (uint32_t i = 0; i < n; ++i)
+-    for (uint32_t j = 0; j < si[i].commandBufferCount; ++j) {
+-      const CommandBuffer* c = from<CommandBuffer>(si[i].pCommandBuffers[j]);
+-      translate(*c->rec, frame, st, d);
+-      barriers += c->rec->barriers;
+-      ++cbs;
+-    }
+-  if (!frame.commands().empty()) d->gpu->submit(frame);
+-  ++d->submits;
+-  if (st.dropped || st.skippedDraws || st.skippedDispatches || d->submits <= 3 || d->submits % 600 == 0)
+-    logf("vk.submit n=%llu cbs=%u passes=%u draws=%u dispatches=%u copies=%u clears=%u vk_barriers=%u "
+-         "draws_skipped=%u dispatch_skipped=%u dropped=%u",
+-         static_cast<unsigned long long>(d->submits), cbs, st.passes, st.draws, st.dispatches, st.copies, st.clears,
+-         barriers, st.skippedDraws, st.skippedDispatches, st.dropped);
+-  if (fence) {
+-    from<Fence>(fence)->signaled = true;  // see vkWaitForFences / vkGetFenceStatus: wait idle first
+-    from<Fence>(fence)->submitted = true;
+-  }
+-  return VK_SUCCESS;
+-}
+-
+ // ---------------------------------------------------------------------------------------------
+ // Proc addresses
+ // ---------------------------------------------------------------------------------------------
+@@ -1363,7 +1273,7 @@ const Entry kEntries[] = {
+     E(vkEnumerateDeviceExtensionProperties, false), E(vkEnumerateDeviceLayerProperties, false),
+     E(vkCreateDevice, false),
+     E(vkDestroyDevice, true), E(vkGetDeviceQueue, true), E(vkGetDeviceQueue2, true),
+-    E(vkDeviceWaitIdle, true), E(vkQueueWaitIdle, true), E(vkAllocateMemory, true), E(vkFreeMemory, true),
++    E(vkAllocateMemory, true), E(vkFreeMemory, true),
+     E(vkMapMemory, true), E(vkUnmapMemory, true), E(vkFlushMappedMemoryRanges, true),
+     E(vkInvalidateMappedMemoryRanges, true), E(vkGetDeviceMemoryCommitment, true),
+     E(vkCreateBuffer, true), E(vkDestroyBuffer, true), E(vkGetBufferMemoryRequirements, true),
+@@ -1380,11 +1290,8 @@ const Entry kEntries[] = {
+     E(vkEndCommandBuffer, true), E(vkResetCommandBuffer, true), E(vkCmdBeginRenderPass, true),
+     E(vkCmdBeginRenderPass2, true), E(vkCmdEndRenderPass, true), E(vkCmdEndRenderPass2, true),
+     E(vkCmdPipelineBarrier, true), E(vkCmdCopyBuffer, true), E(vkCmdFillBuffer, true),
+-    E(vkCmdClearColorImage, true), E(vkCmdCopyBufferToImage, true), E(vkCreateFence, true), E(vkDestroyFence, true),
+-    E(vkResetFences, true), E(vkGetFenceStatus, true), E(vkWaitForFences, true),
+-    E(vkCreateSemaphore, true), E(vkDestroySemaphore, true), E(vkCreateEvent, true),
++    E(vkCmdClearColorImage, true), E(vkCmdCopyBufferToImage, true), E(vkCreateEvent, true),
+     E(vkDestroyEvent, true), E(vkGetEventStatus, true), E(vkSetEvent, true), E(vkResetEvent, true),
+-    E(vkQueueSubmit, true),
+ };
+ #undef E
+ 
+@@ -1414,6 +1321,7 @@ PFN_vkVoidFunction vpvk::lookup(const char* name, bool deviceLevel) {
+   for (const Entry& e : kEntries)
+     if (!std::strcmp(e.name, name)) return deviceLevel && !e.device ? nullptr : e.fn;
+   if (PFN_vkVoidFunction f = lookupPhase3(name)) return f;
++  if (PFN_vkVoidFunction f = lookupSync(name)) return f;
+   {
+     std::lock_guard<std::mutex> lock(gUnimplMutex);
+     if (gUnimpl.insert(name).second) logf("vk.unimpl %s", name);
+diff --git a/gpu/vulkan/src/physical_device.cpp b/gpu/vulkan/src/physical_device.cpp
+index 310230f..32c96d5 100644
+--- a/gpu/vulkan/src/physical_device.cpp
++++ b/gpu/vulkan/src/physical_device.cpp
+@@ -268,6 +268,8 @@ std::vector<VkExtensionProperties> deviceExtensions() {
+           {VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME, 1},
+           {VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, 1},
+           {VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME, 1},
++          {VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, 2},
++          {VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, 1},
+           {VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME, 1},
+           {VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, 1},
+           {VK_KHR_SHADER_TERMINATE_INVOCATION_EXTENSION_NAME, 1},
+diff --git a/gpu/vulkan/src/platform_null.cpp b/gpu/vulkan/src/platform_null.cpp
+index 7611030..c74124f 100644
+--- a/gpu/vulkan/src/platform_null.cpp
++++ b/gpu/vulkan/src/platform_null.cpp
+@@ -5,6 +5,8 @@ namespace vpvk {
+ namespace {
+ class NullPlatform final : public Platform {
+  public:
++  // Nothing executes, so every frame is finished at once (tests move completedBelow to hold one).
++  NullPlatform() { backend_.completedBelow = ~uint64_t(0); }
+   vpgpu::Backend& backend() override { return backend_; }
+ 
+  private:
+diff --git a/gpu/vulkan/src/sync.cpp b/gpu/vulkan/src/sync.cpp
+new file mode 100644
+index 0000000..87d7a8f
+--- /dev/null
++++ b/gpu/vulkan/src/sync.cpp
+@@ -0,0 +1,403 @@
++// VPVulkan synchronisation: fences, binary and timeline semaphores (VK_KHR_timeline_semaphore),
++// vkQueueSubmit / vkQueueSubmit2 (VK_KHR_synchronization2) and the sync2 command forms, idle waits.
++//
++// One queue whose submissions execute in order. Each vkQueueSubmit becomes one core frame; fences and
++// semaphore signals attached to it complete when the backend reports that frame finished
++// (vpgpu::Device::completedFrames: gpu/metal2's command buffer completion handlers), so a wait
++// covers exactly the work it names and never idles the whole device. Semaphore waits between
++// submissions of this queue are satisfied by submission order and need no GPU work; a wait on a
++// timeline value no submission has signalled yet blocks the submitting thread until the host
++// signals it (vkSignalSemaphore), as the spec allows for wait-before-signal.
++#include <algorithm>
++#include <chrono>
++#include <cstring>
++#include <thread>
++
++#include "commands.h"
++#include "vpvk.h"
++
++#define VPVK_EXPORT extern "C" __attribute__((visibility("default")))
++
++namespace vpvk {
++
++bool Device::frameDone(uint64_t frame) { return frame == kNoFrame || gpu->completedFrames() > frame; }
++
++// The backend reports completion by polling (gpu/metal2 completion handlers set it): a short spin,
++// then sleeps growing to 1 ms. Fine for frame-rate waits; nothing here holds a lock while waiting.
++bool Device::waitFrame(uint64_t frame, uint64_t timeoutNs) {
++  if (frameDone(frame)) return true;
++  if (!timeoutNs) return false;
++  const auto start = std::chrono::steady_clock::now();
++  auto sleep = std::chrono::microseconds(20);
++  while (!frameDone(frame)) {
++    if (timeoutNs != UINT64_MAX &&
++        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()) >=
++            timeoutNs)
++      return false;
++    std::this_thread::sleep_for(sleep);
++    sleep = std::min(sleep * 2, std::chrono::microseconds(1000));
++  }
++  return true;
++}
++
++namespace {
++
++// Applies the signals of `s` whose frames completed. Caller holds s.m.
++void settle(Device& d, Semaphore& s) {
++  bool changed = false;
++  auto it = s.pending.begin();
++  while (it != s.pending.end()) {
++    if (!d.frameDone(it->second)) {
++      ++it;
++      continue;
++    }
++    s.value = s.timeline ? std::max(s.value, it->first) : 1;
++    it = s.pending.erase(it);
++    changed = true;
++  }
++  if (changed) s.cv.notify_all();
++}
++
++uint64_t semaphoreValue(Device& d, Semaphore& s) {
++  std::lock_guard<std::mutex> lock(s.m);
++  settle(d, s);
++  return s.value;
++}
++
++// Highest value `s` will reach once everything submitted so far completes. Caller holds s.m.
++uint64_t promised(const Semaphore& s) {
++  uint64_t v = s.value;
++  for (const auto& [value, frame] : s.pending) v = std::max(v, s.timeline ? value : 1);
++  return v;
++}
++
++// Waits until `s` reaches `value` (timeline) or is signaled (binary, value 1). A value already
++// promised by a submitted frame waits for that frame; one nobody promised yet waits for a host
++// signal. Returns false on timeout.
++bool waitSemaphore(Device& d, Semaphore& s, uint64_t value, uint64_t timeoutNs) {
++  const auto deadline = timeoutNs == UINT64_MAX ? std::chrono::steady_clock::time_point::max()
++                                                : std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeoutNs);
++  std::unique_lock<std::mutex> lock(s.m);
++  for (;;) {
++    settle(d, s);
++    if (s.value >= value) return true;
++    // The earliest pending frame that gets it there.
++    uint64_t frame = kNoFrame;
++    for (const auto& [v, f] : s.pending)
++      if ((s.timeline ? v : 1) >= value) frame = std::min(frame, f);
++    const auto now = std::chrono::steady_clock::now();
++    if (now >= deadline) return false;
++    if (frame != kNoFrame) {
++      lock.unlock();
++      const uint64_t left = deadline == std::chrono::steady_clock::time_point::max()
++                                ? UINT64_MAX
++                                : uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count());
++      const bool ok = d.waitFrame(frame, left);
++      lock.lock();
++      if (!ok) return false;
++      continue;
++    }
++    // Not promised by any submission: a host signal (vkSignalSemaphore) or a later submit.
++    if (deadline == std::chrono::steady_clock::time_point::max()) s.cv.wait_for(lock, std::chrono::milliseconds(2));
++    else s.cv.wait_until(lock, std::min(deadline, now + std::chrono::milliseconds(2)));
++  }
++}
++
++struct SemOp {
++  Semaphore* sem = nullptr;
++  uint64_t value = 0;
++};
++
++// One submission batch, independent of the VkSubmitInfo version.
++struct Batch {
++  std::vector<SemOp> waits, signals;
++  std::vector<const CommandBuffer*> cbs;
++};
++
++// Submits batches in order. Timeline waits on values no earlier work promises block here until the
++// host signals them. Binary waits never block: on this in-order queue a binary semaphore is
++// signalled by an earlier submission or by the host layer's own swapchain acquire (Klepton
++// synthesizes vkAcquireNextImageKHR and never signals this driver's semaphores).
++VkResult submit(Device& d, std::vector<Batch>& batches, Fence* fence) {
++  for (Batch& b : batches)
++    for (const SemOp& w : b.waits) {
++      if (!w.sem->timeline) continue;
++      bool promisedNow;
++      {
++        std::lock_guard<std::mutex> lock(w.sem->m);
++        settle(d, *w.sem);
++        promisedNow = promised(*w.sem) >= w.value;
++      }
++      // Promised by an earlier submission of this queue: ordered by submission already.
++      if (!promisedNow && !waitSemaphore(d, *w.sem, w.value, UINT64_MAX)) return VK_TIMEOUT;
++    }
++  std::lock_guard<std::mutex> lock(d.submitMutex);
++  vpgpu::Frame frame;
++  TranslateStats st;
++  uint32_t barriers = 0, cbs = 0;
++  for (Batch& b : batches)
++    for (const CommandBuffer* c : b.cbs) {
++      translate(*c->rec, frame, st, &d);
++      barriers += c->rec->barriers;
++      ++cbs;
++    }
++  if (!frame.commands().empty()) d.lastFrame = d.gpu->submit(frame).frame;
++  ++d.submits;
++  if (st.dropped || st.skippedDraws || st.skippedDispatches || d.submits <= 3 || d.submits % 600 == 0)
++    logf("vk.submit n=%llu cbs=%u passes=%u draws=%u dispatches=%u copies=%u clears=%u vk_barriers=%u "
++         "draws_skipped=%u dispatch_skipped=%u dropped=%u local_reads=%u",
++         static_cast<unsigned long long>(d.submits), cbs, st.passes, st.draws, st.dispatches, st.copies, st.clears,
++         barriers, st.skippedDraws, st.skippedDispatches, st.dropped, st.localReads);
++  // Everything submitted so far completes with the last frame (in-order queue).
++  const uint64_t doneWith = d.lastFrame;
++  for (Batch& b : batches)
++    for (const SemOp& s : b.signals) {
++      std::lock_guard<std::mutex> sl(s.sem->m);
++      if (s.sem->timeline && s.value <= promised(*s.sem)) continue;  // must increase: ignore a stale one
++      if (!s.sem->timeline) s.sem->value = 0;
++      s.sem->pending.push_back({s.sem->timeline ? s.value : 1, doneWith});
++      settle(d, *s.sem);
++      s.sem->cv.notify_all();
++    }
++  for (Batch& b : batches)
++    for (const SemOp& w : b.waits)
++      if (!w.sem->timeline) {  // a binary wait consumes the signal
++        std::lock_guard<std::mutex> sl(w.sem->m);
++        settle(d, *w.sem);
++        w.sem->value = 0;
++        w.sem->pending.clear();
++      }
++  if (fence) {
++    fence->frame = doneWith;
++    fence->signaled = true;
++  }
++  return VK_SUCCESS;
++}
++
++}  // namespace
++}  // namespace vpvk
++
++using namespace vpvk;
++
++// ---------------------------------------------------------------------------------------------
++// Fences
++// ---------------------------------------------------------------------------------------------
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateFence(VkDevice, const VkFenceCreateInfo* ci,
++                                                         const VkAllocationCallbacks*, VkFence* out) {
++  auto* f = new Fence;
++  f->signaled = (ci->flags & VK_FENCE_CREATE_SIGNALED_BIT) != 0;
++  *out = to<VkFence>(f);
++  return VK_SUCCESS;
++}
++
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyFence(VkDevice, VkFence f, const VkAllocationCallbacks*) {
++  delete from<Fence>(f);
++}
++
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkResetFences(VkDevice, uint32_t n, const VkFence* fs) {
++  for (uint32_t i = 0; i < n; ++i) {
++    from<Fence>(fs[i])->signaled = false;
++    from<Fence>(fs[i])->frame = kNoFrame;
++  }
++  return VK_SUCCESS;
++}
++
++// Signaled by a submission: done when its frame completed (the client then reuses the command
++// buffers, upload memory and descriptors of that submission).
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetFenceStatus(VkDevice dv, VkFence f) {
++  Fence* fe = from<Fence>(f);
++  if (!fe->signaled) return VK_NOT_READY;
++  return from<Device>(dv)->frameDone(fe->frame) ? VK_SUCCESS : VK_NOT_READY;
++}
++
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dv, uint32_t n, const VkFence* fs, VkBool32 all,
++                                                           uint64_t timeout) {
++  Device* d = from<Device>(dv);
++  const auto start = std::chrono::steady_clock::now();
++  auto left = [&]() -> uint64_t {
++    if (timeout == UINT64_MAX) return UINT64_MAX;
++    const uint64_t spent =
++        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
++    return spent >= timeout ? 0 : timeout - spent;
++  };
++  if (all || n == 1) {
++    for (uint32_t i = 0; i < n; ++i) {
++      Fence* f = from<Fence>(fs[i]);
++      if (!f->signaled) return VK_TIMEOUT;  // never submitted: no host signal exists for fences here
++      if (!d->waitFrame(f->frame, left())) return VK_TIMEOUT;
++    }
++    return VK_SUCCESS;
++  }
++  // Any: the earliest frame among the submitted ones completes first (in-order queue).
++  uint64_t earliest = kNoFrame;
++  for (uint32_t i = 0; i < n; ++i) {
++    Fence* f = from<Fence>(fs[i]);
++    if (f->signaled) earliest = std::min(earliest, f->frame.load());
++    if (f->signaled && f->frame == kNoFrame) return VK_SUCCESS;
++  }
++  if (earliest == kNoFrame) return VK_TIMEOUT;
++  return d->waitFrame(earliest, left()) ? VK_SUCCESS : VK_TIMEOUT;
++}
++
++// ---------------------------------------------------------------------------------------------
++// Semaphores
++// ---------------------------------------------------------------------------------------------
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateSemaphore(VkDevice, const VkSemaphoreCreateInfo* ci,
++                                                             const VkAllocationCallbacks*, VkSemaphore* out) {
++  auto* s = new Semaphore;
++  for (auto* x = static_cast<const VkBaseInStructure*>(ci ? ci->pNext : nullptr); x; x = x->pNext)
++    if (x->sType == VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO) {
++      const auto* t = reinterpret_cast<const VkSemaphoreTypeCreateInfo*>(x);
++      s->timeline = t->semaphoreType == VK_SEMAPHORE_TYPE_TIMELINE;
++      s->value = s->timeline ? t->initialValue : 0;
++    }
++  *out = to<VkSemaphore>(s);
++  return VK_SUCCESS;
++}
++
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroySemaphore(VkDevice, VkSemaphore s, const VkAllocationCallbacks*) {
++  delete from<Semaphore>(s);
++}
++
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkGetSemaphoreCounterValue(VkDevice dv, VkSemaphore s, uint64_t* value) {
++  *value = semaphoreValue(*from<Device>(dv), *from<Semaphore>(s));
++  return VK_SUCCESS;
++}
++
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(VkDevice dv, const VkSemaphoreWaitInfo* wi, uint64_t timeout) {
++  Device* d = from<Device>(dv);
++  const bool any = wi->flags & VK_SEMAPHORE_WAIT_ANY_BIT;
++  const auto start = std::chrono::steady_clock::now();
++  auto left = [&]() -> uint64_t {
++    if (timeout == UINT64_MAX) return UINT64_MAX;
++    const uint64_t spent =
++        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
++    return spent >= timeout ? 0 : timeout - spent;
++  };
++  if (!any) {
++    for (uint32_t i = 0; i < wi->semaphoreCount; ++i)
++      if (!waitSemaphore(*d, *from<Semaphore>(wi->pSemaphores[i]), wi->pValues[i], left())) return VK_TIMEOUT;
++    return VK_SUCCESS;
++  }
++  for (;;) {
++    for (uint32_t i = 0; i < wi->semaphoreCount; ++i)
++      if (semaphoreValue(*d, *from<Semaphore>(wi->pSemaphores[i])) >= wi->pValues[i]) return VK_SUCCESS;
++    if (!left()) return VK_TIMEOUT;
++    std::this_thread::sleep_for(std::chrono::microseconds(200));
++  }
++}
++
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkSignalSemaphore(VkDevice dv, const VkSemaphoreSignalInfo* si) {
++  Semaphore* s = from<Semaphore>(si->semaphore);
++  std::lock_guard<std::mutex> lock(s->m);
++  settle(*from<Device>(dv), *s);
++  s->value = std::max(s->value, si->value);
++  s->cv.notify_all();
++  return VK_SUCCESS;
++}
++
++// ---------------------------------------------------------------------------------------------
++// Submission
++// ---------------------------------------------------------------------------------------------
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n, const VkSubmitInfo* si, VkFence fence) {
++  std::vector<Batch> batches(n);
++  for (uint32_t i = 0; i < n; ++i) {
++    const VkTimelineSemaphoreSubmitInfo* tv = nullptr;
++    for (auto* x = static_cast<const VkBaseInStructure*>(si[i].pNext); x; x = x->pNext)
++      if (x->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO)
++        tv = reinterpret_cast<const VkTimelineSemaphoreSubmitInfo*>(x);
++    for (uint32_t k = 0; k < si[i].waitSemaphoreCount; ++k)
++      batches[i].waits.push_back({from<Semaphore>(si[i].pWaitSemaphores[k]),
++                                  tv && k < tv->waitSemaphoreValueCount && tv->pWaitSemaphoreValues ? tv->pWaitSemaphoreValues[k] : 1});
++    for (uint32_t k = 0; k < si[i].signalSemaphoreCount; ++k)
++      batches[i].signals.push_back({from<Semaphore>(si[i].pSignalSemaphores[k]),
++                                    tv && k < tv->signalSemaphoreValueCount && tv->pSignalSemaphoreValues ? tv->pSignalSemaphoreValues[k] : 1});
++    for (uint32_t k = 0; k < si[i].commandBufferCount; ++k)
++      batches[i].cbs.push_back(from<CommandBuffer>(si[i].pCommandBuffers[k]));
++  }
++  return submit(*from<Queue>(q)->device, batches, fence ? from<Fence>(fence) : nullptr);
++}
++
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2(VkQueue q, uint32_t n, const VkSubmitInfo2* si, VkFence fence) {
++  std::vector<Batch> batches(n);
++  for (uint32_t i = 0; i < n; ++i) {
++    for (uint32_t k = 0; k < si[i].waitSemaphoreInfoCount; ++k)
++      batches[i].waits.push_back({from<Semaphore>(si[i].pWaitSemaphoreInfos[k].semaphore), si[i].pWaitSemaphoreInfos[k].value});
++    for (uint32_t k = 0; k < si[i].signalSemaphoreInfoCount; ++k)
++      batches[i].signals.push_back({from<Semaphore>(si[i].pSignalSemaphoreInfos[k].semaphore), si[i].pSignalSemaphoreInfos[k].value});
++    for (uint32_t k = 0; k < si[i].commandBufferInfoCount; ++k)
++      batches[i].cbs.push_back(from<CommandBuffer>(si[i].pCommandBufferInfos[k].commandBuffer));
++  }
++  return submit(*from<Queue>(q)->device, batches, fence ? from<Fence>(fence) : nullptr);
++}
++
++// Idle: the last submitted frame completed (in-order queue: everything before it too).
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue q) {
++  Device* d = from<Queue>(q)->device;
++  uint64_t last;
++  {
++    std::lock_guard<std::mutex> lock(d->submitMutex);
++    last = d->lastFrame;
++  }
++  d->waitFrame(last, UINT64_MAX);
++  return VK_SUCCESS;
++}
++
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkDeviceWaitIdle(VkDevice dv) {
++  return vkQueueWaitIdle(to<VkQueue>(&from<Device>(dv)->queue));
++}
++
++// ---------------------------------------------------------------------------------------------
++// Synchronization2 command forms. Barriers are hazards the core already derives; only an in-pass
++// barrier matters (local read). Events stay host-visible flags (in-order queue).
++// ---------------------------------------------------------------------------------------------
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo*) {
++  Recorder& r = *from<CommandBuffer>(cb)->rec;
++  ++r.barriers;
++  recordInPassBarrier(r);
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetEvent2(VkCommandBuffer, VkEvent e, const VkDependencyInfo*) {
++  from<Event>(e)->set = true;
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResetEvent2(VkCommandBuffer, VkEvent e, VkPipelineStageFlags2) {
++  from<Event>(e)->set = false;
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWaitEvents2(VkCommandBuffer cb, uint32_t, const VkEvent*, const VkDependencyInfo*) {
++  ++from<CommandBuffer>(cb)->rec->barriers;
++}
++extern "C" void vkCmdWriteTimestamp(VkCommandBuffer, VkPipelineStageFlagBits, VkQueryPool, uint32_t);
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWriteTimestamp2(VkCommandBuffer cb, VkPipelineStageFlags2 stage, VkQueryPool p,
++                                                            uint32_t q) {
++  vkCmdWriteTimestamp(cb, stage == VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
++                                                                       : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                      p, q);
++}
++
++namespace vpvk {
++PFN_vkVoidFunction lookupSync(const char* name) {
++  struct E {
++    const char* name;
++    PFN_vkVoidFunction fn;
++  };
++#define F(f) {#f, reinterpret_cast<PFN_vkVoidFunction>(&f)}
++  static const E table[] = {
++      F(vkCreateFence), F(vkDestroyFence), F(vkResetFences), F(vkGetFenceStatus), F(vkWaitForFences),
++      F(vkCreateSemaphore), F(vkDestroySemaphore), F(vkGetSemaphoreCounterValue), F(vkWaitSemaphores),
++      F(vkSignalSemaphore), F(vkQueueSubmit), F(vkQueueSubmit2), F(vkQueueWaitIdle), F(vkDeviceWaitIdle),
++      F(vkCmdPipelineBarrier2), F(vkCmdSetEvent2), F(vkCmdResetEvent2), F(vkCmdWaitEvents2), F(vkCmdWriteTimestamp2),
++  };
++#undef F
++  static const std::pair<const char*, const char*> aliases[] = {
++      {"vkGetSemaphoreCounterValueKHR", "vkGetSemaphoreCounterValue"}, {"vkWaitSemaphoresKHR", "vkWaitSemaphores"},
++      {"vkSignalSemaphoreKHR", "vkSignalSemaphore"}, {"vkQueueSubmit2KHR", "vkQueueSubmit2"},
++      {"vkCmdPipelineBarrier2KHR", "vkCmdPipelineBarrier2"}, {"vkCmdSetEvent2KHR", "vkCmdSetEvent2"},
++      {"vkCmdResetEvent2KHR", "vkCmdResetEvent2"}, {"vkCmdWaitEvents2KHR", "vkCmdWaitEvents2"},
++      {"vkCmdWriteTimestamp2KHR", "vkCmdWriteTimestamp2"},
++  };
++  for (const auto& [alias, real] : aliases)
++    if (!std::strcmp(name, alias)) name = real;
++  for (const E& e : table)
++    if (!std::strcmp(e.name, name)) return e.fn;
++  return nullptr;
++}
++}  // namespace vpvk
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index 79026b5..75cdbba 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -7,6 +7,7 @@
+ #include <vulkan/vk_icd.h>
+ 
+ #include <atomic>
++#include <condition_variable>
+ #include <cstdint>
+ #include <memory>
+ #include <mutex>
+@@ -99,12 +100,22 @@ struct Sampler {
+   vpgpu::SamplerId id;
+ };
+ 
++// Fences and semaphores complete with a core frame (sync.cpp): `frame` is the index of the frame
++// vkQueueSubmit produced (gpu::Device frame counter), done once the backend reports every frame
++// below frame + 1 finished. No device-wide waits.
++inline constexpr uint64_t kNoFrame = ~uint64_t(0);
+ struct Fence {
+   std::atomic<bool> signaled{false};
+-  bool submitted = false;  // signaled by a submission: the GPU may still be running it
++  std::atomic<uint64_t> frame{kNoFrame};  // set: signaled once this frame completes
+ };
+ struct Semaphore {
++  bool timeline = false;
++  // Binary: value 1 = signaled. Timeline: the counter. `pending` holds signals of submitted frames
++  // not completed yet (value, frame), applied as the frames complete.
++  std::mutex m;
++  std::condition_variable cv;
+   uint64_t value = 0;
++  std::vector<std::pair<uint64_t, uint64_t>> pending;
+ };
+ struct Event {
+   std::atomic<bool> set{false};
+@@ -262,6 +273,14 @@ struct Device : Dispatchable {
+   std::mutex submitMutex;
+   std::mutex resourceMutex;  // gpu->create*/destroy from recording threads (upload arenas)
+   uint64_t submits = 0;
++  // Core frame index the next vkQueueSubmit produces (guarded by submitMutex), and the last one
++  // submitted (kNoFrame before any): what fences / semaphores signalled with no work wait for.
++  uint64_t nextFrame = 0, lastFrame = kNoFrame;
++  // Completion tracking (sync.cpp): frames below `completed` finished on the GPU.
++  bool frameDone(uint64_t frame);
++  bool waitFrame(uint64_t frame, uint64_t timeoutNs);  // false on timeout
++  std::mutex doneMutex;
++  std::condition_variable doneCv;
+ };
+ 
+ // VkResolveModeFlagBits of a depth resolve -> the core's filter (min/max; anything else sample 0).
+@@ -289,6 +308,7 @@ void fillProperties2(void* chain);
+ // Entry points (entry.cpp): null for names the driver does not implement (logged once).
+ PFN_vkVoidFunction lookup(const char* name, bool deviceLevel);
+ PFN_vkVoidFunction lookupPhase3(const char* name);  // pipelines.cpp
++PFN_vkVoidFunction lookupSync(const char* name);    // sync.cpp
+ 
+ template <class T, class H>
+ T* from(H h) { return reinterpret_cast<T*>(h); }
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index 7c2bfb6..af4cf10 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -10,6 +10,8 @@
+ #include <functional>
+ #include <string>
+ #include <vector>
++#include <chrono>
++#include <thread>
+ 
+ #include "commands.h"
+ #include "vpvk.h"
+@@ -1113,6 +1115,119 @@ void testLocalRead() {
+   vkFreeMemory(c.dev, m, nullptr);
+ }
+ 
++// Fences and timeline semaphores complete with their own frame, not a device-wide idle: the null
++// backend holds frames unfinished until the test moves completedBelow.
++void testSync() {
++  Ctx c;
++  auto& nb = dynamic_cast<vpgpu::NullBackend&>(from<Device>(c.dev)->platform->backend());
++  VkDeviceMemory m = alloc(c, 1 << 20, 1);
++  VkBuffer a = buffer(c, 4096, m, 0), b = buffer(c, 4096, m, 65536);
++  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++  VkCommandPool pool;
++  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
++  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++  ai.commandPool = pool, ai.commandBufferCount = 1;
++  VkCommandBuffer cb;
++  vkAllocateCommandBuffers(c.dev, &ai, &cb);
++  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++  vkBeginCommandBuffer(cb, &bi);
++  VkBufferCopy bc{0, 0, 256};
++  vkCmdCopyBuffer(cb, a, b, 1, &bc);
++  VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
++  vkCmdPipelineBarrier2(cb, &dep);
++  vkEndCommandBuffer(cb);
++
++  VkSemaphoreTypeCreateInfo tci{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
++  tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE, tci.initialValue = 5;
++  VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &tci};
++  VkSemaphore tl;
++  vkCreateSemaphore(c.dev, &sci, nullptr, &tl);
++  uint64_t v = 0;
++  vkGetSemaphoreCounterValue(c.dev, tl, &v);
++  CHECK(v == 5);
++  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++  VkFence f1, f2;
++  vkCreateFence(c.dev, &fci, nullptr, &f1);
++  vkCreateFence(c.dev, &fci, nullptr, &f2);
++
++  nb.completedBelow = 0;  // nothing finishes from now on
++  // Submit 1 (vkQueueSubmit2): signals timeline 10 and fence f1.
++  VkCommandBufferSubmitInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
++  cbi.commandBuffer = cb;
++  VkSemaphoreSubmitInfo sig{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
++  sig.semaphore = tl, sig.value = 10;
++  VkSubmitInfo2 s2{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
++  s2.commandBufferInfoCount = 1, s2.pCommandBufferInfos = &cbi, s2.signalSemaphoreInfoCount = 1, s2.pSignalSemaphoreInfos = &sig;
++  CHECK(vkQueueSubmit2(c.queue, 1, &s2, f1) == VK_SUCCESS);
++  const uint64_t frame1 = from<Fence>(f1)->frame;
++  // Submit 2 (vkQueueSubmit + timeline values): waits 10 (promised by submit 1: no block), signals 20.
++  uint64_t wv = 10, sv = 20;
++  VkTimelineSemaphoreSubmitInfo tsi{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
++  tsi.waitSemaphoreValueCount = 1, tsi.pWaitSemaphoreValues = &wv, tsi.signalSemaphoreValueCount = 1, tsi.pSignalSemaphoreValues = &sv;
++  VkPipelineStageFlags ws = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, &tsi};
++  si.waitSemaphoreCount = 1, si.pWaitSemaphores = &tl, si.pWaitDstStageMask = &ws;
++  si.signalSemaphoreCount = 1, si.pSignalSemaphores = &tl;
++  si.commandBufferCount = 1, si.pCommandBuffers = &cb;
++  CHECK(vkQueueSubmit(c.queue, 1, &si, f2) == VK_SUCCESS);
++  const uint64_t frame2 = from<Fence>(f2)->frame;
++  CHECK(frame1 != kNoFrame && frame2 == frame1 + 1);
++
++  CHECK(vkGetFenceStatus(c.dev, f1) == VK_NOT_READY);
++  CHECK(vkWaitForFences(c.dev, 1, &f1, VK_TRUE, 1000000) == VK_TIMEOUT);  // 1 ms, honoured
++  vkGetSemaphoreCounterValue(c.dev, tl, &v);
++  CHECK(v == 5);
++  nb.completedBelow = frame1 + 1;  // the first frame finished; the second has not
++  CHECK(vkGetFenceStatus(c.dev, f1) == VK_SUCCESS);
++  CHECK(vkGetFenceStatus(c.dev, f2) == VK_NOT_READY);
++  VkFence both[2] = {f1, f2};
++  CHECK(vkWaitForFences(c.dev, 2, both, VK_FALSE, 0) == VK_SUCCESS);  // any
++  CHECK(vkWaitForFences(c.dev, 2, both, VK_TRUE, 0) == VK_TIMEOUT);   // all
++  vkGetSemaphoreCounterValue(c.dev, tl, &v);
++  CHECK(v == 10);
++  VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
++  wi.semaphoreCount = 1, wi.pSemaphores = &tl, wi.pValues = &sv;
++  CHECK(vkWaitSemaphores(c.dev, &wi, 0) == VK_TIMEOUT);
++  nb.completedBelow = frame2 + 1;
++  CHECK(vkWaitSemaphores(c.dev, &wi, UINT64_MAX) == VK_SUCCESS);
++  CHECK(vkWaitForFences(c.dev, 2, both, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
++  // Host signal releases a wait nobody promised.
++  uint64_t far = 30;
++  wi.pValues = &far;
++  std::thread t([&] {
++    std::this_thread::sleep_for(std::chrono::milliseconds(5));
++    VkSemaphoreSignalInfo hs{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
++    hs.semaphore = tl, hs.value = 30;
++    vkSignalSemaphore(c.dev, &hs);
++  });
++  CHECK(vkWaitSemaphores(c.dev, &wi, 2000000000ull) == VK_SUCCESS);
++  t.join();
++  vkResetFences(c.dev, 1, &f1);
++  CHECK(vkGetFenceStatus(c.dev, f1) == VK_NOT_READY);
++  CHECK(vkQueueWaitIdle(c.queue) == VK_SUCCESS && vkDeviceWaitIdle(c.dev) == VK_SUCCESS);
++  // Binary semaphores: a signal then a wait between submissions needs nothing from the host.
++  VkSemaphore bin;
++  VkSemaphoreCreateInfo bci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
++  vkCreateSemaphore(c.dev, &bci, nullptr, &bin);
++  VkSubmitInfo s1{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++  s1.signalSemaphoreCount = 1, s1.pSignalSemaphores = &bin;
++  CHECK(vkQueueSubmit(c.queue, 1, &s1, VK_NULL_HANDLE) == VK_SUCCESS);
++  VkSubmitInfo s3{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++  s3.waitSemaphoreCount = 1, s3.pWaitSemaphores = &bin, s3.pWaitDstStageMask = &ws;
++  CHECK(vkQueueSubmit(c.queue, 1, &s3, VK_NULL_HANDLE) == VK_SUCCESS);
++  // ... and a wait on one only the host layer's swapchain acquire signalled does not block.
++  CHECK(vkQueueSubmit(c.queue, 1, &s3, VK_NULL_HANDLE) == VK_SUCCESS);
++  CHECK(vkGetDeviceProcAddr(c.dev, "vkQueueSubmit2KHR") && vkGetDeviceProcAddr(c.dev, "vkWaitSemaphoresKHR"));
++  vkDestroySemaphore(c.dev, bin, nullptr);
++  vkDestroySemaphore(c.dev, tl, nullptr);
++  vkDestroyFence(c.dev, f1, nullptr);
++  vkDestroyFence(c.dev, f2, nullptr);
++  vkDestroyCommandPool(c.dev, pool, nullptr);
++  vkDestroyBuffer(c.dev, a, nullptr);
++  vkDestroyBuffer(c.dev, b, nullptr);
++  vkFreeMemory(c.dev, m, nullptr);
++}
++
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+@@ -1121,7 +1236,7 @@ int main(int argc, char** argv) {
+       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
+       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
+       {"recipes", testRecipes}, {"alyx", testAlyxSurface}, {"depth_resolve", testDepthResolve},
+-      {"local_read", testLocalRead}};
++      {"local_read", testLocalRead}, {"sync", testSync}};
+   bool ran = false;
+   for (const auto& [name, fn] : groups) {
+     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
+-- 
+2.43.0
+

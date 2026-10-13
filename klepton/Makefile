@@ -11,14 +11,21 @@ MVK_INC := -Ivendor-moltenvk/out/include
 # too. One -I per source directory is what buys that; gen_xcodeproj.py carries
 # the same list as HEADER_SEARCH_PATHS.
 RUNTIME_INC := -Iruntime -Iruntime/jni -Iruntime/libc -Iruntime/gfx -Iruntime/xr \
-               -Iruntime/media -Iruntime/guest -Iruntime/diag
+               -Iruntime/media -Iruntime/guest -Iruntime/diag -Iruntime/linux
+# AVP: the dependency builds (scripts/build-luajit.sh, build-fossilize.sh write them into the
+# repo's build/deps): LuaJIT's headers as <luajit/lua.h>, Fossilize's under include/fossilize.
+DEPS_DIR ?= ../build/deps
+DEPS_INC := -I$(DEPS_DIR)/include
+FZ_INC   := -I$(DEPS_DIR)/include/fossilize
 CFLAGS  := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
 # VideoToolbox/CoreMedia/CoreVideo are the video decoder (kl_vtdec.c), and they
 # are in the base LDLIBS rather than on one target because kl_vtdec is in
 # RUNTIME_SHIP — everything that links the runtime needs them.
 LDLIBS  := -lz -framework AudioToolbox \
            -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
-           -framework CoreFoundation -framework AVFoundation -framework Foundation
+           -framework CoreFoundation -framework AVFoundation -framework Foundation \
+           -framework Metal -framework QuartzCore
+# (Metal/QuartzCore: kl_gpu_time.m, in RUNTIME_SHIP for the Alyx GPU frame time.)
 # The host/ship split is a source-list boundary, not a runtime getenv.
 #
 # RUNTIME_SHIP is everything that goes into the visionOS app bundle. It is the
@@ -58,12 +65,13 @@ RUNTIME_SHIP := runtime/kl_env.c runtime/kl_image.c runtime/kl_stub_cells.S runt
            runtime/guest/kl_jkxr.c runtime/guest/kl_native.c runtime/guest/kl_sdl2.c \
            runtime/guest/kl_gles3jni.c runtime/guest/kl_driver.c \
            runtime/media/kl_aaudio.c runtime/media/kl_mediaplayer.c runtime/media/kl_hostvideo.c \
-           runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
+           runtime/gfx/kl_glfb.c runtime/gfx/kl_cvmtl.m runtime/gfx/kl_gpu_time.m runtime/gfx/kl_gl_trace.S runtime/gfx/kl_gl_lock.S \
            runtime/guest/kl_mono.c \
            runtime/guest/kl_il2cpp.c runtime/kl_fault.c runtime/guest/kl_guestpatch.c \
            runtime/guest/kl_guestpoke.c runtime/kl_cacerts.c runtime/media/kl_phonon_hrtf.S \
            runtime/media/kl_menu_font.S \
-           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c
+           runtime/diag/kl_sample.c runtime/diag/kl_mprobe.c \
+           runtime/linux/kl_elftls.c runtime/linux/kl_elftls_resolver.S
 RUNTIME_DIAG := runtime/diag/kl_metadump.c
 RUNTIME := $(RUNTIME_SHIP) $(RUNTIME_DIAG)
 
@@ -738,7 +746,11 @@ XROS_LIBS  := $(foreach p,$(XROS_PLATFORMS),build/$(p)/libklepton.a)
 # fails; a Vulkan guest simply reports that the hardware does not meet its
 # requirements, on device only). Nothing links against MoltenVK either way —
 # kl_vulkan.c is VK_NO_PROTOTYPES and dlopens it — so this is headers only.
-XROS_CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC)
+# KL_PATHMAP / KL_LD_PATHMAP: compiler/linker flags that rename build paths in what is compiled in
+# (__FILE__, debug info), e.g. -ffile-prefix-map=$PWD/=klepton/, so no build machine's paths ship.
+KL_PATHMAP ?=
+KL_LD_PATHMAP ?=
+XROS_CFLAGS := -g -O1 -Wall -Wextra -Wno-unused-parameter -arch arm64 $(MVK_INC) $(RUNTIME_INC) $(KL_PATHMAP)
 
 .PHONY: xros xros-device xros-sim swiftcheck
 xros: $(XROS_GATES) build/Klepton.xcframework swiftcheck
@@ -781,23 +793,54 @@ swiftcheck:
 # runs the PREVIOUS constant while the source says otherwise. That is the same
 # stale-artifact trap the xcframework rule below already records; the fix there
 # stopped at the archives and left this behind it.
-build/xros/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
-	@mkdir -p build/xros
-	@rm -f $@
-	@for s in $(RUNTIME_SHIP); do \
-	  o=build/xros/$$(basename $$s | sed 's/\.[cSm]$$/.o/'); \
-	  $(CC) $(XROS_CFLAGS) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) \
-	    -c $$s -o $$o || exit 1; done
-	@ar rcs $@ build/xros/*.o
+# AVP: Half-Life: Alyx's Linux guest runtime goes into the same archive (the app links one
+# library): the glibc personality, the Steam networking loopback, the native-LuaJIT hooks, the
+# Fossilize pipeline recorder/replayer and the OpenVR shim. C/asm/ObjC with XROS_CFLAGS; C++
+# with its own flags; Fossilize's own headers only for kl_fossilize.cpp (its bundled Vulkan
+# headers must not shadow MoltenVK's for the rest of the runtime).
+RUNTIME_LINUX_C   := runtime/linux/kl_alyx.c runtime/linux/kl_alyx_app.c runtime/linux/kl_glibc.c \
+                     runtime/linux/kl_glibc_va.S runtime/linux/kl_imp_trace.S runtime/linux/kl_steam_null.S \
+                     runtime/linux/kl_lua.c runtime/openvr/platform/klvr_platform_klepton.c
+RUNTIME_LINUX_CXX := runtime/linux/kl_steamnet.cpp
+KLVR_DIR := runtime/openvr
+KLVR_SRC := $(wildcard $(KLVR_DIR)/src/klvr_*.cpp)
+KLVR_HDRS := $(wildcard $(KLVR_DIR)/src/*.h) $(wildcard $(KLVR_DIR)/src/generated/*) $(KLVR_DIR)/third_party/openvr/openvr.h
+XROS_CXXFLAGS := -std=c++17 -g -O1 -arch arm64 -Wall -Wno-unused-parameter $(KL_PATHMAP)
+KLVR_CXXFLAGS := $(XROS_CXXFLAGS) -fvisibility=hidden -Werror=missing-declarations -DVR_API_EXPORT \
+                 -I$(KLVR_DIR)/src -iquote $(KLVR_DIR)/third_party/openvr $(MVK_INC)
+FZ_CXXFLAGS   := -std=c++17 -g -O2 -arch arm64 -fno-exceptions -Wno-unused-parameter $(FZ_INC) $(KL_PATHMAP)
+ALYX_ALL_SRC  := $(RUNTIME_LINUX_C) $(RUNTIME_LINUX_CXX) $(KLVR_SRC) runtime/linux/kl_fossilize.cpp
 
-build/xrsim/libklepton.a: $(RUNTIME_SHIP) $(RUNTIME_ALL_HDRS)
-	@mkdir -p build/xrsim
-	@rm -f $@
+# One rule for both slices: $(1) = xros|xrsim, $(2) = the -target/-isysroot pair.
+XR_TGT_xros  = -target arm64-apple-xros1.0 -isysroot $(XROS_SDK)
+XR_TGT_xrsim = -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK)
+define XR_ARCHIVE_RULE
+build/$(1)/libklepton.a: $(RUNTIME_SHIP) $(ALYX_ALL_SRC) $(RUNTIME_ALL_HDRS) $(KLVR_HDRS)
+	@mkdir -p build/$(1)/alyx
+	@rm -f $$@ build/$(1)/alyx/*.o
 	@for s in $(RUNTIME_SHIP); do \
-	  o=build/xrsim/$$(basename $$s | sed 's/\.[cSm]$$/.o/'); \
-	  $(CC) $(XROS_CFLAGS) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) \
-	    -c $$s -o $$o || exit 1; done
-	@ar rcs $@ build/xrsim/*.o
+	  o=build/$(1)/$$$$(basename $$$$s | sed 's/\.[cSm]$$$$/.o/'); \
+	  $(CC) $(XROS_CFLAGS) $(XR_TGT_$(1)) -c $$$$s -o $$$$o || exit 1; done
+	@for s in $(RUNTIME_LINUX_C); do \
+	  $(CC) $(XROS_CFLAGS) $(DEPS_INC) -DKL_OPENVR_SHIM -I$(KLVR_DIR)/src $(XR_TGT_$(1)) -c $$$$s \
+	    -o build/$(1)/alyx/$$$$(basename $$$$s | sed 's/\.[cS]$$$$/.o/') || exit 1; done
+	@for s in $(RUNTIME_LINUX_CXX); do \
+	  clang++ $(XROS_CXXFLAGS) -Iruntime/linux $(XR_TGT_$(1)) -c $$$$s \
+	    -o build/$(1)/alyx/$$$$(basename $$$$s .cpp).o || exit 1; done
+	@clang++ $(FZ_CXXFLAGS) $(XR_TGT_$(1)) -c runtime/linux/kl_fossilize.cpp -o build/$(1)/alyx/kl_fossilize.o
+	@for s in $(KLVR_SRC); do \
+	  clang++ $(KLVR_CXXFLAGS) $(XR_TGT_$(1)) -c $$$$s -o build/$(1)/alyx/$$$$(basename $$$$s .cpp).o || exit 1; done
+	@# The shim's methods are weak stubs in klvr_registry.o and strong in the other klvr_*.o;
+	@# from an archive the linker would never pull those in (the weak stubs already satisfy
+	@# every reference). One relocatable object carries them together, strong ones winning.
+	@ld -r -arch arm64 $(KL_LD_PATHMAP) -o build/$(1)/alyx/klvr_all.o.tmp build/$(1)/alyx/klvr_*.o
+	@rm -f build/$(1)/alyx/klvr_*.o && mv build/$(1)/alyx/klvr_all.o.tmp build/$(1)/alyx/klvr_all.o
+	@ar rcs $$@ build/$(1)/*.o build/$(1)/alyx/*.o
+endef
+$(foreach p,xros xrsim,$(eval $(call XR_ARCHIVE_RULE,$(p))))
+
+# The Alyx objects in the archive need LuaJIT, Fossilize, libc++ and Metal at link time.
+XR_GATE_LIBS := -L$(DEPS_DIR)/lib -lluajit -lfossilize -lc++ -liconv -framework Metal -framework QuartzCore
 
 # The gate: link each archive into a dylib with -all_load, so a symbol that is
 # declared in a header but absent from the platform fails the build even inside
@@ -806,14 +849,14 @@ build/xros/libklepton.dylib: build/xros/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0 -isysroot $(XROS_SDK) -arch arm64 \
 	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
-	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
+	   -framework CoreFoundation -framework AVFoundation -framework Foundation $(XR_GATE_LIBS) \
 	   -install_name @rpath/libklepton.dylib
 
 build/xrsim/libklepton.dylib: build/xrsim/libklepton.a
 	@$(CC) -target arm64-apple-xros1.0-simulator -isysroot $(XRSIM_SDK) -arch arm64 \
 	   -dynamiclib -o $@ -Wl,-all_load $< -lz -framework AudioToolbox \
 	   -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface \
-	   -framework CoreFoundation -framework AVFoundation -framework Foundation \
+	   -framework CoreFoundation -framework AVFoundation -framework Foundation $(XR_GATE_LIBS) \
 	   -install_name @rpath/libklepton.dylib
 
 xros-device: build/xros/libklepton.dylib

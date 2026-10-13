@@ -32,6 +32,8 @@
 #include <sys/un.h>
 #include <sys/param.h>
 #include <sys/socket.h>
+#include <os/lock.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
@@ -309,10 +311,150 @@ ssize_t klb_sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
 #define EPOLLERR    0x008
 #define EPOLLHUP    0x010
 #define EPOLLRDHUP  0x2000
+#define EPOLLIN_    0x001
+#define EPOLLOUT_   0x004
 
 // Linux's struct is PACKED on x86 but not on aarch64: 4-byte events then an
 // 8-byte union at offset 8. Measured 16 bytes with the NDK headers.
 typedef struct { uint32_t events; uint32_t __pad; uint64_t data; } linux_epoll_event;
+
+// ---- The job-semaphore fast path ------------------------------------------
+// Source 2 parks each of its ~35 job workers in epoll_wait on its own epoll
+// set holding THREE eventfds (two private semaphores and the shared job
+// semaphore, all EFD_SEMAPHORE, EPOLLIN|EPOLLET|EPOLLEXCLUSIVE). On kqueue
+// every post woke every worker (EPOLLEXCLUSIVE has no kqueue equivalent) and
+// each post cost datagrams: a Time Profiler run of VR Chapter 1 had ~90% of
+// the process's running samples in kevent/sendto/recvfrom/fcntl and ~7% in
+// the game. So an epoll set made only of eventfds (EPOLLIN, up to 4) waits
+// with a futex (__ulock) on a sequence word of its own, and each eventfd keeps
+// the list of such sets watching it. A post bumps and wakes subscriber sets
+// that have a waiter parked: one per unit, round-robin, when the registration
+// is EPOLLEXCLUSIVE; all of them otherwise — Linux's rule. Sets with anything
+// else in them keep the kqueue path, and the eventfd keeps feeding it.
+#define EPOLLEXCLUSIVE_ 0x10000000u
+#define EPOLLET_        0x80000000u
+extern int __ulock_wait(uint32_t op, void *addr, uint64_t value, uint32_t timeout_us);
+extern int __ulock_wake(uint32_t op, void *addr, uint64_t wake_value);
+#define UL_COMPARE_AND_WAIT 1
+#define ULF_WAKE_ALL        0x00000100
+#define ULF_NO_ERRNO        0x01000000
+
+#define EP_MAXREG 4
+#define EFD_MAXSUB 64
+typedef struct { int fd; uint32_t ev; uint64_t data; } ep_reg;
+typedef struct { int n, overflow, fast; ep_reg r[EP_MAXREG]; } ep_set;
+static ep_set g_ep[4096];
+static os_unfair_lock g_ep_lock = OS_UNFAIR_LOCK_INIT;
+static _Atomic uint32_t g_ep_seq[4096];       // per fast set: the futex word
+static _Atomic int g_ep_waiting[4096];        // per fast set: threads parked
+// Per eventfd: fast sets watching it (epfd, or -1), whether any of those
+// registrations is non-EXCLUSIVE, a round-robin cursor, and how many kqueue-
+// path registrations are edge-triggered (then a post needs a datagram).
+static _Atomic int g_efd_sub[4096][EFD_MAXSUB];
+static _Atomic int g_efd_nsub[4096];
+static _Atomic int g_efd_shared[4096];
+static _Atomic unsigned g_efd_rr[4096];
+static _Atomic int g_efd_slow_et[4096];
+int kl_eventfd_kind(int fd);
+
+static int efd_ok(int fd) { return fd >= 0 && fd < 4096 && kl_eventfd_kind(fd); }
+static void ep_account(int epfd, ep_set *e, int sign) {    // g_ep_lock held
+    for (int i = 0; i < e->n; i++) {
+        int fd = e->r[i].fd;
+        if (!efd_ok(fd)) continue;
+        if (!e->fast) { if (e->r[i].ev & EPOLLET_) g_efd_slow_et[fd] += sign; continue; }
+        if (!(e->r[i].ev & EPOLLEXCLUSIVE_)) g_efd_shared[fd] += sign;
+        if (sign > 0) {
+            int k = g_efd_nsub[fd];
+            if (k < EFD_MAXSUB) { g_efd_sub[fd][k] = epfd; g_efd_nsub[fd] = k + 1; }
+        } else {
+            int k = g_efd_nsub[fd];
+            for (int j = 0; j < k; j++)
+                if (g_efd_sub[fd][j] == epfd) { g_efd_sub[fd][j] = g_efd_sub[fd][k - 1]; g_efd_nsub[fd] = k - 1; break; }
+        }
+    }
+}
+static void ep_track(int epfd, int op, int fd, uint32_t ev, uint64_t data) {
+    if (epfd < 0 || epfd >= 4096) return;
+    os_unfair_lock_lock(&g_ep_lock);
+    ep_set *e = &g_ep[epfd];
+    ep_account(epfd, e, -1);
+    int i = 0;
+    for (; i < e->n; i++) if (e->r[i].fd == fd) break;
+    if (op == EPOLL_CTL_DEL) {
+        if (i < e->n) e->r[i] = e->r[--e->n];
+    } else if (i < e->n) {
+        e->r[i].ev = ev; e->r[i].data = data;
+    } else if (e->n < EP_MAXREG) {
+        e->r[e->n++] = (ep_reg){ fd, ev, data };
+    } else {
+        e->overflow = 1;
+    }
+    int fast = !e->overflow && e->n > 0 && !kl_env_on("KL_EPOLL_NO_FAST", 0);
+    for (int j = 0; fast && j < e->n; j++)
+        fast = efd_ok(e->r[j].fd) && (e->r[j].ev & EPOLLIN_) && !(e->r[j].ev & EPOLLOUT_);
+    e->fast = fast;
+    ep_account(epfd, e, +1);
+    os_unfair_lock_unlock(&g_ep_lock);
+}
+// An fd number being closed: it may have been an epoll set.
+void kl_epoll_forget(int fd) {
+    if (fd < 0 || fd >= 4096) return;
+    os_unfair_lock_lock(&g_ep_lock);
+    ep_account(fd, &g_ep[fd], -1);
+    memset(&g_ep[fd], 0, sizeof g_ep[fd]);
+    os_unfair_lock_unlock(&g_ep_lock);
+}
+static uint64_t efd_count_now(int fd);
+// 1 with *out filled if the set is a fast one and the call was handled.
+static int ep_fast_wait(int epfd, void *events, int maxevents, int timeout_ms, int *out) {
+    if (epfd < 0 || epfd >= 4096 || !g_ep[epfd].fast) return 0;
+    ep_set snap;
+    os_unfair_lock_lock(&g_ep_lock);
+    snap = g_ep[epfd];
+    os_unfair_lock_unlock(&g_ep_lock);
+    if (!snap.fast) return 0;
+    uint64_t deadline = 0;
+    if (timeout_ms > 0) deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + (uint64_t)timeout_ms * 1000000ull;
+    linux_epoll_event *o = events;
+    for (;;) {
+        uint32_t seq = atomic_load(&g_ep_seq[epfd]);
+        atomic_fetch_add(&g_ep_waiting[epfd], 1);
+        int n = 0;
+        for (int i = 0; i < snap.n && n < maxevents; i++)
+            if (efd_count_now(snap.r[i].fd)) {
+                o[n].events = EPOLLIN_; o[n].__pad = 0; o[n].data = snap.r[i].data; n++;
+            }
+        if (n || timeout_ms == 0) { atomic_fetch_sub(&g_ep_waiting[epfd], 1); *out = n; return 1; }
+        uint32_t us = 0;
+        if (timeout_ms > 0) {
+            uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            if (now >= deadline) { atomic_fetch_sub(&g_ep_waiting[epfd], 1); *out = 0; return 1; }
+            uint64_t left = (deadline - now) / 1000;
+            us = left > 0xffffffffu ? 0xffffffffu : (left ? (uint32_t)left : 1);
+        }
+        __ulock_wait(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, &g_ep_seq[epfd], seq, us);
+        atomic_fetch_sub(&g_ep_waiting[epfd], 1);
+    }
+}
+static void ep_wake_set(int epfd, int all) {
+    atomic_fetch_add(&g_ep_seq[epfd], 1);
+    __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO | (all ? ULF_WAKE_ALL : 0), &g_ep_seq[epfd], 0);
+}
+// After the count went up by n: wake parked subscriber sets.
+static void efd_fast_wake(int fd, uint64_t n) {
+    int k = atomic_load(&g_efd_nsub[fd]);
+    if (k <= 0) return;
+    int all = atomic_load(&g_efd_shared[fd]) > 0;
+    unsigned start = atomic_fetch_add(&g_efd_rr[fd], 1);
+    uint64_t woken = 0;
+    for (int j = 0; j < k && (all || woken < n); j++) {
+        int ep = atomic_load(&g_efd_sub[fd][(start + (unsigned)j) % (unsigned)k]);
+        if (ep < 0 || ep >= 4096 || atomic_load(&g_ep_waiting[ep]) <= 0) continue;
+        ep_wake_set(ep, all);
+        woken++;
+    }
+}
 
 int klb_epoll_create1(int flags) {
     int kq = kqueue();
@@ -331,7 +473,14 @@ int klb_epoll_ctl(int epfd, int op, int fd, void *ev) {
     // the caller registered, which is what its consumers key on.
     void *ud = e ? (void *)(uintptr_t)e->data : NULL;
     uint32_t want = e ? e->events : 0;
+    if (kl_env_on("KL_TRACE_EPOLL", 0)) {
+        static uint32_t seen[16]; static int ns;
+        int dup = 0; for (int i = 0; i < ns; i++) dup |= seen[i] == want;
+        if (!dup && ns < 16) { seen[ns++] = want; fprintf(stderr, "  [epoll] ctl op %d fd %d events %#x\n", op, fd, want); }
+    }
 
+    if (op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD || op == EPOLL_CTL_DEL)
+        ep_track(epfd, op, fd, want, (uint64_t)(uintptr_t)ud);
     if (op == EPOLL_CTL_DEL) {
         EV_SET(&ch[n++], fd, EVFILT_READ,  EV_DELETE, 0, 0, NULL);
         EV_SET(&ch[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
@@ -340,10 +489,16 @@ int klb_epoll_ctl(int epfd, int op, int fd, void *ev) {
     }
     if (op != EPOLL_CTL_ADD && op != EPOLL_CTL_MOD) { errno = EINVAL; return -1; }
 
+    // EPOLLET (bit 31) is edge-triggered: kqueue's EV_CLEAR. Treating it as
+    // level-triggered made every waiter on a still-readable fd return at once,
+    // forever — Source 2 registers its job semaphore EPOLLIN|EPOLLET|
+    // EPOLLEXCLUSIVE, and all 35 workers spun. (EPOLLEXCLUSIVE, wake-one, has
+    // no kqueue equivalent across separate queues; edges bound the herd.)
+    unsigned short et = (want & 0x80000000u) ? EV_CLEAR : 0;
     EV_SET(&ch[n++], fd, EVFILT_READ,
-           (want & (EPOLLIN | EPOLLPRI | EPOLLRDHUP)) ? (EV_ADD | EV_ENABLE) : EV_DELETE, 0, 0, ud);
+           (want & (EPOLLIN | EPOLLPRI | EPOLLRDHUP)) ? (EV_ADD | EV_ENABLE | et) : EV_DELETE, 0, 0, ud);
     EV_SET(&ch[n++], fd, EVFILT_WRITE,
-           (want & EPOLLOUT) ? (EV_ADD | EV_ENABLE) : EV_DELETE, 0, 0, ud);
+           (want & EPOLLOUT) ? (EV_ADD | EV_ENABLE | et) : EV_DELETE, 0, 0, ud);
     struct kevent out[2];
     int r = kevent(epfd, ch, n, out, n, &(struct timespec){0, 0});
     if (r < 0) return -1;
@@ -360,6 +515,22 @@ int klb_epoll_ctl(int epfd, int op, int fd, void *ev) {
 
 int klb_epoll_wait(int epfd, void *events, int maxevents, int timeout_ms) {
     if (maxevents <= 0) { errno = EINVAL; return -1; }
+    { int got; if (ep_fast_wait(epfd, events, maxevents, timeout_ms, &got)) return got; }
+    if (epfd >= 0 && epfd < 4096 && kl_env_on("KL_EPOLL_STATS", 0)) {
+        static _Atomic unsigned calls[4096];
+        unsigned c = ++calls[epfd];
+        if (c == 20000) {
+            os_unfair_lock_lock(&g_ep_lock);
+            ep_set *e = &g_ep[epfd];
+            fprintf(stderr, "  [epoll] slow set %d: %u waits, %d regs%s, timeout %d:", epfd, c, e->n,
+                    e->overflow ? " (+more)" : "", timeout_ms);
+            for (int i = 0; i < e->n; i++)
+                fprintf(stderr, " fd %d kind %d ev %#x;", e->r[i].fd,
+                        (e->r[i].fd >= 0 && e->r[i].fd < 4096) ? kl_eventfd_kind(e->r[i].fd) : -1, e->r[i].ev);
+            fprintf(stderr, "\n");
+            os_unfair_lock_unlock(&g_ep_lock);
+        }
+    }
     struct kevent *kev = calloc((size_t)maxevents, sizeof *kev);
     if (!kev) { errno = ENOMEM; return -1; }
     struct timespec ts, *tsp = NULL;
@@ -816,35 +987,153 @@ int   klb_fwide(void *f, int mode)         { return fwide(kl_host_file(f), mode)
 // SEMAPHORE (EFD_SEMAPHORE) would see different behaviour — none does, and the
 // flag is refused below rather than ignored.
 #define LX_EFD_SEMAPHORE 1
+int kl_eventfd_semaphore_ok;
 #define LX_EFD_CLOEXEC   0x80000
 #define LX_EFD_NONBLOCK  0x800
 
+// Which descriptors are eventfds, and in which mode: 1 counter, 2 semaphore.
+// A personality whose guest drives eventfds with plain read()/write() (Source 2
+// builds its semaphores on EFD_SEMAPHORE) consults this to give each mode its
+// Linux semantics; see kl_eventfd_kind() users in runtime/linux/.
+static _Atomic unsigned char g_efd_kind[4096];
+int  kl_eventfd_kind(int fd) { return (fd >= 0 && fd < 4096) ? g_efd_kind[fd] : 0; }
+void kl_epoll_forget(int fd);
+static void efd_close_peer(int fd);
+void kl_eventfd_forget(int fd) {
+    if (fd >= 0 && fd < 4096) { if (g_efd_kind[fd]) efd_close_peer(fd); g_efd_kind[fd] = 0; }
+    kl_epoll_forget(fd);
+}
+// Any call that hands back a NEW descriptor number makes that number not-an-
+// eventfd (the number may have been an eventfd closed by a path other than
+// close()). Cheaper than validating the fd on every read and write.
+void kl_eventfd_fresh(int fd) { if (fd >= 0 && fd < 4096 && g_efd_kind[fd]) g_efd_kind[fd] = 0; }
+
+// The COUNTER lives here, not in the socket. The socket only carries
+// readiness: it holds exactly one marker datagram while the count is non-zero
+// and none while it is zero, so poll/epoll/kqueue see "readable" exactly when a
+// Linux eventfd would. Queuing one datagram per unit (the first design) fills
+// an AF_UNIX datagram buffer after a few hundred units — Source 2 releases its
+// job semaphores by large counts, so writers blocked in sendto (or, when
+// non-blocking, silently lost units) and the job workers never woke: the level
+// load waited forever for work that was queued.
+static _Atomic uint64_t g_efd_count[4096];
+// The writing end of each eventfd's socket pair, +1 (0 = none).
+static int g_efd_peer[4096];
+static int efd_peer(int fd) { return g_efd_peer[fd] ? g_efd_peer[fd] - 1 : fd; }
+static void efd_close_peer(int fd) { if (g_efd_peer[fd]) { close(g_efd_peer[fd] - 1); g_efd_peer[fd] = 0; } }
+static os_unfair_lock g_efd_locks[4096];          // per fd: no cross-fd contention
+static void efd_marker(int fd, int want) {           // fd lock held
+    uint64_t v = 1;
+    char buf[16];
+    while (recv(fd, buf, sizeof buf, MSG_DONTWAIT) > 0) {}
+    if (want) (void)send(efd_peer(fd), &v, sizeof v, MSG_DONTWAIT);
+}
+// Datagrams queued on the socket right now (readiness plus pending edges).
+static unsigned char g_efd_dgrams[4096];
+void kl_eventfd_add(int fd, uint64_t n) {
+    if (fd < 0 || fd >= 4096 || !n) return;
+    os_unfair_lock_lock(&g_efd_locks[fd]);
+    uint64_t was = atomic_fetch_add(&g_efd_count[fd], n);
+    if (!was) { efd_marker(fd, 1); g_efd_dgrams[fd] = 1; }
+    else if (atomic_load(&g_efd_slow_et[fd]) > 0) {
+        // Every write is a new EDGE for edge-triggered (EV_CLEAR) waiters, as
+        // on Linux: a datagram arriving re-fires the kqueue filter. Never skip
+        // one — capping the edges lost wakeups (sleeping job workers missed
+        // queued work and the level load stalled). To bound the buffer, drop
+        // an old datagram before adding the new one once 8 are queued.
+        uint64_t v = 1;
+        char buf[16];
+        if (g_efd_dgrams[fd] >= 8 && recv(fd, buf, sizeof buf, MSG_DONTWAIT) > 0) g_efd_dgrams[fd]--;
+        if (send(efd_peer(fd), &v, sizeof v, MSG_DONTWAIT) == (ssize_t)sizeof v) g_efd_dgrams[fd]++;
+    }
+    os_unfair_lock_unlock(&g_efd_locks[fd]);
+    efd_fast_wake(fd, n);
+}
+static uint64_t efd_count_now(int fd) { return atomic_load_explicit(&g_efd_count[fd], memory_order_acquire); }
+// O_NONBLOCK, cached: an empty non-blocking read is the job workers' hot path,
+// and asking fcntl every time was a syscall per miss.
+static _Atomic unsigned char g_efd_nb[4096];
+int kl_eventfd_nonblock(int fd) { return fd >= 0 && fd < 4096 && g_efd_nb[fd]; }
+void kl_eventfd_setfl(int fd, int nonblock) { if (fd >= 0 && fd < 4096 && g_efd_kind[fd]) g_efd_nb[fd] = nonblock != 0; }
+// Take from the counter: semaphore mode takes 1, counter mode takes all.
+// Returns 0 (and leaves *out alone) if the count is zero. The empty check is
+// lock-free, so a non-blocking poll of an empty eventfd costs no syscall.
+int kl_eventfd_take(int fd, int semaphore, uint64_t *out) {
+    if (fd < 0 || fd >= 4096) return 0;
+    if (!atomic_load_explicit(&g_efd_count[fd], memory_order_acquire)) return 0;
+    // Lock-free take: a CAS on the count (one in semaphore mode, all of it
+    // otherwise). Only the taker that brings it to zero then takes the lock,
+    // to clear the readiness marker if the count is STILL zero; a writer that
+    // got in between (kl_eventfd_add, under the lock) has already re-armed
+    // it. A reader that loses the race sees zero and never touches the lock.
+    // Alyx's job workers all read the same semaphores; this lock was ~15% of
+    // the process's samples on the Mac.
+    static int locked = -1;       // KL_EFD_LOCKED_TAKE=1: the old, fully locked take (A/B)
+    if (locked < 0) { const char *e = getenv("KL_EFD_LOCKED_TAKE"); locked = e && *e == '1'; }
+    if (locked) {
+        os_unfair_lock_lock(&g_efd_locks[fd]);
+        uint64_t c = atomic_load(&g_efd_count[fd]), v;
+        do { if (!c) { os_unfair_lock_unlock(&g_efd_locks[fd]); return 0; } v = semaphore ? 1 : c; }
+        while (!atomic_compare_exchange_weak(&g_efd_count[fd], &c, c - v));
+        if (c == v) { efd_marker(fd, 0); g_efd_dgrams[fd] = 0; }
+        os_unfair_lock_unlock(&g_efd_locks[fd]);
+        *out = v;
+        return 1;
+    }
+    uint64_t c = atomic_load_explicit(&g_efd_count[fd], memory_order_acquire), v;
+    for (;;) {
+        if (!c) return 0;
+        v = semaphore ? 1 : c;
+        if (atomic_compare_exchange_weak_explicit(&g_efd_count[fd], &c, c - v,
+                                                  memory_order_acq_rel, memory_order_acquire)) break;
+    }
+    if (c == v) {
+        os_unfair_lock_lock(&g_efd_locks[fd]);
+        if (!atomic_load(&g_efd_count[fd])) { efd_marker(fd, 0); g_efd_dgrams[fd] = 0; }
+        os_unfair_lock_unlock(&g_efd_locks[fd]);
+    }
+    *out = v;
+    return 1;
+}
+void kl_eventfd_reset(int fd, uint64_t initval) {
+    if (fd < 0 || fd >= 4096) return;
+    os_unfair_lock_lock(&g_efd_locks[fd]);
+    atomic_store(&g_efd_count[fd], initval);
+    efd_marker(fd, initval != 0);
+    g_efd_dgrams[fd] = initval != 0;
+    os_unfair_lock_unlock(&g_efd_locks[fd]);
+    if (initval) efd_fast_wake(fd, initval);
+}
+
 int klb_eventfd(unsigned int initval, int flags) {
-    if (flags & LX_EFD_SEMAPHORE) {   // see above: we do not implement counting
+    if (getenv("KL_TRACE_EVENTFD")) fprintf(stderr, "[eventfd] eventfd(%u, %#x)\n", initval, flags);
+    // EFD_SEMAPHORE needs a personality that routes read()/write() on the fd
+    // through kl_eventfd_kind (runtime/linux/kl_glibc.c does). Without one the
+    // counter semantics below would be wrong for it, so it is refused.
+    extern int kl_eventfd_semaphore_ok;
+    if ((flags & LX_EFD_SEMAPHORE) && !kl_eventfd_semaphore_ok) {
         errno = EINVAL;
         return -1;
     }
-    int s = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (s < 0) return -1;
-
-    // A name is needed only long enough to bind and connect; the connection
-    // outlives the unlink, so nothing is left in the filesystem.
-    static _Atomic unsigned seq;
-    struct sockaddr_un a = { .sun_family = AF_UNIX };
-    const char *tmp = getenv("TMPDIR"); if (!tmp || !*tmp) tmp = "/tmp";
-    snprintf(a.sun_path, sizeof a.sun_path, "%s/kl-efd-%d-%u",
-             tmp, (int)getpid(), atomic_fetch_add(&seq, 1));
-    unlink(a.sun_path);
-    if (bind(s, (struct sockaddr *)&a, sizeof a) < 0
-        || connect(s, (struct sockaddr *)&a, sizeof a) < 0) {
-        int e = errno; unlink(a.sun_path); close(s); errno = e;
-        return -1;
-    }
-    unlink(a.sun_path);
+    // A connected pair, not a socket bound to a name and connected to itself:
+    // sun_path holds 104 bytes, and an app container's TMPDIR on visionOS (and
+    // in its simulator) is longer than that, so the name was truncated and the
+    // bind collided ("Unable to create event, error 98" from tier0). The
+    // guest gets sv[0]; the runtime sends its markers through sv[1].
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) return -1;
+    int s = sv[0];
+    if (s >= 4096) { close(sv[0]); close(sv[1]); errno = EMFILE; return -1; }
+    fcntl(sv[1], F_SETFD, FD_CLOEXEC);
+    fcntl(sv[1], F_SETFL, fcntl(sv[1], F_GETFL) | O_NONBLOCK);
+    g_efd_peer[s] = sv[1] + 1;
 
     if (flags & LX_EFD_CLOEXEC)  fcntl(s, F_SETFD, FD_CLOEXEC);
     if (flags & LX_EFD_NONBLOCK) fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK);
-    for (unsigned i = 0; i < initval; i++) {   // initval is 0 in every real use
+    if (s < 4096) g_efd_kind[s] = (flags & LX_EFD_SEMAPHORE) ? 2 : 1;
+    kl_eventfd_setfl(s, (flags & LX_EFD_NONBLOCK) != 0);
+    kl_eventfd_reset(s, initval);
+    for (unsigned i = 0; i < 0; i++) {         // (the count is kl_eventfd_reset's now)
         uint64_t one = 1;
         if (send(s, &one, sizeof one, 0) < 0) break;
     }
@@ -852,24 +1141,18 @@ int klb_eventfd(unsigned int initval, int flags) {
 }
 
 int klb_eventfd_read(int fd, uint64_t *value) {
-    uint64_t total = 0, v;
-    ssize_t r = recv(fd, &v, sizeof v, 0);       // honours the fd's blocking mode
-    if (r != (ssize_t)sizeof v) return -1;
-    total = v;
-    // Drain the rest without blocking, so one read clears the channel the way a
-    // real eventfd does rather than leaving it spuriously readable.
     for (;;) {
-        r = recv(fd, &v, sizeof v, MSG_DONTWAIT);
-        if (r != (ssize_t)sizeof v) break;
-        total += v;
+        uint64_t v;
+        if (kl_eventfd_take(fd, kl_eventfd_kind(fd) == 2, &v)) { if (value) *value = v; return 0; }
+        if (kl_eventfd_nonblock(fd)) { errno = EAGAIN; return -1; }
+        struct pollfd p = { .fd = fd, .events = POLLIN };
+        if (poll(&p, 1, -1) < 0 && errno != EINTR) return -1;
     }
-    if (value) *value = total;
-    return 0;
 }
 
 int klb_eventfd_write(int fd, uint64_t value) {
-    ssize_t w = send(fd, &value, sizeof value, 0);
-    return w == (ssize_t)sizeof value ? 0 : -1;
+    kl_eventfd_add(fd, value);
+    return 0;
 }
 
 // ---- ppoll ----

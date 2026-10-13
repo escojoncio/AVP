@@ -439,6 +439,24 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
                          "not walked. Use lr above.\n", (void *)fp);
         if (m > 0) { klf_emit(buf, (size_t)m); }
         fp = NULL;
+        // The frame chain is smashed, so scan the stack conservatively instead:
+        // every word above sp that points into code, oldest callers last. Some
+        // are stale, but the call path that led here is among them.
+        void **sp = uc ? (void **)uc->uc_mcontext->__ss.__sp : NULL;
+        for (int i = 0, shown = 0; sp && i < 2048 && shown < 40; i++) {
+            if (!klf_readable(sp + i, 8)) break;
+            void *w = sp[i];
+            size_t woff = 0;
+            const char *wimg = kl_addr_image(w, &woff);
+            Dl_info wdi;
+            int host = !wimg && w && dladdr(w, &wdi) && wdi.dli_sname;
+            if (!wimg && !host) continue;
+            m = host ? snprintf(buf, sizeof buf, "    stack[sp+%#x] %s+%#zx\n", i * 8, wdi.dli_sname,
+                                (size_t)((char *)w - (char *)wdi.dli_saddr))
+                     : snprintf(buf, sizeof buf, "    stack[sp+%#x] %s+%#zx\n", i * 8, wimg, woff);
+            if (m > 0) { klf_emit(buf, (size_t)m); }
+            shown++;
+        }
     }
     for (int depth = 0; fp && klf_readable(fp, 16) && depth < 12; depth++) {
         void *ret = fp[1];

@@ -121,6 +121,11 @@ void *kl_trace_stub(const char *name, void *desc, void *tramp);
 
 // ---- image registry (backs guest dlopen/dlsym/dladdr) ----
 void      kl_set_library_path(const char *dir);
+void      kl_add_library_path(const char *dir);
+const char *kl_image_path(kl_image *img);      // extra DT_NEEDED search dir
+extern int (*kl_soname_served_hook)(const char *soname);
+// Consulted before an image's OWN definition of a name (LD_PRELOAD-style).
+extern void *(*kl_preload_hook)(const char *name);
 void      kl_register_image(const char *soname, kl_image *img);
 kl_image *kl_find_image(const char *soname);
 // Load an .so plus its DT_NEEDED chain, dependencies first (kl_dl.c).

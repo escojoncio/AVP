@@ -1,0 +1,347 @@
+From c5016f7d8b0b9c6f19a41880d416f4808f0a6f7c Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 04:33:33 +0000
+Subject: [PATCH 04/10] VPVulkan: VK_EXT_host_image_copy
+
+vkCopyMemoryToImageEXT / vkCopyImageToMemoryEXT / vkCopyImageToImageEXT /
+vkTransitionImageLayoutEXT / vkGetImageSubresourceLayout2(KHR|EXT). Images live in Metal private
+storage (replaceRegion cannot reach them), so each call is a staged GPU copy submitted alone and
+waited for (that frame only): host memory -> page-aligned staging buffer -> texture and back,
+with memoryRowLength / memoryImageHeight pitches. Layout transitions are no-ops. Properties list
+every layout; image format queries accept HOST_TRANSFER usage and answer the performance query;
+VkFormatProperties3 reports HOST_IMAGE_TRANSFER. Completes Alyx's captured extension list
+(gpu_vulkan.alyx creates the device with all of them).
+
+Test: gpu_vulkan.host_image_copy.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
+---
+ gpu/vulkan/CMakeLists.txt          |   2 +-
+ gpu/vulkan/src/physical_device.cpp |  26 ++++-
+ gpu/vulkan/src/sync.cpp            | 159 +++++++++++++++++++++++++++++
+ gpu/vulkan/tests/vk_tests.cpp      |  46 ++++++++-
+ 4 files changed, 229 insertions(+), 4 deletions(-)
+
+diff --git a/gpu/vulkan/CMakeLists.txt b/gpu/vulkan/CMakeLists.txt
+index 2a1b125..ad8d68f 100644
+--- a/gpu/vulkan/CMakeLists.txt
++++ b/gpu/vulkan/CMakeLists.txt
+@@ -34,7 +34,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
+     target_compile_definitions(vpvk_tests PRIVATE VPVK_SPIRV_TESTS="${CMAKE_CURRENT_SOURCE_DIR}/../shader/spirv/tests")
+     add_dependencies(vpvk_tests VPVulkan)
+     target_compile_options(vpvk_tests PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+-    foreach(t exports physical memory passes submit pipeline recipes alyx depth_resolve local_read sync)
++    foreach(t exports physical memory passes submit pipeline recipes alyx depth_resolve local_read sync host_image_copy)
+       add_test(NAME gpu_vulkan.${t} COMMAND vpvk_tests ${t} $<TARGET_FILE:VPVulkan>)
+     endforeach()
+   endif()
+diff --git a/gpu/vulkan/src/physical_device.cpp b/gpu/vulkan/src/physical_device.cpp
+index 32c96d5..3eb29ee 100644
+--- a/gpu/vulkan/src/physical_device.cpp
++++ b/gpu/vulkan/src/physical_device.cpp
+@@ -2,6 +2,7 @@
+ // driver reports where Apple GPUs can honour them, so engines that pick their Vulkan path from these
+ // numbers (Unity) take the same one they take on the headset; where the Vision Pro GPU is stricter,
+ // the stricter value is reported.
++#include <algorithm>
+ #include <cstring>
+ 
+ #include "vpvk.h"
+@@ -270,6 +271,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
+           {VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME, 1},
+           {VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, 2},
+           {VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, 1},
++          {VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME, 1},
+           {VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME, 1},
+           {VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME, 1},
+           {VK_KHR_SHADER_TERMINATE_INVOCATION_EXTENSION_NAME, 1},
+@@ -623,7 +625,29 @@ void fillProperties2(void* chain) {
+ }
+ 
+ // Property structures of extensions outside core 1.3.
+-void fillExtensionProperties(VkBaseOutStructure*) {}
++void fillExtensionProperties(VkBaseOutStructure* s) {
++  if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES_EXT) {
++    auto* p = reinterpret_cast<VkPhysicalDeviceHostImageCopyPropertiesEXT*>(s);
++    // Every layout works: layouts are not tracked (copies go through the GPU).
++    static const VkImageLayout layouts[] = {
++        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR};
++    const uint32_t n = sizeof layouts / sizeof *layouts;
++    auto fill = [&](uint32_t& count, VkImageLayout* out) {
++      if (!out) {
++        count = n;
++        return;
++      }
++      count = std::min(count, n);
++      std::memcpy(out, layouts, count * sizeof *out);
++    };
++    fill(p->copySrcLayoutCount, p->pCopySrcLayouts);
++    fill(p->copyDstLayoutCount, p->pCopyDstLayouts);
++    std::memcpy(p->optimalTilingLayoutUUID, deviceProperties().pipelineCacheUUID, VK_UUID_SIZE);
++    p->identicalMemoryTypeRequirements = VK_TRUE;
++  }
++}
+ 
+ bool hasDeviceExtension(const char* name) {
+   for (const VkExtensionProperties& e : deviceExtensions())
+diff --git a/gpu/vulkan/src/sync.cpp b/gpu/vulkan/src/sync.cpp
+index 87d7a8f..3449e99 100644
+--- a/gpu/vulkan/src/sync.cpp
++++ b/gpu/vulkan/src/sync.cpp
+@@ -10,6 +10,7 @@
+ // signals it (vkSignalSemaphore), as the spec allows for wait-before-signal.
+ #include <algorithm>
+ #include <chrono>
++#include <cstdlib>
+ #include <cstring>
+ #include <thread>
+ 
+@@ -374,6 +375,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWriteTimestamp2(VkCommandBuffer cb,
+ }
+ 
+ namespace vpvk {
++PFN_vkVoidFunction lookupHostImageCopy(const char* name);
+ PFN_vkVoidFunction lookupSync(const char* name) {
+   struct E {
+     const char* name;
+@@ -396,6 +398,163 @@ PFN_vkVoidFunction lookupSync(const char* name) {
+   };
+   for (const auto& [alias, real] : aliases)
+     if (!std::strcmp(name, alias)) name = real;
++  for (const E& e : table)
++    if (!std::strcmp(e.name, name)) return e.fn;
++  return lookupHostImageCopy(name);
++}
++}  // namespace vpvk
++
++// =================================================================================================
++// VK_EXT_host_image_copy. Images live in Metal private storage, so a host copy is a staged GPU copy
++// submitted on its own and waited for (that frame only): memory -> page-aligned staging buffer ->
++// texture, texture -> staging -> memory, texture -> texture. Layout transitions are no-ops (layouts
++// are not tracked). Row pitches follow memoryRowLength / memoryImageHeight like buffer copies.
++// =================================================================================================
++namespace vpvk {
++namespace {
++
++struct Staging {
++  uint8_t* host = nullptr;
++  vpgpu::BufferId id;
++  Device* d = nullptr;
++  Staging(Device& dev, uint64_t bytes) : d(&dev) {
++    const uint64_t size = (std::max<uint64_t>(bytes, 1) + 16383) & ~uint64_t(16383);
++    host = static_cast<uint8_t*>(std::aligned_alloc(16384, size));
++    vpgpu::BufferDesc bd;
++    bd.size = size, bd.guestMemory = host, bd.label = "vk.host_image_copy";
++    std::lock_guard<std::mutex> lock(d->submitMutex);
++    id = d->gpu->createBuffer(bd);
++  }
++  ~Staging() {
++    {
++      std::lock_guard<std::mutex> lock(d->submitMutex);
++      if (id) d->gpu->destroy(id);
++    }
++    std::free(host);
++  }
++};
++
++// Bytes of one layer of a region and its row pitch, in the image's block units.
++void regionPitch(const Image& im, uint32_t rowLength, uint32_t imageHeight, const VkExtent3D& e, uint32_t& row,
++                 uint32_t& rows, uint64_t& layerBytes) {
++  const vpgpu::FormatInfo& fi = vpgpu::formatInfo(im.desc.format);
++  const uint32_t w = rowLength ? rowLength : e.width, h = imageHeight ? imageHeight : e.height;
++  row = (w + fi.blockSize - 1) / fi.blockSize * fi.bytesPerBlock;
++  rows = (h + fi.blockSize - 1) / fi.blockSize;
++  layerBytes = uint64_t(row) * rows * std::max(1u, e.depth);
++}
++
++vpgpu::TextureSpan span(const Image& im, const VkImageSubresourceLayers& s, const VkOffset3D& o, const VkExtent3D& e) {
++  const uint16_t layers = s.layerCount == VK_REMAINING_ARRAY_LAYERS ? uint16_t(im.desc.layers - s.baseArrayLayer)
++                                                                     : uint16_t(s.layerCount);
++  return {im.id, uint16_t(s.mipLevel), uint16_t(s.baseArrayLayer), layers, uint32_t(o.x), uint32_t(o.y), uint32_t(o.z),
++          e.width, e.height, std::max(1u, e.depth)};
++}
++
++// Submits `frame` and waits for it.
++VkResult runNow(Device& d, const vpgpu::Frame& frame) {
++  uint64_t f;
++  {
++    std::lock_guard<std::mutex> lock(d.submitMutex);
++    f = d.gpu->submit(frame).frame;
++    d.lastFrame = f;
++  }
++  return d.waitFrame(f, UINT64_MAX) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
++}
++
++}  // namespace
++}  // namespace vpvk
++
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCopyMemoryToImageEXT(VkDevice dv, const VkCopyMemoryToImageInfoEXT* ci) {
++  Device& d = *from<Device>(dv);
++  const Image& im = *from<Image>(ci->dstImage);
++  if (!im.id) return VK_ERROR_MEMORY_MAP_FAILED;
++  for (uint32_t i = 0; i < ci->regionCount; ++i) {
++    const VkMemoryToImageCopyEXT& r = ci->pRegions[i];
++    uint32_t row, rows;
++    uint64_t layerBytes;
++    regionPitch(im, r.memoryRowLength, r.memoryImageHeight, r.imageExtent, row, rows, layerBytes);
++    vpgpu::Copy c;
++    c.kind = vpgpu::CopyKind::BufferToTexture;
++    c.dstTexture = span(im, r.imageSubresource, r.imageOffset, r.imageExtent);
++    const uint64_t bytes = layerBytes * c.dstTexture.layerCount;
++    Staging st(d, bytes);
++    if (!st.id) return VK_ERROR_OUT_OF_HOST_MEMORY;
++    std::memcpy(st.host, r.pHostPointer, bytes);
++    c.srcBuffer = {st.id, 0, bytes, row, rows};
++    c.label = "vk.host_upload";
++    vpgpu::Frame frame;
++    frame.copy(std::move(c));
++    if (VkResult res = runNow(d, frame)) return res;
++  }
++  return VK_SUCCESS;
++}
++
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCopyImageToMemoryEXT(VkDevice dv, const VkCopyImageToMemoryInfoEXT* ci) {
++  Device& d = *from<Device>(dv);
++  const Image& im = *from<Image>(ci->srcImage);
++  if (!im.id) return VK_ERROR_MEMORY_MAP_FAILED;
++  for (uint32_t i = 0; i < ci->regionCount; ++i) {
++    const VkImageToMemoryCopyEXT& r = ci->pRegions[i];
++    uint32_t row, rows;
++    uint64_t layerBytes;
++    regionPitch(im, r.memoryRowLength, r.memoryImageHeight, r.imageExtent, row, rows, layerBytes);
++    vpgpu::Copy c;
++    c.kind = vpgpu::CopyKind::TextureToBuffer;
++    c.srcTexture = span(im, r.imageSubresource, r.imageOffset, r.imageExtent);
++    const uint64_t bytes = layerBytes * c.srcTexture.layerCount;
++    Staging st(d, bytes);
++    if (!st.id) return VK_ERROR_OUT_OF_HOST_MEMORY;
++    c.dstBuffer = {st.id, 0, bytes, row, rows};
++    c.label = "vk.host_readback";
++    vpgpu::Frame frame;
++    frame.copy(std::move(c));
++    if (VkResult res = runNow(d, frame)) return res;
++    std::memcpy(r.pHostPointer, st.host, bytes);
++  }
++  return VK_SUCCESS;
++}
++
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCopyImageToImageEXT(VkDevice dv, const VkCopyImageToImageInfoEXT* ci) {
++  Device& d = *from<Device>(dv);
++  const Image &src = *from<Image>(ci->srcImage), &dst = *from<Image>(ci->dstImage);
++  if (!src.id || !dst.id) return VK_ERROR_MEMORY_MAP_FAILED;
++  vpgpu::Frame frame;
++  for (uint32_t i = 0; i < ci->regionCount; ++i) {
++    const VkImageCopy2& r = ci->pRegions[i];
++    vpgpu::Copy c;
++    c.kind = vpgpu::CopyKind::TextureToTexture;
++    c.srcTexture = span(src, r.srcSubresource, r.srcOffset, r.extent);
++    c.dstTexture = span(dst, r.dstSubresource, r.dstOffset, r.extent);
++    c.label = "vk.host_image_copy";
++    frame.copy(std::move(c));
++  }
++  return frame.commands().empty() ? VK_SUCCESS : runNow(d, frame);
++}
++
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkTransitionImageLayoutEXT(VkDevice, uint32_t, const VkHostImageLayoutTransitionInfoEXT*) {
++  return VK_SUCCESS;
++}
++
++extern "C" void vkGetImageSubresourceLayout(VkDevice, VkImage, const VkImageSubresource*, VkSubresourceLayout*);
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetImageSubresourceLayout2KHR(VkDevice dv, VkImage im, const VkImageSubresource2KHR* s,
++                                                                       VkSubresourceLayout2KHR* out) {
++  vkGetImageSubresourceLayout(dv, im, &s->imageSubresource, &out->subresourceLayout);
++}
++
++namespace vpvk {
++PFN_vkVoidFunction lookupHostImageCopy(const char* name) {
++  struct E {
++    const char* name;
++    PFN_vkVoidFunction fn;
++  };
++#define F(f) {#f, reinterpret_cast<PFN_vkVoidFunction>(&f)}
++  static const E table[] = {
++      F(vkCopyMemoryToImageEXT), F(vkCopyImageToMemoryEXT), F(vkCopyImageToImageEXT), F(vkTransitionImageLayoutEXT),
++      F(vkGetImageSubresourceLayout2KHR),
++  };
++#undef F
++  if (!std::strcmp(name, "vkGetImageSubresourceLayout2EXT")) name = "vkGetImageSubresourceLayout2KHR";
+   for (const E& e : table)
+     if (!std::strcmp(e.name, name)) return e.fn;
+   return nullptr;
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index af4cf10..fde8cf8 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -837,7 +837,7 @@ const char* const kAlyxExts[] = {
+     "VK_EXT_host_image_copy", "VK_KHR_multiview"};
+ 
+ // Extensions of the capture not implemented yet (emptied as they land).
+-const std::vector<std::string> kAlyxPending = {"VK_EXT_host_image_copy"};
++const std::vector<std::string> kAlyxPending = {};
+ bool pending(const char* e) {
+   for (const auto& p : kAlyxPending)
+     if (p == e) return true;
+@@ -1228,6 +1228,47 @@ void testSync() {
+   vkFreeMemory(c.dev, m, nullptr);
+ }
+ 
++// VK_EXT_host_image_copy: each call is a staged copy submitted and waited for on its own.
++void testHostImageCopy() {
++  Ctx c({VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME});
++  CHECK(c.dev != nullptr);
++  auto& nb = dynamic_cast<vpgpu::NullBackend&>(from<Device>(c.dev)->platform->backend());
++  VkDeviceMemory m = alloc(c, 1 << 20, 0);
++  VkImage im = image(c, VK_FORMAT_BC7_UNORM_BLOCK, 64, 2, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT, m);
++  CHECK(im != VK_NULL_HANDLE);
++  std::vector<uint8_t> data(64 * 64 * 2, 7);  // BC7: 16 bytes per 4x4 block, two layers
++  VkMemoryToImageCopyEXT r{VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT};
++  r.pHostPointer = data.data();
++  r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 2};
++  r.imageExtent = {64, 64, 1};
++  VkCopyMemoryToImageInfoEXT ci{VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT};
++  ci.dstImage = im, ci.dstImageLayout = VK_IMAGE_LAYOUT_GENERAL, ci.regionCount = 1, ci.pRegions = &r;
++  const size_t before = nb.calls.size();
++  auto copyToImage = reinterpret_cast<PFN_vkCopyMemoryToImageEXT>(vkGetDeviceProcAddr(c.dev, "vkCopyMemoryToImageEXT"));
++  CHECK(copyToImage && copyToImage(c.dev, &ci) == VK_SUCCESS);
++  bool submitted = false, staged = false;
++  for (size_t i = before; i < nb.calls.size(); ++i) {
++    submitted |= nb.calls[i].rfind("submit", 0) == 0 && nb.calls[i].find("encoders=1") != std::string::npos;
++    staged |= nb.calls[i].rfind("createBuffer", 0) == 0 && nb.calls[i].find("size=16384") != std::string::npos;
++  }
++  CHECK(submitted && staged);
++  std::vector<uint8_t> back(data.size(), 0);
++  VkImageToMemoryCopyEXT rb{VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY_EXT};
++  rb.pHostPointer = back.data(), rb.imageSubresource = r.imageSubresource, rb.imageExtent = r.imageExtent;
++  VkCopyImageToMemoryInfoEXT bi{VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_EXT};
++  bi.srcImage = im, bi.regionCount = 1, bi.pRegions = &rb;
++  CHECK(vkCopyImageToMemoryEXT(c.dev, &bi) == VK_SUCCESS);
++  VkHostImageLayoutTransitionInfoEXT tr{VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT};
++  tr.image = im;
++  CHECK(vkTransitionImageLayoutEXT(c.dev, 1, &tr) == VK_SUCCESS);
++  VkPhysicalDeviceHostImageCopyPropertiesEXT hp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES_EXT};
++  VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &hp};
++  vkGetPhysicalDeviceProperties2(c.pd, &p2);
++  CHECK(hp.copySrcLayoutCount > 0 && hp.copyDstLayoutCount > 0);
++  vkDestroyImage(c.dev, im, nullptr);
++  vkFreeMemory(c.dev, m, nullptr);
++}
++
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+@@ -1236,7 +1277,8 @@ int main(int argc, char** argv) {
+       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
+       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
+       {"recipes", testRecipes}, {"alyx", testAlyxSurface}, {"depth_resolve", testDepthResolve},
+-      {"local_read", testLocalRead}, {"sync", testSync}};
++      {"local_read", testLocalRead}, {"sync", testSync},
++      {"host_image_copy", testHostImageCopy}};
+   bool ran = false;
+   for (const auto& [name, fn] : groups) {
+     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
+-- 
+2.43.0
+
