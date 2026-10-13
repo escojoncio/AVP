@@ -71,7 +71,7 @@ Enlace: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa
 - Log B9 (VPKEngine): 3038+274 pipelines OK, luego "Error in Init() of RenderDeviceMgr001" sin ningún vkCreate tras
   el device (MoltenVK crea texturas por defecto justo ahí).
 
-## Build 10 — todo lo pendiente
+## Build 10 (`97d230e`, CI OK) — todo lo pendiente
 Causa (7 agentes, 5 independientes coinciden; sondas contra libVPVulkan.so Linux): VPVulkan anunciaba
 `textureCompressionBC=TRUE` sin BC1_RGB/BC2/BC4/BC5/BC6H en `kFormats` → FormatProperties 0, IFP -11; Source 2 los
 comprueba en Init. Inputs de los agentes: `scratchpad/agents/*` (efímero).
