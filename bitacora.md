@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/`). MoltenVK
 queda como referencia de diagnóstico (no se usa para jugar ni se arregla nada en él). Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: build 10, `97d230e`, CI OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última OK en CI: build 11, `8b1282b`).
 
 ## 100 % funcional en el visor
 - Steam: login (contraseña + Steam Guard), propiedad (paquete 134870), descarga build 25487405 en background, Cloud.
@@ -48,8 +48,18 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
 - Icono: `app/Assets.xcassets/AppIcon.solidimagestack` (Front palanca / Middle hexágono / Back degradado, 1024²,
   diseño original; generador fuera del repo), `ASSETCATALOG_COMPILER_APPICON_NAME`.
 
-## Siguiente (log de la build 10 con VPKEngine)
-- Primero: ¿la build 11 pasa el precompilado? Si cae: `klepton-crash-vpkengine.log` + `klepton-prewarm-vpkengine.log`.
+## Build 12 (sin validar): causa real del crash del precompilado
+- Logs_Alyx_6 (build 11, con el nuevo log): `MTLReportFailure` → abort en `vpgpu::metal2::MetalBackend::Impl::buildRender`
+  (hilo `klfz replay`): "Dual source blending is used in combination with multiple render targets". Pipelines de Alyx
+  con factores SRC1 (census: `blend src 1 dst 15`) recibían la variante de movimiento de VPKTAA (+RG16F) en
+  `buildMotionVariants`. Los thunks de diagnóstico eran inocentes.
+- VPKEngine `0014`: `buildMotionVariants` no crea variantes si algún blend usa Src1 (`vk.motion no_variant … dual-source
+  blending`; `passTakesMotion` deja ese pase sin movimiento); `metal2` `buildRender` devuelve error en vez de abortar
+  si hay dual-source con >1 render target. `pipelines.cpp` compila en Linux; `vpvk_tests` ya fallaba antes de 0014
+  (`std::bad_variant_access`, Release, sin investigar).
+
+## Siguiente
+- ¿Pasa el precompilado y arranca el juego? Si cae: `klepton-crash-vpkengine.log` + `klepton-prewarm-vpkengine.log`.
 - Si arranca: comprobar imagen en ambos ojos, VPKTAA (`[taa] … foveated`), FPS/GPU (`[gputime]`), pausa (PS izq. 1 s),
   Home/PS accidental + "Volver al juego" (segundo CompositorLayer sobre el mismo guest: sin validar).
 - Si sigue "RenderDeviceMgr001": leer `[vk] diag` (ring + errores), la consola del juego tras el message box y
