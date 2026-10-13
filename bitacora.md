@@ -126,6 +126,10 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   por el motor de P.T., `xr_host_visionos.mm` EyeFactor/CenterTangent): Alyx es binario cerrado, así que aquí va el
   rate map (estándar para juegos sin soporte del motor); quad views en VPKEngine (repetir el fotograma de ojo con
   proyección ampliada + objetivos propios) = investigación posterior.
+- Decisión del usuario: el juego se renderiza tal cual con MSAA; el foveado (rate map) baja la periferia; VPKTAA se
+  aplica a la periferia foveada (suavizar los bloques): fase 1 filtro espacial de reconstrucción en el unwarp del
+  compositor (bicúbico/adaptativo a bordes, sin vectores); fase 2 acumulación temporal solo en periferia con jitter +
+  movimiento de cámara (depth + pose). El centro se controla con la resolución del launcher (ya existe).
 - Foveado nativo de VPKEngine: rate map en TODOS los pases de ojo (también solo-color y compute que escriben la
   imagen del ojo), no por heurística en el hook de Klepton.
 
