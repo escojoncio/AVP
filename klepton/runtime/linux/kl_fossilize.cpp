@@ -605,13 +605,14 @@ static int foz_prewarm(const char *info_path) {
     start_replay(dev, (PFN_vkGetDeviceProcAddr)gipa(inst, "vkGetDeviceProcAddr"), true);
     // vkCreate*Pipelines only queues the compiles: without this wait, retiring the device drops whatever is
     // still queued (build 12: 1268 of ~2900 libraries compiled when the prewarm device went away).
-    // Without binary archives (AVP: off for good) the wait buys nothing that persists: the compiles it waits for
-    // land in the OS shader cache anyway, and on a cold cache it is minutes (build 14). The prewarm then is the
-    // replay alone (build 12's behaviour) and the game replays its own list.
+    // Without binary archives the wait is what fills the OS shader cache BEFORE the game runs: build 18 skipped it,
+    // the translator had changed (cold cache), and the game held every frame 1.5 s for pipelines still compiling
+    // (0.7 fps, black). Waiting costs minutes once after a translator/OS change and seconds afterwards (the OS cache
+    // answers); the game then replays its own list against a warm cache.
     const char *cache = getenv("VP_PIPELINE_CACHE_DIR"), *archive = getenv("VP_PIPELINE_ARCHIVE");
     const bool have_cache = cache && *cache, archive_off = archive && *archive == '0';
     bool drained = false;
-    if (!archive_off) {
+    {
         typedef uint32_t (*wait_fn)(VkDevice);
         void *h = nullptr;
         if (const char *drv = kl_vulkan_driver_path()) h = dlopen(drv, RTLD_NOW | RTLD_NOLOAD);
@@ -624,7 +625,7 @@ static int foz_prewarm(const char *info_path) {
         }
         if (h) dlclose(h);
     }
-    if (!drained && !archive_off)
+    if (!drained)
         fprintf(stderr, "  [foz] prewarm: the driver cannot wait for its queued compiles (not VPKEngine 0017+)\n");
     // Complete = every compile waited for AND kept on disk: the recipes (VP_PIPELINE_CACHE_DIR) and the binary
     // archive (off with VP_PIPELINE_ARCHIVE=0: the game would then compile every pipeline again, so it replays).

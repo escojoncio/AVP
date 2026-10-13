@@ -1,0 +1,67 @@
+From dbc57d782ffec2ab0ed3b6d2ab95e514fac60ffc Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 20:43:03 +0000
+Subject: [PATCH] Core: after a pipeline hold times out, holds are cut to 15 ms
+ for 3 s (a cold shader cache no longer stalls every frame 1.5 s)
+
+---
+ gpu/core/include/vpgpu/core/device.h |  6 ++++++
+ gpu/core/src/device.cpp              | 10 ++++++++--
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/gpu/core/include/vpgpu/core/device.h b/gpu/core/include/vpgpu/core/device.h
+index f2e5d1a..a918061 100644
+--- a/gpu/core/include/vpgpu/core/device.h
++++ b/gpu/core/include/vpgpu/core/device.h
+@@ -2,6 +2,7 @@
+ // submits frames, and produces the per-frame log lines.
+ #pragma once
+ 
++#include <chrono>
+ #include <deque>
+ #include <mutex>
+ #include <tuple>
+@@ -56,6 +57,11 @@ class Device {
+   // frame is one the host compositor never sees half-drawn: it keeps reprojecting the last
+   // complete one, which in VR reads as a brief pause instead of corrupted geometry.
+   uint32_t holdMs_ = 1500;
++  // After a hold that timed out (a cold shader cache: every frame brings pipelines still compiling, build 18
++  // held 1.5 s per frame = 0.7 fps), holds are cut to kHoldBackoffMs for a while: draws that are not ready
++  // are skipped instead of stalling the game thread frame after frame.
++  static constexpr uint32_t kHoldBackoffMs = 15;
++  std::chrono::steady_clock::time_point holdBackoffUntil_{};
+   uint64_t holdFrames_ = 0, holdTimeouts_ = 0;
+   double holdTotalMs_ = 0;
+   // Frames waiting for their timings: index + one descriptor per encoder ("pass=i label=.. fmt=.. WxH draws=..").
+diff --git a/gpu/core/src/device.cpp b/gpu/core/src/device.cpp
+index 73640d6..0edf651 100644
+--- a/gpu/core/src/device.cpp
++++ b/gpu/core/src/device.cpp
+@@ -1,5 +1,6 @@
+ #include "vpgpu/core/device.h"
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -65,10 +66,15 @@ FrameReport Device::submit(const Frame& frame) {
+     }
+     if (!pending.empty()) {
+       const auto h0 = std::chrono::steady_clock::now();
+-      const bool complete = pipelines_.waitReady(pending, std::chrono::milliseconds(holdMs_));
++      const bool backoff = h0 < holdBackoffUntil_;
++      const uint32_t budget = backoff ? std::min(holdMs_, kHoldBackoffMs) : holdMs_;
++      const bool complete = pipelines_.waitReady(pending, std::chrono::milliseconds(budget));
+       const double held = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
+       ++holdFrames_, holdTotalMs_ += held;
+-      if (!complete) ++holdTimeouts_;
++      if (!complete) {
++        ++holdTimeouts_;
++        holdBackoffUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(3);
++      }
+       if (holdFrames_ <= 16 || holdFrames_ % 64 == 0 || !complete) {
+         char buf[160];
+         std::snprintf(buf, sizeof buf, "gpu.hold f=%llu pipelines=%zu ms=%.0f complete=%d total_frames=%llu total_ms=%.0f timeouts=%llu",
+-- 
+2.43.0
+

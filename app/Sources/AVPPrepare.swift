@@ -122,7 +122,15 @@ enum AVPPrepare {
         while done.wait(timeout: .now() + 0.25) == .timedOut {
             let p = AlyxBoot.pipelineProgress()
             let f = p.total > 0 ? Double(p.done) / Double(p.total) : 0
-            progress(4, f, AVPL("Shaders \(p.done) / \(p.total)", "Shaders \(p.done) / \(p.total)"))
+            if p.total > 0 && p.done >= p.total {
+                // Replay done: VPKEngine is compiling the queued shaders into the system's shader cache. Seconds with
+                // a warm cache; minutes once after an update that changed the shader translator.
+                let s = Int(Date().timeIntervalSince(t0))
+                progress(4, 0.99, AVPL("Compilando shaders en la GPU… \(s) s — no cierres la app (tras una actualización puede tardar unos minutos, solo una vez)",
+                                       "Compiling shaders on the GPU… \(s) s — keep the app open (after an update this can take a few minutes, once)"))
+            } else {
+                progress(4, f, AVPL("Shaders \(p.done) / \(p.total)", "Shaders \(p.done) / \(p.total)"))
+            }
         }
         let p = AlyxBoot.pipelineProgress()
         progress(4, 1, AVPL("Shaders listos", "Shaders ready"))

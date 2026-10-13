@@ -65,7 +65,7 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   `gpu.hunt`/`resolve_refused` de la sesión anterior.
 - Linux: ctest 149/149, vpvk_tests OK (incl. `resolve_1x`). Metal/Swift revisados (Sonnet).
 
-## Build 18 (sin validar): imagen negra, rendimiento, shaders (3 agentes sobre Logs_Alyx_13)
+## Build 18 (log Logs_Alyx_13: 0 cuelgues, 0,7 fps, negro: caché de shaders del SO fría): imagen negra, rendimiento, shaders (3 agentes sobre Logs_Alyx_13)
 - Negro: Source 2 parte el pase de ojo en chunks suspend/resume (flags 0x2/0x6/0x4) repitiendo loadOp CLEAR; VPVulkan
   limpiaba en cada chunk → solo sobrevivía el último. `0022`: chunk RESUMING → Load, SUSPENDING → Store sin resolve,
   copia del depth 1x solo al final (`vk.rendering suspend_resume`). Test `suspend_resume`.
@@ -87,6 +87,15 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   `vkCopyMemoryToImageEXT` espera la GPU por región; copia del depth (aliasar); mapa VRR usa tamaño de textura (no
   renderArea); parche de arenas de movimiento (agents/perf/03) para cuando vuelvan los vectores.
 - Linux: ctest 152/152, vpvk_tests OK, shim 311/311. Metal/Swift revisados (Sonnet).
+
+## Build 19 (sin validar): caché de shaders fría tras cambiar el traductor
+- Logs_Alyx_13 (build 18): traductor v3 → todo el MSL nuevo; el prewarm se saltaba la espera al driver con archives
+  off, así que el juego compilaba en frío y `gpu.hold` retenía cada frame 1,5 s (`timeouts`), draws sin pipeline
+  (`missing_pipelines=49`) → 0,7 fps y negro. GPU del juego 28 ms/frame (`[gputime]` ya mide), foveado aplicado
+  (`[vrr] foveating 1x`), `suspend_resume` y `gpu.attachment view` activos. Imagen aún sin juzgar.
+- `kl_fossilize.cpp`: el prewarm SIEMPRE espera `vpvk_device_wait_compiles` (llena la caché del SO antes de jugar).
+  `AVPPrepare.prewarm`: texto "Compilando shaders en la GPU… N s — no cierres la app" cuando el replay llega al total.
+- VPKEngine `0025`: tras un hold que agota el tiempo, los holds bajan a 15 ms durante 3 s (`Device::submit`).
 
 ## Siguiente
 - Log build 18: imagen correcta? (`[cp] eye probe` no negro), fps (`[openvr] frames`), `[gputime] game avg` > 0,
