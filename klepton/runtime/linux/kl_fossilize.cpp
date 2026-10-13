@@ -363,6 +363,10 @@ void replay_db(VkDevice dev, const Fns &f, const std::string &path, unsigned nth
     (void)entries;
 }
 
+// The app's crash guard: after a prewarm that never finished, the next replays run on this many threads
+// (0 = KL_VK_FOZ_THREADS). Set without setenv, which races the other threads' getenv.
+std::atomic<unsigned> g_threads_override{0};
+
 // Set while kl_foz_prewarm makes its own device: that device's replay is the prewarm's to run, not the hook's.
 std::atomic<bool> g_prewarming{false};
 
@@ -380,14 +384,17 @@ void start_replay(VkDevice dev, PFN_vkGetDeviceProcAddr gdpa, bool block) {
     std::vector<std::string> files = replay_files();
     if (files.empty()) return;
     static Fns f;
+    klvk_set_replay_thread(1);   // this thread only: the replayer's entry points are raw (no diag thunks)
 #define L(n) f.n = (PFN_vk##n)gdpa(dev, "vk" #n)
     L(CreateSampler); L(DestroySampler); L(CreateDescriptorSetLayout); L(DestroyDescriptorSetLayout);
     L(CreatePipelineLayout); L(DestroyPipelineLayout); L(CreateShaderModule); L(DestroyShaderModule);
     L(CreateRenderPass); L(CreateRenderPass2); L(DestroyRenderPass);
     L(CreateGraphicsPipelines); L(CreateComputePipelines); L(DestroyPipeline);
 #undef L
+    klvk_set_replay_thread(0);
     unsigned nthreads = 4;
     if (const char *t = getenv("KL_VK_FOZ_THREADS")) nthreads = (unsigned)atoi(t);
+    if (unsigned o = g_threads_override.load()) nthreads = o;   // the app's crash guard (kl_foz_set_threads)
     if (nthreads < 1) nthreads = 1;
     fprintf(stderr, "  [foz] replaying %zu database(s) on %u threads to warm the Metal cache%s\n",
             files.size(), nthreads, block ? " (holding device creation until done)" : " in the background");
@@ -447,6 +454,8 @@ extern "C" void kl_fossilize_install(void) {
 
 extern "C" void *kl_vulkan_sym(const char *name);
 
+extern "C" void kl_foz_set_threads(unsigned n) { g_threads_override.store(n); }
+
 // One line per "Preparing graphics" before Play in prewarm.log beside the recording, which a stutter report carries
 // (diagnostics/): "<unix time it began> <seconds> <pipelines> <over 100 ms> <result>" (result 0, or why it could not:
 // -1 the device, -2 no usable device info). The launcher's own log line comes before the game's log file exists.
@@ -466,7 +475,15 @@ extern "C" void kl_foz_prewarm_log(double seconds, unsigned pipelines, unsigned 
 // usable (a feature struct this build cannot rebuild: try another copy), -1 when it could not otherwise (no databases,
 // a create that failed). The game's own replay is the fallback. The device and instance are retired after the replay
 // (klvk_retire_device), so the game's own device is the layer's first.
+static int foz_prewarm(const char *info_path);
+// The whole prewarm is Klepton's own Vulkan use: the diag thunks (meant for the guest's calls) stay out of it.
 extern "C" int kl_foz_prewarm(const char *info_path) {
+    klvk_diag_suspend(1);
+    int rc = foz_prewarm(info_path);
+    klvk_diag_suspend(0);
+    return rc;
+}
+static int foz_prewarm(const char *info_path) {
     kl_fossilize_install();
     if (replay_files().empty()) return -1;
     if (!info_path) return -2;

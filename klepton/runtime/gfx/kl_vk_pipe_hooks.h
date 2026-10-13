@@ -36,6 +36,8 @@ void klvk_retire_device(VkInstance inst, VkDevice dev);
 // On a replayer's own threads: their creates are neither handed to the hooks nor counted
 // as guest compiles in the "pipeline warmup" report.
 void klvk_set_replay_thread(int on);
+// The Vulkan diag thunks (kl_vk_diag.inc) hand out raw pointers while suspended (nested count).
+void klvk_diag_suspend(int on);
 
 #ifdef __cplusplus
 }

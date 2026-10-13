@@ -59,6 +59,7 @@ int   kl_vulkan_is_handle(const void *h) { (void)h; return 0; }
 void *kl_vulkan_sym(const char *n) { (void)n; return NULL; }
 void *kl_vulkan_lookup(const char *n) { (void)n; return NULL; }
 void  kl_vulkan_diag_dump(const char *why) { (void)why; }
+void  klvk_diag_suspend(int on) { (void)on; }
 int   kl_vulkan_available(void) { return 0; }
 const char *kl_vulkan_driver_path(void) { return NULL; }
 int   kl_vulkan_own_wsi(void) { return 0; }
