@@ -116,6 +116,19 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   `[vrr] foveating 1x`, `gpu.cfg frames_in_flight=12`, `vk.rendering suspend_resume`, `gpu.attachment view`, cero
   `Caused_GPU_Hang` (si hay: `gpu.hunt`). Activar capturas (Ajustes › Diagnóstico) si la imagen sigue mal.
 
+## Plan acordado (siguiente chat)
+- Imagen de referencia: MSAA x4 por defecto para Alyx (VPVK_FORCE_1X=0, vr_msaa 4); el hook KL_VRR foveaba bien
+  todos los pases con MSAA (camino validado con MoltenVK): reactivarlo con VPKEngine solo en modo MSAA. VPKTAA queda
+  como opción experimental hasta tener: profundidad linealizada (z = 0.95 - 0.0375/d, proyección en `[openvr] eye N
+  depth`), movimiento de cámara por depth + pose (estilo ASW), rechazo de historial en objetos móviles.
+- Foveado agresivo: preset tipo PTVisionPro (zona nítida 60°, periferia 10 %): con mapa separable de Metal ≈ 16-30 %
+  de píxeles (actual "soft" 61-67 %). PTVisionPro hace "quad views" (vista ancha al 10 % + inset nítido, dibujadas
+  por el motor de P.T., `xr_host_visionos.mm` EyeFactor/CenterTangent): Alyx es binario cerrado, así que aquí va el
+  rate map (estándar para juegos sin soporte del motor); quad views en VPKEngine (repetir el fotograma de ojo con
+  proyección ampliada + objetivos propios) = investigación posterior.
+- Foveado nativo de VPKEngine: rate map en TODOS los pases de ojo (también solo-color y compute que escriben la
+  imagen del ojo), no por heurística en el hook de Klepton.
+
 ## Pendiente
 - Ajustes en vivo que faltan: resolución/texturas (convars del juego), anisotrópico (solo afecta a samplers nuevos);
   activar/desactivar foveado requiere reiniciar.
