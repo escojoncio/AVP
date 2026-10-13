@@ -216,10 +216,11 @@ static int g_configured;
 // Alyx's fatal error box: onto the window's status line and into a file next
 // to the boot log, where the app keeps it after the guest thread parks.
 static char g_container[1024];
+static char g_logdir[1024];   // KL_ALYX_LOG_DIR (the app: Documents/Logs Alyx), else <data>/logs
 static void alyx_msgbox(const char *title, const char *msg) {
     snprintf(g_status, sizeof g_status, "Alyx: %s — %s", title, msg);
     char p[1100];
-    snprintf(p, sizeof p, "%s/logs/alyx-error.txt", g_container);
+    snprintf(p, sizeof p, "%s/alyx-error.txt", g_logdir);
     FILE *f = fopen(p, "w");
     if (f) { fprintf(f, "%s\n%s\n", title, msg); fclose(f); }
 }
@@ -342,7 +343,10 @@ int kl_app_configure_alyx(const char *resources, const char *game, const char *d
     snprintf(g_alyx_data, sizeof g_alyx_data, "%s", data);
     char dir[1200];
     mkdir(data, 0755);
-    snprintf(dir, sizeof dir, "%s/logs", data);   mkdir(dir, 0755);
+    const char *ld = getenv("KL_ALYX_LOG_DIR");
+    if (ld && *ld) snprintf(g_logdir, sizeof g_logdir, "%s", ld);
+    else snprintf(g_logdir, sizeof g_logdir, "%s/logs", data);
+    mkdir(g_logdir, 0755);
     snprintf(dir, sizeof dir, "%s/klfz", data);   mkdir(dir, 0755);
     snprintf(dir, sizeof dir, "%s/files", data);  mkdir(dir, 0755);
 
@@ -384,9 +388,9 @@ int kl_app_configure_alyx(const char *resources, const char *game, const char *d
     snprintf(g_assets, sizeof g_assets, "%s", game);
     snprintf(g_apk,    sizeof g_apk,    "%s", game);
     snprintf(g_files,  sizeof g_files,  "%s/files", data);
-    snprintf(g_log,    sizeof g_log,    "%s/logs/klepton-boot.log", data);
+    snprintf(g_log,    sizeof g_log,    "%s/klepton-boot.log", g_logdir);
     static char crash[1100];
-    snprintf(crash, sizeof crash, "%s/logs/klepton-crash.log", data);
+    snprintf(crash, sizeof crash, "%s/klepton-crash.log", g_logdir);
     kl_fault_set_crash_path(crash);
     setenv("KL_ALYX_GAME", game, 1);
     // Every library by name from the dylibs folder (configure_rest sets this only when it finds <dylibs>/hlvr.dylib).
