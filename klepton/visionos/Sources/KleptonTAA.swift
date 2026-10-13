@@ -104,6 +104,7 @@ final class KleptonTAA {
     private var lastMode: Int32 = -1
     private var resetsLogged = 0
     private var saidCropOff = [false, false]
+    private var saidFoveated = [false, false]
 
     init?(device: MTLDevice) {
         guard KleptonTAA.enabled, let c = VPKTAACore(device: device) else { return nil }
@@ -432,9 +433,22 @@ final class KleptonTAA {
             m.mapsCrop = mvMap == "crop" ? true : mvMap == "full" ? false : !same
             mot = m
         }
-        return VPKTAAEyeInput(color: color, slice: slice, flipY: flipY, tangents: tan, jitter: jit,
-                              crop: crop, cropOff: cropOff, orientation: qh * qe, position: pos,
-                              depth: dep, motion: mot)
+        var input = VPKTAAEyeInput(color: color, slice: slice, flipY: flipY, tangents: tan, jitter: jit,
+                                   crop: crop, cropOff: cropOff, orientation: qh * qe, position: pos,
+                                   depth: dep, motion: mot)
+        // Foveated eye (KL_VRR): the map it was rasterized through, keyed by the render size (kl_gpu_time.m).
+        let rw = Int32((Float(w) * crop.x).rounded()), rh = Int32((Float(h) * crop.y).rounded())
+        if let ptr = kl_vrr_map_for(Int32(w), Int32(h)) ?? kl_vrr_map_for(rw, rh),
+           let map = Unmanaged<AnyObject>.fromOpaque(ptr).takeUnretainedValue() as? MTLRasterizationRateMap {
+            input.rateMap = map
+            input.rateLayer = slice
+            if !saidFoveated[eye] {
+                saidFoveated[eye] = true
+                NSLog("[taa] eye \(eye) is foveated (rate map \(map.screenSize.width)x\(map.screenSize.height), \(map.layerCount) layer(s)): "
+                      + "resolved in screen space, same history and sharpening in the sharp zone and the periphery")
+            }
+        }
+        return input
     }
 
     private func pct(_ a: UInt32, _ b: UInt32) -> String {

@@ -388,9 +388,12 @@ int kl_app_configure_alyx(const char *resources, const char *game, const char *d
     snprintf(g_assets, sizeof g_assets, "%s", game);
     snprintf(g_apk,    sizeof g_apk,    "%s", game);
     snprintf(g_files,  sizeof g_files,  "%s/files", data);
-    snprintf(g_log,    sizeof g_log,    "%s/klepton-boot.log", g_logdir);
+    // KL_LOG_TAG (the graphics engine): one boot/crash log per engine, so a run on one does not overwrite the other's.
+    const char *tag = getenv("KL_LOG_TAG");
+    int tagged = tag && *tag && strlen(tag) < 32;
+    snprintf(g_log,    sizeof g_log,    "%s/klepton-boot%s%s.log", g_logdir, tagged ? "-" : "", tagged ? tag : "");
     static char crash[1100];
-    snprintf(crash, sizeof crash, "%s/klepton-crash.log", g_logdir);
+    snprintf(crash, sizeof crash, "%s/klepton-crash%s%s.log", g_logdir, tagged ? "-" : "", tagged ? tag : "");
     kl_fault_set_crash_path(crash);
     setenv("KL_ALYX_GAME", game, 1);
     // Every library by name from the dylibs folder (configure_rest sets this only when it finds <dylibs>/hlvr.dylib).
@@ -1381,7 +1384,8 @@ static void guest_pace_wait(void) {
         else if (t - win_t0 >= 1.0) {
             double rate = (double)(p - win_p0) / (t - win_t0);
             last_rate = rate;
-            unsigned want = (unsigned)ceil(rate / pace_hz - 0.05);
+            // Up to 15 % over the target: 100 Hz panels pace 1/2 = 50 (not 1/3 = 33), 90 Hz 45, 120 Hz 40.
+            unsigned want = (unsigned)ceil(rate / (pace_hz * 1.15) - 0.05);
             if (want < 1) want = 1;
             // Hysteresis: a new N must hold for two windows in a row, so one
             // window short of publishes (a hitch, a pose gap) does not flip it.
@@ -1402,7 +1406,7 @@ static void guest_pace_wait(void) {
         }
     }
     unsigned eff = div, ex = g_pace_extra;
-    if (pace_hz > 0 && ex && last_rate > 0 && last_rate / (div + ex) >= 39.0) eff = div + ex;
+    if (pace_hz > 0 && ex && last_rate > 0 && last_rate / (div + ex) >= 31.5) eff = div + ex;
     if (pace_hz > 0 && last_rate > 20) g_pace_fps = (float)(last_rate / eff);
     {
         static unsigned said_eff;

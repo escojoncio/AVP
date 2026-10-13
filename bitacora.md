@@ -56,20 +56,30 @@ Enlace: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa
   el VPKTAA (depth SAMPLED/STORE + copias en la cola del juego) o el MSAA 0.
 - Opción pendiente si VPEngine aún no arranca: ajuste experimental VPKTAA con MoltenVK (solo profundidad) para bisectar.
 
-## Siguiente: el usuario envía los logs de la build 6
-Pedido: (1) partida corta con MoltenVK (comprobar idioma español), (2) partida con VPEngine; carpeta `Logs Alyx`
-(app.txt, klepton-boot.log, klepton-crash.log, census.txt, console.log, prewarm.log).
-Revisar:
-- `census.txt`: versión/extensiones/features pedidas en vkCreateDevice, capacidades SPIR-V por módulo (int64/16-bit,
-  MS reads, subgroup), teselación, depth bounds → lista de huecos de VPEngine. Del log B5: 0 índices dinámicos,
-  0 timeline, 0 vkQueueSubmit2, 8 query pools (tipos 0 y 2), 0 render passes (dynamic rendering).
-- `console.log`: líneas `AVPFORCE` (si el juego cambió convars forzados) y errores del juego.
-- Con VPEngine: `vk.feature`, `vk.err what=shader`, `vk.unimpl`, `vk.motion`, `[taa] inputs/stats`, `gpu.hold`.
-- Rendimiento: `[gputime]` y `[openvr] frames:` (MoltenVK dio ~33 fps).
+## Build 7 (en curso) — logs B6 analizados
+Logs B6 (2 partidas MoltenVK, español OK): panel a **100 Hz** (no 90); pacer `ceil(100/45)=3` → fijo 33,3 fps aunque la
+GPU iba a 14 ms al inicio; en partida GPU juego 28–31 ms (foveado off, MSAA 4). Crash 11:39 (misma firma B4,
+librendersystemvulkan+0x21f9c0) sin boot log: lo pisó la partida siguiente. Censo: Alyx NO usa int64/16-bit,
+teselación, depth bounds ni mesh → no son pendientes de VPEngine para Alyx.
+Cambios B7:
+- `kl_app.c` pacer: `N = ceil(rate/(pace_hz*1.15) - 0.05)` (100 Hz→50, 90→45, 120→40); extra del governor si ≥31,5 fps.
+  Logs por motor: `KL_LOG_TAG` → `klepton-boot-<motor>.log` / `klepton-crash-<motor>.log` (+ `.prev.log`).
+- `klvr_platform_klepton.c` governor: fallback si ≥32 fps (100 Hz: 50↔33,3); umbrales escalados a 1000/base
+  (late 0,96/0,90, bajar avg>0,90, subir avg<0,75 durante 5 s).
+- `AVPSettings`: `KLVR_PACE_FALLBACK=1` con halfRate, `KL_LOG_TAG=engine`, foveado por defecto `.m2` (clave `avp.fov2`),
+  MetalFX forzado off (no implementado en ningún motor; picker quitado de `AVPSettingsView`).
+- `AVPLauncher`: `AVPCertificateGate` es lo primero mientras no haya .p12 (antes de carpeta/Steam/descarga);
+  `AVPModel.startInstall` exige certificado. `AVPLog.engineLogs` en compartir/espejo.
+- VPKTAA + foveado: `kl_gpu_time.m` foveа también pases 1x con VPKTAA (multiview `renderTargetArrayLength>1`, depth
+  ≥1024, color no RG16F; log `[vrr] foveating 1x`). `VPKTAACore` kernel con `rasterization_rate_map_decoder`
+  (buffer 3 datos del mapa, buffer 4 `uint4` on/capa): reproyecta en pantalla y vuelve a físico para historia/votos;
+  reset al cambiar de mapa. `KleptonTAA.makeInput` toma `kl_vrr_map_for` (log `[taa] eye N is foveated`).
+Riesgos a mirar en el log: sombras en cascada si son layered (se foveaarían), MV de VPEngine en layout físico o no.
+
+## Siguiente
+Logs B7: (1) MoltenVK: `[guest] pacing`, `pace governor`, `[vrr] foveated map`, `[gputime]`; (2) VPEngine:
+`klepton-boot-vpengine.log` + crash; `vk.feature`, `vk.err`, `vk.unimpl`, `[taa]`, `[vrr] foveating 1x`.
 
 ## Pendiente
-- VPEngine: int64/16-bit en shaders, teselación, depth bounds, foveado (`MTLRasterizationRateMap`), MetalFX, bindless
-  (no necesario para Alyx: todos los descriptores count 1).
-- Rendimiento a 45 fps (foveado, resolución, VPEngine).
-- QR de Steam; `vpvk_config_set_metalfx` / `_texture_cap` no existen aún (la app solo los registra).
-- Píldoras de batería: verificar mano (vendorName trae "(Left)/(Right)").
+- VPEngine arrancando Alyx (necesita log B7). MetalFX (VPEngine `vpvk_config_set_metalfx`) y luego reactivar el ajuste.
+- QR de Steam. Píldoras de batería: verificar mano.
