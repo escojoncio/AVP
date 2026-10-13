@@ -178,7 +178,7 @@ static uint32_t g_vrr_at = 900;
 static double g_vrr_toggle;
 static IMP g_rce;                    // the original -renderCommandEncoderWithDescriptor:
 static unsigned g_vrr_injected;
-static struct { NSUInteger w, h, layers; void *map; } g_vrr_maps[8];
+static struct { NSUInteger w, h, layers; void *map; int zones; } g_vrr_maps[8];   // zones: per axis (fov maps)
 
 static void vrr_census(MTLRenderPassDescriptor *d, uint32_t f) {
     static unsigned n;
@@ -649,7 +649,10 @@ static void hook(Class c, SEL s, IMP mine, IMP *orig);
 // axis is off-centre: ~63% across for the left eye, ~37% for the right), falling off to KL_VRR_EDGE
 // (default 0.35) at the far edge. KL_VRR_INNER / KL_VRR_OUTER: where the fall-off starts and ends, as
 // fractions of the image width from the axis (defaults 0.18 and 0.50).
-enum { kVrrZones = 16 };
+enum { kVrrZones = 16, kVrrZonesMax = 32 };
+// Zones per axis of the map the scene passes are foveated with (vrr_fov_map): 32 for the wide map (half the
+// quantisation of 16: the sharp zone ends within ~3 degrees of where it should), 16 otherwise or if Metal refuses 32.
+static int g_vrr_fov_zones = kVrrZones;
 extern void kl_ovrp_eye_view(int eye, float *px, float *py, float *pz, float *qx, float *qy, float *qz, float *qw, float tan4[4]);
 static int g_vrr_on = -1;
 // Live overrides (pause menu, kl_vrr_set): win over the environment read at start. NAN = not set.
@@ -663,9 +666,9 @@ static float vrr_env(const char *n, float d) {
     return e && *e ? (float)atof(e) : d;
 }
 // Rate per zone along one axis: 1 within `in` (a fraction of the image) of the axis, falling linearly to `edge` at `out`.
-static void vrr_rates(float centre, float in, float outr, float edge, float *out) {
-    for (int i = 0; i < kVrrZones; i++) {
-        float p = ((float)i + 0.5f) / kVrrZones, t = fabsf(p - centre);
+static void vrr_rates(float centre, float in, float outr, float edge, float *out, int n) {
+    for (int i = 0; i < n; i++) {
+        float p = ((float)i + 0.5f) / n, t = fabsf(p - centre);
         out[i] = t <= in ? 1.0f : t >= outr ? edge : 1.0f - (1.0f - edge) * (t - in) / (outr - in);
     }
 }
@@ -677,8 +680,9 @@ static void vrr_rates(float centre, float in, float outr, float edge, float *out
 // across around each eye's FORWARD axis (tangent 0, not the image centre), its centre 10 degrees BELOW that axis (the
 // headset shows more below than above), the rest at KL_VRR_EDGE (10 % default, up to 65 % on an M5). A rate map is
 // separable, so the circle becomes the
-// rectangle that holds it; the ramp to the periphery is one zone wide, and a zone is given the rate of its point
-// nearest the centre so the sharp zone is never cut by the 16-zone quantisation.
+// rectangle that holds it; the ramp to the periphery is one zone wide. Build 24 gave a zone the rate of its point
+// NEAREST the centre and used 16 zones: the sharp zone grew by up to a zone plus the ramp on each side (~13 degrees,
+// the user saw it reach well past P.T.'s edge). Build 25: 32 zones, each rated at its own centre.
 // Live mode (kl_vrr_set): 0 centre, 1 soft, 2 wide; -1 = from the environment.
 static int vrr_mode(void) {
     if (g_vrr_live_soft >= 0) return g_vrr_live_soft;
@@ -686,15 +690,6 @@ static int vrr_mode(void) {
     return m && !strcmp(m, "soft") ? 1 : m && !strcmp(m, "wide") ? 2 : 0;
 }
 static int vrr_soft(void) { return vrr_mode() == 1; }
-// Rate per zone: 1 for any zone reaching within `in` of `centre`, falling linearly to `edge` at `out` (by the
-// zone's nearest point), `edge` beyond.
-static void vrr_rates_near(float centre, float in, float outr, float edge, float *out) {
-    for (int i = 0; i < kVrrZones; i++) {
-        float a = (float)i / kVrrZones, b = (float)(i + 1) / kVrrZones;
-        float t = centre < a ? a - centre : centre > b ? centre - b : 0.0f;
-        out[i] = t <= in ? 1.0f : t >= outr ? edge : 1.0f - (1.0f - edge) * (t - in) / (outr - in);
-    }
-}
 static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, NSUInteger h, NSUInteger layers) {
     for (int i = 0; i < 8; i++)
         if (g_vrr_maps[i].map && g_vrr_maps[i].w == w && g_vrr_maps[i].h == h && g_vrr_maps[i].layers == layers)
@@ -710,52 +705,61 @@ static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, 
     int soft = vrr_soft(), wide = vrr_mode() == 2;
     float tan20 = 0.364f;
     char wide_deg[24] = "";
-    float in_x, in_y, out_x, out_y, edge, ry[kVrrZones];
+    float in_x, in_y, out_x, out_y, edge;
+    float deg = 60.0f;
     if (wide) {
         // Forward axis = tangent 0: x at left/(left+right) across (cx), y at up/(up+down) from the top (cy). The
         // centre sits 10 degrees below it, tan(10) = 0.1763 further down; half width tan(deg / 2): KL_VRR_WIDE_DEG
         // (30..70, the launcher's "zona nítida"; 60 = PTVisionPro's, tan(30) = 0.5774).
         cy += 0.1763f / span_y;
         const char *wd = getenv("KL_VRR_WIDE_DEG");   // launch-time only (not a live value)
-        float deg = wd && *wd ? (float)atof(wd) : 60.0f;
+        deg = wd && *wd ? (float)atof(wd) : 60.0f;
         if (!(deg >= 30.0f)) deg = 30.0f;
         if (deg > 70.0f) deg = 70.0f;
-        const float half = tanf(deg * 0.5f * (float)M_PI / 180.0f);
         snprintf(wide_deg, sizeof wide_deg, " %.0f deg", deg);
-        in_x = vrr_env("KL_VRR_INNER", half / span_x);
-        in_y = vrr_env("KL_VRR_INNER", half / span_y);
-        out_x = vrr_env("KL_VRR_OUTER", in_x + 1.0f / kVrrZones);
-        out_y = vrr_env("KL_VRR_OUTER", in_y + 1.0f / kVrrZones);
-        edge = vrr_env("KL_VRR_EDGE", 0.10f);
-        vrr_rates_near(cy, in_y, out_y, edge, ry);
-    } else {
-        in_x = vrr_env("KL_VRR_INNER", soft ? 0.18f : tan20 / span_x);
-        in_y = vrr_env("KL_VRR_INNER", soft ? 0.18f : tan20 / span_y);
-        out_x = vrr_env("KL_VRR_OUTER", soft ? 0.50f : in_x + 0.12f);
-        out_y = vrr_env("KL_VRR_OUTER", soft ? 0.50f : in_y + 0.12f);
-        edge = vrr_env("KL_VRR_EDGE", soft ? 0.35f : 0.25f);
-        vrr_rates(cy, in_y, out_y, edge, ry);
     }
-    for (NSUInteger l = 0; l < layers && l < 2; l++) {
-        float rx[kVrrZones];
-        if (wide) vrr_rates_near(cx[layers > 1 ? l : 0], in_x, out_x, edge, rx);
-        else vrr_rates(cx[layers > 1 ? l : 0], in_x, out_x, edge, rx);
-        ls[l] = [[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(kVrrZones, kVrrZones, 0)
-                                                                     horizontal:rx vertical:ry];
+    id<MTLRasterizationRateMap> map = nil;
+    // The wide map at 32 zones per axis, 16 if Metal refuses it; the other maps at 16 as before.
+    for (int zones = wide ? kVrrZonesMax : kVrrZones; !map && zones >= kVrrZones; zones /= 2) {
+        float rx[2][kVrrZonesMax], ry[kVrrZonesMax];
+        if (wide) {
+            const float half = tanf(deg * 0.5f * (float)M_PI / 180.0f);
+            in_x = vrr_env("KL_VRR_INNER", half / span_x);
+            in_y = vrr_env("KL_VRR_INNER", half / span_y);
+            out_x = vrr_env("KL_VRR_OUTER", in_x + 1.0f / zones);   // the ramp: one zone
+            out_y = vrr_env("KL_VRR_OUTER", in_y + 1.0f / zones);
+            edge = vrr_env("KL_VRR_EDGE", 0.10f);
+        } else {
+            in_x = vrr_env("KL_VRR_INNER", soft ? 0.18f : tan20 / span_x);
+            in_y = vrr_env("KL_VRR_INNER", soft ? 0.18f : tan20 / span_y);
+            out_x = vrr_env("KL_VRR_OUTER", soft ? 0.50f : in_x + 0.12f);
+            out_y = vrr_env("KL_VRR_OUTER", soft ? 0.50f : in_y + 0.12f);
+            edge = vrr_env("KL_VRR_EDGE", soft ? 0.35f : 0.25f);
+        }
+        // Every zone rated at its own centre (wide included: see above).
+        vrr_rates(cy, in_y, out_y, edge, ry, zones);
+        for (NSUInteger l = 0; l < layers && l < 2; l++) {
+            vrr_rates(cx[layers > 1 ? l : 0], in_x, out_x, edge, rx[l], zones);
+            ls[l] = [[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(zones, zones, 0)
+                                                                         horizontal:rx[l] vertical:ry];
+        }
+        MTLRasterizationRateMapDescriptor *md = [MTLRasterizationRateMapDescriptor
+            rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake(w, h, 0) layerCount:(layers > 1 ? 2 : 1) layers:ls];
+        map = [dev newRasterizationRateMapWithDescriptor:md];
+        if (map) g_vrr_fov_zones = zones;   // this map's count, stored with it in the cache below
+        else fprintf(stderr, "[vrr] Metal refused a %d-zone map\n", zones);
     }
-    MTLRasterizationRateMapDescriptor *md = [MTLRasterizationRateMapDescriptor
-        rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake(w, h, 0) layerCount:(layers > 1 ? 2 : 1) layers:ls];
-    id<MTLRasterizationRateMap> map = [dev newRasterizationRateMapWithDescriptor:md];
     if (!map) return nil;
     for (int i = 0; i < 8; i++)
         if (!g_vrr_maps[i].map) {
             g_vrr_maps[i].w = w; g_vrr_maps[i].h = h; g_vrr_maps[i].layers = layers;
             g_vrr_maps[i].map = (void *)CFBridgingRetain(map);
+            g_vrr_maps[i].zones = g_vrr_fov_zones;
             break;
         }
     MTLSize p0 = [map physicalSizeForLayer:0];
-    fprintf(stderr, "[vrr] foveated map (%s%s) %lu layer(s) %lux%lu: axis at %.0f%% / %.0f%% across, %.0f%% down; full rate within %.0f%%/%.0f%%, "
-            "edge %.2f; physical %lux%lu (%.0f%% of the pixels)\n", soft ? "soft" : wide ? "wide" : "centre", wide_deg, (unsigned long)(layers > 1 ? 2 : 1),
+    fprintf(stderr, "[vrr] foveated map (%s%s, %d zones) %lu layer(s) %lux%lu: axis at %.0f%% / %.0f%% across, %.0f%% down; full rate within %.0f%%/%.0f%%, "
+            "edge %.2f; physical %lux%lu (%.0f%% of the pixels)\n", soft ? "soft" : wide ? "wide" : "centre", wide_deg, g_vrr_fov_zones, (unsigned long)(layers > 1 ? 2 : 1),
             (unsigned long)w, (unsigned long)h, 100 * cx[0], 100 * cx[1], 100 * cy, 100 * in_x, 100 * in_y, edge, (unsigned long)p0.width,
             (unsigned long)p0.height, 100.0 * p0.width * p0.height / ((double)w * h));
     const char *dump = getenv("KL_VRR_DUMP");
@@ -918,22 +922,26 @@ static id kl_rce(id self, SEL sel, MTLRenderPassDescriptor *d) {
         }
         if (role == 0 && g_vrr_on > 0 && !d.rasterizationRateMap) {
             id<MTLTexture> t = d.colorAttachments[0].texture ? d.colorAttachments[0].texture : d.depthAttachment.texture;
-            // With VPKTAA the game renders 1x (no MSAA scene target to key on): the scene passes are then the
-            // multiview (both eyes, layered) ones with a depth attachment, at eye size. Post passes have no depth,
-            // shadow maps are not layered, and the motion-vector target (RG16F) is left alone.
-            static int taa = -1;
-            if (taa < 0) { const char *v = getenv("KL_VPKTAA"); taa = v && *v == '1'; }
+            // Besides the MSAA scene passes, every eye-sized LAYERED pass with a depth attachment at 1x: Source 2
+            // draws its 3D overlays (the menu panels, the hands, world UI) after the resolve, into the 1x eye image
+            // with the resolved depth (build 24 dump, pass 61: 112 draws on the RGBA8 sRGB eye texture). Left out
+            // they were drawn in screen space onto a foveated picture: the left eye's menu squeezed into a corner,
+            // different in each eye. Post passes (tonemap, bloom: fullscreen, no depth) stay unfoveated: they read
+            // and write texel for texel, which carries the foveated layout through. Shadow maps are not layered;
+            // the motion-vector target (RG16F) is left alone.
             id<MTLTexture> dt = d.depthAttachment.texture;
             id<MTLTexture> ct = d.colorAttachments[0].texture;
-            int scene1x = taa && dt && dt.width >= 1024 && d.renderTargetArrayLength > 1 &&
+            int scene1x = dt && dt.width >= 1024 && d.renderTargetArrayLength == 2 &&   // two eyes, not a cascade
                           (dt.textureType == MTLTextureType2DArray || dt.textureType == MTLTextureType2DMultisampleArray) &&
                           (!ct || ct.pixelFormat != MTLPixelFormatRG16Float);
             if (t && (t.sampleCount >= 4 || scene1x) && t.width >= 1024) {
                 static int said1x;
-                if (scene1x && t.sampleCount < 4 && !said1x) {
-                    said1x = 1;
-                    fprintf(stderr, "[vrr] foveating 1x layered scene passes (VPKTAA on): first %lux%lu x%lu\n",
-                            (unsigned long)t.width, (unsigned long)t.height, (unsigned long)d.renderTargetArrayLength);
+                if (scene1x && t.sampleCount < 4 && said1x < 4) {
+                    said1x++;
+                    fprintf(stderr, "[vrr] foveating a 1x layered pass with depth (overlays after the resolve): colour fmt %lu, "
+                            "depth fmt %lu, %lux%lu x%lu, load %lu\n", ct ? (unsigned long)ct.pixelFormat : 0ul,
+                            (unsigned long)dt.pixelFormat, (unsigned long)t.width, (unsigned long)t.height,
+                            (unsigned long)d.renderTargetArrayLength, (unsigned long)d.colorAttachments[0].loadAction);
                 }
                 NSUInteger layers = d.renderTargetArrayLength > 1 ? d.renderTargetArrayLength : 1;
                 NSUInteger w = d.renderTargetWidth ? d.renderTargetWidth : t.width;
@@ -944,8 +952,20 @@ static id kl_rce(id self, SEL sel, MTLRenderPassDescriptor *d) {
                     static void *published;
                     if ((__bridge void *)map != published) {   // the compositor unwarps the eye image with it
                         published = (__bridge void *)map;
-                        kl_glfb_publish_eye_rate_map(published, kVrrZones, kVrrZones);
+                        int zones = kVrrZones;   // the zone count this map was built with
+                        for (int i = 0; i < 8; i++)
+                            if (g_vrr_maps[i].map == published && g_vrr_maps[i].zones > 0) zones = g_vrr_maps[i].zones;
+                        kl_glfb_publish_eye_rate_map(published, zones, zones);
                     }
+                }
+            } else if (t && t.width >= 1024 && d.renderTargetArrayLength > 1) {
+                // Measurement: eye-sized layered passes left unfoveated (expected: the fullscreen post passes only).
+                static int saidNot;
+                if (saidNot < 6) {
+                    saidNot++;
+                    fprintf(stderr, "[vrr] eye-sized layered pass NOT foveated: colour fmt %lu x%lu samples, depth %s, load %lu\n",
+                            ct ? (unsigned long)ct.pixelFormat : 0ul, (unsigned long)t.sampleCount, dt ? "yes" : "no",
+                            (unsigned long)d.colorAttachments[0].loadAction);
                 }
             }
         }
