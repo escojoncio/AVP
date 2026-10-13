@@ -1,6 +1,7 @@
 # Bitácora — AVP
 
-## Build 1 (2026-10-13) — primera build, sin probar en el visor
+## Build 1 (2026-10-13) — COMPILA (e45e0d7, release `visionos`, AVP.ipa), sin probar en el visor
+Fixes de CI: LuaJIT necesita `MACOSX_DEPLOYMENT_TARGET` (host tools); `dismissWindow` duplicado en BootView. VPVulkan con los 10 parches compila.
 Base: VisionQuestPro `04f7e6a` (app, Klepton propio, CI). Glovebox (MIT) fusionado en el Klepton propio.
 - **x18** (`klepton/runtime/kl_x18.c/.h`, `klepton/tools/klepton_ld.c`): veneers de Glovebox (casp x18:x19, blr/adr x18,
   stp/ldp con writeback, límite 12 instr.). Se conserva `KLEPTON_LD_INPROC`, error por setjmp y LC_CODE_SIGNATURE vacío;
