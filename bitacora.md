@@ -56,7 +56,7 @@ Enlace: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa
   el VPKTAA (depth SAMPLED/STORE + copias en la cola del juego) o el MSAA 0.
 - Opción pendiente si VPEngine aún no arranca: ajuste experimental VPKTAA con MoltenVK (solo profundidad) para bisectar.
 
-## Build 7 (en curso) — logs B6 analizados
+## Build 7 (`874ea87`, CI OK, AVP.ipa en release `visionos`) — logs B6 analizados
 Logs B6 (2 partidas MoltenVK, español OK): panel a **100 Hz** (no 90); pacer `ceil(100/45)=3` → fijo 33,3 fps aunque la
 GPU iba a 14 ms al inicio; en partida GPU juego 28–31 ms (foveado off, MSAA 4). Crash 11:39 (misma firma B4,
 librendersystemvulkan+0x21f9c0) al SALIR con la corona (confirmado por el usuario): cierre del device en teardown, no en juego; sin boot log (lo pisó la siguiente). Censo: Alyx NO usa int64/16-bit,
