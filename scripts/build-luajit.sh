@@ -21,6 +21,8 @@ git -C "$SRC" checkout -q -f "$LUAJIT_REV"
 git -C "$SRC" clean -qfdx
 
 XR="$(xcrun --sdk xros --show-sdk-path)"
+# LuaJIT's Makefile insists on a deployment target for the Mac-side generators (buildvm, minilua).
+export MACOSX_DEPLOYMENT_TARGET=14.0
 echo "[luajit] building $LUAJIT_REV for arm64-apple-xros26.0 (no JIT, GC64)"
 # HOST_CC builds the buildvm/minilua generators for the Mac; TARGET_* the library for the device.
 make -C "$SRC" -s clean > /dev/null
