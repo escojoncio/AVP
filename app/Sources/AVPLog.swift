@@ -43,10 +43,7 @@ enum AVPLog {
         try? FileManager.default.moveItem(at: appLog, to: previousLog)
         for old in captures { try? FileManager.default.removeItem(at: old) }
         // Logs of earlier builds' names (untagged, and the engine's old name): they only confuse a shared folder.
-        for name in ["klepton-boot.log", "klepton-boot.prev.log", "klepton-crash.log", "klepton-boot-vpengine.log",
-                     "klepton-boot-vpengine.prev.log", "klepton-crash-vpengine.log"] {
-            try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
-        }
+        for name in legacyNames { try? FileManager.default.removeItem(at: directory.appendingPathComponent(name)) }
         FileManager.default.createFile(atPath: appLog.path, contents: nil)
         handle = try? FileHandle(forWritingTo: appLog)
         let info = Bundle.main.infoDictionary ?? [:]
@@ -62,9 +59,29 @@ enum AVPLog {
         handle?.write(Data("\(stamp) \(message)\n".utf8))
     }
 
+    private static let mirrorLock = NSLock()
+    private static let legacyNames = ["klepton-boot.log", "klepton-boot.prev.log", "klepton-crash.log", "klepton-boot-vpengine.log",
+                                      "klepton-boot-vpengine.prev.log", "klepton-crash-vpengine.log"]
+    nonisolated(unsafe) private static var mirrorTimer: DispatchSourceTimer?
+
+    /// While the game runs: the logs are copied to the AVP folder every 20 s, so a zip taken during or after a
+    /// session that never went to the background (killed, crashed) still holds that session's boot log.
+    static func startPeriodicMirror() {
+        lock.lock(); defer { lock.unlock() }
+        guard mirrorTimer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        t.schedule(deadline: .now() + 20, repeating: 20)
+        t.setEventHandler { mirrorToFolder() }
+        t.resume()
+        mirrorTimer = t
+    }
+
     /// Copies this session's logs into AVP/Logs (survives a reinstall; visible in Files).
     static func mirrorToFolder() {
         guard let dir = AVPFolder.shared.logs else { return }
+        mirrorLock.lock(); defer { mirrorLock.unlock() }
+        // Earlier builds' log names: stale copies there made a shared zip mix sessions (Logs_Alyx_12).
+        for name in legacyNames { try? FileManager.default.removeItem(at: dir.appendingPathComponent(name)) }
         for url in all where FileManager.default.fileExists(atPath: url.path) {
             let dest = dir.appendingPathComponent(url.lastPathComponent)
             try? FileManager.default.removeItem(at: dest)
