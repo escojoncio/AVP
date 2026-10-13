@@ -1,0 +1,239 @@
+From 6cbcd73fad6b6c44cda6bbfdac764945d7850d47 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 23:45:15 +0000
+Subject: [PATCH] Metal + core: resource tables locked (recursive table mutex
+ in metal2, resMutex_ in vpgpu::Device): images and buffers created/destroyed
+ on the game's loading threads no longer rehash the maps the submit thread is
+ encoding from (SIGSEGV/SIGBUS in Impl::texture under submit)
+
+---
+ gpu/core/include/vpgpu/core/device.h | 14 +++++++++++++-
+ gpu/core/src/device.cpp              | 21 ++++++++++++++++++---
+ gpu/metal2/src/metal_backend.mm      | 27 +++++++++++++++++++++++++--
+ gpu/vulkan/src/motion.cpp            |  6 ++++--
+ 4 files changed, 60 insertions(+), 8 deletions(-)
+
+diff --git a/gpu/core/include/vpgpu/core/device.h b/gpu/core/include/vpgpu/core/device.h
+index a918061..f74abab 100644
+--- a/gpu/core/include/vpgpu/core/device.h
++++ b/gpu/core/include/vpgpu/core/device.h
+@@ -29,7 +29,15 @@ class Device {
+   void destroy(BufferId);
+   void destroy(TextureId);
+   void destroy(SamplerId);
+-  const ResourceTable& resources() const { return resources_; }
++  const ResourceTable& resources() const { return resources_; }  // submit-thread reads only: prefer textureDesc()
++  // A copy of a texture's description, taken under the table lock (safe from any thread).
++  bool textureDesc(TextureId id, TextureDesc& out) {
++    std::lock_guard lock(resMutex_);
++    const TextureDesc* d = resources_.get(id);
++    if (!d) return false;
++    out = *d;
++    return true;
++  }
+   PipelineCache& pipelines() { return pipelines_; }
+ 
+   // Compiles and submits a frame and logs its summary; every `detailEvery`-th frame (0 = never)
+@@ -47,6 +55,10 @@ class Device {
+ 
+  private:
+   Backend& backend_;
++  // resources_ is written by create/destroy on the client's loading threads and read by compileFrame on
++  // the submit thread (a vector-backed pool: a create that grows it moves what compileFrame is reading).
++  // Taken before the backend's own table lock, never the other way round.
++  std::mutex resMutex_;
+   ResourceTable resources_;
+   PipelineCache pipelines_;
+   LogSink log_;
+diff --git a/gpu/core/src/device.cpp b/gpu/core/src/device.cpp
+index 0edf651..5471922 100644
+--- a/gpu/core/src/device.cpp
++++ b/gpu/core/src/device.cpp
+@@ -20,6 +20,7 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
+ }
+ 
+ BufferId Device::createBuffer(BufferDesc d) {
++  std::lock_guard lock(resMutex_);
+   const BufferId id = resources_.createBuffer(d);
+   if (id) backend_.createBuffer(id, *resources_.get(id));
+   else log_("gpu.err what=buffer_desc label=" + d.label);
+@@ -27,6 +28,7 @@ BufferId Device::createBuffer(BufferDesc d) {
+ }
+ 
+ TextureId Device::createTexture(TextureDesc d) {
++  std::lock_guard lock(resMutex_);
+   const TextureId id = resources_.createTexture(d);
+   if (id) backend_.createTexture(id, *resources_.get(id));
+   else log_("gpu.err what=texture_desc label=" + d.label);
+@@ -34,19 +36,31 @@ TextureId Device::createTexture(TextureDesc d) {
+ }
+ 
+ SamplerId Device::createSampler(SamplerDesc d) {
++  std::lock_guard lock(resMutex_);
+   const SamplerId id = resources_.createSampler(std::move(d));
+   backend_.createSampler(id, *resources_.get(id));
+   return id;
+ }
+ 
+-void Device::destroy(BufferId id) { if (resources_.destroy(id)) backend_.destroyBuffer(id); }
+-void Device::destroy(TextureId id) { if (resources_.destroy(id)) backend_.destroyTexture(id); }
+-void Device::destroy(SamplerId id) { if (resources_.destroy(id)) backend_.destroySampler(id); }
++void Device::destroy(BufferId id) {
++  std::lock_guard lock(resMutex_);
++  if (resources_.destroy(id)) backend_.destroyBuffer(id);
++}
++void Device::destroy(TextureId id) {
++  std::lock_guard lock(resMutex_);
++  if (resources_.destroy(id)) backend_.destroyTexture(id);
++}
++void Device::destroy(SamplerId id) {
++  std::lock_guard lock(resMutex_);
++  if (resources_.destroy(id)) backend_.destroySampler(id);
++}
+ 
+ FrameReport Device::submit(const Frame& frame) {
+   const uint64_t index = frame_++;
+   const auto start = std::chrono::steady_clock::now();
++  std::unique_lock resLock(resMutex_);
+   const CompiledFrame compiled = compileFrame(frame, &resources_);
++  resLock.unlock();
+   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+   if (holdMs_) {
+     std::vector<PipelineKey> pending;
+@@ -107,6 +121,7 @@ FrameReport Device::submit(const Frame& frame) {
+   // Per-pass timing (diagnostic): describe the encoders of the first frame with render work after
+   // each `passEvery_` boundary (VPVulkan alternates render frames with trivial compute submits).
+   if (passEvery_ && index >= passNext_ && passPending_.size() < 8) {
++    std::lock_guard resGuard(resMutex_);  // resources_.get below
+     bool render = false;
+     for (const Encoder& e : compiled.encoders) render |= e.kind == Encoder::Kind::Render;
+     if (render) {
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 9102803..a5c186d 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -660,6 +660,11 @@ struct MetalBackend::Impl {
+     id<MTLTexture> view;
+   };
+   std::unordered_map<uint64_t, FormatView> formatViews;
++  // The resource tables (buffers, textures, views, samplers, formatViews), the graveyard and the residency
++  // set. The game creates and destroys images and buffers on its loading threads while the submit thread
++  // encodes (builds 22 and 24: SIGSEGV/SIGBUS in Impl::texture() under submit, a std::unordered_map rehashed
++  // under its reader). Recursive: texture() is reached from inside locked callers.
++  std::recursive_mutex tableMutex;
+   id<MTLTexture> formatView(id<MTLTexture> base, TextureId id, MTLPixelFormat pf);
+   id<MTLFunction> function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader, std::string& error,
+                            bool noPointSize = false, bool noFragDepth = false, bool coverageTest = false);
+@@ -1885,6 +1890,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   slot.frame = frameIndex;
+   const uint64_t prevCb = lastCbFrame;
+   lastCbFrame = frameIndex;
++  // Encoding reads the resource tables throughout; held until the command buffer is committed.
++  std::lock_guard<std::recursive_mutex> tables(tableMutex);
+   // The slot's previous frame finished, and so did every frame that could use its leftovers:
+   // only now do they leave the residency set and get released.
+   for (id obj : slot.retired)
+@@ -3284,6 +3291,7 @@ const MetalCaps& MetalBackend::caps() const { return impl_->caps; }
+ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
+   Impl& m = *impl_;
+   if (!ok()) return;
++  std::lock_guard<std::recursive_mutex> tables(m.tableMutex);
+   Impl::Buffer b{handle.generation, nil, 0};
+   if (d.guestMemory) {
+     // No-copy buffers must start on a page and span whole pages: widen the window around the
+@@ -3316,6 +3324,7 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
+ void MetalBackend::createTexture(TextureId handle, const TextureDesc& d) {
+   Impl& m = *impl_;
+   if (!ok()) return;
++  std::lock_guard<std::recursive_mutex> tables(m.tableMutex);
+   m.textures[handle.index] = {handle.generation, nil, d, false};
+   // Render targets wait for their first use: one that only ever lives on tile never gets memory.
+   const bool deferred = !d.persistent && m.tileMemory && (d.usage & (usage::colorTarget | usage::depthTarget));
+@@ -3348,10 +3357,12 @@ void MetalBackend::createSampler(SamplerId handle, const SamplerDesc& d) {
+     m.err("what=sampler index=%u label=%s", handle.index, token(d.label).c_str());
+     return;
+   }
++  std::lock_guard<std::recursive_mutex> tables(m.tableMutex);
+   m.samplers[handle.index] = {handle.generation, st};
+ }
+ 
+ void MetalBackend::destroyBuffer(BufferId handle) {
++  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
+   auto it = impl_->buffers.find(handle.index);
+   if (it == impl_->buffers.end() || it->second.generation != handle.generation) return;
+   impl_->retire(it->second.buffer);
+@@ -3359,6 +3370,7 @@ void MetalBackend::destroyBuffer(BufferId handle) {
+ }
+ 
+ void MetalBackend::destroyTexture(TextureId handle) {
++  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
+   auto it = impl_->textures.find(handle.index);
+   if (it == impl_->textures.end() || it->second.generation != handle.generation) return;
+   impl_->retire(it->second.texture);
+@@ -3374,6 +3386,7 @@ void MetalBackend::destroyTexture(TextureId handle) {
+ }
+ 
+ void MetalBackend::destroySampler(SamplerId handle) {
++  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
+   auto it = impl_->samplers.find(handle.index);
+   if (it == impl_->samplers.end() || it->second.generation != handle.generation) return;
+   impl_->retire(it->second.sampler);
+@@ -3452,6 +3465,7 @@ void MetalBackend::waitIdle() {
+ }
+ 
+ void* MetalBackend::contents(BufferId handle) const {
++  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
+   auto it = impl_->buffers.find(handle.index);
+   if (it == impl_->buffers.end() || it->second.generation != handle.generation) return nullptr;
+   return static_cast<uint8_t*>(it->second.buffer.contents) + it->second.base;
+@@ -3459,6 +3473,7 @@ void* MetalBackend::contents(BufferId handle) const {
+ 
+ TextureId MetalBackend::createView(TextureId base, const ViewDesc& d) {
+   Impl& m = *impl_;
++  std::lock_guard<std::recursive_mutex> tables(m.tableMutex);
+   const uint32_t index = Impl::kViewBit | m.nextView++;
+   Impl::View v;
+   v.generation = 1, v.base = base, v.desc = d;
+@@ -3466,12 +3481,20 @@ TextureId MetalBackend::createView(TextureId base, const ViewDesc& d) {
+   return TextureId{index, 1};
+ }
+ 
+-void MetalBackend::destroyView(TextureId t) { impl_->views.erase(t.index); }
++void MetalBackend::destroyView(TextureId t) {
++  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
++  // Its texture goes with the slot of the next command buffer, like any destroyed resource.
++  if (auto it = impl_->views.find(t.index); it != impl_->views.end()) impl_->retire(it->second.texture);
++  impl_->views.erase(t.index);
++}
+ 
+ void* MetalBackend::nativeDevice() const { return (__bridge void*)impl_->device; }
+ void* MetalBackend::nativeQueue() const { return (__bridge void*)impl_->queue; }
+ 
+-void* MetalBackend::nativeTexture(TextureId handle) { return (__bridge void*)impl_->texture(handle); }
++void* MetalBackend::nativeTexture(TextureId handle) {
++  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
++  return (__bridge void*)impl_->texture(handle);
++}
+ 
+ // ---------------------------------------------------------------------------------------------
+ // Pipeline binary archives
+diff --git a/gpu/vulkan/src/motion.cpp b/gpu/vulkan/src/motion.cpp
+index 166ab24..860926c 100644
+--- a/gpu/vulkan/src/motion.cpp
++++ b/gpu/vulkan/src/motion.cpp
+@@ -190,8 +190,10 @@ void motionDeviceDestroyed(Device& d) {
+ // A pass about to open: if it is an eye pass the motion target joins it. Returns the slot used, -1 none.
+ int motionPassBegin(Device* d, vpgpu::RenderPassDesc& desc, uint64_t lastSubmitted) {
+   if (!d || !d->motion || desc.layerCount < 2 || !desc.depth.texture) return -1;
+-  const vpgpu::TextureDesc* td = d->gpu->resources().get(desc.depth.texture);
+-  if (!td || td->samples != 1) return -1;
++  vpgpu::TextureDesc depthDesc;  // a copy: the table may grow under a pointer into it
++  if (!d->gpu->textureDesc(desc.depth.texture, depthDesc)) return -1;
++  const vpgpu::TextureDesc* td = &depthDesc;
++  if (td->samples != 1) return -1;
+   int slot = -1;
+   for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
+     if (!desc.colors[c].texture) {
+-- 
+2.43.0
+

@@ -152,7 +152,7 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   (PNG de ojos y salida del siguiente frame) + `vpgpu_metal2_request_dump` (VPKEngine `0028`: volcado por pase del
   siguiente frame real, `gpu.dump requested f=N`), encontrado con `dlopen(KL_MVK_DYLIB, RTLD_NOLOAD)`.
 
-## Build 24 (sin validar): orden entre command buffers (causa de las explosiones) + zona nítida en grados
+## Build 24 (Logs_Alyx_17: 33 fps, sin explosiones; ojo/UI mal con M2): orden entre command buffers (causa de las explosiones) + zona nítida en grados
 - Logs_Alyx_2_4 (build 23, cola 3, foveado off, VPKTAA off): sin explosiones de vértices; fps 33 en menú, 18-20 en juego
   y 5-11 en zonas oscuras con linterna (render CPU 20-160 ms: con 3 command buffers en vuelo y ~5 por frame del juego,
   CPU y GPU se serializan). 0 cuelgues. Explosiones ⇔ 12 en vuelo desde la build 14 (logs 14-17 todos con 12).
@@ -170,7 +170,26 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
 - App: cola GPU vuelve a 12 por defecto (clave nueva `avp.gpuQueueDepth24`); Foveado M2/M5 › "Zona nítida" 30-70°
   (5°, 60 por defecto) → `KL_VRR_WIDE_DEG` (kl_gpu_time.m, al arrancar; log `[vrr] foveated map (wide N deg)`).
 
+## Build 25 (sin validar): overlays foveados, M2 a su tamaño real, cerrojo de recursos
+- Logs_Alyx_17 (B24, M2 60° + VPKTAA periferia, cola 12): 33 fps estables, `gpu.order overlapped=0
+  out_of_order=0 slot_busy=0`, sin explosiones. Fallos: (1) ojo mal: volcado L3+R3 f=4606 pase 61 = RGBA8 sRGB
+  2784x2208, 112 draws (paneles del menú, manos, UI 3D) dibujado DESPUÉS del resolve a 1x con depth resuelto, sin
+  rate map → en coordenadas lógicas sobre imagen foveada (menú del ojo izq. encogido en una esquina). Ya pasaba en
+  B22 (capturas Logs_16). (2) M2 más nítido que P.T.: 16 zonas y cada zona con la calidad de su punto más cercano al
+  centro → zona nítida +~13° por lado. (3) crash `Impl::texture()` bajo submit (B22 22:37, B24 23:25): tablas de
+  recursos sin cerrojo, el juego crea/borra imágenes en hilos de carga.
+- `kl_gpu_time.m`: hook foveado también para pases de ojo con 2 capas exactas y depth 2D-array a 1x (antes solo con
+  KL_VPKTAA=1); log `[vrr] foveating a 1x layered pass with depth` y `[vrr] eye-sized layered pass NOT foveated`
+  (medida: solo deberían quedar los post fullscreen). Mapa wide: 32 zonas (16 si Metal lo rechaza), cada zona a la
+  calidad de su centro, rampa de 1 zona; zonas guardadas por mapa en `g_vrr_maps[].zones` y publicadas al
+  compositor; log `[vrr] foveated map (wide N deg, Z zones)`.
+- VPKEngine `0030`: `tableMutex` recursivo en metal2 (create/destroy/views/contents/nativeTexture + submit tras la
+  espera de slot hasta commit) y `resMutex_` en `vpgpu::Device` (orden: resMutex_ → tableMutex);
+  `Device::textureDesc()` copia bajo cerrojo (motion.cpp).
+
 ## Siguiente
+- Log build 25: menú y manos iguales en ambos ojos con M2; `[vrr] ... NOT foveated` solo post; borde de zona nítida
+  como P.T.; 0 crashes en `texture()`.
 - Log build 24: sin explosiones con 12 en vuelo, fps vuelve a ~30; `gpu.order` (overlapped≈0 con cb_order=1).
   Sombras/efectos: volcado L3 + R3 de 12 command buffers (pases de sombra incluidos).
 - Log build 21: `[vrr] foveated map (wide)` (% de píxeles), `[vrr] foveated scene passes on`, `[cp] periphery
