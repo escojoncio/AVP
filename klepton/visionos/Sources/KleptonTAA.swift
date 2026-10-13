@@ -9,10 +9,10 @@
 //     tangents, Halton jitter, per-eye viewport crop), the eye offsets the guest was told
 //     (kl_ovrp_eye_local), the eye DEPTH kl_vulkan picked for that very frame
 //     (kl_vulkan_eye_depth_get, tagged with the record serial) and the AppSW motion vectors
-//     when the guest wrote them this frame (rendered.asw & KL_OVRP_ASW_MV), or VPEngine's own
+//     when the guest wrote them this frame (rendered.asw & KL_OVRP_ASW_MV), or VPKEngine's own
 //     motion vectors (vpvk/motion.h, found with dlsym: the driver generates them for games that
 //     render none, e.g. Source 2) — preferred when present, KL_VPKTAA_MV_SRC = auto | appsw |
-//     vpengine;
+//     vpkengine;
 //   * conventions: reversed-Z from kl_vulkan (eye-pass clear 0.0 / compare-op census), near
 //     from the submit (KL_VPKTAA_NEARFAR_OFF) else KL_VPKTAA_NEAR (0.05 m), far
 //     KL_VPKTAA_FAR (0 = infinite); MV scale KL_VPKTAA_MV_SCALE (0.5: NDC delta -> uv) with the
@@ -52,7 +52,7 @@ final class KleptonTAA {
     private let depthWaitMs = Double(KleptonTAA.envF("KL_VPKTAA_DEPTH_WAIT_MS", 25))
     private let mvSource = KleptonTAA.envS("KL_VPKTAA_MV_SRC") ?? "auto"
 
-    /// VPEngine's motion vectors (vpvk/motion.h, plain C; layout kept in step with it). Resolved
+    /// VPKEngine's motion vectors (vpvk/motion.h, plain C; layout kept in step with it). Resolved
     /// with dlsym so Klepton builds and runs on any Vulkan driver (absent: AppSW path only).
     private struct VPMotionInfo {
         var texture: UnsafeMutableRawPointer? = nil
@@ -199,14 +199,14 @@ final class KleptonTAA {
                 desc, true)
     }
 
-    /// VPEngine's motion vectors of `eye`: the newest complete motion frame (whole screen motion,
+    /// VPKEngine's motion vectors of `eye`: the newest complete motion frame (whole screen motion,
     /// camera included). Its jitter is the game's: the delta to the previous frame's jitter is
     /// removed in the resolve (VPKTAAMotionInput.jitterDelta).
-    private func vpengineMotion(_ eye: Int, _ r: kl_ovrp_render_pose, flipY: Bool) -> (VPKTAAMotionInput?, String) {
-        guard let get = KleptonTAA.vpMotionGet else { return (nil, "no-vpengine") }
+    private func vpkengineMotion(_ eye: Int, _ r: kl_ovrp_render_pose, flipY: Bool) -> (VPKTAAMotionInput?, String) {
+        guard let get = KleptonTAA.vpMotionGet else { return (nil, "no-vpkengine") }
         var info = VPMotionInfo()
         let ok = withUnsafeMutablePointer(to: &info) { get(0, UnsafeMutableRawPointer($0)) }
-        guard ok != 0, info.complete != 0, let p = info.texture, Int(info.layers) > eye else { return (nil, "vpengine-none") }
+        guard ok != 0, info.complete != 0, let p = info.texture, Int(info.layers) > eye else { return (nil, "vpkengine-none") }
         let tex = Unmanaged<MTLTexture>.fromOpaque(p).takeUnretainedValue() as MTLTexture
         // Vulkan NDC difference, +y down = texture row 0 at the top (flipY); a bottom-up source flips y.
         let scale = SIMD2<Float>(info.scaleX, flipY ? info.scaleY : -info.scaleY)
@@ -226,16 +226,16 @@ final class KleptonTAA {
         m.fullMotion = info.includesCamera != 0
         m.invalidAbove = info.invalidThreshold
         m.jitterDelta = jd
-        return (m, "vpengine \(info.width)x\(info.height) f\(info.serial)")
+        return (m, "vpkengine \(info.width)x\(info.height) f\(info.serial)")
     }
 
-    /// Motion vectors of `eye`: VPEngine's (preferred when the driver makes them) or the AppSW
+    /// Motion vectors of `eye`: VPKEngine's (preferred when the driver makes them) or the AppSW
     /// ones the guest wrote for this frame.
     private func motionInput(_ eye: Int, _ r: kl_ovrp_render_pose, flipY: Bool) -> (VPKTAAMotionInput?, String) {
         guard useMV else { return (nil, "off(KL_VPKTAA_MV=0)") }
         if mvSource != "appsw" {
-            let (m, d) = vpengineMotion(eye, r, flipY: flipY)
-            if m != nil || mvSource == "vpengine" { return (m, d) }
+            let (m, d) = vpkengineMotion(eye, r, flipY: flipY)
+            if m != nil || mvSource == "vpkengine" { return (m, d) }
         }
         return appswMotion(eye, r)
     }

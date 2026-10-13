@@ -202,7 +202,7 @@ unsigned kl_vulkan_spacewarp_writes(int stage, int kind);
 //                  the eye image's size (URP final-blit pattern: the scene pass
 //                  has no eye attachment).
 // To make that depth readable at all, eye-sized depth images are created with
-// SAMPLED usage and without TRANSIENT (VPEngine would keep them on tile), and
+// SAMPLED usage and without TRANSIENT (VPKEngine would keep them on tile), and
 // every depth attachment's storeOp is forced to STORE (DONT_CARE discards it
 // on Metal). At kl_vulkan_frame_done(stage) the pick is filed for the stage;
 // a depth image the guest shares between stages is first COPIED (on the

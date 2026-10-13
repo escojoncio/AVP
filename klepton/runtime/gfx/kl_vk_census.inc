@@ -1,7 +1,7 @@
 // kl_vk_census.inc — the Vulkan census (KL_VK_CENSUS=1, on by default in the visionOS app).
 //
 // What the guest actually asks of Vulkan, written to the log once per distinct item, as the input
-// to finishing VPEngine (AVP PLAN.md §5.1): API versions, instance and device extensions, every pNext
+// to finishing VPKEngine (AVP PLAN.md §5.1): API versions, instance and device extensions, every pNext
 // struct of VkDeviceCreateInfo with the feature booleans it turns on, every features2 query, descriptor
 // set layouts (types, counts, binding flags), push constant ranges, pipelines (sample counts, dynamic
 // states, attachment formats, resolve modes), render passes and dynamic rendering, query pools,

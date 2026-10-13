@@ -1,5 +1,5 @@
-# AVP for Apple Vision Pro: Klepton's runtime + the launcher, VPEngine's Vulkan driver
-# (VPVulkan.framework, the default) and MoltenVK v1.4.2 (diagnostic engine), VPEngine's signature
+# AVP for Apple Vision Pro: Klepton's runtime + the launcher, VPKEngine's Vulkan driver
+# (VPVulkan.framework, the default) and MoltenVK v1.4.2 (diagnostic engine), VPKEngine's signature
 # code, LuaJIT / SDL3 + sdl2-compat / Fossilize. Unsigned IPA, published as the release "visionos"
 # (AVP.ipa). Nothing from Valve is built in or shipped: the game is downloaded by the app.
 #
@@ -24,21 +24,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-      - name: VPEngine commit (vpengine.ref)
+      - name: VPKEngine commit (vpkengine.ref)
         id: vpref
-        run: echo "sha=$(tr -d ' \n' < vpengine.ref)" >> "$GITHUB_OUTPUT"
-      - name: VPEngine (the signature code and the GPU layer), pinned
+        run: echo "sha=$(tr -d ' \n' < vpkengine.ref)" >> "$GITHUB_OUTPUT"
+      - name: VPKEngine (the signature code and the GPU layer), pinned
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/VPEngine
+          repository: ${{ github.repository_owner }}/VPKEngine
           ref: ${{ steps.vpref.outputs.sha }}
-          path: vpengine
+          path: vpkengine
           fetch-depth: 1
-      - name: AVP's VPEngine patches
+      - name: AVP's VPKEngine patches
         run: |
-          git -C vpengine config user.email ci@localhost
-          git -C vpengine config user.name ci
-          bash scripts/apply-vpengine-patches.sh vpengine vpengine-patches
+          git -C vpkengine config user.email ci@localhost
+          git -C vpkengine config user.name ci
+          bash scripts/apply-vpkengine-patches.sh vpkengine vpkengine-patches
       - name: Xcode
         run: |
           XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
@@ -50,12 +50,12 @@ jobs:
         id: vpvk
         with:
           path: build/VPVulkan.framework
-          key: vpvulkan-xros-${{ hashFiles('vpengine.ref', 'vpengine-patches/**', 'scripts/build-vpvulkan.sh', 'scripts/apply-vpengine-patches.sh') }}
-      - name: VPVulkan.framework (VPEngine's Vulkan driver for visionOS)
+          key: vpvulkan-xros-${{ hashFiles('vpkengine.ref', 'vpkengine-patches/**', 'scripts/build-vpvulkan.sh', 'scripts/apply-vpkengine-patches.sh') }}
+      - name: VPVulkan.framework (VPKEngine's Vulkan driver for visionOS)
         if: steps.vpvk.outputs.cache-hit != 'true'
         run: |
           set -o pipefail
-          bash scripts/build-vpvulkan.sh vpengine build 2>&1 | tee vpvulkan.log
+          bash scripts/build-vpvulkan.sh vpkengine build 2>&1 | tee vpvulkan.log
 
       - uses: actions/cache@v4
         id: mvk
@@ -127,18 +127,18 @@ jobs:
       - uses: actions/cache@v4
         id: certs
         with:
-          path: build/VPEngineCertificates
+          path: build/VPKEngineCertificates
           key: apple-certificates-v1
       - name: Apple's certificates (the chain a signed library carries)
         if: steps.certs.outputs.cache-hit != 'true'
         run: |
-          mkdir -p build/VPEngineCertificates
+          mkdir -p build/VPKEngineCertificates
           for C in AppleWWDRCAG3 AppleWWDRCAG4 AppleWWDRCAG5 AppleWWDRCAG6; do
-            curl -sSfL --retry 4 --retry-delay 5 -o build/VPEngineCertificates/$C.cer https://www.apple.com/certificateauthority/$C.cer || echo "no $C"
+            curl -sSfL --retry 4 --retry-delay 5 -o build/VPKEngineCertificates/$C.cer https://www.apple.com/certificateauthority/$C.cer || echo "no $C"
           done
-          curl -sSfL --retry 4 --retry-delay 5 -o build/VPEngineCertificates/AppleRootCA-G3.cer https://www.apple.com/certificateauthority/AppleRootCA-G3.cer || true
-          curl -sSfL --retry 4 --retry-delay 5 -o build/VPEngineCertificates/AppleIncRootCertificate.cer https://www.apple.com/appleca/AppleIncRootCertificate.cer
-          ls -la build/VPEngineCertificates
+          curl -sSfL --retry 4 --retry-delay 5 -o build/VPKEngineCertificates/AppleRootCA-G3.cer https://www.apple.com/certificateauthority/AppleRootCA-G3.cer || true
+          curl -sSfL --retry 4 --retry-delay 5 -o build/VPKEngineCertificates/AppleIncRootCertificate.cer https://www.apple.com/appleca/AppleIncRootCertificate.cer
+          ls -la build/VPKEngineCertificates
 
       - name: The app
         run: |
@@ -172,4 +172,4 @@ jobs:
           gh release create visionos build/AVP.ipa \
             --target "$GITHUB_SHA" --prerelease \
             --title "AVP para Apple Vision Pro" \
-            --notes "App sin firmar, compilada de ${GITHUB_SHA::7}. Half-Life: Alyx en Apple Vision Pro: descarga desde tu cuenta de Steam, conversión y firma en el visor; gráficos con VPEngine (VPVulkan), MoltenVK solo como motor de diagnóstico. No incluye nada de Valve: necesitas tu propia copia del juego."
+            --notes "App sin firmar, compilada de ${GITHUB_SHA::7}. Half-Life: Alyx en Apple Vision Pro: descarga desde tu cuenta de Steam, conversión y firma en el visor; gráficos con VPKEngine (VPVulkan), MoltenVK solo como motor de diagnóstico. No incluye nada de Valve: necesitas tu propia copia del juego."

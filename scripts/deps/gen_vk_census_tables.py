@@ -67,7 +67,7 @@ for name, t in sorted(structs.items()):
     if not g:
         continue
     # Core versions, and the cross-vendor KHR/EXT extensions: a vendor extension's struct can postdate the
-    # extension macro in older headers (the drivers' headers lag the registry), and none matter for VPEngine.
+    # extension macro in older headers (the drivers' headers lag the registry), and none matter for VPKEngine.
     if not (g.startswith('VK_VERSION_') or g.startswith('VK_KHR_') or g.startswith('VK_EXT_')):
         continue
     ms = members(t)

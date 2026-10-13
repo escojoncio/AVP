@@ -367,7 +367,7 @@ int kl_app_configure_alyx(const char *resources, const char *game, const char *d
     setenv("KL_VK_FOZ_RECORD", "auto", 0);
     setenv("KL_VK_FOZ_REPLAY", "auto", 0);
     setenv("KL_VK_DEVICE_INFO", "auto", 0);
-    // The Vulkan census (kl_vk_census.inc): what the game asks of Vulkan, for VPEngine's gaps.
+    // The Vulkan census (kl_vk_census.inc): what the game asks of Vulkan, for VPKEngine's gaps.
     setenv("KL_VK_CENSUS", "1", 0);
 
     // The app's settings files: the env file first, so everything below defaults only what it left unset.

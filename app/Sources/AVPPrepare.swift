@@ -10,10 +10,10 @@
 //   3. sign      copies in Library/Application Support/AVP/Signed, signed with the imported .p12
 //                (VisionQuestPro's scheme, AVPSigner); all redone when the certificate changes
 //   4. pipelines Glovebox's recipe + the game's shader packs -> AVP/Cache/pipelines.foz (avp_pipelines.c)
-//   5. prewarm   AlyxBoot.prewarm compiles every pipeline into VPEngine's archives before the first play
+//   5. prewarm   AlyxBoot.prewarm compiles every pipeline into VPKEngine's archives before the first play
 //
 // Why the signed copies live inside the app: the system only accepts them as copies in the app's own
-// container, signed with the app's identifier and certificate (VisionQuestPro, VPEngine).
+// container, signed with the app's identifier and certificate (VisionQuestPro, VPKEngine).
 
 import CryptoKit
 import Foundation
@@ -77,7 +77,7 @@ enum AVPPrepare {
         return Prepared(signed: signed, pipelines: foz)
     }
 
-    /// AlyxBoot.prewarm with progress (VPEngine compiles every pipeline of the list). Blocking.
+    /// AlyxBoot.prewarm with progress (VPKEngine compiles every pipeline of the list). Blocking.
     static func prewarm(_ paths: AVPLaunchPaths, progress: @escaping Progress) {
         let t0 = Date()
         let done = DispatchSemaphore(value: 0)

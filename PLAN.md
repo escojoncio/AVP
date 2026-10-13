@@ -1,8 +1,8 @@
 # AVP — Work plan
 
 Native visionOS app that runs **Half-Life: Alyx** (Steam's native ARM64 Linux build) on
-**Apple Vision Pro**, with no PC and no Mac step. Graphics on **VPEngine** (own Vulkan → Metal
-driver, `escojoncio/VPEngine`), antialiasing with **VPKTAA**.
+**Apple Vision Pro**, with no PC and no Mac step. Graphics on **VPKEngine** (own Vulkan → Metal
+driver, `escojoncio/VPKEngine`), antialiasing with **VPKTAA**.
 
 Status: plan settled (2026-10-13), implementation starting.
 
@@ -47,7 +47,7 @@ All pure data transforms, ported from Glovebox's Python to C/Swift:
 3. **Signing**: `vp_codesign` with the imported `.p12`; re-sign if the certificate changes.
 4. **Pipeline list**: rebuild the Fossilize database from the game's own `.vcs` shaders using a
    recipe with offsets only (no shader code in the repo), port of `engine/pipelines.py`.
-5. **Pre-compile** every pipeline through VPEngine into its `MTLBinaryArchive` before the first
+5. **Pre-compile** every pipeline through VPKEngine into its `MTLBinaryArchive` before the first
    play (progress bar). New pipelines met in play are recorded and compiled for the next launch.
    Goal: **zero shader stutter, first session included**.
 6. Outputs live in the user folder (Files): `AVP/game`, `AVP/cache` (converted + signed libs,
@@ -67,7 +67,7 @@ pieces; VisionQuestPro is not touched.
   real `VK_EXT_memory_budget` from `os_proc_available_memory`.
 - Known game fixes: NPC eyeball shader UBO guard, minmax sampler fake.
 
-## 5. Graphics: VPEngine
+## 5. Graphics: VPKEngine
 
 ### 5.1 Gaps to close for Source 2 (in `gpu/metal2` + SPIR-V translator)
 1. Dynamically indexed descriptor arrays (bindless) → argument buffers.
@@ -80,14 +80,14 @@ pieces; VisionQuestPro is not touched.
 6. Foveation with `MTLRasterizationRateMap` (fixed, adjustable), MetalFX.
 
 **Diagnostic switch (hidden, temporary): MoltenVK.** Only to isolate CPU/OpenVR/signing bugs from
-VPEngine bugs while the gaps are closed. Not a play mode; removed once VPEngine boots Alyx.
+VPKEngine bugs while the gaps are closed. Not a play mode; removed once VPKEngine boots Alyx.
 
 ### 5.2 VPKTAA, fully native
-Alyx (OpenVR) has no SpaceWarp and never generates motion vectors. VPEngine owns the shader
+Alyx (OpenVR) has no SpaceWarp and never generates motion vectors. VPKEngine owns the shader
 translator, so it generates them itself:
 - **Depth**: the eye depth the game renders (already captured for the compositor).
 - **Camera motion**: from depth + previous/current eye pose (exact for static geometry).
-- **Object motion**: VPEngine keeps the previous frame's copy of each draw's transform data
+- **Object motion**: VPKEngine keeps the previous frame's copy of each draw's transform data
   (UBO/push constant ranges feeding the position output) and the translated vertex shader
   computes the position twice (current + previous) → per-pixel motion vectors written to an
   extra render target in the main pass. Exact for skinned and moving objects.
@@ -98,10 +98,10 @@ translator, so it generates them itself:
 ## 6. The app rules over the game
 Enforced on **every** launch, overriding game files, in-game options and Steam Cloud:
 - `video2.txt` and `vr_fidelity_levels_override.csv` written from app settings (Vendor/Device ID
-  matching VPEngine so the game doesn't discard them).
+  matching VPKEngine so the game doesn't discard them).
 - Launch convars + Lua hooks at `player_activate` that re-apply them if the game changes them.
 - OpenVR shim reports the render size, FOV and refresh the app chose.
-- VPEngine enforces MSAA off, anisotropy, foveation, texture cap regardless of what the game asks.
+- VPKEngine enforces MSAA off, anisotropy, foveation, texture cap regardless of what the game asks.
 
 ## 7. Settings menu (in the app)
 Render resolution (% / native Vision Pro) · dynamic resolution on/off + range · texture quality
@@ -111,12 +111,12 @@ available, else English; voice always English) · FPS HUD · movement defaults �
 captures.
 
 ## 8. Phases
-1. Repo scaffold from VisionQuestPro (app, Klepton fork, CI `[build]`-only, VPEngine checkout).
+1. Repo scaffold from VisionQuestPro (app, Klepton fork, CI `[build]`-only, VPKEngine checkout).
 2. Merge Glovebox Linux/OpenVR/x18 pieces into the Klepton fork; LuaJIT/SDL/Fossilize in CI.
 3. Steam client + download + Cloud.
 4. Preparation pipeline (debs, conversion, signing, pipelines recipe).
 5. Launch + menu + enforcement; first device test (MoltenVK diagnostic switch available).
-6. VPEngine gaps (§5.1), then native VPKTAA (§5.2), foveation, MetalFX.
+6. VPKEngine gaps (§5.1), then native VPKTAA (§5.2), foveation, MetalFX.
 7. Polish: stutter reports in the log, performance HUD, memory tuning.
 
 ## 9. Credits

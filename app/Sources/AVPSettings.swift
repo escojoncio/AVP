@@ -1,9 +1,9 @@
 // AVP: the settings that rule over the game. All of them live in the app (UserDefaults, the
 // Settings screen); none is ever read back from a text file. On EVERY launch they are written
-// into the config folder (AlyxBoot's configDir) and pushed to VPEngine, overriding whatever the
+// into the config folder (AlyxBoot's configDir) and pushed to VPKEngine, overriding whatever the
 // game's own files, its Options menu or Steam Cloud left behind:
 //
-//   alyx-env.txt                      KEY=VALUE for Klepton / the OpenVR shim / VPEngine
+//   alyx-env.txt                      KEY=VALUE for Klepton / the OpenVR shim / VPKEngine
 //   video2.txt                        the game's video settings (from video2-visionpro-demo.txt)
 //   vr_fidelity_levels_override.csv   the fidelity table (one level, or a range for dynamic res)
 //   alyx-convars.lua                  re-applies the forced convars at every spawn and every few seconds
@@ -20,7 +20,7 @@ final class AVPSettings: ObservableObject {
 
     enum Foveation: Int, CaseIterable { case off = 0, m2 = 1, m5 = 2, custom = 3 }
     enum Movement: Int, CaseIterable { case teleport = 0, continuousHead = 2, continuousHand = 3 }
-    enum Engine: String, CaseIterable { case vpengine, moltenvk }
+    enum Engine: String, CaseIterable { case vpkengine, moltenvk }
     enum Upscaling: Int, CaseIterable { case off = 0, spatial = 1 }
 
     /// Vision Pro's native per-eye render size (what visionOS asks for at 100 %).
@@ -72,7 +72,7 @@ final class AVPSettings: ObservableObject {
         vpktaaSharpness = d.object(forKey: "avp.vpktaaSharp") as? Double ?? 0.3
         upscaling = .off   // MetalFX: not implemented in either engine yet, no setting shown
         anisotropy = d.object(forKey: "avp.aniso") as? Int ?? 16
-        engine = Engine(rawValue: d.string(forKey: "avp.engine") ?? "") ?? .vpengine
+        engine = Engine(rawValue: d.string(forKey: "avp.engine") ?? "") ?? .vpkengine
         systemLanguage = d.object(forKey: "avp.sysLang") as? Bool ?? true
         refreshHz = d.object(forKey: "avp.refreshHz") as? Int ?? 90
         halfRate = d.object(forKey: "avp.halfRate") as? Bool ?? true
@@ -156,9 +156,9 @@ final class AVPSettings: ObservableObject {
     }
 
     /// The game's MSAA: always off with VPKTAA (it does the antialiasing), else 4x.
-    /// VPKTAA only rides with VPEngine. MoltenVK is the diagnostic engine and runs Glovebox's proven setup
+    /// VPKTAA only rides with VPKEngine. MoltenVK is the diagnostic engine and runs Glovebox's proven setup
     /// (game MSAA 4x, no TAA): build 2's first device test hung the GPU on the first frame with VPKTAA + MSAA 0 on it.
-    var taaActive: Bool { vpktaa && engine == .vpengine }
+    var taaActive: Bool { vpktaa && engine == .vpkengine }
     var gameMSAA: Int { taaActive ? 0 : 4 }
 
     /// The Steam language name the game is started with: the system's when Alyx has its text,
@@ -280,7 +280,7 @@ final class AVPSettings: ObservableObject {
             ("KL_FPS_HUD", showFps ? "1" : "0"),
             ("KL_CAPTURE", diagCaptures ? "1" : "0"),
         ]
-        // Foveation: Klepton's rasterization-rate map (kl_gpu_time.m) and VPEngine's own.
+        // Foveation: Klepton's rasterization-rate map (kl_gpu_time.m) and VPKEngine's own.
         switch foveation {
         case .off:
             env.append(("KL_VRR", "0"))
@@ -386,8 +386,8 @@ end, nil)
         return lua
     }
 
-    /// VPEngine's own settings (vpvk_config_set_* through avp_config.c).
-    func applyToVPEngine() {
+    /// VPKEngine's own settings (vpvk_config_set_* through avp_config.c).
+    func applyToVPKEngine() {
         var c = avp_gfx_config()
         c.foveation_mode = Int32(foveation.rawValue)
         c.sharp_zone = Float(sharpZone)
