@@ -212,6 +212,9 @@ void klvk_set_replay_thread(int on) { t_pipe_replay = on; }
 static PFN_vkVoidFunction VKAPI_CALL klvk_GetDeviceProcAddr(VkDevice dev, const char *name);
 static PFN_vkGetDeviceProcAddr   real_gdpa;
 static int g_init_done, g_avail;
+static int ext_supported(const VkExtensionProperties *have, uint32_t nhave, const char *name);
+static int g_own_wsi;   // the driver has no WSI: Klepton serves surface + swapchain (vk_init)
+extern int kl_vk_native_wsi;
 
 static void *mvk_sym(const char *n) { return g_mvk ? dlsym(g_mvk, n) : NULL; }
 
@@ -296,6 +299,21 @@ static void vk_init(void) {
     if (eiv) eiv(&ver);
     VKI("MoltenVK loaded — instance API %u.%u.%u\n", VK_VERSION_MAJOR(ver),
         VK_VERSION_MINOR(ver), VK_VERSION_PATCH(ver));
+    // A driver with no window system at all (VPVulkan: VR only, nothing reaches a window) gets Klepton's
+    // own surface + swapchain (the synthetic ones the XR guests use), and the names a desktop guest gates
+    // on (VK_KHR_surface, its Linux WSI, VK_KHR_swapchain) are advertised by us, not dropped.
+    PFN_vkEnumerateInstanceExtensionProperties ee =
+        (PFN_vkEnumerateInstanceExtensionProperties)real_gipa(NULL, "vkEnumerateInstanceExtensionProperties");
+    uint32_t ne = 0;
+    if (ee && ee(NULL, &ne, NULL) == VK_SUCCESS) {
+        VkExtensionProperties *pe = calloc(ne ? ne : 1, sizeof *pe);
+        if (pe && ee(NULL, &ne, pe) == VK_SUCCESS) g_own_wsi = !ext_supported(pe, ne, "VK_KHR_surface");
+        free(pe);
+    }
+    if (g_own_wsi) {
+        kl_vk_native_wsi = 0;
+        VKI("driver has no VK_KHR_surface: surfaces and swapchains are Klepton's own (headless)\n");
+    }
 }
 
 int kl_vulkan_available(void) { vk_init(); return g_avail; }
@@ -533,6 +551,20 @@ static VkResult klvk_EnumerateInstanceExtensionProperties(
         n++;
     }
 
+    if (!layer && g_own_wsi && !ext_supported(tmp, n, "VK_KHR_surface")) {
+        tmp = realloc(tmp, (n + 1) * sizeof *tmp);
+        memset(&tmp[n], 0, sizeof tmp[n]);
+        snprintf(tmp[n].extensionName, sizeof tmp[n].extensionName, "%s", "VK_KHR_surface");
+        tmp[n].specVersion = 25;
+        n++;
+    }
+    if (!layer && g_own_wsi && !ext_supported(tmp, n, "VK_EXT_headless_surface")) {
+        tmp = realloc(tmp, (n + 1) * sizeof *tmp);
+        memset(&tmp[n], 0, sizeof tmp[n]);
+        snprintf(tmp[n].extensionName, sizeof tmp[n].extensionName, "%s", "VK_EXT_headless_surface");
+        tmp[n].specVersion = 1;
+        n++;
+    }
     // A personality can advertise extra instance extensions its guest gates
     // on (a Linux guest wants a Linux WSI name before it will go on to create
     // a surface through SDL). They are dropped at vkCreateInstance, like any
@@ -967,6 +999,14 @@ static VkResult klvk_CreateAndroidSurfaceKHR(VkInstance inst,
     *out = (VkSurfaceKHR)s;
     VKI("vkCreateAndroidSurfaceKHR -> synthetic surface %ux%u\n", s->w, s->h);
     return VK_SUCCESS;
+}
+
+// Desktop WSI names (a Linux guest's xlib / xcb / wayland window, SDL's headless one) on a driver with no
+// WSI (g_own_wsi): the same synthetic surface. All four share the (instance, info, alloc, out) shape.
+static VkResult VKAPI_CALL klvk_CreateAnyLinuxSurface(VkInstance inst, const void *ci,
+        const VkAllocationCallbacks *alloc, VkSurfaceKHR *out) {
+    (void)ci;
+    return klvk_CreateAndroidSurfaceKHR(inst, NULL, alloc, out);
 }
 
 static klvk_surface *surf_of(VkSurfaceKHR h) {
@@ -6094,6 +6134,16 @@ static VkResult VKAPI_CALL klvk_EnumerateDeviceExtensionProperties(
             !strcmp(e, "VK_QCOM_fragment_density_map_offset")) continue;
         all[k++] = all[i];
     }
+    if (g_own_wsi && !layer && !ext_supported(all, k, "VK_KHR_swapchain")) {
+        VkExtensionProperties *g = realloc(all, (k + 1) * sizeof *all);
+        if (g) {
+            all = g;
+            memset(&all[k], 0, sizeof all[k]);
+            snprintf(all[k].extensionName, sizeof all[k].extensionName, "%s", "VK_KHR_swapchain");
+            all[k].specVersion = 70;
+            k++;
+        }
+    }
     if (!props) { *count = k; free(all); return VK_SUCCESS; }
     uint32_t w = *count < k ? *count : k;
     memcpy(props, all, w * sizeof *all);
@@ -8737,6 +8787,10 @@ static const entry g_ours[] = {
     E(EnumeratePhysicalDevices),
     E(CreateDevice),
     E(CreateAndroidSurfaceKHR), E(DestroySurfaceKHR),
+    { "vkCreateXlibSurfaceKHR", (PFN_vkVoidFunction)klvk_CreateAnyLinuxSurface },
+    { "vkCreateXcbSurfaceKHR", (PFN_vkVoidFunction)klvk_CreateAnyLinuxSurface },
+    { "vkCreateWaylandSurfaceKHR", (PFN_vkVoidFunction)klvk_CreateAnyLinuxSurface },
+    { "vkCreateHeadlessSurfaceEXT", (PFN_vkVoidFunction)klvk_CreateAnyLinuxSurface },
     E(GetPhysicalDeviceSurfaceSupportKHR), E(GetPhysicalDeviceSurfaceCapabilitiesKHR),
     E(GetPhysicalDeviceSurfaceFormatsKHR), E(GetPhysicalDeviceSurfacePresentModesKHR),
     E(CreateSwapchainKHR), E(DestroySwapchainKHR), E(GetSwapchainImagesKHR),
@@ -8868,11 +8922,11 @@ static PFN_vkVoidFunction ours(const char *name) {
     // MoltenVK's own, not the headless swapchain built for XR guests. The
     // swapchain's images still have to join the image registry, or every copy,
     // blit and resolve into them is refused as an unknown image.
-    if (kl_vk_native_wsi && name && !strcmp(name, "vkGetSwapchainImagesKHR"))
+    if ((kl_vk_native_wsi && !g_own_wsi) && name && !strcmp(name, "vkGetSwapchainImagesKHR"))
         return (PFN_vkVoidFunction)klvk_native_GetSwapchainImagesKHR;
-    if (kl_vk_native_wsi && name && !strcmp(name, "vkQueuePresentKHR") && kl_env_on("KL_VK_FPS", 0))
+    if ((kl_vk_native_wsi && !g_own_wsi) && name && !strcmp(name, "vkQueuePresentKHR") && kl_env_on("KL_VK_FPS", 0))
         return (PFN_vkVoidFunction)klvk_native_QueuePresentKHR;
-    if (kl_vk_native_wsi && name &&
+    if ((kl_vk_native_wsi && !g_own_wsi) && name &&
         (strstr(name, "Surface") || strstr(name, "Swapchain") ||
          !strcmp(name, "vkAcquireNextImageKHR") || !strcmp(name, "vkQueuePresentKHR")))
         return NULL;

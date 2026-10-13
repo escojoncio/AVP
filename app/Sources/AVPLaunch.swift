@@ -33,7 +33,7 @@ enum AVPLaunch {
         if dlopen(path, RTLD_NOW | RTLD_GLOBAL) != nil {
             driverPath = path
             setenv("KL_MVK_DYLIB", path, 1)
-            AVPLog.log("Gráficos: VPEngine (VPVulkan) \(path)")
+            AVPLog.log("Gráficos: VPKEngine (VPVulkan) \(path)")
         } else {
             let reason = dlerror().map { String(cString: $0) } ?? "?"
             AVPLog.log("Gráficos: VPVulkan no carga (\(reason)); se usa MoltenVK")

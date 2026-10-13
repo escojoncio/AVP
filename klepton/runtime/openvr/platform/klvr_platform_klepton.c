@@ -160,6 +160,8 @@ static double host_period(void) {
 // where there is no app pacer (the Mac), which host_wait_frame covers.
 void kl_guest_pace_extra(unsigned extra);
 __attribute__((weak)) void kl_guest_pace_extra(unsigned extra) { (void)extra; }
+float kl_guest_display_rate(void);
+__attribute__((weak)) float kl_guest_display_rate(void) { return 0; }
 static unsigned g_pace_extra;
 static void pace_plan(float *base, float *fallback) {
     float panel;
@@ -168,7 +170,8 @@ static void pace_plan(float *base, float *fallback) {
         const char *hp = getenv("KLVR_HOST_PANEL_HZ");
         panel = hp && atof(hp) > 0 ? (float)atof(hp) : 2.0f * (float)atof(hf);
     } else {
-        panel = kl_ovrp_display_frequency();
+        float measured = kl_guest_display_rate();
+        panel = measured > 20 ? roundf(measured) : kl_ovrp_display_frequency();
     }
     if (!(panel > 20)) panel = 90;
     unsigned div = (unsigned)ceil(panel / 60.0 - 0.05);

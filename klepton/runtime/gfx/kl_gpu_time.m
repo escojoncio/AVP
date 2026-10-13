@@ -703,8 +703,8 @@ static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, 
             break;
         }
     MTLSize p0 = [map physicalSizeForLayer:0];
-    fprintf(stderr, "[vrr] foveated map (%s) %lux%lu: axis at %.0f%% / %.0f%% across, %.0f%% down; full rate within %.0f%%/%.0f%%, "
-            "edge %.2f; physical %lux%lu (%.0f%% of the pixels)\n", soft ? "soft" : "centre",
+    fprintf(stderr, "[vrr] foveated map (%s) %lu layer(s) %lux%lu: axis at %.0f%% / %.0f%% across, %.0f%% down; full rate within %.0f%%/%.0f%%, "
+            "edge %.2f; physical %lux%lu (%.0f%% of the pixels)\n", soft ? "soft" : "centre", (unsigned long)(layers > 1 ? 2 : 1),
             (unsigned long)w, (unsigned long)h, 100 * cx[0], 100 * cx[1], 100 * cy, 100 * in_x, 100 * in_y, edge, (unsigned long)p0.width,
             (unsigned long)p0.height, 100.0 * p0.width * p0.height / ((double)w * h));
     const char *dump = getenv("KL_VRR_DUMP");

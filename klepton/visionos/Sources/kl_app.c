@@ -1342,6 +1342,11 @@ void kl_guest_pace_extra(unsigned extra) { g_pace_extra = extra; }
 static _Atomic float g_pace_fps;
 float kl_guest_pace_fps(void);
 float kl_guest_pace_fps(void) { return g_pace_fps; }
+// The panel rate poses really arrive at (0 until measured): the OpenVR shim's pace plan uses it, since the
+// rate the game is TOLD (KL_DISPLAY_HZ, 90) is not the panel's (100 Hz on the M2 unit).
+static _Atomic float g_disp_rate;
+float kl_guest_display_rate(void);
+float kl_guest_display_rate(void) { return g_disp_rate; }
 
 unsigned long long kl_vulkan_frame_serial(void);   // kl_vulkan.c: guest frames so far (0 before the first)
 static void guest_pace_wait(void) {
@@ -1384,6 +1389,7 @@ static void guest_pace_wait(void) {
         else if (t - win_t0 >= 1.0) {
             double rate = (double)(p - win_p0) / (t - win_t0);
             last_rate = rate;
+            if (rate > 20) g_disp_rate = (float)rate;
             // Up to 15 % over the target: 100 Hz panels pace 1/2 = 50 (not 1/3 = 33), 90 Hz 45, 120 Hz 40.
             unsigned want = (unsigned)ceil(rate / (pace_hz * 1.15) - 0.05);
             if (want < 1) want = 1;

@@ -104,7 +104,7 @@ enum AVPSigner {
                 return Identity(certificate: certificate, key: key, chain: Array(chain.dropFirst()))
             }
         }
-        if !quiet { AVPLog.log("Firma: el lector PKCS#12 del sistema dio \(status); probando el de VPEngine") }
+        if !quiet { AVPLog.log("Firma: el lector PKCS#12 del sistema dio \(status); probando el de VPKEngine") }
         var parsed = VpPkcs12()
         var error = [CChar](repeating: 0, count: 256)
         let rc = p12.withUnsafeBytes { raw in
@@ -112,7 +112,7 @@ enum AVPSigner {
         }
         defer { vp_pkcs12_free(&parsed) }
         let detail = String(cString: error)
-        if rc != 0 && !quiet { AVPLog.log("Firma: lector de VPEngine: \(rc), \(detail)") }
+        if rc != 0 && !quiet { AVPLog.log("Firma: lector de VPKEngine: \(rc), \(detail)") }
         if status == errSecAuthFailed && rc != 0 && rc != -4 { throw Problem.wrongPassword }
         switch rc {
         case 0: break
