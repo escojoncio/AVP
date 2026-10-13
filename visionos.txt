@@ -1,4 +1,4 @@
-# visionos - 46b2420aa095cae009846f6b0e6f3e33d26b7ab0 - 2026-10-13T09:26:50Z
+# visionos - 26a44eb5bb48219663735c0e6477d2822355eed9 - 2026-10-13T09:29:28Z
 
 ## app.log:      862 lines
 ### errors
@@ -89,13 +89,13 @@ ProcessInfoPlistFile /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-
 
 ExtractAppIntentsMetadata (in target 'AVP' from project 'AVP')
     cd /Users/runner/work/AVP/AVP
-    /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/appintentsmetadataprocessor --toolchain-dir /var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.109.0.5Gu078/Metal.xctoolchain --module-name AVP --sdk-root /Applications/Xcode_26.6.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS26.5.sdk --xcode-version 17F113 --platform-family xrOS --deployment-target 26.0 --bundle-identifier com.kdt.livecontainer --output /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app --target-triple arm64-apple-xros26.0 --binary-file /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/AVP --dependency-file /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP_dependency_info.dat --stringsdata-file /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/ExtractedAppShortcutsMetadata.stringsdata --source-file-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP.SwiftFileList --metadata-file-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/AVP.DependencyMetadataFileList --static-metadata-file-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/AVP.DependencyStaticMetadataFileList --swift-const-vals-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP.SwiftConstValuesFileList --compile-time-extraction --deployment-aware-processing --validate-assistant-intents --no-app-shortcuts-localization
-2026-10-13 09:26:49.276 appintentsmetadataprocessor[5456:21205] Starting appintentsmetadataprocessor export
-2026-10-13 09:26:49.283 appintentsmetadataprocessor[5456:21205] warning: Metadata extraction skipped. No AppIntents.framework dependency found.
+    /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/appintentsmetadataprocessor --toolchain-dir /var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.109.0.kuFRVU/Metal.xctoolchain --module-name AVP --sdk-root /Applications/Xcode_26.6.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS26.5.sdk --xcode-version 17F113 --platform-family xrOS --deployment-target 26.0 --bundle-identifier com.kdt.livecontainer --output /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app --target-triple arm64-apple-xros26.0 --binary-file /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/AVP --dependency-file /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP_dependency_info.dat --stringsdata-file /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/ExtractedAppShortcutsMetadata.stringsdata --source-file-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP.SwiftFileList --metadata-file-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/AVP.DependencyMetadataFileList --static-metadata-file-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/AVP.DependencyStaticMetadataFileList --swift-const-vals-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP.SwiftConstValuesFileList --compile-time-extraction --deployment-aware-processing --validate-assistant-intents --no-app-shortcuts-localization
+2026-10-13 09:29:27.279 appintentsmetadataprocessor[3829:16476] Starting appintentsmetadataprocessor export
+2026-10-13 09:29:27.286 appintentsmetadataprocessor[3829:16476] warning: Metadata extraction skipped. No AppIntents.framework dependency found.
 
 CopySwiftLibs /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app (in target 'AVP' from project 'AVP')
     cd /Users/runner/work/AVP/AVP
-    builtin-swiftStdLibTool --copy --verbose --scan-executable /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/AVP --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/PlugIns --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/SystemExtensions --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Extensions --scan-folder /Users/runner/work/AVP/AVP/build/deps/Frameworks/SDL3.framework --platform xros --toolchain /var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.109.0.5Gu078/Metal.xctoolchain --toolchain /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain --destination /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks --strip-bitcode --strip-bitcode-tool /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip --emit-dependency-info /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/SwiftStdLibToolInputDependencies.dep --filter-for-swift-os
+    builtin-swiftStdLibTool --copy --verbose --scan-executable /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/AVP --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/PlugIns --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/SystemExtensions --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Extensions --scan-folder /Users/runner/work/AVP/AVP/build/deps/Frameworks/SDL3.framework --platform xros --toolchain /var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.109.0.kuFRVU/Metal.xctoolchain --toolchain /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain --destination /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks --strip-bitcode --strip-bitcode-tool /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip --emit-dependency-info /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/SwiftStdLibToolInputDependencies.dep --filter-for-swift-os
 Ignoring --strip-bitcode because --sign was not passed
 
 GenerateDSYMFile /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app.dSYM /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/AVP (in target 'AVP' from project 'AVP')
@@ -130,26 +130,26 @@ Touch /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app (i
 ** BUILD SUCCEEDED **
 
 build/dd/Build/Products/Release-xros/AVP.app:
-total 33184
-drwxr-xr-x  13 runner  staff       416 Oct 13 09:26 .
-drwxr-xr-x@  5 runner  staff       160 Oct 13 09:26 ..
--rw-r--r--   1 runner  staff   4112192 Oct 13 09:26 alyx.recipe
--rw-r--r--   1 runner  staff      2416 Oct 13 09:26 app-convars.lua
--rwxr-xr-x   1 runner  staff  12841864 Oct 13 09:26 AVP
--rw-r--r--   1 runner  staff      1824 Oct 13 09:26 device-info.json
-drwxr-xr-x   6 runner  staff       192 Oct 13 09:26 Frameworks
--rw-r--r--   1 runner  staff      2050 Oct 13 09:26 Info.plist
--rw-r--r--   1 runner  staff         8 Oct 13 09:26 PkgInfo
--rw-r--r--   1 runner  staff      4507 Oct 13 09:26 runtime-debs.json
--rw-r--r--   1 runner  staff      1940 Oct 13 09:26 video2-visionpro-demo.txt
-drwxr-xr-x   8 runner  staff       256 Oct 13 09:26 VPEngineCertificates
--rw-r--r--   1 runner  staff       310 Oct 13 09:26 vr_fidelity_fixed_1.0.csv
+total 33216
+drwxr-xr-x  13 runner  staff       416 Oct 13 09:29 .
+drwxr-xr-x@  5 runner  staff       160 Oct 13 09:29 ..
+-rw-r--r--   1 runner  staff   4112192 Oct 13 09:28 alyx.recipe
+-rw-r--r--   1 runner  staff      2416 Oct 13 09:28 app-convars.lua
+-rwxr-xr-x   1 runner  staff  12861400 Oct 13 09:29 AVP
+-rw-r--r--   1 runner  staff      1824 Oct 13 09:28 device-info.json
+drwxr-xr-x   6 runner  staff       192 Oct 13 09:29 Frameworks
+-rw-r--r--   1 runner  staff      2050 Oct 13 09:29 Info.plist
+-rw-r--r--   1 runner  staff         8 Oct 13 09:29 PkgInfo
+-rw-r--r--   1 runner  staff      4507 Oct 13 09:28 runtime-debs.json
+-rw-r--r--   1 runner  staff      1940 Oct 13 09:28 video2-visionpro-demo.txt
+drwxr-xr-x   8 runner  staff       256 Oct 13 09:28 VPEngineCertificates
+-rw-r--r--   1 runner  staff       310 Oct 13 09:28 vr_fidelity_fixed_1.0.csv
 
 build/dd/Build/Products/Release-xros/AVP.app/Frameworks:
 total 0
-drwxr-xr-x   6 runner  staff  192 Oct 13 09:26 .
-drwxr-xr-x  13 runner  staff  416 Oct 13 09:26 ..
-drwxr-xr-x   4 runner  staff  128 Oct 13 09:26 MoltenVK.framework
-drwxr-xr-x   5 runner  staff  160 Oct 13 09:26 SDL2.framework
-drwxr-xr-x   5 runner  staff  160 Oct 13 09:26 SDL3.framework
-drwxr-xr-x   4 runner  staff  128 Oct 13 09:26 VPVulkan.framework
+drwxr-xr-x   6 runner  staff  192 Oct 13 09:29 .
+drwxr-xr-x  13 runner  staff  416 Oct 13 09:29 ..
+drwxr-xr-x   4 runner  staff  128 Oct 13 09:29 MoltenVK.framework
+drwxr-xr-x   5 runner  staff  160 Oct 13 09:29 SDL2.framework
+drwxr-xr-x   5 runner  staff  160 Oct 13 09:29 SDL3.framework
+drwxr-xr-x   4 runner  staff  128 Oct 13 09:29 VPVulkan.framework
