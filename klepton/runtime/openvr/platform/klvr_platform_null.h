@@ -28,6 +28,8 @@ typedef struct {
     int             async_frames;   // klvr_plat_async_frames was called
     klvr_pose       last_render_head;
     float           last_tan[2][4];     // the frustum the last stage was closed with
+    float           last_jit[2][2];     // the jitter klvr_plat_close_stage was handed (VPKTAA)
+    int             last_have_jit[2];
     uint32_t        eye_w[2], eye_h[2];
     int             eye_srgb;
     char            last_log[512];

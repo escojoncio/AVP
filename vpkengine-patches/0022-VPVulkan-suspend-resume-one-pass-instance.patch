@@ -1,0 +1,165 @@
+From 3ddc529f1d2ee3e92c4dd0fafebbe2050e428634 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 20:00:01 +0000
+Subject: [PATCH 1/3] VPVulkan: suspended/resumed dynamic rendering is one
+ render pass instance (resumed chunks load, suspending chunks store, resolves
+ at the end): Source 2's eye pass no longer clears at every chunk
+
+---
+ gpu/vulkan/CMakeLists.txt     |  2 +-
+ gpu/vulkan/src/pipelines.cpp  | 23 ++++++++++---
+ gpu/vulkan/tests/vk_tests.cpp | 65 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 85 insertions(+), 5 deletions(-)
+
+diff --git a/gpu/vulkan/CMakeLists.txt b/gpu/vulkan/CMakeLists.txt
+index 4499d83..f4abac1 100644
+--- a/gpu/vulkan/CMakeLists.txt
++++ b/gpu/vulkan/CMakeLists.txt
+@@ -34,7 +34,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
+     target_compile_definitions(vpvk_tests PRIVATE VPVK_SPIRV_TESTS="${CMAKE_CURRENT_SOURCE_DIR}/../shader/spirv/tests")
+     add_dependencies(vpvk_tests VPVulkan)
+     target_compile_options(vpvk_tests PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+-    foreach(t exports physical memory passes submit pipeline recipes alyx depth_resolve local_read sync host_image_copy motion)
++    foreach(t exports physical memory passes submit pipeline recipes alyx depth_resolve resolve_1x suspend_resume local_read sync host_image_copy motion)
+       add_test(NAME gpu_vulkan.${t} COMMAND vpvk_tests ${t} $<TARGET_FILE:VPVulkan>)
+     endforeach()
+   endif()
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index 3719639..4a30f70 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -1631,12 +1631,25 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
+   OpBeginRendering op;
+   vpgpu::RenderPassDesc& d = op.desc;
+   std::vector<std::pair<const ImageView*, const ImageView*>> forcedPairs;
++  // Suspend/resume: the chunks of a suspended render pass instance are ONE instance (Source 2 records
++  // its eye pass over several command buffers: flags 0x2 / 0x6 / 0x4). Vulkan requires every chunk to
++  // repeat the same VkRenderingInfo, loadOp CLEAR included, and runs load ops only at the first chunk
++  // and store/resolve ops only at the last. Taken literally, every resumed chunk cleared colour and
++  // depth: only the last chunk's draws survived (build 17's broken picture).
++  const bool resuming = (ri->flags & VK_RENDERING_RESUMING_BIT) != 0;
++  const bool suspending = (ri->flags & VK_RENDERING_SUSPENDING_BIT) != 0;
++  {
++    static std::atomic<unsigned> said{0};
++    if ((resuming || suspending) && said.fetch_add(1) < 4)
++      logf("vk.rendering suspend_resume flags=0x%x: loads kept from the first chunk, stores/resolves at the last",
++           unsigned(ri->flags));
++  }
+   auto fill = [&](const VkRenderingAttachmentInfo& a, vpgpu::Attachment& t, bool depth) {
+     const ImageView* v = a.imageView ? from<ImageView>(a.imageView) : nullptr;
+     if (!v || !v->image || !v->image->id) return;
+     t.texture = v->image->id;
+     t.mip = uint16_t(v->range.baseMipLevel), t.layer = uint16_t(v->range.baseArrayLayer);
+-    t.load = toLoad(a.loadOp);
++    t.load = resuming ? vpgpu::LoadAction::Load : toLoad(a.loadOp);
+     bool resolve = false;
+     if (a.resolveMode != VK_RESOLVE_MODE_NONE && a.resolveImageView) {
+       const ImageView* rv = from<ImageView>(a.resolveImageView);
+@@ -1651,16 +1664,18 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
+           for (int i = 0; i < 4; ++i) t.clear.color[i] = a.clearValue.color.float32[i];
+         // Vulkan resolves at the END of the render pass instance: a suspending chunk does not
+         // (the resuming one that finishes the instance does), so no copy between chunks.
+-        if (!(ri->flags & VK_RENDERING_SUSPENDING_BIT) && resolveCopyUsable(v, rv)) forcedPairs.push_back({v, rv});
++        if (!suspending && resolveCopyUsable(v, rv)) forcedPairs.push_back({v, rv});
+         return;
+       }
+-      if (rv && rv->image && rv->image->id) {
++      // A real MSAA resolve likewise happens only when the instance ends (not at a suspension).
++      if (rv && rv->image && rv->image->id && !suspending) {
+         t.resolve = rv->image->id;
+         t.resolveMip = uint16_t(rv->range.baseMipLevel), t.resolveLayer = uint16_t(rv->range.baseArrayLayer);
+         resolve = true;
+       }
+     }
+-    t.store = toStore(a.storeOp, resolve);
++    // A suspending chunk keeps everything for the chunk that resumes it, whatever storeOp says.
++    t.store = suspending ? vpgpu::StoreAction::Store : toStore(a.storeOp, resolve);
+     if (depth) t.clear.depth = a.clearValue.depthStencil.depth, t.clear.stencil = uint8_t(a.clearValue.depthStencil.stencil);
+     else
+       for (int i = 0; i < 4; ++i) t.clear.color[i] = a.clearValue.color.float32[i];
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index fb82bb4..7fcc852 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -1277,6 +1277,70 @@ void testResolve1x() {
+   vkFreeMemory(c.dev, m, nullptr);
+ }
+ 
++// Suspend/resume (Source 2's eye pass): every chunk repeats loadOp CLEAR and storeOp DONT_CARE, as Vulkan
++// requires; only the first chunk may clear and every chunk but the last must store.
++void testSuspendResume() {
++  Ctx c;
++  VkDeviceMemory m = alloc(c, 32 << 20, 0);
++  VkImage col = image(c, VK_FORMAT_B10G11R11_UFLOAT_PACK32, 64, 2,
++                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, m);
++  VkImage dep = image(c, VK_FORMAT_D32_SFLOAT_S8_UINT, 64, 2,
++                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, m);
++  VkImageView cv, dv;
++  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++  vi.image = col, vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY, vi.format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
++  vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
++  vkCreateImageView(c.dev, &vi, nullptr, &cv);
++  vi.image = dep, vi.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
++  vi.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 2};
++  vkCreateImageView(c.dev, &vi, nullptr, &dv);
++  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++  VkCommandPool pool;
++  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
++  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++  ai.commandPool = pool, ai.commandBufferCount = 1;
++  VkCommandBuffer cb;
++  vkAllocateCommandBuffers(c.dev, &ai, &cb);
++  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++  vkBeginCommandBuffer(cb, &bi);
++  VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++  ca.imageView = cv, ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++  VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++  da.imageView = dv, da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
++  ri.renderArea = {{0, 0}, {64, 64}}, ri.layerCount = 1, ri.viewMask = 0x3;
++  ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca, ri.pDepthAttachment = &da, ri.pStencilAttachment = &da;
++  const VkRenderingFlags chunks[3] = {VK_RENDERING_SUSPENDING_BIT,
++                                      VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT, VK_RENDERING_RESUMING_BIT};
++  for (VkRenderingFlags f : chunks) {
++    ri.flags = f;
++    vkCmdBeginRendering(cb, &ri);
++    vkCmdEndRendering(cb);
++  }
++  vkEndCommandBuffer(cb);
++  vpgpu::Frame frame;
++  TranslateStats st;
++  translate(*from<CommandBuffer>(cb)->rec, frame, st);
++  std::vector<vpgpu::RenderPassDesc> passes;
++  for (const auto& cmd : frame.commands())
++    if (const auto* p = std::get_if<vpgpu::RenderPass>(&cmd)) passes.push_back(p->desc);
++  CHECK(passes.size() == 3);
++  if (passes.size() == 3) {
++    CHECK(passes[0].colors[0].load == vpgpu::LoadAction::Clear && passes[0].depth.load == vpgpu::LoadAction::Clear);
++    for (int i = 1; i < 3; ++i)
++      CHECK(passes[i].colors[0].load == vpgpu::LoadAction::Load && passes[i].depth.load == vpgpu::LoadAction::Load);
++    for (int i = 0; i < 2; ++i)
++      CHECK(passes[i].colors[0].store == vpgpu::StoreAction::Store && passes[i].depth.store == vpgpu::StoreAction::Store);
++    CHECK(passes[2].depth.store == vpgpu::StoreAction::DontCare);  // the instance's own storeOp, at its end
++  }
++  vkDestroyCommandPool(c.dev, pool, nullptr);
++  vkDestroyImageView(c.dev, cv, nullptr);
++  vkDestroyImageView(c.dev, dv, nullptr);
++  vkDestroyImage(c.dev, col, nullptr);
++  vkDestroyImage(c.dev, dep, nullptr);
++  vkFreeMemory(c.dev, m, nullptr);
++}
++
+ // VK_KHR_dynamic_rendering_local_read: a barrier inside dynamic rendering, then a draw reading the
+ // depth attachment as a texture (Source 2 soft particles). The pass is split, depth copied, the
+ // pass reopened with its contents loaded and the read rebound to the copy.
+@@ -1762,6 +1826,7 @@ int main(int argc, char** argv) {
+       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
+       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
+       {"recipes", testRecipes}, {"alyx", testAlyxSurface}, {"depth_resolve", testDepthResolve}, {"resolve_1x", testResolve1x},
++      {"suspend_resume", testSuspendResume},
+       {"local_read", testLocalRead}, {"sync", testSync},
+       {"host_image_copy", testHostImageCopy}, {"motion", testMotion}, {"recipe_keys", testRecipeKeys}};
+   bool ran = false;
+-- 
+2.43.0
+

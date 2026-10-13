@@ -312,6 +312,32 @@ static void test_compositor() {
         NEAR(klvr_null.last_tan[0][0], 1.0f); NEAR(klvr_null.last_tan[0][1], 0.9f);
         NEAR(klvr_null.last_tan[0][2], 1.1f); NEAR(klvr_null.last_tan[0][3], 1.2f);
 
+        // VPKTAA: a frame rendered with the frustum shifted by a sub-pixel offset (jx right, jy up). The
+        // stage keeps the UNjittered frustum and the offset read off the projection goes to the platform
+        // with the frame (klvr_plat_close_stage), whatever offset was served last.
+        {
+            const float jx = 0.004f, jy = -0.003f;
+            comp->WaitGetPoses(render, 1, nullptr, 0);
+            for (int e = 0; e < 2; e++) {
+                arr.m_unArrayIndex = e;
+                float l, r, t, b;
+                sys->GetProjectionRaw((vr::EVREye)e, &l, &r, &t, &b);
+                l += jx, r += jx, t += jy, b += jy;   // OpenVR raw: t = -down, b = up
+                vr::HmdMatrix44_t m{};
+                m.m[0][0] = 2 / (r - l); m.m[0][2] = (r + l) / (r - l);
+                m.m[1][1] = 2 / (b - t); m.m[1][2] = (b + t) / (b - t);
+                m.m[2][2] = -100.0f / 99.9f; m.m[2][3] = -10.0f / 99.9f; m.m[3][2] = -1;
+                tp.depth.mProjection = m;
+                CHECK(comp->Submit((vr::EVREye)e, &tp, nullptr, flags) == vr::VRCompositorError_None);
+            }
+            NEAR(klvr_null.last_tan[0][0], 1.0f); NEAR(klvr_null.last_tan[0][1], 0.9f);
+            NEAR(klvr_null.last_tan[0][2], 1.1f); NEAR(klvr_null.last_tan[0][3], 1.2f);
+            for (int e = 0; e < 2; e++) {
+                CHECK(klvr_null.last_have_jit[e] == 1);
+                CHECK(std::fabs(klvr_null.last_jit[e][0] - jx) < 1e-5f && std::fabs(klvr_null.last_jit[e][1] - jy) < 1e-5f);
+            }
+        }
+
         // A game that renders with a frustum of its own (here symmetric 1.5 x
         // 1.25, Vulkan-flipped, and column-major for the right eye): the
         // stage is closed with THAT, so the picture is placed as drawn.

@@ -309,6 +309,31 @@ void stage_tangents(const klvr_display &d, float tan[2][4]) {
         if (use_rendered && g_have_rendered_tan[e]) memcpy(tan[e], g_rendered_tan[e], sizeof g_rendered_tan[e]);
 }
 
+// VPKTAA: the sub-pixel jitter this very frame was rendered with, read off the projection the game
+// submitted with its depth (= the platform frustum shifted by the Halton offset it was served). Only a
+// pure shift (both edges moved alike, at most a few pixels) counts; that eye then keeps the platform's
+// UNjittered frustum for the record and the composite. Anything else is a real field-of-view
+// difference and stays the game's own frustum (stage_tangents). The served offsets cannot be paired
+// with a frame on the async path: the worker files frame N after the game was served N+1's offset.
+void stage_jitter(const klvr_display &d, float tan[2][4], float jit[2][2], int have[2]) {
+    for (int e = 0; e < 2; e++) {
+        have[e] = 0;
+        jit[e][0] = jit[e][1] = 0;
+        if (!g_have_rendered_tan[e]) continue;
+        const float *p = d.tan[e], *t = g_rendered_tan[e];   // l, r, u, d (positive extents)
+        const float dl = t[0] - p[0], dr = t[1] - p[1], du = t[2] - p[2], dd = t[3] - p[3];
+        const float sx = p[0] + p[1], sy = p[2] + p[3];
+        if (!(sx > 0) || !(sy > 0)) continue;
+        // x in [-l+dx, r+dx]: dr = dx, dl = -dx; y in [-d+dy, u+dy]: du = dy, dd = -dy.
+        if (std::fabs(dl + dr) > 2e-4f * sx || std::fabs(du + dd) > 2e-4f * sy) continue;
+        const float dx = 0.5f * (dr - dl), dy = 0.5f * (du - dd);
+        if (std::fabs(dx) > 4e-3f * sx || std::fabs(dy) > 4e-3f * sy) continue;
+        memcpy(tan[e], p, sizeof(float) * 4);
+        jit[e][0] = dx, jit[e][1] = dy;
+        have[e] = 1;
+    }
+}
+
 void close_stage_locked() {
     if (g_stage < 0) return;
     klvr_plat_frame_closed();
@@ -317,17 +342,21 @@ void close_stage_locked() {
     static bool use_submit_pose = env_on("KLVR_SUBMIT_POSE", true);
     const klvr_pose *head = g_render_frame.head.valid ? &g_render_frame.head.pose : nullptr;
     if (use_submit_pose && g_have_submit_head) head = &g_submit_head;
+    float tan[2][4], jit[2][2];
+    int have_jit[2];
+    stage_tangents(d, tan);
+    stage_jitter(d, tan, jit, have_jit);
+    // On this (the game's) thread, before its next WaitGetPoses opens the next frame's record.
+    klvr_plat_close_stage(g_stage, jit, have_jit);
     if (async_frames() && klvr_plat_presents()) {
         Job j;
         j.stage = g_stage;
         j.have_head = head != nullptr;
         if (head) j.head = *head;
-        stage_tangents(d, j.tan);
+        memcpy(j.tan, tan, sizeof j.tan);
         j.copies = g_copies;
         publish_async(j);
     } else {
-        float tan[2][4];
-        stage_tangents(d, tan);
         klvr_plat_end_stage(g_stage, head, tan);
     }
     g_copies = StageCopies();
