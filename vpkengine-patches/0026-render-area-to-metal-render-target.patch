@@ -1,0 +1,102 @@
+From 8fbb3e63fbc29ee8b5940e4b3aba0a5ba782568c Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 20:59:42 +0000
+Subject: [PATCH] Render area carried to the backend (renderTargetWidth/Height:
+ a rate map covers the drawn area); per-pass dump capped at 512 MB
+
+---
+ gpu/core/include/vpgpu/core/commands.h |  4 ++++
+ gpu/metal2/src/metal_backend.mm        | 28 +++++++++++++++++++++++++-
+ gpu/vulkan/src/commands.cpp            |  2 ++
+ gpu/vulkan/src/pipelines.cpp           |  1 +
+ 4 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/gpu/core/include/vpgpu/core/commands.h b/gpu/core/include/vpgpu/core/commands.h
+index 0b9ae25..007b279 100644
+--- a/gpu/core/include/vpgpu/core/commands.h
++++ b/gpu/core/include/vpgpu/core/commands.h
+@@ -116,6 +116,10 @@ struct RenderPassDesc {
+   Attachment depth;        // depth and/or stencil, per the texture's format
+   uint16_t layerCount = 1;  // layered rendering (e.g. both eyes in one pass)
+   std::string label;
++  // Render area extent from the origin (Vulkan renderArea offset + extent); 0 = the attachments' size. Source 2
++  // allocates its eye targets at the largest fidelity (3072x2496) and renders the top-left 2784x2208: the backend
++  // constrains the render target to it, so a rasterization rate map (foveation) covers what is drawn.
++  uint32_t renderWidth = 0, renderHeight = 0;
+   bool sameTargets(const RenderPassDesc& o) const;
+ };
+ 
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index b8bc582..9369eab 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -1314,7 +1314,7 @@ struct Open {
+ // buffer; after the frame completes each one becomes an 8-bit PNG preview plus a stats log line.
+ // Off by default; the frame is fully serialised while dumping (diagnostics only).
+ constexpr uint64_t kDumpMaxItemBytes = 128ull << 20;
+-constexpr uint64_t kDumpMaxTotalBytes = 768ull << 20;
++constexpr uint64_t kDumpMaxTotalBytes = 512ull << 20;  // Alyx leaves ~1.5 GB free in game
+ constexpr uint32_t kDumpMaxItems = 256;
+ constexpr uint32_t kDumpMaxWidth = 1024;
+ 
+@@ -2446,6 +2446,32 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         }
+       }
+       if (enc.pass.layerCount > 1) rp.renderTargetArrayLength = enc.pass.layerCount;
++      {
++        // Render area: the largest of the passes merged into this encoder (0 = one of them covers the whole
++        // target), never past the smallest attachment. Without it a rasterization rate map attached to the pass
++        // (Klepton's foveation) covered Source 2's 3072x2496 target while the scene is 2784x2208 at its top-left,
++        // and the compositor, which unwarps by the eye image's size, found no map for it (build 19).
++        uint32_t w = 0, h = 0;
++        bool whole = false;
++        for (uint32_t ci : enc.commands) {
++          const RenderPassDesc& pd = std::get<RenderPass>(cmds[ci]).desc;
++          if (!pd.renderWidth || !pd.renderHeight) whole = true;
++          w = std::max(w, pd.renderWidth), h = std::max(h, pd.renderHeight);
++        }
++        NSUInteger minW = NSUIntegerMax, minH = NSUIntegerMax;
++        auto clampTo = [&](id<MTLTexture> t, NSUInteger level) {
++          if (!t) return;
++          minW = std::min<NSUInteger>(minW, std::max<NSUInteger>(1, t.width >> level));
++          minH = std::min<NSUInteger>(minH, std::max<NSUInteger>(1, t.height >> level));
++        };
++        for (int i = 0; i < kMaxColorAttachments; ++i) clampTo(rp.colorAttachments[i].texture, rp.colorAttachments[i].level);
++        clampTo(rp.depthAttachment.texture, rp.depthAttachment.level);
++        clampTo(rp.stencilAttachment.texture, rp.stencilAttachment.level);
++        if (!whole && w && h && minW != NSUIntegerMax && (w < minW || h < minH)) {
++          rp.renderTargetWidth = std::min<NSUInteger>(w, minW);
++          rp.renderTargetHeight = std::min<NSUInteger>(h, minH);
++        }
++      }
+       NSUInteger s0, s1;
+       samplePair(e, s0, s1);
+       if (s0 != MTLCounterDontSample) {
+diff --git a/gpu/vulkan/src/commands.cpp b/gpu/vulkan/src/commands.cpp
+index 5d32758..d1cac5a 100644
+--- a/gpu/vulkan/src/commands.cpp
++++ b/gpu/vulkan/src/commands.cpp
+@@ -180,6 +180,8 @@ bool beginPass(const OpBeginPass& b, uint32_t sub, vpgpu::RenderPassDesc& desc,
+   desc.layerCount = sp.viewMask ? static_cast<uint16_t>(std::popcount(sp.viewMask))
+                                 : static_cast<uint16_t>(b.framebuffer ? b.framebuffer->layers : 1);
+   desc.label = "vk.pass";
++  desc.renderWidth = uint32_t(std::max<int32_t>(0, b.area.offset.x)) + b.area.extent.width;
++  desc.renderHeight = uint32_t(std::max<int32_t>(0, b.area.offset.y)) + b.area.extent.height;
+   if (resolveCopies)
+     for (const auto& [src, dst] : forced) resolveCopies->push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(desc.layerCount, 1)));
+   return true;
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index 53785ee..d73737a 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -1703,6 +1703,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
+   for (const auto& [src, dst] : forcedPairs) op.resolveCopies.push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(d.layerCount, 1)));
+   r.bound.targetWidth = uint32_t(ri->renderArea.offset.x) + ri->renderArea.extent.width;
+   r.bound.targetHeight = uint32_t(ri->renderArea.offset.y) + ri->renderArea.extent.height;
++  op.desc.renderWidth = r.bound.targetWidth, op.desc.renderHeight = r.bound.targetHeight;
+   r.bound.passImages.clear();
+   r.bound.localRead = false;
+   auto attached = [&](const VkRenderingAttachmentInfo* a) {
+-- 
+2.43.0
+
