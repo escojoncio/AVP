@@ -48,6 +48,9 @@ void *kl_vulkan_sym(const char *name);        // dlsym semantics: NULL when abse
 // through a DT_NEEDED rather than through dlopen/dlsym. libunity takes the
 // dlopen road; libSLZQuestNative names six vk* symbols directly.
 void *kl_vulkan_lookup(const char *name);
+// Print the last 64 Vulkan calls the guest made (vkCmd* excepted) and the totals of every
+// non-success result / VK_NULL_HANDLE output seen (kl_vk_diag.inc). Any thread; no-op without Vulkan.
+void kl_vulkan_diag_dump(const char *why);
 
 // Was MoltenVK actually reachable? Separated from `claims` so the failure can be
 // reported once, by name, at the point the guest asks — rather than as a NULL
@@ -56,6 +59,8 @@ int   kl_vulkan_available(void);
 // The path of the Vulkan driver the layer loaded (KL_MVK_DYLIB: VPVulkan.framework or MoltenVK; else the
 // KL_MVK_DIR search), or NULL when none loaded. Anything else that loads a Vulkan driver uses this one.
 const char *kl_vulkan_driver_path(void);
+// 1 when that driver has no WSI and the layer serves surfaces and swapchains itself (VPVulkan).
+int kl_vulkan_own_wsi(void);
 
 // ---------------------------------------------------------------------------
 // The eye-texture seam, for kl_ovrp.c

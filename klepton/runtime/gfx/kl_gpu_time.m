@@ -652,7 +652,16 @@ static void hook(Class c, SEL s, IMP mine, IMP *orig);
 enum { kVrrZones = 16 };
 extern void kl_ovrp_eye_view(int eye, float *px, float *py, float *pz, float *qx, float *qy, float *qz, float *qw, float tan4[4]);
 static int g_vrr_on = -1;
-static float vrr_env(const char *n, float d) { const char *e = getenv(n); return e && *e ? (float)atof(e) : d; }
+// Live overrides (pause menu, kl_vrr_set): win over the environment read at start. NAN = not set.
+static float g_vrr_live_inner = NAN, g_vrr_live_outer = NAN, g_vrr_live_edge = NAN;
+static int g_vrr_live_soft = -1;
+static float vrr_env(const char *n, float d) {
+    float live = !strcmp(n, "KL_VRR_INNER") ? g_vrr_live_inner : !strcmp(n, "KL_VRR_OUTER") ? g_vrr_live_outer
+               : !strcmp(n, "KL_VRR_EDGE") ? g_vrr_live_edge : NAN;
+    if (g_vrr_live_soft >= 0) return isnan(live) ? d : live;   // a live preset replaces the start-up values
+    const char *e = getenv(n);
+    return e && *e ? (float)atof(e) : d;
+}
 // Rate per zone along one axis: 1 within `in` (a fraction of the image) of the axis, falling linearly to `edge` at `out`.
 static void vrr_rates(float centre, float in, float outr, float edge, float *out) {
     for (int i = 0; i < kVrrZones; i++) {
@@ -664,7 +673,11 @@ static void vrr_rates(float centre, float in, float outr, float edge, float *out
 // foveation region), converted to image fractions from the eye's tangents, then falls to 0.25 over the next 12%
 // of the image; "soft" is the first map (full rate within 18% of the width, 0.35 from 50% out). KL_VRR_EDGE,
 // KL_VRR_INNER, KL_VRR_OUTER override either.
-static int vrr_soft(void) { const char *m = getenv("KL_VRR_MAP"); return m && !strcmp(m, "soft"); }
+static int vrr_soft(void) {
+    if (g_vrr_live_soft >= 0) return g_vrr_live_soft;
+    const char *m = getenv("KL_VRR_MAP");
+    return m && !strcmp(m, "soft");
+}
 static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, NSUInteger h, NSUInteger layers) {
     for (int i = 0; i < 8; i++)
         if (g_vrr_maps[i].map && g_vrr_maps[i].w == w && g_vrr_maps[i].h == h && g_vrr_maps[i].layers == layers)
@@ -742,6 +755,21 @@ void kl_vrr_s2p(void *ctx, float sx, float sy, float *px, float *py) {
 }
 // The foveated map an eye image of this size was rasterized through (NULL if none): the compositor picks by the
 // size of the image in hand, so a frame rendered at the previous fidelity level is unwarped with ITS map.
+// Live foveation settings (pause menu): forget the cached maps so the next scene pass builds one from the
+// current KL_VRR_* environment. The old maps are not released: the compositor and the guest's published
+// eye-map pointer may still be using them for a frame in flight (8 small objects at most per change).
+void kl_vrr_set(int soft, float inner, float outer, float edge) {
+    g_vrr_live_inner = inner, g_vrr_live_outer = outer, g_vrr_live_edge = edge;   // < 0: preset default
+    if (inner < 0) g_vrr_live_inner = NAN;
+    if (outer < 0) g_vrr_live_outer = NAN;
+    if (edge < 0) g_vrr_live_edge = NAN;
+    g_vrr_live_soft = soft ? 1 : 0;
+    kl_vrr_reload();
+}
+void kl_vrr_reload(void) {
+    for (int i = 0; i < 8; i++) g_vrr_maps[i].map = NULL, g_vrr_maps[i].w = g_vrr_maps[i].h = 0;
+    fprintf(stderr, "[vrr] settings changed: maps rebuilt on the next frame\n");
+}
 void *kl_vrr_map_for(int w, int h) {
     if (g_vrr_on <= 0) return NULL;
     for (int i = 0; i < 8; i++)

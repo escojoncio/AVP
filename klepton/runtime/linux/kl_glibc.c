@@ -675,6 +675,33 @@ void (*kl_glibc_msgbox_hook)(const char *title, const char *msg);
 static int g_sdl_simple_box(uint32_t flags, const char *title, const char *msg, void *win) {
     (void)win;
     fprintf(stderr, "\n[guest message box] flags=%#x title=\"%s\"\n%s\n\n", flags, title ? title : "", msg ? msg : "");
+    // What the guest last asked of Vulkan: a fatal box after device creation (Source 2's
+    // "Error in Init() of RenderDeviceMgr001") is usually the answer to one of these calls.
+    extern void kl_vulkan_diag_dump(const char *why);
+    kl_vulkan_diag_dump("guest message box");
+    // The game's own console (-condebug -> <game>/hlvr/console.log) names the reason behind a fatal box
+    // ("Error in Init() of …" says nothing more): its last 8 KB go into this log.
+    {
+        const char *g = getenv("KL_ALYX_GAME");
+        char cp[1200];
+        if (g && snprintf(cp, sizeof cp, "%s/hlvr/console.log", g) < (int)sizeof cp) {
+            fflush(NULL);
+            FILE *cf = fopen(cp, "rb");
+            if (cf) {
+                static char tail[8193];
+                fseek(cf, 0, SEEK_END);
+                long sz = ftell(cf), from = sz > 8192 ? sz - 8192 : 0;
+                fseek(cf, from, SEEK_SET);
+                size_t n = fread(tail, 1, 8192, cf);
+                tail[n] = 0;
+                fclose(cf);
+                fprintf(stderr, "[guest message box] game console (last %zu bytes of %ld):\n%s\n[guest message box] end of game console\n",
+                        n, sz, tail);
+            } else {
+                fprintf(stderr, "[guest message box] no game console at %s\n", cp);
+            }
+        }
+    }
     fflush(NULL);
     if (kl_glibc_msgbox_hook) kl_glibc_msgbox_hook(title ? title : "", msg ? msg : "");
     if (kl_env_on("KL_MSGBOX_PARK", 0)) {
@@ -718,7 +745,61 @@ static int is_sdl_soname(const char *p) {
     const char *b = p ? strrchr(p, '/') : NULL; b = b ? b + 1 : p;
     return b && (!strcmp(b, "libSDL2-2.0.so.0") || !strcmp(b, "libSDL2.so") || !strcmp(b, "libSDL2-2.0.so"));
 }
+// Klepton's own WSI (VPVulkan, a driver with no VK_KHR_surface): the host SDL must not load a Vulkan
+// library of its own. SDL3's offscreen driver, asked with no path (SDL_CreateWindow(SDL_WINDOW_VULKAN),
+// SDL_Vulkan_CreateSurface on a window without that flag), takes dlsym(RTLD_DEFAULT,
+// "vkGetInstanceProcAddr") — VPVulkan's raw entry point once the launcher has dlopened it RTLD_GLOBAL —
+// then refuses it ("Installed Vulkan doesn't implement the VK_KHR_surface extension"), so the window or
+// the surface fails with no Vulkan error anywhere. With MoltenVK the same code found MoltenVK and
+// worked. Here the guest's SDL Vulkan calls are answered from Klepton's loader instead: the surface
+// comes from Klepton's vkCreateHeadlessSurfaceEXT on the guest's own instance, and the window is made
+// without the Vulkan flag (nothing of SDL's Vulkan state is used).
+extern int kl_vulkan_own_wsi(void);
+extern void *kl_vulkan_sym(const char *name);
+#define KL_SDL2_WINDOW_VULKAN 0x10000000u
+static void *g_sdl_create_window(const char *title, int x, int y, int w, int h, uint32_t flags) {
+    void *(*f)(const char *, int, int, int, int, uint32_t) =
+        (void *(*)(const char *, int, int, int, int, uint32_t))dlsym(sdl_host(), "SDL_CreateWindow");
+    uint32_t give = flags;
+    if ((flags & KL_SDL2_WINDOW_VULKAN) && kl_vulkan_own_wsi()) give &= ~KL_SDL2_WINDOW_VULKAN;
+    void *win = f ? f(title, x, y, w, h, give) : NULL;
+    const char *(*err)(void) = (const char *(*)(void))dlsym(sdl_host(), "SDL_GetError");
+    fprintf(stderr, "[glibc] SDL_CreateWindow(\"%s\" %dx%d flags %#x -> %#x) -> %p%s%s\n", title ? title : "",
+            w, h, flags, give, win, win ? "" : " : ", win ? "" : (err ? err() : "?"));
+    return win;
+}
+static int g_sdl_vk_create_surface(void *win, void *inst, uint64_t *surface) {
+    (void)win;
+    typedef void *(*gipa_t)(void *, const char *);
+    typedef int32_t (*mk_t)(void *, const void *, const void *, uint64_t *);
+    gipa_t gipa = (gipa_t)kl_vulkan_sym("vkGetInstanceProcAddr");
+    mk_t mk = gipa ? (mk_t)gipa(inst, "vkCreateHeadlessSurfaceEXT") : NULL;
+    // VkHeadlessSurfaceCreateInfoEXT
+    struct { int32_t sType; const void *pNext; uint32_t flags; } ci = { 1000256000, NULL, 0 };
+    if (surface) *surface = 0;
+    int32_t r = mk && surface ? mk(inst, &ci, NULL, surface) : -3;
+    int ok = r == 0 && surface && *surface;
+    fprintf(stderr, "[glibc] SDL_Vulkan_CreateSurface(inst %p) -> Klepton's vkCreateHeadlessSurfaceEXT %d, surface %#llx\n",
+            inst, r, surface ? (unsigned long long)*surface : 0ull);
+    return ok;
+}
+static int g_sdl_vk_instance_exts(void *win, unsigned *count, const char **names) {
+    (void)win;
+    static const char *const ext[] = { "VK_KHR_surface", "VK_EXT_headless_surface" };
+    if (!count) return 0;
+    if (!names) { *count = 2; return 1; }
+    unsigned give = *count < 2 ? *count : 2;
+    for (unsigned i = 0; i < give; i++) names[i] = ext[i];
+    *count = give;
+    return give == 2;
+}
+static void *g_sdl_vk_gipa(void) { return kl_vulkan_sym("vkGetInstanceProcAddr"); }
+static void g_sdl_vk_unload(void) {}
 static int g_sdl_vulkan_load(const char *path) {
+    if (kl_vulkan_own_wsi()) {   // nothing to load: the guest's SDL Vulkan calls are Klepton's (above)
+        fprintf(stderr, "[glibc] SDL_Vulkan_LoadLibrary(%s) -> 0 (Klepton's loader; SDL loads nothing)\n", path ? path : "NULL");
+        return 0;
+    }
     // A Linux loader name: load the driver Klepton's Vulkan layer selected instead (KL_MVK_DYLIB:
     // VPVulkan.framework by default, MoltenVK as the diagnostic switch), so SDL and the layer always
     // talk to the same driver. Without one loaded yet: KL_MVK_DYLIB, else MoltenVK under KL_MVK_DIR.
@@ -741,6 +822,13 @@ static void *sdl_sym(const char *name) {
     if (!strcmp(name, "SDL_ShowMessageBox")) return (void *)g_sdl_box;
     if (!strcmp(name, "SDL_Vulkan_LoadLibrary")) return (void *)g_sdl_vulkan_load;
     if (!strcmp(name, "SDL_GetPlatform")) return (void *)g_sdl_platform;
+    if (!strcmp(name, "SDL_CreateWindow")) return (void *)g_sdl_create_window;
+    if (!strncmp(name, "SDL_Vulkan_", 11) && kl_vulkan_own_wsi()) {
+        if (!strcmp(name, "SDL_Vulkan_CreateSurface")) return (void *)g_sdl_vk_create_surface;
+        if (!strcmp(name, "SDL_Vulkan_GetInstanceExtensions")) return (void *)g_sdl_vk_instance_exts;
+        if (!strcmp(name, "SDL_Vulkan_GetVkGetInstanceProcAddr")) return (void *)g_sdl_vk_gipa;
+        if (!strcmp(name, "SDL_Vulkan_UnloadLibrary")) return (void *)g_sdl_vk_unload;
+    }
     void *p = sdl_host() ? dlsym(g_sdl_host, name) : NULL;
     if (!p) fprintf(stderr, "[glibc] SDL: host has no %s\n", name);
     return p;

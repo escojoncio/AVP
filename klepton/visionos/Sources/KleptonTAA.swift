@@ -35,8 +35,21 @@ final class KleptonTAA {
         guard let s = envS(k), let f = Float(s) else { return d }
         return f
     }
-    private let percent = min(max(KleptonTAA.envF("KL_VPKTAA_PCT", 80), 0), 100)
-    private let sharp = min(max(KleptonTAA.envF("KL_VPKTAA_SHARP", 0.3), 0), 1)
+    private var percent = min(max(KleptonTAA.envF("KL_VPKTAA_PCT", 80), 0), 100)
+    private var sharp = min(max(KleptonTAA.envF("KL_VPKTAA_SHARP", 0.3), 0), 1)
+    /// The live instance (the compositor owns it), for settings changed from the pause menu.
+    nonisolated(unsafe) static weak var current: KleptonTAA?
+    /// Pause menu: re-read KL_VPKTAA_PCT / KL_VPKTAA_SHARP (the same values everywhere: sharp zone and periphery).
+    static func reloadSettings(percent: Float, sharpness: Float) {
+        guard let t = current else { return }
+        t.lock.lock()
+        t.percent = min(max(percent, 0), 100)
+        t.sharp = min(max(sharpness, 0), 1)
+        t.core.historyPercent = t.percent
+        t.core.sharpness = t.sharp
+        t.lock.unlock()
+        NSLog("[taa] settings reloaded: pct=\(Int(t.percent)) rcas=\(t.sharp)")
+    }
     private let nearDefault = max(KleptonTAA.envF("KL_VPKTAA_NEAR", 0.05), 0.001)
     private let farDefault = max(KleptonTAA.envF("KL_VPKTAA_FAR", 0), 0)
     private let mvScaleMag = KleptonTAA.envF("KL_VPKTAA_MV_SCALE", 0.5)
@@ -120,6 +133,7 @@ final class KleptonTAA {
         c.disocclusion = min(max(KleptonTAA.envF("KL_VPKTAA_DISOCC", 0.1), 0.02), 1)
         if sign == "-1" { mvSign = SIMD2<Float>(-1, -1) }
         if KleptonTAA.envS("KL_VPKTAA_MV_YFLIP") == "1" { mvSign.y = -mvSign.y }
+        KleptonTAA.current = self
     }
 
     /// Output picture: rgba8 sRGB, written by the kernels through a non-sRGB view with the

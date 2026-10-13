@@ -1871,6 +1871,11 @@ final class KleptonCompositor {
                 NSLog("[cp] lifecycle_begin failed: \(String(cString: kl_app_status()))")
                 return
             }
+        } else if KleptonCompositor.guestKeptAlive {
+            // AVP pause: the system closed the previous space but the guest was kept (held, not stopped);
+            // this new space just takes over presenting it.
+            KleptonCompositor.guestKeptAlive = false
+            NSLog("[cp] new render loop on the kept guest (resume after the space was lost)")
         } else if kl_app_guest_start() != 0 {
             NSLog("[cp] guest thread failed to start: \(String(cString: kl_app_status()))")
             return
@@ -1938,7 +1943,13 @@ final class KleptonCompositor {
         // Ends the guest's loop and joins it, so its report — which is the
         // lifecycle report, and belongs to the guest's end of the run rather than
         // to this one — has been written before this returns.
-        if syncGuest { kl_app_lifecycle_report() } else { kl_app_guest_stop() }
+        // AVP: with the game running, a space the SYSTEM closed (Home/PS, Crown) keeps the guest: it is held
+        // (kl_guest_set_paused) instead of stopped, and the next space presents it again (Lifecycle.resumeGame).
+        if !syncGuest && Lifecycle.keepGuestOnSpaceLoss {
+            kl_guest_set_paused(1)
+            KleptonCompositor.guestKeptAlive = true
+            NSLog("[cp] guest kept alive and held (pause on space loss)")
+        } else if syncGuest { kl_app_lifecycle_report() } else { kl_app_guest_stop() }
         // VisionQuestPro: the space is gone — bring the launcher back (or exit).
         Task { @MainActor in Lifecycle.immersiveEnded() }
     }
@@ -2572,7 +2583,11 @@ final class KleptonCompositor {
     // A small head-locked panel: guest frames/s, compositor presents/s, VPKTAA state. Drawn
     // with the overlay pipeline through kl_overlay_build, like any guest Quad layer, from a
     // CoreGraphics bitmap refreshed twice a second.
-    static let fpsHudEnabled: Bool = (getenv("KL_FPS_HUD").map { String(cString: $0) } ?? "0") == "1"
+    // Live (pause menu): set by AVPSettings.applyLive, not read from the environment each frame (setenv
+    // racing getenv on another thread is a crash).
+    nonisolated(unsafe) static var fpsHudEnabled: Bool = (getenv("KL_FPS_HUD").map { String(cString: $0) } ?? "0") == "1"
+    /// AVP: the guest outlived the last space (held), so the next render loop must not start it again.
+    nonisolated(unsafe) static var guestKeptAlive = false
     private var hudTex: MTLTexture?
     private var hudWindowStart = Date()
     private var hudPresents = 0, hudGuestFrames = 0

@@ -1348,8 +1348,18 @@ static _Atomic float g_disp_rate;
 float kl_guest_display_rate(void);
 float kl_guest_display_rate(void) { return g_disp_rate; }
 
+// Pause (the launcher over the game, or the space lost to the Home/PS button): the guest's frame loop is
+// held at its next frame boundary until resumed. Its simulation, input and rendering stop with it.
+static int g_guest_paused;   // __atomic_* only
+void kl_guest_set_paused(int on) {
+    int was = __atomic_exchange_n(&g_guest_paused, on ? 1 : 0, __ATOMIC_SEQ_CST);
+    if (was != (on ? 1 : 0)) { printf("[guest] %s\n", on ? "paused (frame loop held)" : "resumed"); fflush(stdout); }
+}
+int kl_guest_paused(void) { return __atomic_load_n(&g_guest_paused, __ATOMIC_ACQUIRE); }
+
 unsigned long long kl_vulkan_frame_serial(void);   // kl_vulkan.c: guest frames so far (0 before the first)
 static void guest_pace_wait(void) {
+    while (__atomic_load_n(&g_guest_paused, __ATOMIC_ACQUIRE) && !g_guest.stop) usleep(20000);
     static unsigned div;
     static double pace_hz = -1, win_t0, last_rate;
     static uint64_t win_p0;

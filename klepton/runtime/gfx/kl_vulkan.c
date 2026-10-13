@@ -58,8 +58,10 @@ void *kl_vulkan_dlopen(const char *n) { if (name_is_vulkan(n)) complain_once(); 
 int   kl_vulkan_is_handle(const void *h) { (void)h; return 0; }
 void *kl_vulkan_sym(const char *n) { (void)n; return NULL; }
 void *kl_vulkan_lookup(const char *n) { (void)n; return NULL; }
+void  kl_vulkan_diag_dump(const char *why) { (void)why; }
 int   kl_vulkan_available(void) { return 0; }
 const char *kl_vulkan_driver_path(void) { return NULL; }
+int   kl_vulkan_own_wsi(void) { return 0; }
 void  kl_vulkan_stats(unsigned *p, unsigned *c) { if (p) *p = 0; if (c) *c = 0; }
 int   kl_vulkan_guest_active(void) { return 0; }
 int   kl_vulkan_gpu_ids(unsigned *v, unsigned *d) { (void)v; (void)d; return 0; }
@@ -206,6 +208,9 @@ static PFN_vkGetInstanceProcAddr real_gipa;
 // render pass and pipeline the guest creates, and replays recorded ones at device creation.
 static const klvk_pipe_hooks *g_pipe_hooks;
 static __thread int t_pipe_replay;   // this thread belongs to the replayer
+// Guest call site of the outermost diag thunk on this thread (kl_vk_diag.inc), so call-site
+// logging inside a Klepton wrapper (KLVK_WHO) names the guest, not the thunk in between.
+static __thread const void *t_kld_ra;
 void klvk_set_pipe_hooks(const klvk_pipe_hooks *h) { g_pipe_hooks = h; }
 void klvk_set_replay_thread(int on) { t_pipe_replay = on; }
 #define PIPE_HOOK(fn, ...) do { if (g_pipe_hooks && g_pipe_hooks->fn && !t_pipe_replay) g_pipe_hooks->fn(__VA_ARGS__); } while (0)
@@ -318,6 +323,9 @@ static void vk_init(void) {
 
 int kl_vulkan_available(void) { vk_init(); return g_avail; }
 const char *kl_vulkan_driver_path(void) { vk_init(); return g_mvk_path[0] ? g_mvk_path : NULL; }
+// 1 when the driver has no WSI and Klepton serves surfaces + swapchains itself (VPVulkan): the glibc
+// personality then keeps the guest's SDL from loading a Vulkan library of its own (see g_sdl_vk_*).
+int kl_vulkan_own_wsi(void) { vk_init(); return g_own_wsi; }
 
 // ---------------------------------------------------------------------------
 // State
@@ -1074,6 +1082,41 @@ static VkResult klvk_GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice p,
     return give < n ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
+// VK_KHR_get_surface_capabilities2 over the same synthetic surface. Without these the guest got the
+// missing-function trap: VK_SUCCESS with nothing written (an uninitialised count, a zeroed caps).
+static VkResult VKAPI_CALL klvk_GetPhysicalDeviceSurfaceCapabilities2KHR(VkPhysicalDevice p,
+        const VkPhysicalDeviceSurfaceInfo2KHR *info, VkSurfaceCapabilities2KHR *c) {
+    if (!c) return VK_SUCCESS;
+    return klvk_GetPhysicalDeviceSurfaceCapabilitiesKHR(p, info ? info->surface : VK_NULL_HANDLE,
+                                                         &c->surfaceCapabilities);
+}
+static VkResult VKAPI_CALL klvk_GetPhysicalDeviceSurfaceFormats2KHR(VkPhysicalDevice p,
+        const VkPhysicalDeviceSurfaceInfo2KHR *info, uint32_t *count, VkSurfaceFormat2KHR *out) {
+    (void)info; (void)p;
+    uint32_t n = sizeof k_surf_formats / sizeof *k_surf_formats;
+    if (!out) { *count = n; return VK_SUCCESS; }
+    uint32_t give = *count < n ? *count : n;
+    for (uint32_t i = 0; i < give; i++) {
+        out[i].surfaceFormat.format = k_surf_formats[i];
+        out[i].surfaceFormat.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    }
+    *count = give;
+    return give < n ? VK_INCOMPLETE : VK_SUCCESS;
+}
+static VkResult VKAPI_CALL klvk_GetPhysicalDevicePresentRectanglesKHR(VkPhysicalDevice p,
+        VkSurfaceKHR surf, uint32_t *count, VkRect2D *rects) {
+    (void)p;
+    if (!rects) { *count = 1; return VK_SUCCESS; }
+    if (*count < 1) return VK_INCOMPLETE;
+    klvk_surface *s = surf_of(surf);
+    rects[0] = (VkRect2D){ { 0, 0 }, { s ? s->w : 1024, s ? s->h : 1024 } };
+    *count = 1;
+    return VK_SUCCESS;
+}
+// The Linux "can this queue present to an X/Wayland display" queries: every queue can present to the
+// synthetic surface. The trap answered 0 (VK_FALSE) here.
+static VkBool32 VKAPI_CALL klvk_PresentationSupportTrue(void) { return VK_TRUE; }
+
 static VkResult klvk_GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice p,
         VkSurfaceKHR surf, uint32_t *count, VkPresentModeKHR *out) {
     (void)p; (void)surf;
@@ -1124,6 +1167,16 @@ static VkResult klvk_CreateSwapchainKHR(VkDevice dev, const VkSwapchainCreateInf
     sc->extent = ci->imageExtent;
     sc->n = ci->minImageCount < 2 ? 2 : ci->minImageCount;
     if (sc->n > KLVK_MAX_IMAGES) sc->n = KLVK_MAX_IMAGES;
+    // VK_KHR_swapchain_mutable_format: the images are MUTABLE_FORMAT images and the swapchain's
+    // VkImageFormatListCreateInfo (UNORM + SRGB) belongs on each of them, or an SRGB view of a UNORM
+    // swapchain image is invalid (VPVulkan only gives the Metal texture PixelFormatView usage when
+    // the image is MUTABLE_FORMAT).
+    const VkImageFormatListCreateInfo *fl = NULL;
+    for (const VkBaseInStructure *b = (const VkBaseInStructure *)ci->pNext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) fl = (const VkImageFormatListCreateInfo *)b;
+    VkImageFormatListCreateInfo fl_copy = { .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO };
+    if (fl) { fl_copy = *fl; fl_copy.pNext = NULL; }
+    const int mutable_fmt = (ci->flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR) != 0;
 
     for (uint32_t i = 0; i < sc->n; i++) {
         VkImageCreateInfo ic = {
@@ -1143,6 +1196,10 @@ static VkResult klvk_CreateSwapchainKHR(VkDevice dev, const VkSwapchainCreateInf
             .pQueueFamilyIndices = ci->pQueueFamilyIndices,
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         };
+        if (mutable_fmt) {
+            ic.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            if (fl) ic.pNext = &fl_copy;
+        }
         VkResult r = d->CreateImage(dev, &ic, NULL, &sc->images[i]);
         if (r != VK_SUCCESS) { VKI("swapchain image %u: %d\n", i, r); goto fail; }
         klvk_img_reg_add(sc->images[i]);
@@ -1163,8 +1220,9 @@ static VkResult klvk_CreateSwapchainKHR(VkDevice dev, const VkSwapchainCreateInf
     }
 
     *out = (VkSwapchainKHR)sc;
-    VKI("vkCreateSwapchainKHR -> %u image(s) %ux%u fmt %d (ours, no presentation engine)\n",
-        sc->n, sc->extent.width, sc->extent.height, (int)sc->format);
+    VKI("vkCreateSwapchainKHR -> %u image(s) %ux%u fmt %d usage %#x flags %#x views %u (ours, no presentation engine)\n",
+        sc->n, sc->extent.width, sc->extent.height, (int)sc->format, (unsigned)ci->imageUsage,
+        (unsigned)ci->flags, fl ? fl->viewFormatCount : 0u);
     return VK_SUCCESS;
 fail:
     free(sc);
@@ -5774,7 +5832,7 @@ static void klvk_who(const char *what, const void *ret) {
     size_t off = 0; const char *img = kl_addr_image(ret, &off);
     VKI("who: %s <- %s+0x%zx\n", what, img ? img : "?", off);
 }
-#define KLVK_WHO(what) klvk_who(what, __builtin_return_address(0))
+#define KLVK_WHO(what) klvk_who(what, t_kld_ra ? t_kld_ra : __builtin_return_address(0))
 
 // ---- GPU-identity spoof --------------------------------------------------
 // Some titles gate on the GPU they see rather than on Build.MODEL. batman
@@ -8930,6 +8988,19 @@ static PFN_vkVoidFunction ours(const char *name) {
         (strstr(name, "Surface") || strstr(name, "Swapchain") ||
          !strcmp(name, "vkAcquireNextImageKHR") || !strcmp(name, "vkQueuePresentKHR")))
         return NULL;
+    // Klepton's own WSI (the driver has none): the rest of the surface queries a desktop guest resolves.
+    if (g_own_wsi && name) {
+        static const entry own[] = {
+            { "vkGetPhysicalDeviceSurfaceCapabilities2KHR", (PFN_vkVoidFunction)klvk_GetPhysicalDeviceSurfaceCapabilities2KHR },
+            { "vkGetPhysicalDeviceSurfaceFormats2KHR", (PFN_vkVoidFunction)klvk_GetPhysicalDeviceSurfaceFormats2KHR },
+            { "vkGetPhysicalDevicePresentRectanglesKHR", (PFN_vkVoidFunction)klvk_GetPhysicalDevicePresentRectanglesKHR },
+            { "vkGetPhysicalDeviceXlibPresentationSupportKHR", (PFN_vkVoidFunction)klvk_PresentationSupportTrue },
+            { "vkGetPhysicalDeviceXcbPresentationSupportKHR", (PFN_vkVoidFunction)klvk_PresentationSupportTrue },
+            { "vkGetPhysicalDeviceWaylandPresentationSupportKHR", (PFN_vkVoidFunction)klvk_PresentationSupportTrue },
+        };
+        for (size_t i = 0; i < sizeof own / sizeof *own; i++)
+            if (!strcmp(own[i].name, name)) return own[i].fn;
+    }
     for (size_t i = 0; i < sizeof g_ours / sizeof *g_ours; i++)
         if (!strcmp(g_ours[i].name, name)) return g_ours[i].fn;
     return census_ours(name);
@@ -8963,6 +9034,9 @@ static void klvk_note_missing(const char *name) {
         "kills as an invalid page)\n", name);
 }
 
+// Result checks, NULL-handle checks and the call ring around everything handed out below.
+#include "kl_vk_diag.inc"
+
 static PFN_vkVoidFunction VKAPI_CALL klvk_GetInstanceProcAddr(VkInstance inst,
                                                               const char *name) {
     vk_init();
@@ -8973,11 +9047,11 @@ static PFN_vkVoidFunction VKAPI_CALL klvk_GetInstanceProcAddr(VkInstance inst,
     if (!strcmp(name, "vkGetDeviceProcAddr"))
         return (PFN_vkVoidFunction)klvk_GetDeviceProcAddr;
     PFN_vkVoidFunction m = ours(name);
-    if (m) return m;
+    if (m) return kld_wrap(name, m);
     if (!g_avail) return NULL;
     PFN_vkVoidFunction fn = real_gipa(inst ? inst : g_instance, name);
     if (!fn) { klvk_note_missing(name); return (PFN_vkVoidFunction)klvk_missing_trap; }
-    return fn;
+    return kld_wrap(name, fn);
 }
 
 static PFN_vkVoidFunction VKAPI_CALL klvk_GetDeviceProcAddr(VkDevice dev,
@@ -8987,11 +9061,11 @@ static PFN_vkVoidFunction VKAPI_CALL klvk_GetDeviceProcAddr(VkDevice dev,
     if (!strcmp(name, "vkGetDeviceProcAddr"))
         return (PFN_vkVoidFunction)klvk_GetDeviceProcAddr;
     PFN_vkVoidFunction m = ours(name);
-    if (m) return m;
+    if (m) return kld_wrap(name, m);
     if (!g_avail || !real_gdpa) return NULL;
     PFN_vkVoidFunction fn = real_gdpa(dev, name);
     if (!fn) { klvk_note_missing(name); return (PFN_vkVoidFunction)klvk_missing_trap; }
-    return fn;
+    return kld_wrap(name, fn);
 }
 
 // ---------------------------------------------------------------------------
@@ -9026,11 +9100,11 @@ void *kl_vulkan_sym(const char *name) {
     if (!strcmp(name, "vkGetInstanceProcAddr")) return (void *)klvk_GetInstanceProcAddr;
     if (!strcmp(name, "vkGetDeviceProcAddr")) return (void *)klvk_GetDeviceProcAddr;
     PFN_vkVoidFunction m = ours(name);
-    if (m) return (void *)m;
+    if (m) return (void *)kld_wrap(name, m);
     // MoltenVK exports the whole API statically, so a guest that resolves entry
     // points by dlsym rather than through vkGetInstanceProcAddr — which is legal
     // and which libSLZQuestNative does — gets a working pointer either way.
-    return mvk_sym(name);
+    return (void *)kld_wrap(name, (PFN_vkVoidFunction)mvk_sym(name));
 }
 
 void *kl_vulkan_lookup(const char *name) {
