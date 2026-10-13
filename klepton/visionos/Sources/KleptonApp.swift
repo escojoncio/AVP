@@ -391,7 +391,6 @@ struct BootView: View {
     @FocusState private var kbFocused: Bool
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.openWindow) private var openWindow
-    @Environment(\.dismissWindow) private var dismissWindow
     // VisionQuestPro: the boot log stays in the log file; the window shows a loading screen
     // unless the player asks to see it.
     @State private var showLog = false
