@@ -24,6 +24,7 @@ int avp_gfx_config_forward(void) {
     void (*set_asw)(int) = SYM(void (*)(int), "vpvk_config_set_asw_disabled");
     void (*set_q3)(int) = SYM(void (*)(int), "vpvk_config_set_quest3_profile");
     void (*set_tcap)(int) = SYM(void (*)(int), "vpvk_config_set_texture_cap");
+    void (*set_prewarm)(int) = SYM(void (*)(int), "vpvk_config_set_prewarm");
     if (!set_fov || !set_taa) {
         fprintf(stderr, "avp.gfx config stored; VPVulkan not loaded (MoltenVK path): foveation/VPKTAA not applied\n");
         return 0;
@@ -38,6 +39,9 @@ int avp_gfx_config_forward(void) {
     if (set_asw) set_asw(1);   // OpenVR has no SpaceWarp: every frame is real
     if (set_q3) set_q3(0);     // no Quest identity for a PC VR game
     if (set_tcap) set_tcap(g_cfg.texture_cap);
+    // No recipe prewarm inside vkCreateDevice: Klepton's pipeline replay (launcher prewarm + the game's own) is the
+    // warm-up, and the device-creation prewarm only added load time and memory on top (builds 13/14).
+    if (set_prewarm) set_prewarm(0);
     fprintf(stderr, "avp.gfx config forwarded to VPVulkan (texture cap setter %s)\n", set_tcap ? "yes" : "missing");
     return 1;
 }

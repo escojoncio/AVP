@@ -90,9 +90,19 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   cuelgues/cuarentena de la sesión anterior. Parches 0001-0010: quitados trailers con noreply.
 - Linux: ctest 149/149, vpvk_tests y vpgpu_core_tests OK. Metal/Swift revisados (Sonnet).
 
+## Build 15 (sin validar): el precompilado de la 14 no terminaba
+- Logs_Alyx_9 (build 14): replay del prewarm OK (13,7 s) pero `vpvk_device_wait_compiles` seguía >2 min: traductor v2
+  → caché de shaders del SO fría (`gpu.shader.lib ms_total=1121750`) + guardado serie de `.metalar` (40 ficheros,
+  15 `cannot_pack`). Abrir `pipelines-4.metalar` (95 MB) costó +4,4 GB (`ratio=29.9`): el presupuesto de 0019 no lo
+  puede predecir.
+- AVP: archivos binarios Metal desactivados para siempre (`VP_PIPELINE_ARCHIVE=0`; se borran `*.metalar`,
+  `pipelines.count`, `archive.*`); `kl_fossilize.cpp` no espera al driver sin archives (prewarm = replay, rc 1, el juego
+  repite su replay: flujo de la build 12); `avp_config.c` `vpvk_config_set_prewarm(0)` (sin prewarm de recetas en
+  vkCreateDevice). Se mantienen 0018 (diagnóstico de cuelgue, cuarentena, traductor v2) y la pantalla de carga.
+
 ## Siguiente
-- Log build 14: `gpu.mem`, `gpu.pso.cache open … mem_delta_mb`, `gpu.prewarm skipped=lazy`, `gpu.hang.enc` (qué es el
-  encoder 5: kind, label, target, pipelines, waits), `gpu.quarantine`, `gpu.recover`, `[cp] eye probe`, panel de carga.
+- Log build 15: entrar al juego; `gpu.hang.enc`/`gpu.hang.stuck` (qué es el encoder del cuelgue), `gpu.quarantine`,
+  `gpu.recover`, `gpu.mem`, `[cp] eye probe`, panel de carga. Carga rápida de verdad: pendiente (sin archives).
 
 ## Pendiente
 - Ajustes en vivo que faltan: resolución/texturas (convars del juego), anisotrópico (solo afecta a samplers nuevos);

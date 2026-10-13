@@ -605,8 +605,13 @@ static int foz_prewarm(const char *info_path) {
     start_replay(dev, (PFN_vkGetDeviceProcAddr)gipa(inst, "vkGetDeviceProcAddr"), true);
     // vkCreate*Pipelines only queues the compiles: without this wait, retiring the device drops whatever is
     // still queued (build 12: 1268 of ~2900 libraries compiled when the prewarm device went away).
+    // Without binary archives (AVP: off for good) the wait buys nothing that persists: the compiles it waits for
+    // land in the OS shader cache anyway, and on a cold cache it is minutes (build 14). The prewarm then is the
+    // replay alone (build 12's behaviour) and the game replays its own list.
+    const char *cache = getenv("VP_PIPELINE_CACHE_DIR"), *archive = getenv("VP_PIPELINE_ARCHIVE");
+    const bool have_cache = cache && *cache, archive_off = archive && *archive == '0';
     bool drained = false;
-    {
+    if (!archive_off) {
         typedef uint32_t (*wait_fn)(VkDevice);
         void *h = nullptr;
         if (const char *drv = kl_vulkan_driver_path()) h = dlopen(drv, RTLD_NOW | RTLD_NOLOAD);
@@ -619,15 +624,14 @@ static int foz_prewarm(const char *info_path) {
         }
         if (h) dlclose(h);
     }
-    if (!drained) fprintf(stderr, "  [foz] prewarm: the driver cannot wait for its queued compiles (not VPKEngine 0017+)\n");
+    if (!drained && !archive_off)
+        fprintf(stderr, "  [foz] prewarm: the driver cannot wait for its queued compiles (not VPKEngine 0017+)\n");
     // Complete = every compile waited for AND kept on disk: the recipes (VP_PIPELINE_CACHE_DIR) and the binary
     // archive (off with VP_PIPELINE_ARCHIVE=0: the game would then compile every pipeline again, so it replays).
-    const char *cache = getenv("VP_PIPELINE_CACHE_DIR"), *archive = getenv("VP_PIPELINE_ARCHIVE");
-    const bool have_cache = cache && *cache, archive_off = archive && *archive == '0';
     if (drained && have_cache && !archive_off) g_prewarm_complete.store(true);
     else fprintf(stderr, "  [foz] prewarm: not complete (driver wait %s, VP_PIPELINE_CACHE_DIR %s, binary archive %s): "
                          "the game replays again\n",
-                 drained ? "done" : "unavailable", have_cache ? "set" : "unset", archive_off ? "off" : "on");
+                 drained ? "done" : archive_off ? "skipped (no archives)" : "unavailable", have_cache ? "set" : "unset", archive_off ? "off" : "on");
     klvk_retire_device(inst, dev);
     fprintf(stderr, "  [foz] prewarm done in %.1f s\n", now_s() - t0);
     // 1: replayed, but nothing persistent says so (the app must not mark its cache warm; the game replays).
