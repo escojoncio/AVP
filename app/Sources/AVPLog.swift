@@ -1,6 +1,6 @@
 // AVP: the app's own log. Every diagnostic goes here (and to the system log): there is no Mac to
-// attach. Written to Documents/Logs/app.txt and mirrored into AVP/Logs when the folder is chosen;
-// the guest's own log is Documents/klepton-boot.log (kl_app.c). Shared from the app.
+// attach. Written to Documents/Logs Alyx/app.txt and mirrored into AVP/Logs Alyx when the folder is chosen;
+// the guest's logs (klepton-boot.log, klepton-crash.log, alyx-error.txt) go to the same folder. Shared from the app.
 
 import Foundation
 
@@ -10,22 +10,24 @@ enum AVPLog {
 
     static var directory: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Logs", isDirectory: true)
+            .appendingPathComponent("Logs Alyx", isDirectory: true)
     }
     static var appLog: URL { directory.appendingPathComponent("app.txt") }
     static var previousLog: URL { directory.appendingPathComponent("app-previous.txt") }
-    static var bootLog: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("klepton-boot.log")
-    }
-    static var crashLog: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("klepton-crash.log")
-    }
+    // The guest's logs go to the same folder (kl_app.c, KL_ALYX_LOG_DIR set by AVPLaunch), apart from
+    // VisionQuestPro's, which shares this container (same bundle id).
+    static var bootLog: URL { directory.appendingPathComponent("klepton-boot.log") }
+    static var crashLog: URL { directory.appendingPathComponent("klepton-crash.log") }
+    static var errorLog: URL { directory.appendingPathComponent("alyx-error.txt") }
+    static var prewarmLog: URL { AVPFolder.data.appendingPathComponent("klfz/prewarm.log") }
 
     /// Starts a new log for this session (the previous one is kept as app-previous.txt).
     static func start() {
         lock.lock(); defer { lock.unlock() }
         guard handle == nil else { return }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // Before any kl_app_configure_alyx (prewarm or Play): the guest's logs land here too.
+        setenv("KL_ALYX_LOG_DIR", directory.path, 1)
         try? FileManager.default.removeItem(at: previousLog)
         try? FileManager.default.moveItem(at: appLog, to: previousLog)
         for old in captures { try? FileManager.default.removeItem(at: old) }
@@ -47,7 +49,7 @@ enum AVPLog {
     /// Copies this session's logs into AVP/Logs (survives a reinstall; visible in Files).
     static func mirrorToFolder() {
         guard let dir = AVPFolder.shared.logs else { return }
-        for url in [appLog, previousLog, bootLog, crashLog] where FileManager.default.fileExists(atPath: url.path) {
+        for url in [appLog, previousLog, bootLog, crashLog, errorLog, prewarmLog] where FileManager.default.fileExists(atPath: url.path) {
             let dest = dir.appendingPathComponent(url.lastPathComponent)
             try? FileManager.default.removeItem(at: dest)
             try? FileManager.default.copyItem(at: url, to: dest)
@@ -56,7 +58,7 @@ enum AVPLog {
 
     /// The logs that exist, for the share button.
     static var shareable: [URL] {
-        [appLog, previousLog, bootLog, crashLog]
+        [appLog, previousLog, bootLog, crashLog, errorLog, prewarmLog]
             .filter { FileManager.default.fileExists(atPath: $0.path) }
             + captures
     }

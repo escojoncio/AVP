@@ -20,7 +20,7 @@ final class AVPFolder: @unchecked Sendable {
     static let folderName = "AVP"
     static let gameName = "game"
     static let cacheName = "Cache"
-    static let logsName = "Logs"
+    static let logsName = "Logs Alyx"
 
     /// Room the preparation needs on top of the download: converted + signed libraries,
     /// runtime packages, the pipeline list and the shader archives (~8 GB), plus a 2 GB margin.

@@ -37,6 +37,13 @@ Base: VisionQuestPro `04f7e6a` (app, Klepton propio, CI). Glovebox (MIT) fusiona
 - Arranque con MoltenVK: líneas `[census]` (lista para VPEngine), `[dl] … unresolved import(s)`.
 - Con VPEngine: `vk.feature`, `vk.err what=shader` (int64/16-bit no soportados), `vk.motion`.
 
+## Build 2 (2026-10-13) — logs separados de VisionQuestPro
+- Prueba 1 (MoltenVK): la preparación terminó en segundos y el juego no arrancó; logs de Alyx mezclados con VQP (mismo
+  contenedor, mismo bundle id) y el boot log en Application Support/AVP/Data/logs (invisible).
+- Ahora todo en `Documents/Logs Alyx/`: app.txt, app-previous.txt, klepton-boot.log, klepton-crash.log, alyx-error.txt;
+  copia en `<carpeta AVP>/Logs Alyx/` (con prewarm.log). `AVPLog.start()` fija `KL_ALYX_LOG_DIR` antes de cualquier
+  `kl_app_configure_alyx` (prewarm o Play); kl_app.c `g_logdir`.
+
 ## Pendiente
 - VPEngine: int64/16-bit en shaders, teselación, depth bounds, foveado (MTLRasterizationRateMap), MetalFX, bindless.
 - QR de Steam; `vpvk_config_set_metalfx`/`_texture_cap` no existen aún (solo se registran).
