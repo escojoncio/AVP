@@ -1,0 +1,228 @@
+From 4ec1846f4cc9e380a36fd679289d51b9dab10a05 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 22:20:12 +0000
+Subject: [PATCH] Multiview: vertex shaders write [[viewport_array_index]] =
+ the view and the backend sets one viewport/scissor per view, so a
+ rasterization rate map's layer follows the eye (translator v4)
+
+---
+ gpu/metal2/src/metal_backend.mm        | 46 ++++++++++++++++++++++----
+ gpu/shader/ir/include/vpir/ir.h        |  2 ++
+ gpu/shader/ir/src/ir.cpp               |  3 +-
+ gpu/shader/ir/src/parse.cpp            |  2 +-
+ gpu/shader/msl/src/msl.cpp             |  1 +
+ gpu/shader/spirv/src/lower.cpp         | 10 ++++++
+ gpu/shader/spirv/tests/spirv_tests.cpp |  2 ++
+ gpu/vulkan/src/recipes.h               |  4 ++-
+ 8 files changed, 61 insertions(+), 9 deletions(-)
+
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 9369eab..7f31bc3 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -69,6 +69,7 @@ std::atomic<uint32_t> gGpuHangs{0};
+ // draw: 1 MiB holds ~52k draws a frame.
+ constexpr uint64_t kIndirectScratchBytes = 8 << 20;  // per frame slot; IndirectCount reserves maxDrawCount
+ constexpr uint64_t kIndirectHeader = 16;
++constexpr NSUInteger kMaxPassViews = 16;  // Metal's viewport array limit
+ // Same limits as VPVulkan's submit-time path (commands.cpp): past them a draw is garbage that would
+ // trip the GPU watchdog, so the kernel turns it into an empty draw and counts it.
+ constexpr uint32_t kIndirectMaxCount = 1u << 25;
+@@ -601,6 +602,7 @@ struct MetalBackend::Impl {
+ 
+   // Per-pass dump (VP_DUMP_FRAME=<n>, VP_DUMP_DIR=<dir>); -1 = off.
+   int64_t dumpFrame = -1;
++  bool dumpTaken = false;  // submit thread: one dump per session
+   std::string dumpDir;
+ 
+   Impl(const ShaderProvider& s, LogSink l, MetalOptions o) : shaders(s), log(std::move(l)), options(std::move(o)) {}
+@@ -2046,7 +2048,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   id<MTLFence> openFence = nil;
+   // Per-pass dump of this frame (diagnostics): items to write after completion, copies waiting for
+   // the open encoder to end.
+-  const bool dumping = dumpFrame >= 0 && frameIndex == uint64_t(dumpFrame);
++  // The first command buffer at or after VP_DUMP_FRAME that renders a real frame (8+ encoders, a layered pass):
++  // Source 2 also submits tiny command buffers, and build 21's frame 6000 was one of them (items=0).
++  bool dumpLayered = false;
++  for (const Encoder& en : compiled.encoders) dumpLayered |= en.kind == Encoder::Kind::Render && en.pass.layerCount > 1;
++  const bool dumping = dumpFrame >= 0 && !dumpTaken && frameIndex >= uint64_t(dumpFrame) &&
++                       compiled.encoders.size() >= 8 && dumpLayered;
++  if (dumping) dumpTaken = true;
+   auto dumpItems = std::make_shared<std::vector<DumpItem>>();
+   std::vector<DumpCopy> dumpCopies;
+   std::unordered_set<uintptr_t> dumpSeen;  // storage textures already queued for the open encoder
+@@ -2472,6 +2480,15 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+           rp.renderTargetHeight = std::min<NSUInteger>(h, minH);
+         }
+       }
++      // Views of a layered (multiview) pass and its drawable size, for the per-view viewports below.
++      const NSUInteger passViews = enc.pass.layerCount > 1 ? std::min<NSUInteger>(enc.pass.layerCount, kMaxPassViews) : 1;
++      NSUInteger passW = rp.renderTargetWidth, passH = rp.renderTargetHeight;
++      if (!passW || !passH) {
++        id<MTLTexture> t0 = rp.colorAttachments[0].texture ? rp.colorAttachments[0].texture : rp.depthAttachment.texture;
++        const NSUInteger lv = rp.colorAttachments[0].texture ? rp.colorAttachments[0].level : rp.depthAttachment.level;
++        passW = t0 ? std::max<NSUInteger>(1, t0.width >> lv) : 1;
++        passH = t0 ? std::max<NSUInteger>(1, t0.height >> lv) : 1;
++      }
+       NSUInteger s0, s1;
+       samplePair(e, s0, s1);
+       if (s0 != MTLCounterDontSample) {
+@@ -2581,11 +2598,28 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+           [open.render setFrontFacingWinding:d.frontFace == Winding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+           [open.render setDepthBias:d.depthBias slopeScale:d.depthBiasSlope clamp:d.depthBiasClamp];
+           [open.render setDepthClipMode:d.depthClamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
+-          if (d.viewport.width > 0)
+-            [open.render setViewport:(MTLViewport){d.viewport.x, d.viewport.y, d.viewport.width, d.viewport.height,
+-                                                   d.viewport.znear, d.viewport.zfar}];
+-          if (d.scissor.width > 0 && d.scissor.height > 0)
+-            [open.render setScissorRect:(MTLScissorRect){d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height}];
++          if (passViews > 1) {
++            // Multiview: the vertex shader writes [[viewport_array_index]] = its view (a rate map's layer
++            // follows it), so every view needs the viewport and scissor; the default covers index 0 only.
++            MTLViewport vp = d.viewport.width > 0
++                                 ? (MTLViewport){d.viewport.x, d.viewport.y, d.viewport.width, d.viewport.height,
++                                                 d.viewport.znear, d.viewport.zfar}
++                                 : (MTLViewport){0.0, 0.0, double(passW), double(passH), 0.0, 1.0};
++            MTLScissorRect sc = d.scissor.width > 0 && d.scissor.height > 0
++                                    ? (MTLScissorRect){d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height}
++                                    : (MTLScissorRect){0, 0, passW, passH};
++            MTLViewport vps[kMaxPassViews];
++            MTLScissorRect scs[kMaxPassViews];
++            for (NSUInteger v = 0; v < passViews; ++v) vps[v] = vp, scs[v] = sc;
++            [open.render setViewports:vps count:passViews];
++            [open.render setScissorRects:scs count:passViews];
++          } else {
++            if (d.viewport.width > 0)
++              [open.render setViewport:(MTLViewport){d.viewport.x, d.viewport.y, d.viewport.width, d.viewport.height,
++                                                     d.viewport.znear, d.viewport.zfar}];
++            if (d.scissor.width > 0 && d.scissor.height > 0)
++              [open.render setScissorRect:(MTLScissorRect){d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height}];
++          }
+           if (p->blendConstant)
+             [open.render setBlendColorRed:d.blendColor[0] green:d.blendColor[1] blue:d.blendColor[2] alpha:d.blendColor[3]];
+           if (vt >= 0) [open.render setVertexBuffer:slot.args offset:vt atIndex:p->stage[0].index];
+diff --git a/gpu/shader/ir/include/vpir/ir.h b/gpu/shader/ir/include/vpir/ir.h
+index 016747e..d66939d 100644
+--- a/gpu/shader/ir/include/vpir/ir.h
++++ b/gpu/shader/ir/include/vpir/ir.h
+@@ -72,6 +72,8 @@ enum class Builtin : uint8_t {
+     SubgroupInvocation,   // fragment/compute/object/mesh in: u32
+     SubgroupSize,         // fragment/compute/object/mesh in: u32
+     ClipDistance,         // vertex/mesh out: f32 x N (N = 1..4; one [[clip_distance]] array of N)
++    ViewportIndex,        // vertex/mesh out: u32 ([[viewport_array_index]]; multiview: = the view, so a
++                          // rasterization rate map's layer follows the view, not layer 0 for every eye)
+ };
+ 
+ enum class Interp : uint8_t { Perspective, Linear, Flat };
+diff --git a/gpu/shader/ir/src/ir.cpp b/gpu/shader/ir/src/ir.cpp
+index 9549790..bb81d90 100644
+--- a/gpu/shader/ir/src/ir.cpp
++++ b/gpu/shader/ir/src/ir.cpp
+@@ -46,7 +46,7 @@ const char* toString(Builtin b) {
+                               "primitive_id",  "layer",             "global_invocation_id",
+                               "local_invocation_id", "workgroup_id", "num_workgroups",
+                               "local_invocation_index", "subgroup_invocation", "subgroup_size",
+-                              "clip_distance"};
++                              "clip_distance", "viewport_index"};
+     return n[unsigned(b)];
+ }
+ const char* toString(Interp i) {
+@@ -111,6 +111,7 @@ BuiltinInfo builtinInfo(Builtin b, bool asInput) {
+         case Builtin::SubgroupInvocation:
+         case Builtin::SubgroupSize: return {kU32, true, kGrid | kFrag};
+         case Builtin::ClipDistance: return {Type{Scalar::F32, 4}, false, kVtx | bit(Stage::Mesh)};  // width 1..4
++        case Builtin::ViewportIndex: return {kU32, false, kVtx | bit(Stage::Mesh)};
+     }
+     return {kVoid, asInput, 0};
+ }
+diff --git a/gpu/shader/ir/src/parse.cpp b/gpu/shader/ir/src/parse.cpp
+index 7fe24e5..4b3037c 100644
+--- a/gpu/shader/ir/src/parse.cpp
++++ b/gpu/shader/ir/src/parse.cpp
+@@ -239,7 +239,7 @@ private:
+         v.type = parseType();
+         if (acceptWord("builtin")) {
+             expectPunct('(');
+-            v.builtin = parseEnum<Builtin>(toString, Builtin::ClipDistance, "builtin");
++            v.builtin = parseEnum<Builtin>(toString, Builtin::ViewportIndex, "builtin");
+             if (v.builtin == Builtin::None) fail("expected builtin");
+             expectPunct(')');
+         } else {
+diff --git a/gpu/shader/msl/src/msl.cpp b/gpu/shader/msl/src/msl.cpp
+index 46f4c03..db5de9d 100644
+--- a/gpu/shader/msl/src/msl.cpp
++++ b/gpu/shader/msl/src/msl.cpp
+@@ -110,6 +110,7 @@ const char* builtinAttr(Builtin b) {
+         case Builtin::SubgroupInvocation: return "thread_index_in_simdgroup";
+         case Builtin::SubgroupSize: return "threads_per_simdgroup";
+         case Builtin::ClipDistance: return "clip_distance";
++        case Builtin::ViewportIndex: return "viewport_array_index";
+         case Builtin::None: break;
+     }
+     return "";
+diff --git a/gpu/shader/spirv/src/lower.cpp b/gpu/shader/spirv/src/lower.cpp
+index ea1b388..897f6ae 100644
+--- a/gpu/shader/spirv/src/lower.cpp
++++ b/gpu/shader/spirv/src/lower.cpp
+@@ -172,6 +172,7 @@ private:
+     uint32_t nextCode_ = 1;
+     int positionInput_ = -1, layerInput_ = -1, instanceInput_ = -1, vertexInput_ = -1;
+     int layerOutput_ = -1;
++    int viewportOutput_ = -1;  // multiview: [[viewport_array_index]] = the view (rate map layer per eye)
+     bool writesLayer_ = false;
+     // Motion variant (SpirvLowerOptions::motion).
+     bool prev_ = false;                 // lowering the previous-frame run of the vertex entry point
+@@ -1296,6 +1297,14 @@ private:
+             v.builtin = vpir::Builtin::Layer, v.name = "layer", v.type = vpir::kU32;
+             layerOutput_ = addOutput(v);
+         }
++        // Metal picks a rasterization rate map's layer by the viewport index, not the render-target layer: without
++        // this every view is rasterized with layer 0 (the first eye's foveation) and the other eye comes out
++        // deformed once the compositor unwarps it with its own layer. The driver sets one viewport per view.
++        if (stage_ == vpir::Stage::Vertex && o_.viewCount > 1) {
++            vpir::IoVar v;
++            v.builtin = vpir::Builtin::ViewportIndex, v.name = "viewport_index", v.type = vpir::kU32;
++            viewportOutput_ = addOutput(v);
++        }
+         if (stage_ == vpir::Stage::Fragment && o_.viewCount > 1) {
+             vpir::IoVar v;
+             v.builtin = vpir::Builtin::Layer, v.name = "layer", v.type = vpir::kU32;
+@@ -1384,6 +1393,7 @@ private:
+                 v = b_->emit(in);
+             }
+             if (int(i) == layerOutput_ && !writesLayer_) v = viewIndex();
++            if (int(i) == viewportOutput_) v = viewIndex();
+             b_->storeOutput(uint32_t(i), v);
+         }
+     }
+diff --git a/gpu/shader/spirv/tests/spirv_tests.cpp b/gpu/shader/spirv/tests/spirv_tests.cpp
+index 8a35e65..f719a5f 100644
+--- a/gpu/shader/spirv/tests/spirv_tests.cpp
++++ b/gpu/shader/spirv/tests/spirv_tests.cpp
+@@ -120,6 +120,8 @@ void meshMultiview(const std::string& dir, const std::string& v) {
+     for (auto& in : r.module.inputs) instance |= in.builtin == vpir::Builtin::InstanceId;
+     CHECK(layer && instance);
+     CHECK(r.msl.source.find("render_target_array_index") != std::string::npos);
++    // The view also picks the viewport (and so the foveation rate map's layer): never layer 0 for both eyes.
++    CHECK(r.msl.source.find("viewport_array_index") != std::string::npos);
+ }
+ 
+ // Motion variant (VPKTAA): the vertex shader runs twice, the first run with every constant
+diff --git a/gpu/vulkan/src/recipes.h b/gpu/vulkan/src/recipes.h
+index 4007d88..fb640ec 100644
+--- a/gpu/vulkan/src/recipes.h
++++ b/gpu/vulkan/src/recipes.h
+@@ -37,7 +37,9 @@ namespace vpvk {
+ // Bump whenever SPIR-V -> VPIR -> MSL output changes for the same input (stored recipes are then
+ // retranslated at the next prewarm instead of being discarded).
+ // 1: per-variable private slots (was recipe file version 2).
+-inline constexpr uint32_t kTranslatorVersion = 3;  // 2: OpKill returns, loop budget (0018); 3: clip distance, invariant, OpKill demotes outside loops, fetch offsets, VP_A2C1
++// 2: OpKill returns, loop budget (0018); 3: clip distance, invariant, OpKill demotes outside loops, fetch offsets,
++// VP_A2C1; 4: multiview vertex shaders write [[viewport_array_index]] = the view.
++inline constexpr uint32_t kTranslatorVersion = 4;
+ 
+ // Content hash of a SPIR-V module (never 0).
+ uint64_t spirvHash(const uint32_t* words, size_t count);
+-- 
+2.43.0
+

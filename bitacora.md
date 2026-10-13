@@ -111,7 +111,7 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   instancing de multiview/base instance, offsets de vertex buffers dinámicos, `0023` (invariant/clip). Rendimiento:
   foveado nativo en VPKEngine (rate map en todos los pases de ojo + compute), alias de la copia del depth.
 
-## Build 21 (sin validar): MSAA x4 de referencia + foveado M2 de P.T. + VPKTAA solo en la periferia (fase 1)
+## Build 21 (log Logs_Alyx_15: 33 fps estables, GPU 23 ms, 49 % de píxeles; ojo izquierdo deformado): MSAA x4 de referencia + foveado M2 de P.T. + VPKTAA solo en la periferia (fase 1)
 - `AVPSettings`: el juego siempre a MSAA 4x (`gameMSAA`, `temporalTAA` = false: `VPVK_FORCE_1X=0`, `VPVK_MOTION=0`,
   `KL_VPKTAA=0`, VPKEngine `vpktaa_enabled=0`, `force_single_sample=0`); foveado de Klepton reactivado con VPKEngine
   (`foveationUsable = gameMSAA >= 4`: con MSAA todos los pases de ojo llevan el mapa, camino validado con MoltenVK).
@@ -131,6 +131,16 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
 - Riesgo conocido: los pipelines grabados en `klfz` desde la build 9 son de 1x; los de 4x pueden compilarse en frío en
   la 1.ª partida (holds, `0025` los limita) y quedan grabados para la siguiente.
 - Revisión adversarial (Sonnet): sin bugs; aplicado su aviso (umbral relativo a la resolución del centro).
+
+## Build 22 (sin validar): ojo izquierdo deformado por el foveado
+- Logs_Alyx_15 (build 21): capturas `capture-600-*`: las dos texturas de ojo comprimidas igual (rasterizadas con la misma
+  capa del rate map), salida izquierda deformada, derecha bien. Causa: Metal elige la capa del rate map por
+  `[[viewport_array_index]]`; VPKEngine solo escribía `[[render_target_array_index]]` (regla fija en la bitácora de
+  VPKEngine). 0 cuelgues, 33,3 fps estables, GPU juego 23 ms, mapa wide 1808x1664 (49 %).
+- VPKEngine `0027`: multiview escribe `[[viewport_array_index]] = vista` (traductor v4: caché fría una vez, el prewarm
+  espera) y metal2 fija un viewport/scissor por vista (`passViews`, `setViewports`/`setScissorRects`); volcado por pase
+  = primer frame >= `VP_DUMP_FRAME` con >= 8 encoders y un pase con capas (el 6000 de la build 21 salió vacío).
+- Capturas también en frames de juego 2400/3600 (`KleptonCompositor` `frames`; 1200 cayó en un fundido a negro).
 
 ## Siguiente
 - Log build 21: `[vrr] foveated map (wide)` (% de píxeles), `[vrr] foveated scene passes on`, `[cp] periphery
