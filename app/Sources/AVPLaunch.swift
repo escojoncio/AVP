@@ -75,7 +75,8 @@ enum AVPLaunch {
         }
         AVPLog.log("Arranque: game=\(paths.gameDir.path) dylibs=\(paths.dylibDir.path) config=\(paths.configDir.path) data=\(paths.dataDir.path)")
         AVPLog.mirrorToFolder()
-        AlyxBoot.launch(paths)
-        return 0
+        // Configure only: BootView (KleptonApp.swift) then runs kl_app_boot and opens the immersive space.
+        return kl_app_configure_alyx(Bundle.main.bundlePath, paths.gameDir.path, paths.dylibDir.path,
+                                     paths.configDir.path, paths.dataDir.path)
     }
 }

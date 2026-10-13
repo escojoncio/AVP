@@ -118,7 +118,7 @@ const char *kl_app_status(void)   { return g_status; }
 // pictures in a row it has reused (kl_guest_stall_check); once that has lasted KL_STALL_DUMP_S seconds, every
 // thread's frames are dumped to the log ([stall] lines, runtime/diag/kl_sample.c), and once more 10 s later in the
 // same stall, at most 4 dumps a run. Also logged: whether a merged scene encoder is held (kl_gpu_time.m).
-void kl_sample_dump_all(FILE *out, const char *why);
+#include "kl_sample.h"
 int kl_merge_held(unsigned *merged, unsigned *flushed);
 static double g_stall_t0;
 static int g_stall_dumps, g_stall_step;
@@ -130,7 +130,7 @@ static void *stall_dump_thread(void *arg) {
     snprintf(why, sizeof why, "the guest sent no new frame for %.1f s; merged scene encoders held %d "
              "(merges %u, real ends %u)", secs, held, merged, flushed);
     fprintf(stderr, "[stall] %s\n", why);
-    kl_sample_dump_all(stderr, why);
+    kl_sample_snapshot(stderr, why);
     return NULL;
 }
 void kl_guest_stall_check(unsigned stale) {
