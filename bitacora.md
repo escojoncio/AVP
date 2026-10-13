@@ -48,6 +48,18 @@ Base: VisionQuestPro `04f7e6a` (app, Klepton propio, CI). Glovebox (MIT) fusiona
   stems repetidos (libavcodec.so vs .so.58.91.100…): ahora se usa el fichero más grande de la carpeta.
   El boot log de esa prueba quedó en Data/logs (no visible): pendiente de ver por qué no arranca.
 
+## Build 4 (2026-10-13) — prueba 2 (MoltenVK) + launcher
+- Prueba 2: prewarm 3038/3038 pipelines en 392 s (2.ª vez 6076 en 3 s, caché caliente). **El juego arranca**: motor,
+  OpenVR (poses, mandos presentes, "Press Left Hand To Start"), primer frame enviado; entonces MoltenVK
+  `Lost VkDevice … Caused GPU Hang` en el primer vkQueueSubmit del ojo → SIGSEGV en librendersystemvulkan+0x21f9c0
+  (puntero nulo tras el device lost). Config de esa prueba distinta de Glovebox: KL_VPKTAA=1 (depth SAMPLED/STORE,
+  copias de depth en la cola del juego), vr_msaa 0, limpieza de imágenes nuevas (KL_VK_CLEAR_NEW, de VQP).
+- `AVPSettings.taaActive` = vpktaa && motor VPEngine: con MoltenVK ahora config de Glovebox (vr_msaa 4, KL_VPKTAA=0,
+  VPVK_FORCE_1X=0, KL_VK_CLEAR_NEW=0). Si arranca, el cuelgue está en el camino VPKTAA/MSAA 0 (bisectar).
+- Launcher (`AVPLauncher.swift`, nuevo `AVPArt.swift` derivado de Glovebox MIT): izquierda 60 % arte sin tapar (hero +
+  capturas del CDN de Steam en tiempo de ejecución, caché `Library/Caches/AVP/art`, Ken Burns), derecha 40 % columna
+  de control. Batería de los Sense (`AVPModel.senseControllers`, sondeo 20 s, log al cambiar).
+
 ## Pendiente
 - VPEngine: int64/16-bit en shaders, teselación, depth bounds, foveado (MTLRasterizationRateMap), MetalFX, bindless.
 - QR de Steam; `vpvk_config_set_metalfx`/`_texture_cap` no existen aún (solo se registran).

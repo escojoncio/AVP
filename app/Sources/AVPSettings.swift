@@ -156,7 +156,10 @@ final class AVPSettings: ObservableObject {
     }
 
     /// The game's MSAA: always off with VPKTAA (it does the antialiasing), else 4x.
-    var gameMSAA: Int { vpktaa ? 0 : 4 }
+    /// VPKTAA only rides with VPEngine. MoltenVK is the diagnostic engine and runs Glovebox's proven setup
+    /// (game MSAA 4x, no TAA): build 2's first device test hung the GPU on the first frame with VPKTAA + MSAA 0 on it.
+    var taaActive: Bool { vpktaa && engine == .vpengine }
+    var gameMSAA: Int { taaActive ? 0 : 4 }
 
     /// The Steam language name the game is started with: the system's when Alyx has its text,
     /// else English. Voices are always English (Alyx ships English voices only).
@@ -265,11 +268,12 @@ final class AVPSettings: ObservableObject {
             ("KL_VK_FOZ_RECORD", "auto"),
             ("KL_VK_DEVICE_INFO", "auto"),
             ("KL_VK_CENSUS", "1"),
-            ("KL_VPKTAA", vpktaa ? "1" : "0"),
+            ("KL_VPKTAA", taaActive ? "1" : "0"),
+            ("KL_VK_CLEAR_NEW", engine == .moltenvk ? "0" : "1"),   // VisionQuestPro's new-image clear: not in Glovebox's setup
             ("KL_VPKTAA_PCT", String(format: "%.0f", vpktaaPercent)),
             ("KL_VPKTAA_SHARP", String(format: "%.2f", vpktaaSharpness)),
             ("VPVK_ANISO", String(anisotropy)),
-            ("VPVK_FORCE_1X", vpktaa ? "1" : "0"),
+            ("VPVK_FORCE_1X", taaActive ? "1" : "0"),
             ("VPVK_METALFX", String(upscaling.rawValue)),
             ("VPVK_TEXTURE_CAP", String(textureCap)),
             ("KL_FPS_HUD", showFps ? "1" : "0"),
@@ -302,7 +306,7 @@ final class AVPSettings: ObservableObject {
         try convarsLua().write(to: p.configDir.appendingPathComponent("alyx-convars.lua"), atomically: true, encoding: .utf8)
         AVPLog.log("Config: \(p.configDir.path): ojo \(eye.width)x\(eye.height) (\(Int(renderPercent)) %), \(refreshHz) Hz"
                    + (halfRate ? " (juego a \(refreshHz / 2))" : "") + ", res. dinámica \(dynamicResolution) [\(dynamicMin)–\(dynamicMax)], "
-                   + "texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveation), VPKTAA \(vpktaa) \(Int(vpktaaPercent)) % "
+                   + "texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveation), VPKTAA \(taaActive) \(Int(vpktaaPercent)) % "
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA), MetalFX \(upscaling), aniso x\(anisotropy), motor \(engine.rawValue), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), FPS \(showFps), capturas \(diagCaptures)")
         return env
@@ -388,12 +392,12 @@ end, nil)
         c.sharp_zone = Float(sharpZone)
         c.periphery = Float(periphery)
         c.transition = Float(transition)
-        c.vpktaa_enabled = vpktaa ? 1 : 0
+        c.vpktaa_enabled = taaActive ? 1 : 0
         c.vpktaa_percent = Float(vpktaaPercent)
         c.vpktaa_sharpness = Float(vpktaaSharpness)
         c.render_scale = 1
         c.anisotropy = Int32(anisotropy)
-        c.force_single_sample = vpktaa ? 1 : 0
+        c.force_single_sample = taaActive ? 1 : 0
         c.metalfx = Int32(upscaling.rawValue)
         c.texture_cap = Int32(textureCap)
         let fwd = avp_gfx_config_apply(&c)
