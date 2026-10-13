@@ -137,6 +137,8 @@ enum Lifecycle {
     // with "Volver al juego". `spaceLost`: the system took the immersive space away (Home/PS button, Digital
     // Crown) — the game is kept, paused, and the space is opened again on resume instead of the app exiting.
     static var spaceLost = false
+    /// Mirror of AVPModel.paused readable outside the main actor (scenePhaseChanged).
+    static var gamePaused = false
     /// Read by the compositor's render thread when its loop ends: keep (hold) the guest instead of stopping it.
     static var keepGuestOnSpaceLoss: Bool {
         #if KL_ALYX_LAUNCHER
@@ -154,6 +156,7 @@ enum Lifecycle {
         }
         kl_guest_set_paused(1)
         AVPModel.shared.paused = true
+        gamePaused = true
         AVPLog.log("Pausa: \(reason) — juego detenido, launcher abierto")
         if let open = reopenLauncher { open(id: AVPMainWindow.id) }
     }
@@ -169,6 +172,7 @@ enum Lifecycle {
             spaceLost = false
         }
         AVPModel.shared.paused = false
+        gamePaused = false
         kl_guest_set_paused(0)
         AVPLog.log("Pausa: juego reanudado")
         dismiss()
@@ -196,6 +200,7 @@ enum Lifecycle {
             spaceLost = true
             kl_guest_set_paused(1)
             AVPModel.shared.paused = true
+            gamePaused = true
             AVPLog.log("Pausa: el sistema cerró el espacio inmersivo (fase \(lastPhase)) — juego en pausa, no se cierra")
             if lastPhase != .background, let open = reopenLauncher { open(id: AVPMainWindow.id) }
             return
@@ -266,7 +271,7 @@ enum Lifecycle {
         }
         #endif
         #if KL_ALYX_LAUNCHER
-        if spaceLost || AVPModel.shared.paused {
+        if spaceLost || gamePaused {
             NSLog("[app] backgrounded with the game paused — staying alive")
             return
         }
