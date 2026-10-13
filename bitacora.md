@@ -43,6 +43,10 @@ Base: VisionQuestPro `04f7e6a` (app, Klepton propio, CI). Glovebox (MIT) fusiona
 - Ahora todo en `Documents/Logs Alyx/`: app.txt, app-previous.txt, klepton-boot.log, klepton-crash.log, alyx-error.txt;
   copia en `<carpeta AVP>/Logs Alyx/` (con prewarm.log). `AVPLog.start()` fija `KL_ALYX_LOG_DIR` antes de cualquier
   `kl_app_configure_alyx` (prewarm o Play); kl_app.c `g_logdir`.
+- app.txt prueba 1: Steam/propiedad/descarga/nube OK; 90 libs convertidas en 1 s y firmadas en 2 s (req4k aceptada);
+  pipelines.foz 1218 shaders en 13 s; **prewarm 0/0 en 0 s** (motivo no registrado → ahora `rc` + `kl_app_status`);
+  stems repetidos (libavcodec.so vs .so.58.91.100…): ahora se usa el fichero más grande de la carpeta.
+  El boot log de esa prueba quedó en Data/logs (no visible): pendiente de ver por qué no arranca.
 
 ## Pendiente
 - VPEngine: int64/16-bit en shaders, teselación, depth bounds, foveado (MTLRasterizationRateMap), MetalFX, bindless.

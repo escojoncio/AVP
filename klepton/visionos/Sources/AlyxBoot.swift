@@ -90,12 +90,13 @@ public enum AlyxBoot {
     /// (<data>/klfz/device-info.json, written at each game launch; else <config>/device-info.json) replays every
     /// pipeline database in <data>/klfz. Blocks for minutes on a first run: call it off the main thread, and poll
     /// pipelineProgress(). Configures the runtime (once per process), so launch() later reuses that configuration.
-    public static func prewarm(_ p: AVPLaunchPaths) {
+    @discardableResult public static func prewarm(_ p: AVPLaunchPaths) -> Int32 {
         let t0 = Date()
         let rc = kl_app_prewarm_alyx(Bundle.main.bundlePath, p.gameDir.path, p.dylibDir.path,
                                      p.configDir.path, p.dataDir.path)
         NSLog("[alyx] prewarm: %@ in %.1f s", rc == 0 ? "done" : "not possible (\(rc)); the game's own replay is the fallback",
               Date().timeIntervalSince(t0))
+        return rc
     }
 
     @MainActor private static func openImmersive() {
