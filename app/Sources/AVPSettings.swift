@@ -18,6 +18,9 @@ final class AVPSettings: ObservableObject {
 
     // MARK: Values
 
+    /// M2 and M5 use the user's foveation tested in PTVisionPro (sharp zone 60° across at full rate, centred 10° below
+    /// each eye's forward axis): Klepton's KL_VRR_MAP=wide, with the periphery's quality (`periphery`) 10 % by
+    /// default and up to 65 % for an M5 (`presetPeriphery`).
     enum Foveation: Int, CaseIterable { case off = 0, m2 = 1, m5 = 2, custom = 3 }
     enum Movement: Int, CaseIterable { case teleport = 0, continuousHead = 2, continuousHand = 3 }
     enum Engine: String, CaseIterable { case vpkengine, moltenvk }
@@ -63,11 +66,11 @@ final class AVPSettings: ObservableObject {
         if fov == .m5 && !Self.isM5 { fov = .m2 }
         foveation = fov
         sharpZone = d.object(forKey: "avp.fovSharp") as? Double ?? 0.18
-        periphery = d.object(forKey: "avp.fovPeriphery") as? Double ?? 0.35
+        periphery = d.object(forKey: "avp.fovPeriphery2") as? Double ?? 0.10
         transition = d.object(forKey: "avp.fovTransition") as? Double ?? 0.32
         vpktaa = d.object(forKey: "avp.vpktaa") as? Bool ?? true
-        vpktaaPercent = d.object(forKey: "avp.vpktaaPercent") as? Double ?? 75
-        vpktaaSharpness = d.object(forKey: "avp.vpktaaSharp") as? Double ?? 0.3
+        vpktaaPercent = d.object(forKey: "avp.reconPercent") as? Double ?? 80
+        vpktaaSharpness = d.object(forKey: "avp.reconSharp") as? Double ?? 1.0
         anisotropy = d.object(forKey: "avp.aniso") as? Int ?? 16
         engine = Engine(rawValue: d.string(forKey: "avp.engine") ?? "") ?? .vpkengine
         systemLanguage = d.object(forKey: "avp.sysLang") as? Bool ?? true
@@ -91,11 +94,11 @@ final class AVPSettings: ObservableObject {
         d.set(textureCap, forKey: "avp.texCap")
         d.set(foveation.rawValue, forKey: "avp.fov2")
         d.set(sharpZone, forKey: "avp.fovSharp")
-        d.set(periphery, forKey: "avp.fovPeriphery")
+        d.set(periphery, forKey: "avp.fovPeriphery2")
         d.set(transition, forKey: "avp.fovTransition")
         d.set(vpktaa, forKey: "avp.vpktaa")
-        d.set(vpktaaPercent, forKey: "avp.vpktaaPercent")
-        d.set(vpktaaSharpness, forKey: "avp.vpktaaSharp")
+        d.set(vpktaaPercent, forKey: "avp.reconPercent")
+        d.set(vpktaaSharpness, forKey: "avp.reconSharp")
         d.set(anisotropy, forKey: "avp.aniso")
         d.set(engine.rawValue, forKey: "avp.engine")
         d.set(systemLanguage, forKey: "avp.sysLang")
@@ -151,11 +154,18 @@ final class AVPSettings: ObservableObject {
         return (r(Self.nativeEye.width), r(Self.nativeEye.height))
     }
 
-    /// The game's MSAA: always off with VPKTAA (it does the antialiasing), else 4x.
-    /// VPKTAA only rides with VPKEngine. MoltenVK is the diagnostic engine and runs Glovebox's proven setup
-    /// (game MSAA 4x, no TAA): build 2's first device test hung the GPU on the first frame with VPKTAA + MSAA 0 on it.
-    var taaActive: Bool { vpktaa && engine == .vpkengine }
-    var gameMSAA: Int { taaActive ? 0 : 4 }
+    /// The game renders with its own MSAA 4x on both engines: that is the reference picture, and with an MSAA scene
+    /// target every eye pass (effects and particles included) gets Klepton's foveation map (kl_gpu_time.m), which a
+    /// 1x game could not give (build 19: colour-only eye passes landed unfoveated on a foveated picture).
+    /// VPKTAA is now periphery-only: phase 1 is a spatial reconstruction in the compositor's unwarp
+    /// (kl_eye_recon, KL_CP_RECON) where the foveated eye is magnified. The temporal VPKTAA (KleptonTAA, 1x game,
+    /// jitter) stays off until it has a linearised depth and camera motion from depth + pose.
+    var temporalTAA: Bool { false }
+    var reconActive: Bool { vpktaa && foveation != .off }
+    var gameMSAA: Int { temporalTAA ? 0 : 4 }
+    /// The periphery's shading rate for the M2/M5 presets: 10 % (the P.T. setting) to 65 % (an M5 has room for it).
+    static let presetPeripheryRange: ClosedRange<Double> = 0.10...0.65
+    var presetPeriphery: Double { min(Self.presetPeripheryRange.upperBound, max(Self.presetPeripheryRange.lowerBound, periphery)) }
 
     /// The Steam language name the game is started with: the system's when Alyx has its text,
     /// else English. Voices are always English (Alyx ships English voices only).
@@ -268,12 +278,16 @@ final class AVPSettings: ObservableObject {
             ("KL_VK_FOZ_RECORD", "auto"),
             ("KL_VK_DEVICE_INFO", "auto"),
             ("KL_VK_CENSUS", "1"),
-            ("KL_VPKTAA", taaActive ? "1" : "0"),
+            ("KL_VPKTAA", temporalTAA ? "1" : "0"),
             ("KL_VK_CLEAR_NEW", engine == .moltenvk ? "0" : "1"),   // VisionQuestPro's new-image clear: not in Glovebox's setup
             ("KL_VPKTAA_PCT", String(format: "%.0f", vpktaaPercent)),
             ("KL_VPKTAA_SHARP", String(format: "%.2f", vpktaaSharpness)),
             ("VPVK_ANISO", String(anisotropy)),
-            ("VPVK_FORCE_1X", taaActive ? "1" : "0"),
+            ("VPVK_FORCE_1X", temporalTAA ? "1" : "0"),
+            ("VPVK_MOTION", temporalTAA ? "1" : "0"),
+            ("KL_CP_RECON", reconActive ? "1" : "0"),
+            ("KL_CP_RECON_PCT", String(format: "%.0f", vpktaaPercent)),
+            ("KL_CP_RECON_SHARP", String(format: "%.2f", vpktaaSharpness)),
             ("VPVK_TEXTURE_CAP", String(textureCap)),
             ("KL_FPS_HUD", showFps ? "1" : "0"),
             ("KL_CAPTURE", (diagCaptures || engine == .vpkengine) ? "1" : "0"),
@@ -284,23 +298,19 @@ final class AVPSettings: ObservableObject {
         // Source 2 linearisation (viewport depth 0.05..0.95, z = 0.95 - 0.0375/d) that VPKTAA does not have. Until
         // both are fixed VPKTAA runs rotation-only, and the motion targets, motion pipeline variants and the
         // per-frame depth snapshot (a 61 MB copy with a CPU wait on the frame worker) are not paid for.
-        if taaActive {
-            env += [("VPVK_MOTION", "0"), ("KL_VPKTAA_DEPTH", "0")]
+        if temporalTAA {
+            env += [("KL_VPKTAA_DEPTH", "0")]
         }
-        // Foveation: Klepton's rasterization-rate map (kl_gpu_time.m) and VPKEngine's own.
-        // Klepton's hook decides per Metal render pass which ones get the map: with MSAA (MoltenVK) every scene pass
-        // has an MSAA target and they all do; at 1x (VPKEngine + VPKTAA) only layered passes with a depth attachment
-        // do, so Source 2's colour-only eye passes (particles, effects) and compute work land in screen layout on a
-        // foveated (physical-layout) picture that the compositor then unwarps: geometry and effects torn apart
-        // (build 19). Off with VPKEngine until VPKEngine applies the rate map itself, to every eye pass.
-        let foveationUsable = engine != .vpkengine
+        // Foveation: Klepton's rasterization-rate map (kl_gpu_time.m), given per Metal render pass to every pass with
+        // an MSAA eye-size target. At 1x (build 19) only layered depth passes could be told apart and the colour-only
+        // eye passes landed unfoveated on a foveated picture; with the game's MSAA 4x on every engine, every scene
+        // pass carries the MSAA target, as in MoltenVK's validated runs.
+        let foveationUsable = gameMSAA >= 4
         switch foveationUsable ? foveation : .off {
         case .off:
             env.append(("KL_VRR", "0"))
-        case .m2:
-            env += [("KL_VRR", "1"), ("KL_VRR_MAP", "soft")]
-        case .m5:
-            env += [("KL_VRR", "1"), ("KL_VRR_MAP", "fov")]
+        case .m2, .m5:
+            env += [("KL_VRR", "1"), ("KL_VRR_MAP", "wide"), ("KL_VRR_EDGE", String(format: "%.3f", presetPeriphery))]
         case .custom:
             env += [("KL_VRR", "1"), ("KL_VRR_MAP", "custom"),
                     ("KL_VRR_INNER", String(format: "%.3f", sharpZone)),
@@ -325,6 +335,10 @@ final class AVPSettings: ObservableObject {
             AVPPipelineCache.current = nil
         }
 
+        // The compositor's statics are read from the environment once per process: a second game start in the same
+        // app session (after Salir) must see this launch's values.
+        KleptonCompositor.reconRef = max(0.25, min(2, Float(eye.width) / Float(Self.nativeEye.width)))
+        KleptonCompositor.setPeripheryRecon(on: reconActive, percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
         var text = "# Written by AVP at every launch from the app's settings. Do not edit: the app rewrites it.\n"
         for (k, v) in env { text += "\(k)=\(v)\n" }
         try text.write(to: p.configDir.appendingPathComponent("alyx-env.txt"), atomically: true, encoding: .utf8)
@@ -333,7 +347,7 @@ final class AVPSettings: ObservableObject {
         try convarsLua().write(to: p.configDir.appendingPathComponent("alyx-convars.lua"), atomically: true, encoding: .utf8)
         AVPLog.log("Config: \(p.configDir.path): ojo \(eye.width)x\(eye.height) (\(Int(renderPercent)) %), \(refreshHz) Hz"
                    + (halfRate ? " (juego a \(refreshHz / 2))" : "") + ", res. dinámica \(dynamicResolution) [\(dynamicMin)–\(dynamicMax)], "
-                   + "texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveation), VPKTAA \(taaActive) \(Int(vpktaaPercent)) % "
+                   + "texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveation), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % "
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA), aniso x\(anisotropy), motor \(engine.rawValue), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), FPS \(showFps), capturas \(diagCaptures)")
         return env
@@ -420,14 +434,14 @@ end, nil)
         // racing getenv is a crash. Each live setting goes straight to its owner.
         KleptonCompositor.fpsHudEnabled = showFps
         KleptonTAA.reloadSettings(percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
+        KleptonCompositor.setPeripheryRecon(on: reconActive, percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
         switch foveation {
         case .off: break   // on/off needs a restart (the scene-pass hook is installed at start)
-        case .m2: kl_vrr_set(1, -1, -1, -1)
-        case .m5: kl_vrr_set(0, -1, -1, -1)
+        case .m2, .m5: kl_vrr_set(2, -1, -1, Float(presetPeriphery))
         case .custom: kl_vrr_set(0, Float(sharpZone), Float(min(0.95, sharpZone + transition)), Float(periphery))
         }
         applyToVPKEngine()
-        AVPLog.log("Ajustes en vivo: foveado \(foveation), VPKTAA \(Int(vpktaaPercent)) % nitidez \(vpktaaSharpness), FPS \(showFps)")
+        AVPLog.log("Ajustes en vivo: foveado \(foveation), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % nitidez \(vpktaaSharpness), FPS \(showFps)")
     }
 
     func applyToVPKEngine() {
@@ -436,12 +450,12 @@ end, nil)
         c.sharp_zone = Float(sharpZone)
         c.periphery = Float(periphery)
         c.transition = Float(transition)
-        c.vpktaa_enabled = taaActive ? 1 : 0
+        c.vpktaa_enabled = temporalTAA ? 1 : 0
         c.vpktaa_percent = Float(vpktaaPercent)
         c.vpktaa_sharpness = Float(vpktaaSharpness)
         c.render_scale = 1
         c.anisotropy = Int32(anisotropy)
-        c.force_single_sample = taaActive ? 1 : 0
+        c.force_single_sample = temporalTAA ? 1 : 0
         c.texture_cap = Int32(textureCap)
         let fwd = avp_gfx_config_apply(&c)
         AVPLog.log("Gráficos: ajustes enviados a VPKEngine: \(fwd == 1 ? "sí" : "no (driver no cargado)")")

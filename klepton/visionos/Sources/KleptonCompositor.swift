@@ -352,6 +352,7 @@ final class KleptonCompositor {
     private var depthPipeline: MTLRenderPipelineState?
     private var depthDummy: MTLTexture?
     private var loggedGameDepth = false
+    private var loggedRecon = false
     /// Red, green, blue — one second each, off the wall clock. Deliberately
     /// full-intensity primaries: whatever tone mapping or colour management sits
     /// between the drawable and the display, these stay obviously themselves.
@@ -2748,6 +2749,29 @@ final class KleptonCompositor {
     nonisolated(unsafe) static var fpsHudEnabled: Bool = (getenv("KL_FPS_HUD").map { String(cString: $0) } ?? "0") == "1"
     /// AVP: the guest outlived the last space (held), so the next render loop must not start it again.
     nonisolated(unsafe) static var guestKeptAlive = false
+    /// VPKTAA periphery reconstruction (KL_CP_RECON=1, KL_CP_RECON_PCT 0..100, KL_CP_RECON_SHARP 0..1): the spatial
+    /// filter kl_eye_recon applies where the foveated eye is magnified. Live through `setPeripheryRecon`.
+    nonisolated(unsafe) static var reconOn: Bool = (getenv("KL_CP_RECON").map { String(cString: $0) } ?? "0") == "1"
+    nonisolated(unsafe) static var reconStrength: Float = {
+        let v = getenv("KL_CP_RECON_PCT").flatMap { Float(String(cString: $0)) } ?? 75
+        return max(0, min(1, v / 100))
+    }()
+    nonisolated(unsafe) static var reconSharp: Float = {
+        let v = getenv("KL_CP_RECON_SHARP").flatMap { Float(String(cString: $0)) } ?? 0.5
+        return max(0, min(1, v))
+    }()
+    /// The sharp centre's texels per drawable pixel: the eye render width (KLVR_EYE_SIZE) over Vision Pro's native 3072.
+    nonisolated(unsafe) static var reconRef: Float = {
+        guard let e = getenv("KLVR_EYE_SIZE").map({ String(cString: $0) }),
+              let w = e.split(separator: ",").first.flatMap({ Float($0) }), w > 0 else { return 1 }
+        return max(0.25, min(2, w / 3072))
+    }()
+    static func setPeripheryRecon(on: Bool, percent: Float, sharpness: Float) {
+        reconOn = on
+        reconStrength = max(0, min(1, percent / 100))
+        reconSharp = max(0, min(1, sharpness))
+        NSLog("[cp] periphery reconstruction \(on ? "on" : "off"): \(Int(percent)) %, sharpness \(sharpness)")
+    }
     private var hudTex: MTLTexture?
     private var hudWindowStart = Date()
     private var hudPresents = 0, hudGuestFrames = 0
@@ -2768,7 +2792,7 @@ final class KleptonCompositor {
             let res = haveRendered && rendered.viewport_of.0 > 0
                 ? "\(rendered.viewport_of.0)x\(rendered.viewport_of.1)" : "-"
             hudLine = String(format: "Juego %.0f fps  Visor %.0f Hz  %@  VPKTAA %@",
-                             game, comp, res, taaOut.isEmpty ? "off" : "on")
+                             game, comp, res, !taaOut.isEmpty ? "on" : Self.reconOn ? "periferia" : "off")
             hudGuestFrames = 0; hudPresents = 0; hudWindowStart = Date()
             hudTex = makeHudTexture(hudLine) ?? hudTex
         }
@@ -3277,6 +3301,18 @@ final class KleptonCompositor {
                 continue
             }
             u.visible = alloc == nil ? 0 : 1
+            // VPKTAA periphery reconstruction: the guest's own (foveated) picture only, never a temporal VPKTAA output.
+            if Self.reconOn && taaOut[vi] == nil && Self.reconStrength > 0 {
+                u.recon_on = 1
+                u.recon_strength = Self.reconStrength
+                u.recon_sharp = Self.reconSharp
+                u.recon_ref = Self.reconRef
+                if !loggedRecon {
+                    loggedRecon = true
+                    NSLog("[cp] periphery reconstruction active: \(Int(Self.reconStrength * 100)) %, sharpness \(Self.reconSharp) "
+                          + "(magnified eye texels only: none at >= 0.75 x the centre's \(Self.reconRef) texels/pixel, full at <= 0.45 x)")
+                }
+            }
             uniforms.append(u)
             sources.append(alloc?.texture)
             if let al = alloc {

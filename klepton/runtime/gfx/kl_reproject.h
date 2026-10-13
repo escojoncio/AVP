@@ -165,6 +165,19 @@ typedef struct {
     // Scalars again, for the layout reason the chroma block gives. kl_reproject_build leaves it off.
     float         depth_m22, depth_m23;
     uint32_t      depth_on;
+    // ---- VPKTAA periphery reconstruction (KL_CP_RECON; kl_eye_recon) ---------
+    // 1 = where the eye texture is MAGNIFIED on the way to the drawable (fewer source texels than output pixels:
+    // the foveated periphery), sample it with an anti-ringing Catmull-Rom plus a smoothing pass along the local
+    // edge instead of the bilinear tent, so the coarse periphery reads as soft detail rather than blocks. The
+    // sharp centre is never touched (it is not magnified past the threshold). Strength 0..1 is the blend with the
+    // plain sample, sharpness 0..1 the share of Catmull-Rom against bilinear in the core. kl_reproject_build
+    // leaves it off; scalars for the layout reason the chroma block gives.
+    uint32_t      recon_on;
+    float         recon_strength;
+    float         recon_sharp;
+    // Texels per drawable pixel the sharp centre has (the render size over the native eye size): the thresholds
+    // above are relative to it, so a lowered render resolution never pulls the centre into the reconstruction.
+    float         recon_ref;
 } kl_reproject_uniforms;
 
 // The blit's uniforms — buffer(0) of its FRAGMENT stage. It carried a bare

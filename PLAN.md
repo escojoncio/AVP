@@ -83,8 +83,12 @@ pieces; VisionQuestPro is not touched.
 VPKEngine bugs while the gaps are closed. Not a play mode; removed once VPKEngine boots Alyx.
 
 ### 5.2 VPKTAA, fully native
-Alyx (OpenVR) has no SpaceWarp and never generates motion vectors. VPKEngine owns the shader
-translator, so it generates them itself:
+**Decision (build 21): the game renders with its own MSAA 4x (the reference picture) and VPKTAA works
+only on the foveated periphery.** Phase 1 (done): a spatial reconstruction in the compositor's unwarp
+(`kl_eye_recon`: clamped Catmull-Rom + smoothing along the local edge) wherever the foveated eye is
+magnified; the sharp centre is never touched (its quality is the render resolution). Phase 2: temporal
+accumulation in the periphery only, with jitter and camera motion from depth + pose. The inputs it
+needs, from the research below:
 - **Depth**: the eye depth the game renders (already captured for the compositor).
 - **Camera motion**: from depth + previous/current eye pose (exact for static geometry).
 - **Object motion**: VPKEngine keeps the previous frame's copy of each draw's transform data
@@ -92,8 +96,8 @@ translator, so it generates them itself:
   computes the position twice (current + previous) → per-pixel motion vectors written to an
   extra render target in the main pass. Exact for skinned and moving objects.
 - **Jitter**: sub-pixel Halton offsets injected into the projection the OpenVR shim returns.
-- Game MSAA always off when VPKTAA is on; TAA resolve + RCAS on its own queue (as in
-  VisionQuestPro), never blocking the compositor.
+- (Superseded) game MSAA off with VPKTAA: the 1x game could not foveate its colour-only eye passes
+  (build 19). The temporal resolve still runs on its own queue (as in VisionQuestPro) when it returns.
 
 ## 6. The app rules over the game
 Enforced on **every** launch, overriding game files, in-game options and Steam Cloud:
@@ -101,12 +105,13 @@ Enforced on **every** launch, overriding game files, in-game options and Steam C
   matching VPKEngine so the game doesn't discard them).
 - Launch convars + Lua hooks at `player_activate` that re-apply them if the game changes them.
 - OpenVR shim reports the render size, FOV and refresh the app chose.
-- VPKEngine enforces MSAA off, anisotropy, foveation, texture cap regardless of what the game asks.
+- VPKEngine enforces anisotropy and texture cap regardless of what the game asks; the game's MSAA is
+  forced to 4x (convars); foveation is Klepton's rate map on every MSAA eye pass.
 
 ## 7. Settings menu (in the app)
 Render resolution (% / native Vision Pro) · dynamic resolution on/off + range · texture quality
-(pool, cap) · foveation (off / M2 / M5 / custom: sharp zone, periphery, transition) · VPKTAA
-(on, intensity, sharpness) · anisotropy (x16 default) · language (system if
+(pool, cap) · foveation (off / M2 / M5: 60° sharp zone 10° below the forward axis, periphery quality 10–65 % /
+custom: sharp zone, periphery, transition) · VPKTAA periphery (on, intensity, sharpness) · anisotropy (x16 default) · language (system if
 available, else English; voice always English) · FPS HUD · movement defaults · diagnostics
 captures.
 
