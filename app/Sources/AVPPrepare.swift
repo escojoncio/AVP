@@ -495,6 +495,17 @@ enum AVPPipelineCache {
         }
         try? key.write(to: lastKeyURL, atomically: true, encoding: .utf8)
         summarizeGpuTrouble(dir: dir, bootLog: AVPLog.directory.appendingPathComponent("klepton-boot-\(engine).log"))
+        // Build 15's quarantine and suspects came from timestamp-only blame (passes with no draws read as stuck):
+        // not proof, so they are dropped once (VPKEngine 0020 quarantines only on Metal's own verdict).
+        let qv2 = dir.appendingPathComponent("quarantine.v2")
+        if !fm.fileExists(atPath: qv2.path) {
+            try? fm.removeItem(at: dir.appendingPathComponent("quarantine.txt"))
+            try? fm.removeItem(at: dir.appendingPathComponent("suspects.txt"))
+            fm.createFile(atPath: qv2.path, contents: nil)
+        }
+        if fm.fileExists(atPath: dir.appendingPathComponent("motion.off").path) {
+            AVPLog.log("Gráficos: vectores de movimiento de VPKTAA desactivados tras un cuelgue de GPU (motion.off)")
+        }
         let quarantined = quarantineCount(dir: dir)
         if quarantined > 0 {
             AVPLog.log("Gráficos: \(quarantined) pipelines en cuarentena (VPKEngine no los dibuja; Ajustes › Diagnóstico › "
@@ -541,6 +552,12 @@ enum AVPPipelineCache {
         let url = quarantineURL()
         // Single-hang suspects go too: a reset is a clean slate, not "persist on the next hang".
         try? FileManager.default.removeItem(at: url.deletingLastPathComponent().appendingPathComponent("suspects.txt"))
+        // And VPKTAA's motion vectors, turned off after a GPU hang (VPKEngine 0020): they come back next launch.
+        let motionOff = url.deletingLastPathComponent().appendingPathComponent("motion.off")
+        if FileManager.default.fileExists(atPath: motionOff.path) {
+            try? FileManager.default.removeItem(at: motionOff)
+            AVPLog.log("Gráficos: vectores de movimiento de VPKTAA reactivados (se aplican en el próximo arranque)")
+        }
         guard FileManager.default.fileExists(atPath: url.path) else {
             AVPLog.log("Gráficos: no hay shaders en cuarentena que restablecer")
             return

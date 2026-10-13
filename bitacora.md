@@ -100,9 +100,21 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   repite su replay: flujo de la build 12); `avp_config.c` `vpvk_config_set_prewarm(0)` (sin prewarm de recetas en
   vkCreateDevice). Se mantienen 0018 (diagnóstico de cuelgue, cuarentena, traductor v2) y la pantalla de carga.
 
+## Build 16 (sin validar): imagen negra por cuelgues de GPU en pases de ojo
+- Logs_Alyx_10 (build 15): arranca; 18 `Caused_GPU_Hang`, 5748 `SubmissionsIgnored`, 16 `gpu.recover` (tope) → eye
+  probe `guest0 00000000` (nada dibujado), HUD ~34 fps. Todos los encoders señalados son pases de ojo 2784x2208x2;
+  los que tienen draws usan variantes `.mv`/`.mvfmt` (vectores de movimiento de VPKTAA). Los pases sin draws salen
+  "stuck" solo por no tener muestra de fin: la culpa por tiempos no es fiable.
+- VPKEngine `0020`: `vpgpu_metal2_gpu_hangs()`; tras el 1.er cuelgue `motionFrameSubmitted` apaga los vectores de
+  movimiento (`motionKilled`, `passTakesMotion` false, `vpvk_motion_get` 0) y escribe `vpcache/motion.off` (siguientes
+  arranques sin ellos); la culpa por tiempos ya no pone en cuarentena (solo Faulted/Affected de Metal).
+- AVP: limpieza única de quarantine.txt/suspects.txt (`quarantine.v2`), log de `motion.off` en app.txt, el botón de
+  Ajustes › Diagnóstico también borra `motion.off`.
+
 ## Siguiente
-- Log build 15: entrar al juego; `gpu.hang.enc`/`gpu.hang.stuck` (qué es el encoder del cuelgue), `gpu.quarantine`,
-  `gpu.recover`, `gpu.mem`, `[cp] eye probe`, panel de carga. Carga rápida de verdad: pendiente (sin archives).
+- Log build 16: ¿cesan los cuelgues tras `vk.motion disabled after GPU hang`? Si sí: causa = variantes de movimiento
+  (revisar MSL `.mv` en vpcache/hang/ y el attachment RG16F). Si no: los cuelgues son de otra cosa en los pases de ojo.
+  Rendimiento (34 fps) cuando haya imagen.
 
 ## Pendiente
 - Ajustes en vivo que faltan: resolución/texturas (convars del juego), anisotrópico (solo afecta a samplers nuevos);
