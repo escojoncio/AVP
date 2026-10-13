@@ -20,13 +20,13 @@ enum AVPLog {
     static var crashLog: URL { directory.appendingPathComponent("klepton-crash.log") }
     static var errorLog: URL { directory.appendingPathComponent("alyx-error.txt") }
     static var prewarmLog: URL { AVPFolder.data.appendingPathComponent("klfz/prewarm.log") }
-    /// Every distinct Vulkan feature the game uses (kl_vk_census.inc), for VPEngine.
+    /// Every distinct Vulkan feature the game uses (kl_vk_census.inc), for VPKEngine.
     static var censusLog: URL { directory.appendingPathComponent("census.txt") }
     /// The game's own console (Msg output, our AVPFORCE lines from alyx-convars.lua).
     static var consoleLog: URL? { AVPFolder.shared.game?.appendingPathComponent("hlvr/console.log") }
     /// One boot/crash log per graphics engine (kl_app.c, KL_LOG_TAG), plus each one's previous run.
     static var engineLogs: [URL] {
-        ["vpengine", "moltenvk"].flatMap { e in
+        ["vpkengine", "moltenvk"].flatMap { e in
             ["klepton-boot-\(e).log", "klepton-boot-\(e).prev.log", "klepton-crash-\(e).log"].map { directory.appendingPathComponent($0) }
         }
     }

@@ -1,7 +1,7 @@
 # AVP (Half-Life: Alyx on Apple Vision Pro) as an XcodeGen project: `xcodegen generate` writes
 # AVP.xcodeproj. Built by .github/workflows/visionos.yml, which first makes
 # klepton/build/xros/libklepton.a (Klepton's runtime), build/deps (LuaJIT, SDL3 + sdl2-compat,
-# Fossilize), MoltenVK, build/VPVulkan.framework and the patched VPEngine checkout (vpengine/).
+# Fossilize), MoltenVK, build/VPVulkan.framework and the patched VPKEngine checkout (vpkengine/).
 name: AVP
 options:
   deploymentTarget:
@@ -36,9 +36,9 @@ targets:
           - "*.h"
       - path: klepton/tools/klepton_ld.c
         compilerFlags: ["-DKLEPTON_LD_INPROC", "-Wno-unused-function"]
-      - path: vpengine/runtime/vp_codesign.c
-      - path: vpengine/runtime/vp_pkcs12.c
-      - path: build/VPEngineCertificates
+      - path: vpkengine/runtime/vp_codesign.c
+      - path: vpkengine/runtime/vp_pkcs12.c
+      - path: build/VPKEngineCertificates
         type: folder
         buildPhase: resources
     dependencies:
@@ -95,7 +95,7 @@ targets:
           - $(SRCROOT)/app/Steam/CSteamSupport/include
           - $(SRCROOT)/app/Steam/CSteamSupport/lzma
           - $(SRCROOT)/app/Steam/CSteamSupport/zstd
-          - $(SRCROOT)/vpengine/runtime
+          - $(SRCROOT)/vpkengine/runtime
           - $(inherited)
         FRAMEWORK_SEARCH_PATHS:
           - $(inherited)

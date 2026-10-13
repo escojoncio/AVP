@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Applies AVP's patches on top of the pinned VPEngine checkout (vpengine.ref).
-# Usage: apply-vpengine-patches.sh <VPEngine checkout> <patch dir>
+# Applies AVP's patches on top of the pinned VPKEngine checkout (vpkengine.ref).
+# Usage: apply-vpkengine-patches.sh <VPKEngine checkout> <patch dir>
 # Every *.patch in the patch dir is applied in sorted order; no patches is a no-op.
 # Any patch that does not apply cleanly (or with a 3-way merge) fails the run.
 set -euo pipefail

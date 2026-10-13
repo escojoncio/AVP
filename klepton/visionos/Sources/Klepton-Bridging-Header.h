@@ -45,7 +45,7 @@
 // kl_glfb's own table, so nothing else about this seam widens.
 #import "kl_vulkan.h"
 // VisionQuestPro: the launcher's C side (APK reader, in-process klepton-ld) and
-// VPEngine's signature (runtime/vp_codesign.h, vp_pkcs12.h, from VPEngine at build time).
+// VPKEngine's signature (runtime/vp_codesign.h, vp_pkcs12.h, from VPKEngine at build time).
 #import "avp_native.h"
 #import "vp_codesign.h"
 #import "vp_pkcs12.h"

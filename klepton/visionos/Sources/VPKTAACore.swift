@@ -25,7 +25,7 @@
 //                  curNDC−prevNDC: 0.5, 0.5; a negative component flips that axis).
 //                  fullMotion = false: OBJECT motion (camera excluded, as Meta AppSW), applied
 //                  before the depth/pose reprojection. fullMotion = true: the whole screen motion
-//                  (camera included, VPEngine's own vectors): previous uv = uv − mv directly, the
+//                  (camera included, VPKEngine's own vectors): previous uv = uv − mv directly, the
 //                  reprojection is used only where a texel holds |x| >= invalidAbove (nothing drew
 //                  motion there: sky, blended effects); `jitterDelta` (crop-uv, current − previous
 //                  frame's jitter) is removed from it, since the game's matrices carry the jitter.

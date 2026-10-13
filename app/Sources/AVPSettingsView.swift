@@ -152,7 +152,7 @@ struct AVPSettingsView: View {
     private var diagnostics: some View {
         Section {
             Picker(AVPL("Motor gráfico", "Graphics engine"), selection: $s.engine) {
-                Text("VPKEngine").tag(AVPSettings.Engine.vpengine)
+                Text("VPKEngine").tag(AVPSettings.Engine.vpkengine)
                 Text(AVPL("MoltenVK (diagnóstico)", "MoltenVK (diagnostic)")).tag(AVPSettings.Engine.moltenvk)
             }
             Toggle(AVPL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $s.diagCaptures)

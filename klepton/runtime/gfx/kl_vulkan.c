@@ -921,7 +921,7 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     extlist keep = {{0}, 0};
     for (uint32_t i = 0; ci && i < ci->enabledExtensionCount; i++) {
         const char *e = ci->ppEnabledExtensionNames[i];
-        // VisionQuestPro: the game's foveation is always off (VPEngine's own
+        // VisionQuestPro: the game's foveation is always off (VPKEngine's own
         // applies), whatever the driver underneath supports.
         if (!strncmp(e, "VK_EXT_fragment_density_map", 27) ||
             !strcmp(e, "VK_KHR_fragment_shading_rate") ||
@@ -4378,7 +4378,7 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
                 ci->extent.width, ci->extent.height); }
     }
     // VPKTAA eye depth (kl_vulkan.h): an eye-sized depth attachment must be
-    // readable afterwards — SAMPLED (else VPEngine makes it render-target only)
+    // readable afterwards — SAMPLED (else VPKEngine makes it render-target only)
     // and not TRANSIENT (else it never leaves tile memory). Only eye-sized,
     // single-sample (or forced-1x) depth images; everything else untouched.
     if (ci && klvk_taa_depth_on() && ci->imageType == VK_IMAGE_TYPE_2D &&
@@ -4532,7 +4532,7 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
     if (r == VK_SUCCESS && out && *out && ci && klvk_taa_depth_on() &&
         klvk_is_depth_format(ci->format) &&
         (ci->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
-        // VPEngine creates a forced-1x MSAA image single-sampled: record what it IS.
+        // VPKEngine creates a forced-1x MSAA image single-sampled: record what it IS.
         uint32_t smp = (uint32_t)ci->samples;
         if (smp > 1 && kl_env_on("VPVK_FORCE_1X", 0)) smp = 1;
         klvk_depth_info_add(*out, ci->format, ci->extent.width, ci->extent.height,

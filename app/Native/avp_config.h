@@ -1,4 +1,4 @@
-// AVP: graphics settings from the app (Settings screen) to VPEngine. Mirrors VPEngine's
+// AVP: graphics settings from the app (Settings screen) to VPKEngine. Mirrors VPKEngine's
 // gpu/vulkan/include/vpvk/config.h (same layout); forwarded to libVPVulkan with dlsym when that
 // driver is loaded (a no-op on the MoltenVK diagnostic path). Diagnostics: log "avp.gfx".
 #pragma once
@@ -12,11 +12,11 @@ typedef struct avp_gfx_config {
     int32_t vpktaa_enabled;
     float vpktaa_percent;     // 0..100
     float vpktaa_sharpness;   // 0..1
-    float render_scale;       // 0.5..1.5 (VPEngine-side scale; the eye size itself is the OpenVR shim's)
+    float render_scale;       // 0.5..1.5 (VPKEngine-side scale; the eye size itself is the OpenVR shim's)
     int32_t anisotropy;       // 0 = game's own; 16 = force 16x on mipmapped linear samplers
     int32_t force_single_sample; // 1 = render the game's MSAA targets at 1x (VPKTAA does the AA)
     int32_t metalfx;          // 0 off, 1 spatial upscaling
-    int32_t texture_cap;      // max texture edge VPEngine lets through (0 = no cap)
+    int32_t texture_cap;      // max texture edge VPKEngine lets through (0 = no cap)
 } avp_gfx_config;
 
 // Stores the config and pushes it to VPVulkan if loaded (returns 1 if forwarded).

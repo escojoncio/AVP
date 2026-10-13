@@ -18,7 +18,7 @@ xcuserdata/
 .DS_Store
 # Built or fetched in CI, never committed.
 /build/
-/vpengine/
+/vpkengine/
 /klepton/build/
 /klepton/vendor-moltenvk/
 *.xcodeproj/

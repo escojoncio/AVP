@@ -1,5 +1,5 @@
 // AVP: from the launcher to the game. Chooses the Vulkan driver, writes the config the app rules
-// with, pushes VPEngine's settings and hands AlyxBoot (klepton/visionos/Sources/AlyxBoot.swift)
+// with, pushes VPKEngine's settings and hands AlyxBoot (klepton/visionos/Sources/AlyxBoot.swift)
 // the four folders.
 
 import Foundation
@@ -15,14 +15,14 @@ enum AVPLaunch {
     /// The driver chosen by selectDriver() (KL_MVK_DYLIB), nil for Klepton's default (MoltenVK).
     nonisolated(unsafe) private(set) static var driverPath: String?
 
-    /// VPEngine (default) is opened here first with RTLD_GLOBAL, so the settings reach it
+    /// VPKEngine (default) is opened here first with RTLD_GLOBAL, so the settings reach it
     /// (vpvk_config_set_*) before the game creates its device; Klepton's own dlopen of the same
     /// path then returns this handle. MoltenVK is the diagnostic choice.
     static func selectDriver() {
         driverPath = nil
         unsetenv("KL_MVK_DYLIB")
         let engine = AVPSettings.shared.engine
-        guard engine == .vpengine else {
+        guard engine == .vpkengine else {
             AVPLog.log("Gráficos: MoltenVK (diagnóstico, elegido en ajustes)")
             return
         }
@@ -60,7 +60,7 @@ enum AVPLaunch {
         for (k, v) in env { setenv(k, v, 1) }
         setenv("KL_AUTOBOOT", "1", 1)
         setenv("KL_IMMERSIVE", "1", 1)
-        settings.applyToVPEngine()
+        settings.applyToVPKEngine()
         return AVPLaunchPaths(gameDir: game, dylibDir: prepared.signed, configDir: AVPFolder.config, dataDir: AVPFolder.data)
     }
 
