@@ -571,6 +571,30 @@ final class KleptonControllers {
         }
     }
 
+    /// Both sticks clicked together (L3 + R3): a diagnostic capture of what is on screen now (the eye pictures,
+    /// FrameCapture, and VPKEngine's pass-by-pass dump of the next frame). Only with KL_CAPTURE=1.
+    nonisolated(unsafe) private static var stickDown = [false, false]
+    nonisolated(unsafe) private static var stickChordFired = false
+    static func stickClick(hand: Int, down: Bool) {
+        guard FrameCapture.enabled, hand == 0 || hand == 1 else { return }
+        stickDown[hand] = down
+        let both = stickDown[0] && stickDown[1]
+        if !both { stickChordFired = false; return }
+        if stickChordFired { return }
+        stickChordFired = true
+        NSLog("[input] L3 + R3 -> diagnostic capture of the next frame")
+        FrameCapture.requestManual()
+        typealias Req = @convention(c) () -> Void
+        // The driver Klepton loaded (KL_MVK_DYLIB: VPVulkan), already in the process: RTLD_NOLOAD only finds it.
+        var handle: UnsafeMutableRawPointer? = nil
+        if let path = getenv("KL_MVK_DYLIB") { handle = dlopen(path, RTLD_NOW | RTLD_NOLOAD) }
+        if let sym = dlsym(handle ?? UnsafeMutableRawPointer(bitPattern: -2), "vpgpu_metal2_request_dump") {
+            unsafeBitCast(sym, to: Req.self)()
+        } else {
+            NSLog("[input] VPKEngine pass dump not available (vpgpu_metal2_request_dump not found)")
+        }
+    }
+
     /// Left PS hold timer: >= 1 s pauses the game and brings the launcher up (AVP).
     nonisolated(unsafe) private static var lPSDownAt: TimeInterval = 0
     nonisolated(unsafe) private static var lPSFired = false
@@ -1242,6 +1266,7 @@ final class KleptonControllers {
                 if touched("Button A") { touch |= OVRPRawButton.x }
                 if touched("Button B") { touch |= OVRPRawButton.y }
                 if pressed("Thumbstick Button") { bits |= OVRPRawButton.lThumbstick }
+                Self.stickClick(hand: 0, down: pressed("Thumbstick Button"))
                 if st.indexTrigger > 0 { bits |= OVRPRawButton.lIndexTrigger }
                 if st.handTrigger  > 0 { bits |= OVRPRawButton.lHandTrigger }
                 if menuish || psStart { bits |= OVRPRawButton.start }
@@ -1256,6 +1281,7 @@ final class KleptonControllers {
                 if touched("Button A") { touch |= OVRPRawButton.a }
                 if touched("Button B") { touch |= OVRPRawButton.b }
                 if pressed("Thumbstick Button") { bits |= OVRPRawButton.rThumbstick }
+                Self.stickClick(hand: 1, down: pressed("Thumbstick Button"))
                 if st.indexTrigger > 0 { bits |= OVRPRawButton.rIndexTrigger }
                 if st.handTrigger  > 0 { bits |= OVRPRawButton.rHandTrigger }
                 // Both bits on both hands. The Oculus Touch interaction profile

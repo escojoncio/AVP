@@ -49,6 +49,9 @@ final class AVPSettings: ObservableObject {
     @Published var halfRate: Bool { didSet { save() } }         // the game renders every 2nd display frame
     @Published var showFps: Bool { didSet { save() } }
     @Published var diagCaptures: Bool { didSet { save() } }
+    /// Command buffers VPKEngine lets the game queue ahead of the GPU (VP_FRAMES_IN_FLIGHT): 12 overlaps CPU and
+    /// GPU (faster); 3 is the A/B test for data the game overwrites while the GPU still reads it.
+    @Published var gpuQueueDepth: Int { didSet { save() } }     // 3 | 12
     @Published var movement: Movement { didSet { save() } }
     @Published var cloudSync: Bool { didSet { save() } }
 
@@ -78,6 +81,7 @@ final class AVPSettings: ObservableObject {
         halfRate = d.object(forKey: "avp.halfRate") as? Bool ?? true
         showFps = d.object(forKey: "avp.showFps") as? Bool ?? false
         diagCaptures = d.object(forKey: "avp.diagCaptures") as? Bool ?? false
+        gpuQueueDepth = (d.object(forKey: "avp.gpuQueueDepth") as? Int).map { $0 == 3 ? 3 : 12 } ?? 12
         movement = Movement(rawValue: d.object(forKey: "avp.movement") as? Int ?? 3) ?? .continuousHand
         cloudSync = d.object(forKey: "avp.cloudSync") as? Bool ?? true
         loading = false
@@ -106,6 +110,7 @@ final class AVPSettings: ObservableObject {
         d.set(halfRate, forKey: "avp.halfRate")
         d.set(showFps, forKey: "avp.showFps")
         d.set(diagCaptures, forKey: "avp.diagCaptures")
+        d.set(gpuQueueDepth, forKey: "avp.gpuQueueDepth")
         d.set(movement.rawValue, forKey: "avp.movement")
         d.set(cloudSync, forKey: "avp.cloudSync")
     }
@@ -123,7 +128,7 @@ final class AVPSettings: ObservableObject {
         vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
         anisotropy = fresh.anisotropy; engine = fresh.engine
         systemLanguage = fresh.systemLanguage; refreshHz = fresh.refreshHz; halfRate = fresh.halfRate
-        showFps = fresh.showFps; diagCaptures = fresh.diagCaptures; movement = fresh.movement; cloudSync = fresh.cloudSync
+        showFps = fresh.showFps; diagCaptures = fresh.diagCaptures; gpuQueueDepth = fresh.gpuQueueDepth; movement = fresh.movement; cloudSync = fresh.cloudSync
         AVPLog.log("Ajustes: valores por defecto")
     }
 
@@ -291,6 +296,7 @@ final class AVPSettings: ObservableObject {
             ("VPVK_TEXTURE_CAP", String(textureCap)),
             ("KL_FPS_HUD", showFps ? "1" : "0"),
             ("KL_CAPTURE", (diagCaptures || engine == .vpkengine) ? "1" : "0"),
+            ("VP_FRAMES_IN_FLIGHT", String(gpuQueueDepth)),
         ]
         // VPKTAA inputs not usable yet (build 17 log): VPKEngine's motion vectors are all zero (its "eye frame"
         // restarts at every depth-clearing multiview pass, 4-7 per game frame, so no draw ever finds last frame's
@@ -349,7 +355,8 @@ final class AVPSettings: ObservableObject {
                    + (halfRate ? " (juego a \(refreshHz / 2))" : "") + ", res. dinámica \(dynamicResolution) [\(dynamicMin)–\(dynamicMax)], "
                    + "texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveation), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % "
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA), aniso x\(anisotropy), motor \(engine.rawValue), "
-                   + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), FPS \(showFps), capturas \(diagCaptures)")
+                   + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), FPS \(showFps), capturas \(diagCaptures), "
+                   + "cola GPU \(gpuQueueDepth)")
         return env
     }
 

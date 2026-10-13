@@ -169,6 +169,15 @@ struct AVPSettingsView: View {
                 Text(AVPL("MoltenVK (diagnóstico)", "MoltenVK (diagnostic)")).tag(AVPSettings.Engine.moltenvk)
             }
             Toggle(AVPL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $s.diagCaptures)
+            Picker(AVPL("Trabajo en cola para la GPU", "Work queued for the GPU"), selection: $s.gpuQueueDepth) {
+                Text(AVPL("12 (rápido)", "12 (fast)")).tag(12)
+                Text(AVPL("3 (prueba: explosiones de vértices; al arrancar el juego)", "3 (test: vertex explosions; at game start)")).tag(3)
+            }
+            Text(AVPL("Con capturas activas, pulsa a la vez los dos sticks (L3 + R3) cuando veas un fallo: se guarda esa imagen "
+                      + "y el fotograma pase a pase en Logs Alyx.",
+                      "With captures on, press both sticks (L3 + R3) together when you see a glitch: that picture and the frame "
+                      + "pass by pass are saved in Logs Alyx."))
+                .font(.footnote).foregroundStyle(.secondary)
             Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
                    role: .destructive) { confirmQuarantine = true }
                 .disabled(quarantined == 0)

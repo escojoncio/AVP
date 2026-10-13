@@ -1,0 +1,52 @@
+From f432fd04fb0b96bb5a827fff805c05fe7fa63644 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 22:45:59 +0000
+Subject: [PATCH] Metal: vpgpu_metal2_request_dump() dumps the next real frame
+ pass by pass (asked for from the headset)
+
+---
+ gpu/metal2/src/metal_backend.mm | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 7f31bc3..fb04901 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -64,6 +64,7 @@ constexpr uint64_t kArgAlign = 256;           // safe offset alignment for buffe
+ constexpr NSUInteger kMaxSamples = 2048;      // timestamp samples per frame slot (2 per sub-encoder)
+ // GPU hangs this process caused (not victims, not ignored submissions): read by VPVulkan (motion kill switch).
+ std::atomic<uint32_t> gGpuHangs{0};
++std::atomic<bool> gDumpRequest{false};  // vpgpu_metal2_request_dump: the next real frame, pass by pass
+ // Indirect draws whose arguments the GPU writes (Draw::indirect): rewritten per frame slot by the
+ // fix-up kernel into Metal's layout. 16-byte diagnostic header, then 20 (indexed) or 16 bytes per
+ // draw: 1 MiB holds ~52k draws a frame.
+@@ -2052,9 +2053,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   // Source 2 also submits tiny command buffers, and build 21's frame 6000 was one of them (items=0).
+   bool dumpLayered = false;
+   for (const Encoder& en : compiled.encoders) dumpLayered |= en.kind == Encoder::Kind::Render && en.pass.layerCount > 1;
+-  const bool dumping = dumpFrame >= 0 && !dumpTaken && frameIndex >= uint64_t(dumpFrame) &&
+-                       compiled.encoders.size() >= 8 && dumpLayered;
++  const bool realFrame = compiled.encoders.size() >= 8 && dumpLayered;
++  bool dumping = dumpFrame >= 0 && !dumpTaken && frameIndex >= uint64_t(dumpFrame) && realFrame;
+   if (dumping) dumpTaken = true;
++  // Asked for from the headset (the user saw a glitch: both sticks pressed): the next real frame.
++  if (!dumping && realFrame && !dumpDir.empty() && gDumpRequest.exchange(false)) {
++    dumping = true;
++    info("gpu.dump requested f=" + std::to_string(frameIndex));
++  }
+   auto dumpItems = std::make_shared<std::vector<DumpItem>>();
+   std::vector<DumpCopy> dumpCopies;
+   std::unordered_set<uintptr_t> dumpSeen;  // storage textures already queued for the open encoder
+@@ -3957,6 +3963,9 @@ bool MetalBackend::saveArchive() {
+ 
+ }  // namespace vpgpu::metal2
+ 
++extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_request_dump(void) {
++  vpgpu::metal2::gDumpRequest.store(true);
++}
+ extern "C" __attribute__((visibility("default"))) uint32_t vpgpu_metal2_gpu_hangs(void) {
+   return vpgpu::metal2::gGpuHangs.load();
+ }
+-- 
+2.43.0
+
