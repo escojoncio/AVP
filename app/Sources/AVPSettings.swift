@@ -193,13 +193,13 @@ final class AVPSettings: ObservableObject {
         }
         guard let name else { return ("english", "sistema en '\(code)', no es un idioma de Steam") }
         if name == "english" { return ("english", "sistema en inglés") }
-        // Whether this build carries the language: its text files (hlvr/resource/*_<lang>.*).
-        if let gameDir {
-            let resource = gameDir.appendingPathComponent("hlvr/resource", isDirectory: true)
-            let files = (try? FileManager.default.contentsOfDirectory(atPath: resource.path)) ?? []
-            let has = files.contains { $0.lowercased().contains("_\(name).") }
-            if !has { return ("english", "el juego no incluye '\(name)'") }
-        }
+        // Alyx's text languages (Steam store page). Its localisation lives inside the VPKs, so the loose files under
+        // hlvr/resource said nothing (build 5 fell back to English with Spanish available).
+        let alyx: Set<String> = ["english", "spanish", "latam", "french", "german", "italian", "japanese", "koreana",
+                                 "russian", "polish", "brazilian", "portuguese", "schinese", "tchinese", "ukrainian",
+                                 "turkish", "thai", "czech", "dutch", "hungarian"]
+        if !alyx.contains(name) { return ("english", "el juego no incluye '\(name)'") }
+        _ = gameDir
         return (name, "idioma del sistema")
     }
 
