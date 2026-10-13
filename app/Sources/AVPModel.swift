@@ -45,6 +45,7 @@ final class AVPModel: ObservableObject {
 
     // Play
     @Published var controllersConnected = 0
+    @Published var senseControllers: [SenseController] = []
     @Published var controllerAccess: ControllerAccess = .notAsked
     @Published var launching = false
     @Published var running = false        // BootView is showing
@@ -392,6 +393,79 @@ final class AVPModel: ObservableObject {
     private func countControllers() {
         controllersConnected = GCController.controllers().filter { $0.productCategory == GCProductCategorySpatialController }.count
         AVPLog.log("Mandos Sense conectados: \(controllersConnected)")
+        refreshBatteries()
+    }
+
+    // MARK: Controller batteries
+
+    struct SenseController: Identifiable, Equatable {
+        enum Hand: Equatable { case left, right, unknown(Int) }
+        let id: ObjectIdentifier
+        let hand: Hand
+        let level: Float?           // 0...1, nil when the controller reports no battery
+        let state: GCDeviceBattery.State?
+    }
+
+    private var batteryPoll: Timer?
+    private var loggedBattery: [String: String] = [:]
+
+    /// Polls every 20 s while the launcher is visible (connect/disconnect also refresh).
+    func setBatteryPolling(_ on: Bool) {
+        batteryPoll?.invalidate()
+        batteryPoll = nil
+        guard on else { return }
+        refreshBatteries()
+        batteryPoll = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { _ in
+            MainActor.assumeIsolated { AVPModel.shared.refreshBatteries() }
+        }
+    }
+
+    /// GCController has no handedness property; the Sense controllers name their side in vendorName,
+    /// e.g. "… (L)" / "… (R)" or "Left"/"Right". Unnamed ones fall back to their connection order.
+    private static func hand(of c: GCController, index: Int) -> SenseController.Hand {
+        let name = [c.vendorName, c.productCategory].compactMap { $0 }.joined(separator: " ")
+        let lower = name.lowercased()
+        if name.contains("(L)") || lower.contains("left") || lower.contains("izquierd") { return .left }
+        if name.contains("(R)") || lower.contains("right") || lower.contains("derech") { return .right }
+        return .unknown(index + 1)
+    }
+
+    func refreshBatteries() {
+        let pads = GCController.controllers().filter { $0.productCategory == GCProductCategorySpatialController }
+        var list: [SenseController] = []
+        for (i, c) in pads.enumerated() {
+            let b = c.battery
+            list.append(SenseController(id: ObjectIdentifier(c), hand: Self.hand(of: c, index: i),
+                                        level: b?.batteryLevel, state: b?.batteryState))
+            let key = "\(c.vendorName ?? "mando") #\(i + 1)"
+            let text: String
+            if let b {
+                let st: String
+                switch b.batteryState {
+                case .charging: st = "cargando"
+                case .full: st = "llena"
+                case .discharging: st = "descargando"
+                default: st = "desconocido"
+                }
+                text = "\(Int((b.batteryLevel * 100).rounded())) % \(st)"
+            } else {
+                text = "sin datos"
+            }
+            if loggedBattery[key] != text {
+                loggedBattery[key] = text
+                AVPLog.log("Batería \(key): \(text)")
+            }
+        }
+        list.sort { Self.order($0.hand) < Self.order($1.hand) }
+        if list != senseControllers { senseControllers = list }
+    }
+
+    private static func order(_ h: SenseController.Hand) -> Int {
+        switch h {
+        case .left: return 0
+        case .right: return 1
+        case .unknown(let n): return 1 + n
+        }
     }
 
     func refreshControllerAccess() {

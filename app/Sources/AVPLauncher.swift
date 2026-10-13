@@ -37,7 +37,34 @@ struct AVPLauncherView: View {
     @State private var showSettings = false
 
     var body: some View {
-        NavigationStack {
+        // Split composition: the artwork on the left, unobstructed; every control in its own column.
+        GeometryReader { geo in
+            HStack(spacing: 0) {
+                AVPBackdrop()
+                    .frame(width: geo.size.width * 0.6, height: geo.size.height)
+                    .clipped()
+                controlColumn
+                    .frame(width: geo.size.width * 0.4, height: geo.size.height)
+                    .background {
+                        LinearGradient(colors: [Color(red: 0.11, green: 0.12, blue: 0.15), AVPTheme.navy],
+                                       startPoint: .top, endPoint: .bottom)
+                    }
+            }
+        }
+        .ignoresSafeArea()
+        .onAppear { model.setBatteryPolling(true) }
+        .onDisappear { model.setBatteryPolling(false) }
+        .sheet(isPresented: $showSettings) { AVPSettingsView() }
+        .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
+            if case .success(let url) = result { model.choose(url) }
+        }
+    }
+
+    private var controlColumn: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+                .padding(.horizontal, 28).padding(.top, 24).padding(.bottom, 12)
+            Divider().opacity(0.3)
             Group {
                 switch model.phase {
                 case .needFolder: noFolder
@@ -45,46 +72,62 @@ struct AVPLauncherView: View {
                 case .checkingOwnership:
                     VStack(spacing: 16) {
                         ProgressView().controlSize(.large)
-                        Text(AVPL("Comprobando tu copia de Half-Life: Alyx…", "Checking your copy of Half-Life: Alyx…")).font(.title3)
+                        Text(AVPL("Comprobando tu copia de Half-Life: Alyx…", "Checking your copy of Half-Life: Alyx…"))
+                            .font(.title3).multilineTextAlignment(.center)
                     }
+                    .padding(32)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case .notOwned: notOwned
                 case .library: AVPLibraryView()
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .safeAreaInset(edge: .bottom) {
-                if let message = model.message {
-                    HStack {
-                        Text(message).font(.callout).foregroundStyle(.orange)
-                        Button { model.message = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            if let message = model.message {
+                HStack(alignment: .top) {
+                    Text(message).font(.callout).foregroundStyle(.orange)
+                    Spacer(minLength: 8)
+                    Button { model.message = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless)
+                }
+                .padding(16)
+                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
+                .padding(.horizontal, 20).padding(.bottom, 20)
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 12) {
+            Text("Half-Life: Alyx").font(.title3.weight(.bold)).lineLimit(1)
+            Spacer(minLength: 8)
+            if model.phase == .library || model.phase == .notOwned {
+                Menu {
+                    if !model.accountName.isEmpty { Text(model.accountName) }
+                    Button(role: .destructive) { model.signOut() } label: {
+                        Label(AVPL("Cerrar sesión", "Sign out"), systemImage: "rectangle.portrait.and.arrow.right")
                     }
-                    .padding().glassBackgroundEffect()
+                } label: {
+                    Label(model.accountName.isEmpty ? AVPL("Cuenta", "Account") : model.accountName, systemImage: "person.crop.circle")
+                        .lineLimit(1)
                 }
+                .buttonStyle(.borderless)
             }
-            .navigationTitle("AVP · Half-Life: Alyx")
-            .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    ShareLink(items: AVPLog.shareable) { Label(AVPL("Registros", "Logs"), systemImage: "doc.text") }
-                    Button { showSettings = true } label: { Label(AVPL("Ajustes", "Settings"), systemImage: "gearshape") }
-                }
-            }
-            .sheet(isPresented: $showSettings) { AVPSettingsView() }
-            .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
-                if case .success(let url) = result { model.choose(url) }
-            }
+            ShareLink(items: AVPLog.shareable) { Label(AVPL("Registros", "Logs"), systemImage: "doc.text").labelStyle(.iconOnly) }
+                .buttonStyle(.borderless)
+            Button { showSettings = true } label: { Label(AVPL("Ajustes", "Settings"), systemImage: "gearshape").labelStyle(.iconOnly) }
+                .buttonStyle(.borderless)
         }
     }
 
     private var noFolder: some View {
         VStack(spacing: 16) {
-            Image(systemName: "folder.badge.questionmark").font(.system(size: 56))
+            Image(systemName: "folder.badge.questionmark").font(.system(size: 44))
             Text(AVPL("Elige la carpeta AVP", "Choose the AVP folder")).font(.title)
             Text(AVPL("Créala una vez en «En mi Apple Vision Pro» (app Archivos). Dentro irán el juego, la caché y los registros, fuera de la app: no se pierden al reinstalarla.",
                       "Make it once in “On My Apple Vision Pro” (Files app). The game, the cache and the logs go inside it, outside the app: they survive reinstalling it."))
-                .multilineTextAlignment(.center).frame(maxWidth: 560).foregroundStyle(.secondary)
-            Button(AVPL("Elegir carpeta", "Choose folder")) { pickingFolder = true }.buttonStyle(.borderedProminent)
+                .multilineTextAlignment(.center).foregroundStyle(.secondary)
+            Button(AVPL("Elegir carpeta", "Choose folder")) { pickingFolder = true }.buttonStyle(AVPPillButtonStyle())
         }
-        .padding(40)
+        .padding(32).frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var notOwned: some View {
@@ -93,10 +136,10 @@ struct AVPLauncherView: View {
             Text(AVPL("Esta cuenta no tiene Half-Life: Alyx", "This account does not own Half-Life: Alyx")).font(.title)
             Text(AVPL("AVP solo descarga el juego a cuentas de Steam que lo han comprado. Inicia sesión con la cuenta que lo tiene.",
                       "AVP only downloads the game for Steam accounts that bought it. Sign in with the account that owns it."))
-                .multilineTextAlignment(.center).frame(maxWidth: 560).foregroundStyle(.secondary)
-            Button(AVPL("Cambiar de cuenta", "Switch account")) { model.signOut() }.buttonStyle(.borderedProminent)
+                .multilineTextAlignment(.center).foregroundStyle(.secondary)
+            Button(AVPL("Cambiar de cuenta", "Switch account")) { model.signOut() }.buttonStyle(AVPPillButtonStyle())
         }
-        .padding(40)
+        .padding(32).frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -110,8 +153,7 @@ struct AVPSignInView: View {
 
     var body: some View {
         VStack(spacing: 20) {
-            Image(systemName: "person.crop.circle.badge.checkmark").font(.system(size: 52))
-            Text(AVPL("Inicia sesión en Steam", "Sign in to Steam")).font(.largeTitle.bold())
+            Text(AVPL("Inicia sesión en Steam", "Sign in to Steam")).font(.title.bold())
             switch model.signInStep {
             case .idle, .working:
                 VStack(spacing: 12) {
@@ -119,17 +161,17 @@ struct AVPSignInView: View {
                         .textContentType(.username).textInputAutocapitalization(.never).autocorrectionDisabled()
                     SecureField(AVPL("Contraseña", "Password"), text: $password).textContentType(.password)
                 }
-                .textFieldStyle(.roundedBorder).frame(maxWidth: 420)
+                .textFieldStyle(.roundedBorder)
                 if model.signInStep == .working {
                     ProgressView()
                 } else {
                     Button(AVPL("Iniciar sesión", "Sign in")) { model.signIn(account: account, password: password); password = "" }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(AVPPillButtonStyle())
                         .disabled(account.isEmpty || password.isEmpty)
                 }
                 Text(AVPL("Conexión oficial con Steam. La contraseña se cifra con la clave de Steam y no se guarda; solo se guarda el token de sesión en el llavero.",
                           "Official connection to Steam. The password is encrypted with Steam's key and never stored; only the session token is kept in the keychain."))
-                    .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 520)
+                    .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
             case .approveInApp(let canEnterCode):
                 ProgressView().controlSize(.large)
                 Text(AVPL("Aprueba el inicio de sesión en la app Steam de tu móvil.", "Approve the sign-in in the Steam app on your phone."))
@@ -154,7 +196,8 @@ struct AVPSignInView: View {
             }
             if let e = model.signInError { Text(e).foregroundStyle(.orange) }
         }
-        .padding(40)
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -164,22 +207,19 @@ struct AVPLibraryView: View {
     @ObservedObject private var model = AVPModel.shared
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                HStack {
-                    VStack(alignment: .leading) {
-                        Text("Half-Life: Alyx").font(.extraLargeTitle2.bold())
-                        Text(AVPL("Cuenta: \(model.accountName) · tienes el juego", "Account: \(model.accountName) · you own the game"))
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    savesBadge
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    HStack { savesBadge; Spacer() }.font(.callout)
+                    AVPControllerPills(controllers: model.senseControllers)
+                    downloadCard
+                    if case .installed = model.install { prepareCard }
                 }
-                downloadCard
-                if case .installed = model.install { prepareCard }
-                playCard
+                .padding(24)
             }
-            .padding(32)
+            playCard
+                .padding(.horizontal, 24).padding(.vertical, 20)
+                .background(Color.black.opacity(0.25))
         }
     }
 
@@ -204,31 +244,41 @@ struct AVPLibraryView: View {
                           "Build \(model.buildID) · \(AVPLog.bytes(model.downloadBytes)) (content + Linux ARM64 binaries)"))
                     .foregroundStyle(.secondary)
                 if let s = model.spaceProblem { Text(s).foregroundStyle(.orange) }
-                Button(AVPL("Descargar", "Download")) { model.startInstall() }
-                    .buttonStyle(.borderedProminent).disabled(model.spaceProblem != nil)
+                Button { model.startInstall() } label: {
+                    Label(AVPL("Descargar", "Download"), systemImage: "arrow.down").font(.title3.weight(.semibold))
+                }
+                .buttonStyle(AVPPillButtonStyle()).disabled(model.spaceProblem != nil)
             case .downloading(let p):
                 progress(p)
-                Button(AVPL("Pausar", "Pause")) { model.pauseInstall() }
+                Button { model.pauseInstall() } label: { Label(AVPL("Pausar", "Pause"), systemImage: "pause.fill") }
+                    .buttonStyle(AVPPillButtonStyle(prominent: false))
             case .paused(let p):
                 progress(p)
-                Button(AVPL("Continuar", "Resume")) { model.startInstall() }.buttonStyle(.borderedProminent)
+                Button { model.startInstall() } label: { Label(AVPL("Continuar", "Resume"), systemImage: "play.fill") }
+                    .buttonStyle(AVPPillButtonStyle())
             case .installed(let update):
                 Label(update ? AVPL("Descargado (hay otra build en Steam; AVP usa la build probada)", "Downloaded (Steam has another build; AVP uses the tested one)")
                              : AVPL("Descargado · build \(model.buildID)", "Downloaded · build \(model.buildID)"),
-                      systemImage: "checkmark.circle").foregroundStyle(.green)
+                      systemImage: "checkmark.circle").foregroundStyle(AVPTheme.ok)
             case .failed(let why):
                 Text(why).foregroundStyle(.orange)
                 Button(AVPL("Reintentar", "Retry")) { Task { await model.refreshInstall() } }
+                    .buttonStyle(AVPPillButtonStyle(prominent: false))
             }
         }
-        .padding(24).frame(maxWidth: .infinity, alignment: .leading).glassBackgroundEffect()
+        .padding(20).frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 20))
     }
 
     private func progress(_ p: DownloadProgress) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ProgressView(value: p.fraction)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("\(Int(p.fraction * 100)) %").font(.system(size: 34, weight: .bold)).monospacedDigit()
+                Spacer()
+            }
+            AVPBar(fraction: p.fraction)
             HStack {
-                Text("\(AVPLog.bytes(p.doneBytes)) / \(AVPLog.bytes(p.totalBytes)) · \(Int(p.fraction * 100)) %")
+                Text("\(AVPLog.bytes(p.doneBytes)) / \(AVPLog.bytes(p.totalBytes))")
                 Spacer()
                 if p.bytesPerSecond > 0 { Text("\(AVPLog.bytes(UInt64(p.bytesPerSecond)))/s") }
                 if let s = p.secondsLeft { Text(AVPL("quedan ", "left ") + Duration.seconds(s).formatted(.units(allowed: [.hours, .minutes], width: .abbreviated))) }
@@ -248,7 +298,7 @@ struct AVPLibraryView: View {
                     Image(systemName: stepIcon(i)).foregroundStyle(stepColor(i))
                     Text(name)
                     if model.preparing && model.prepStep == i {
-                        ProgressView(value: model.prepFraction).frame(maxWidth: 220)
+                        AVPBar(fraction: model.prepFraction).frame(maxWidth: 220)
                     }
                 }
             }
@@ -262,12 +312,14 @@ struct AVPLibraryView: View {
                 Button(model.prepared ? AVPL("Comprobar preparación", "Check preparation") : AVPL("Preparar ahora", "Prepare now")) {
                     model.prepare(thenPlay: false)
                 }
+                .buttonStyle(AVPPillButtonStyle(prominent: !model.prepared))
                 .disabled(model.certificate == nil)
             }
             Text(AVPL("Solo la primera vez tarda: lo hecho se guarda y nunca se repite.", "Only slow the first time: finished work is kept and never redone."))
                 .font(.caption2).foregroundStyle(.tertiary)
         }
-        .padding(24).frame(maxWidth: .infinity, alignment: .leading).glassBackgroundEffect()
+        .padding(20).frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 20))
     }
 
     private func stepIcon(_ i: Int) -> String {
@@ -276,8 +328,8 @@ struct AVPLibraryView: View {
     }
 
     private func stepColor(_ i: Int) -> Color {
-        if model.preparing { return i < model.prepStep ? .green : .secondary }
-        return model.prepared ? .green : .secondary
+        if model.preparing { return i < model.prepStep ? AVPTheme.ok : i == model.prepStep ? AVPTheme.accent : .secondary }
+        return model.prepared ? AVPTheme.ok : .secondary
     }
 
     private var playCard: some View {
@@ -288,21 +340,84 @@ struct AVPLibraryView: View {
                     Button(AVPL("Abrir Ajustes", "Open Settings")) {
                         if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
                     }
+                    .buttonStyle(AVPPillButtonStyle(prominent: false))
                 }
             } else {
                 Label(AVPL("Dos mandos PS VR2 Sense conectados", "Two PS VR2 Sense controllers connected"), systemImage: "gamecontroller.fill")
-                    .foregroundStyle(.green)
+                    .foregroundStyle(AVPTheme.ok)
             }
             Button {
                 model.play()
             } label: {
                 Label(model.launching ? AVPL("Sincronizando partidas…", "Syncing saves…") : AVPL("Jugar", "Play"), systemImage: "play.fill")
-                    .font(.title2).padding(.horizontal, 24).padding(.vertical, 8)
+                    .font(.title.weight(.bold)).padding(.horizontal, 28).padding(.vertical, 4)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(AVPPillButtonStyle())
+            .shadow(color: .white.opacity(model.canPlay ? 0.35 : 0), radius: 22)
             .disabled(!model.canPlay)
         }
-        .padding(24).frame(maxWidth: .infinity, alignment: .leading).glassBackgroundEffect()
+        .padding(20).frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 20))
+    }
+}
+
+// MARK: - Controller battery pills
+
+/// One compact pill per connected PS VR2 Sense controller: hand, battery level, charging state.
+struct AVPControllerPills: View {
+    let controllers: [AVPModel.SenseController]
+
+    var body: some View {
+        if !controllers.isEmpty {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { ForEach(controllers) { c in pill(c) } }
+                VStack(alignment: .leading, spacing: 8) { ForEach(controllers) { c in pill(c) } }
+            }
+            .animation(.easeOut(duration: 0.3), value: controllers)
+        }
+    }
+
+    private func handText(_ h: AVPModel.SenseController.Hand) -> String {
+        switch h {
+        case .left: return AVPL("Izq.", "Left")
+        case .right: return AVPL("Der.", "Right")
+        case .unknown(let n): return AVPL("Mando \(n)", "Controller \(n)")
+        }
+    }
+
+    private func batterySymbol(_ level: Float) -> String {
+        switch level {
+        case ..<0.13: return "battery.0percent"
+        case ..<0.38: return "battery.25percent"
+        case ..<0.63: return "battery.50percent"
+        case ..<0.88: return "battery.75percent"
+        default: return "battery.100percent"
+        }
+    }
+
+    private func pill(_ c: AVPModel.SenseController) -> some View {
+        let low = (c.level ?? 1) < 0.2 && c.state != .charging
+        let tint: Color = low ? AVPTheme.warn : .white
+        return HStack(spacing: 8) {
+            Image(systemName: "gamecontroller.fill").foregroundStyle(.white.opacity(0.8))
+            Text(handText(c.hand)).fontWeight(.semibold)
+            if let level = c.level {
+                Image(systemName: c.state == .charging ? "battery.100percent.bolt" : batterySymbol(level))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(tint)
+                Text(c.state == .full ? AVPL("Llena", "Full") : "\(Int((level * 100).rounded())) %")
+                    .monospacedDigit().foregroundStyle(tint)
+                if c.state == .charging {
+                    Image(systemName: "bolt.fill").font(.caption).foregroundStyle(AVPTheme.ok)
+                }
+            } else {
+                Text("—").foregroundStyle(.secondary)
+            }
+        }
+        .font(.callout)
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .background(Color.white.opacity(0.08), in: Capsule())
+        .accessibilityElement(children: .combine)
     }
 }
 
