@@ -472,8 +472,14 @@ enum AVPPipelineCache {
         let dir = data.appendingPathComponent("vpcache", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let stamp = dir.appendingPathComponent("warm.stamp")
-        checkArchiveInflight(dir: dir)
-        let archiveOff = fm.fileExists(atPath: dir.appendingPathComponent("archive.off").path)
+        // Metal binary archives are off for good: opening one cost ~30x its file size in memory (build 14:
+        // pipelines-4.metalar, 95 MB on disk -> +4.4 GB), and saving them re-compiles every pipeline serially
+        // (minutes). The OS shader cache keeps compiled shaders between launches by itself. Old files are removed.
+        let archiveOff = true
+        for f in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+        where f.hasSuffix(".metalar") || f == "pipelines.count" || f.hasPrefix("archive.") {
+            try? fm.removeItem(at: dir.appendingPathComponent(f))
+        }
         let driver = AVPLaunch.driverPath.flatMap { digest($0) } ?? "?"
         let list = (try? String(contentsOf: pipelines.deletingLastPathComponent().appendingPathComponent("pipelines.stamp"),
                                 encoding: .utf8)) ?? "?"
