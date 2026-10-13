@@ -1,0 +1,263 @@
+From 55c7c6d3c9efda885784b01fc63393bbd419f57b Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 23:10:56 +0000
+Subject: [PATCH] Metal: every encoder of a command buffer waits (vertex stage)
+ on a join fence that follows the previous command buffer's whole tail
+ (cross-submission hazards; VP_CB_ORDER), a slot is reused only once its own
+ previous frame completed, gpu.order measurement (overlap, out-of-order
+ completion, busy slots), dumps cover 12 consecutive command buffers
+
+---
+ gpu/metal2/src/metal_backend.mm | 130 ++++++++++++++++++++++++++++++--
+ 1 file changed, 125 insertions(+), 5 deletions(-)
+
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index fb04901..9102803 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -36,6 +36,7 @@
+ #include <condition_variable>
+ #include <mutex>
+ #include <string>
++#include <thread>
+ #include <unordered_set>
+ #include <vector>
+ 
+@@ -375,6 +376,7 @@ struct MetalBackend::Impl {
+     id<MTLCounterSampleBuffer> samples;
+     std::vector<id<MTLFence>> fences;
+     std::vector<id> retired;  // destroyed resources kept alive until the slot is reused
++    uint64_t frame = UINT64_MAX;  // the frame that last used the slot (reused only once it completed)
+   };
+   struct Done {
+     uint64_t frame;
+@@ -596,6 +598,26 @@ struct MetalBackend::Impl {
+   std::set<uint64_t> inFlightFrames;
+   uint64_t nextFrame = 0;
+ 
++  // Command-buffer ordering (build 24). Resources are hazard-untracked and the frame compiler checks
++  // hazards per command buffer, so only fences order one command buffer after the previous one. Until
++  // build 23 only a command buffer's FIRST encoder waited on the previous one's tail: every later
++  // encoder without an in-frame barrier could run while the previous command buffer was still drawing
++  // (a copy or compute writing vertex/constant data that a render pass of the previous submission was
++  // still reading: the game's barrier at the start of its next command buffer orders against ALL
++  // earlier submissions, the fences against only one encoder). With 12 command buffers queued the GPU
++  // always has the next one at hand, so this happened all the time (builds 14-22: vertex explosions,
++  // gone with 3 in flight, build 23). cbOrder (VP_CB_ORDER, default 1): every encoder waits (at its
++  // vertex stage) on a join fence that follows the previous command buffer's whole tail. Measured (gpu.order): command buffers whose first encoder started
++  // before the previous one's last ended, completions out of submission order, slots found busy.
++  bool cbOrder = true;
++  std::atomic<uint64_t> carriedWaits{0};
++  uint64_t lastCbFrame = UINT64_MAX;  // submit thread
++  struct CbSpan { uint64_t start = 0, end = 0, prev = UINT64_MAX; };
++  std::map<uint64_t, CbSpan> cbSpans;  // guarded by doneMutex; last ~64 command buffers
++  uint64_t cbCompleted = 0, cbOverlaps = 0, cbOutOfOrder = 0;  // doneMutex
++  std::atomic<uint64_t> slotBusyWaits{0};
++  double cbMaxOverlapMs = 0;
++
+   // Fences of encoders not yet ordered before any later encoder. A barrier waits on all of them
+   // and leaves only itself, so ordering is transitive and each barrier costs few waits. It carries
+   // over between frames: a frame's first encoder waits on the previous frame's tail.
+@@ -604,6 +626,10 @@ struct MetalBackend::Impl {
+   // Per-pass dump (VP_DUMP_FRAME=<n>, VP_DUMP_DIR=<dir>); -1 = off.
+   int64_t dumpFrame = -1;
+   bool dumpTaken = false;  // submit thread: one dump per session
++  // A dump covers this many consecutive command buffers (Source 2 splits a frame into several: the
++  // shadow maps, the scene and the post chain each land in a different one), with one byte budget.
++  uint32_t dumpSeqLeft = 0;
++  uint64_t dumpSeqBytes = 0;
+   std::string dumpDir;
+ 
+   Impl(const ShaderProvider& s, LogSink l, MetalOptions o) : shaders(s), log(std::move(l)), options(std::move(o)) {}
+@@ -706,6 +732,8 @@ void MetalBackend::Impl::init() {
+   while (dumpDir.size() > 1 && dumpDir.back() == '/') dumpDir.pop_back();
+   if (dumpFrame >= 0 && dumpDir.empty()) dumpFrame = -1;
+   if (dumpFrame >= 0) info("gpu.dump armed frame=" + std::to_string(dumpFrame) + " dir=" + token(dumpDir));
++  if (const char* o = std::getenv("VP_CB_ORDER"); o && *o == '0') cbOrder = false;
++  info("gpu.order armed cb_order=" + std::to_string(cbOrder ? 1 : 0) + " slots=" + std::to_string(n));
+ 
+   if (!options.cacheRoot.empty()) openArchives();
+ 
+@@ -1319,6 +1347,7 @@ struct Open {
+ constexpr uint64_t kDumpMaxItemBytes = 128ull << 20;
+ constexpr uint64_t kDumpMaxTotalBytes = 512ull << 20;  // Alyx leaves ~1.5 GB free in game
+ constexpr uint32_t kDumpMaxItems = 256;
++constexpr uint32_t kDumpSequence = 12;  // command buffers per dump (about two Source 2 frames)
+ constexpr uint32_t kDumpMaxWidth = 1024;
+ 
+ struct DumpItem {
+@@ -1833,6 +1862,29 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   // Consecutive command buffers use different slots, so the frontier carried over from the
+   // previous one never holds a fence this one updates.
+   Slot& slot = slots[submits++ % slots.size()];
++  // The semaphore counts command buffers in flight, not which ones: one that completes before an
++  // earlier one (a short compute-only command buffer next to a long render one) frees a count while
++  // this slot's previous frame may still be reading its argument ring. Wait for that frame itself.
++  if (slot.frame != UINT64_MAX) {
++    bool busy = false;
++    for (;;) {
++      {
++        std::lock_guard lock(doneMutex);
++        if (!inFlightFrames.count(slot.frame)) break;
++      }
++      busy = true;
++      std::this_thread::sleep_for(std::chrono::microseconds(50));
++    }
++    if (busy) {
++      const uint64_t total = slotBusyWaits.fetch_add(1) + 1;
++      if (total <= 8 || total % 256 == 0)
++        info("gpu.order slot_busy f=" + std::to_string(frameIndex) + " waited_for=" + std::to_string(slot.frame) +
++             " total=" + std::to_string(total));
++    }
++  }
++  slot.frame = frameIndex;
++  const uint64_t prevCb = lastCbFrame;
++  lastCbFrame = frameIndex;
+   // The slot's previous frame finished, and so did every frame that could use its leftovers:
+   // only now do they leave the residency set and get released.
+   for (id obj : slot.retired)
+@@ -1879,6 +1931,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   std::unordered_map<const void*, int> fenceOwner;
+   std::unordered_set<const void*> carried;
+   for (id<MTLFence> f : frontier) carried.insert((__bridge const void*)f);
++  // The previous command buffer's tail: every encoder of this one waits on it (cbOrder; see above).
++  const std::vector<id<MTLFence>> carriedIn = cbOrder ? frontier : std::vector<id<MTLFence>>{};
++  // One fence for all of it (an encoder at the start of the command buffer waits on carriedIn and updates
++  // it), so each encoder adds one wait, at its vertex stage, whatever stage its own barrier asked for.
++  id<MTLFence> joinFence = nil;
+   uint32_t curEnc = 0;  // core encoder being encoded (fence owner / diag)
+   uint32_t orphanWaits = 0, fenceCollisions = 0;
+   std::string firstOrphan;
+@@ -2054,13 +2111,22 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   bool dumpLayered = false;
+   for (const Encoder& en : compiled.encoders) dumpLayered |= en.kind == Encoder::Kind::Render && en.pass.layerCount > 1;
+   const bool realFrame = compiled.encoders.size() >= 8 && dumpLayered;
+-  bool dumping = dumpFrame >= 0 && !dumpTaken && frameIndex >= uint64_t(dumpFrame) && realFrame;
+-  if (dumping) dumpTaken = true;
++  // A sequence already started takes the following command buffers too, whatever they hold.
++  bool dumping = dumpSeqLeft > 0;
++  bool startSeq = !dumping && dumpFrame >= 0 && !dumpTaken && frameIndex >= uint64_t(dumpFrame) && realFrame;
++  if (startSeq) dumpTaken = true;
+   // Asked for from the headset (the user saw a glitch: both sticks pressed): the next real frame.
+-  if (!dumping && realFrame && !dumpDir.empty() && gDumpRequest.exchange(false)) {
+-    dumping = true;
++  if (!dumping && !startSeq && realFrame && !dumpDir.empty() && gDumpRequest.exchange(false)) {
++    startSeq = true;
+     info("gpu.dump requested f=" + std::to_string(frameIndex));
+   }
++  if (startSeq) {
++    dumping = true;
++    dumpSeqLeft = kDumpSequence;
++    dumpSeqBytes = 0;
++    info("gpu.dump sequence f=" + std::to_string(frameIndex) + " command_buffers=" + std::to_string(kDumpSequence));
++  }
++  if (dumping) --dumpSeqLeft;
+   auto dumpItems = std::make_shared<std::vector<DumpItem>>();
+   std::vector<DumpCopy> dumpCopies;
+   std::unordered_set<uintptr_t> dumpSeen;  // storage textures already queued for the open encoder
+@@ -2082,7 +2148,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       if (t.storageMode == MTLStorageModeMemoryless) it.note = "memoryless";
+       else if (t.sampleCount > 1) it.note = "msaa";
+       else if (!bpp) it.note = "unsupported_format";
+-      else if (bytes > kDumpMaxItemBytes || dumpBytes + bytes > kDumpMaxTotalBytes) it.note = "too_big";
++      else if (bytes > kDumpMaxItemBytes || dumpSeqBytes + dumpBytes + bytes > kDumpMaxTotalBytes) it.note = "too_big";
+       else if (!(it.buffer = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared])) it.note = "no_memory";
+       else {
+         dumpBytes += bytes;
+@@ -2168,6 +2234,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     open.any().label = label;
+     openFence = nextFence();
+     if (wait) waitFrontier(before);
++    // Ordered after the whole previous command buffer, not only through this one's first encoder.
++    if (joinFence) {
++      if (open.render) [open.render waitForFence:joinFence beforeStages:MTLRenderStageVertex];
++      else if (open.compute) [open.compute waitForFence:joinFence];
++      else [open.blit waitForFence:joinFence];
++      carriedWaits.fetch_add(1, std::memory_order_relaxed);
++    }
+   };
+ 
+   // Declares the current draw's/dispatch's table resources to the open encoder (no residency set).
+@@ -2304,6 +2377,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     fx.label = [NSString stringWithFormat:@"indirect_fix%u", e];
+     for (id<MTLFence> f : frontier)
+       if (waitable(f)) [fx waitForFence:f];
++    if (joinFence) [fx waitForFence:joinFence];  // the previous command buffer may write these arguments
+     [fx setComputePipelineState:ps];
+     [fx setBuffer:slot.indirect offset:0 atIndex:2];
+     [fx setBuffer:slot.indirect offset:0 atIndex:3];  // diagnostic header (words 0..2)
+@@ -2366,6 +2440,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     return f;
+   };
+ 
++  if (!carriedIn.empty()) {
++    if (id<MTLBlitCommandEncoder> jb = [cb blitCommandEncoder]) {
++      jb.label = @"vpgpu.join";
++      for (id<MTLFence> f : carriedIn) [jb waitForFence:f];  // all in `carried`: updated by the previous one
++      joinFence = nextFence();
++      [jb updateFence:joinFence];
++      [jb endEncoding];
++      fenceOwner[(__bridge const void*)joinFence] = kOwnerPrevious;
++    }
++  }
+   size_t b = 0;  // cursor into compiled.barriers (sorted by encoder, item)
+   for (uint32_t e = 0; e < compiled.encoders.size(); ++e) {
+     const Encoder& enc = compiled.encoders[e];
+@@ -2929,6 +3013,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   Impl* impl = this;  // the destructor waits for every frame, so the handler never outlives *this
+   if (dumping) info("gpu.dump frame=" + std::to_string(frameIndex) + " items=" + std::to_string(dumpItems->size()) +
+                     " copy_mb=" + std::to_string(dumpBytes >> 20));
++  dumpSeqBytes += dumpBytes;
+   std::shared_ptr<std::vector<DumpItem>> dumpDone = dumping ? dumpItems : nullptr;
+   const std::string dumpTo = dumpDir;
+   [cb addCompletedHandler:^(id<MTLCommandBuffer> finished) {
+@@ -3131,11 +3216,46 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       for (const EncDiag& g : *diag) drew |= g.hunted > 0;
+       if (drew) impl->huntOnClean(frameIndex);
+     }
++    // Ordering measurement: this command buffer's first encoder start / last encoder end (GPU ticks,
++    // one clock for every command buffer), against the command buffer submitted just before it.
++    uint64_t spanStart = 0, spanEnd = 0;
++    for (const auto& [t0, t1] : raw) {
++      if (t0 && (!spanStart || t0 < spanStart)) spanStart = t0;
++      if (t1 > spanEnd) spanEnd = t1;
++    }
++    std::string orderLine;
+     {
+       std::lock_guard lock(impl->doneMutex);
++      if (!impl->inFlightFrames.empty() && *impl->inFlightFrames.begin() < frameIndex) ++impl->cbOutOfOrder;
+       impl->done.push_back(std::move(d));
+       impl->inFlightFrames.erase(frameIndex);
++      ++impl->cbCompleted;
++      if (spanStart && spanEnd) {
++        auto overlap = [&](const CbSpan& before, const CbSpan& after) {
++          if (!before.end || !after.start || after.start >= before.end) return;
++          ++impl->cbOverlaps;
++          impl->cbMaxOverlapMs = std::max(impl->cbMaxOverlapMs, double(before.end - after.start) * impl->gpuTickNs / 1e6);
++        };
++        const CbSpan mine{spanStart, spanEnd, prevCb};
++        if (auto it = impl->cbSpans.find(prevCb); it != impl->cbSpans.end()) overlap(it->second, mine);
++        for (const auto& [f, sp] : impl->cbSpans)
++          if (sp.prev == frameIndex) overlap(mine, sp);
++        impl->cbSpans[frameIndex] = mine;
++        while (impl->cbSpans.size() > 64) impl->cbSpans.erase(impl->cbSpans.begin());
++      }
++      if (impl->cbCompleted % 600 == 0) {
++        char buf[256];
++        std::snprintf(buf, sizeof buf,
++                      "gpu.order f=%llu cbs=%llu overlapped=%llu max_overlap_ms=%.2f out_of_order=%llu slot_busy=%llu "
++                      "carried_waits=%llu cb_order=%d",
++                      (unsigned long long)frameIndex, (unsigned long long)impl->cbCompleted,
++                      (unsigned long long)impl->cbOverlaps, impl->cbMaxOverlapMs, (unsigned long long)impl->cbOutOfOrder,
++                      (unsigned long long)impl->slotBusyWaits.load(), (unsigned long long)impl->carriedWaits.load(),
++                      impl->cbOrder ? 1 : 0);
++        orderLine = buf;
++      }
+     }
++    if (!orderLine.empty()) impl->info(orderLine);
+     dispatch_semaphore_signal(sem);
+   }];
+   [cb commit];
+-- 
+2.43.0
+

@@ -119,8 +119,10 @@ struct AVPSettingsView: View {
                 Stepper(AVPL("Calidad de la periferia: \(pct(s.presetPeriphery))", "Periphery quality: \(pct(s.presetPeriphery))"),
                         value: Binding(get: { s.presetPeriphery }, set: { s.periphery = $0 }),
                         in: AVPSettings.presetPeripheryRange, step: 0.05)
-                Text(AVPL("Zona nítida de 60° al 100 %, 10° por debajo del eje de mirada (los valores probados en P.T.). La periferia va del 10 % (máximo rendimiento) al 65 % (para un M5). VPKTAA suaviza la periferia. Se aplica en vivo.",
-                          "60° sharp zone at 100 %, 10° below the straight-ahead axis (the values tested in P.T.). The periphery goes from 10 % (most performance) to 65 % (for an M5). VPKTAA smooths the periphery. Applied live."))
+                Stepper(AVPL("Zona nítida: \(Int(s.wideDegrees))°", "Sharp zone: \(Int(s.wideDegrees))°"),
+                        value: $s.wideDegrees, in: 30...70, step: 5)
+                Text(AVPL("Zona nítida al 100 %, 10° por debajo del eje de mirada (60° es lo probado en P.T.; menos grados = más rendimiento; al arrancar el juego). La periferia va del 10 % (máximo rendimiento) al 65 % (para un M5) y se aplica en vivo. VPKTAA suaviza la periferia.",
+                          "Sharp zone at 100 %, 10° below the straight-ahead axis (60° is what was tested in P.T.; fewer degrees = more performance; at game start). The periphery goes from 10 % (most performance) to 65 % (for an M5) and is applied live. VPKTAA smooths the periphery."))
                     .font(.caption).foregroundStyle(.secondary)
             }
             if s.foveation == .custom {
@@ -171,12 +173,12 @@ struct AVPSettingsView: View {
             Toggle(AVPL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $s.diagCaptures)
             Picker(AVPL("Trabajo en cola para la GPU", "Work queued for the GPU"), selection: $s.gpuQueueDepth) {
                 Text(AVPL("12 (rápido)", "12 (fast)")).tag(12)
-                Text(AVPL("3 (prueba: explosiones de vértices; al arrancar el juego)", "3 (test: vertex explosions; at game start)")).tag(3)
+                Text(AVPL("3 (prueba lenta; al arrancar el juego)", "3 (slow test; at game start)")).tag(3)
             }
             Text(AVPL("Con capturas activas, pulsa a la vez los dos sticks (L3 + R3) cuando veas un fallo: se guarda esa imagen "
-                      + "y el fotograma pase a pase en Logs Alyx.",
+                      + "y los dos fotogramas siguientes pase a pase en Logs Alyx.",
                       "With captures on, press both sticks (L3 + R3) together when you see a glitch: that picture and the frame "
-                      + "pass by pass are saved in Logs Alyx."))
+                      + "the next two frames pass by pass are saved in Logs Alyx."))
                 .font(.footnote).foregroundStyle(.secondary)
             Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
                    role: .destructive) { confirmQuarantine = true }
