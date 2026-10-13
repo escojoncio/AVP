@@ -503,6 +503,17 @@ enum AVPPipelineCache {
             try? fm.removeItem(at: dir.appendingPathComponent("suspects.txt"))
             fm.createFile(atPath: qv2.path, contents: nil)
         }
+        // Build 16: the hangs came from a Metal resolve of the game's 1x depth (VPKEngine 0021 copies instead), not
+        // from motion vectors (they went on after motion.off) nor from the passes Metal called "affected" (victims):
+        // everything blamed until now is dropped once, motion vectors come back.
+        let qv3 = dir.appendingPathComponent("quarantine.v3")
+        if !fm.fileExists(atPath: qv3.path) {
+            try? fm.removeItem(at: dir.appendingPathComponent("quarantine.txt"))
+            try? fm.removeItem(at: dir.appendingPathComponent("suspects.txt"))
+            try? fm.removeItem(at: dir.appendingPathComponent("motion.off"))
+            fm.createFile(atPath: qv3.path, contents: nil)
+            AVPLog.log("Gráficos: cuarentena, sospechosos y motion.off de builds anteriores borrados (una vez)")
+        }
         if fm.fileExists(atPath: dir.appendingPathComponent("motion.off").path) {
             AVPLog.log("Gráficos: vectores de movimiento de VPKTAA desactivados tras un cuelgue de GPU (motion.off)")
         }
@@ -585,17 +596,29 @@ enum AVPPipelineCache {
         try? h.seek(toOffset: size > 8_388_608 ? size - 8_388_608 : 0)
         guard let data = try? h.readToEnd(),
               let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else { return }
-        var hangs: [String] = [], quarantines: [String] = []
-        for line in text.split(whereSeparator: \.isNewline) where line.contains("gpu.hang.stuck") || line.contains("gpu.quarantine") {
+        var hangs: [String] = [], quarantines: [String] = [], hunt: [String] = []
+        var hangCount = 0
+        for line in text.split(whereSeparator: \.isNewline) {
+            if line.contains("kIOGPUCommandBufferCallbackErrorHang") { hangCount += 1 }
+            // The hang hunter's verdicts and the 1x-resolve guards (VPKEngine 0021).
+            for tag in ["gpu.hunt verdict", "gpu.hunt culprit", "gpu.hunt start", "what=resolve_refused", "vk.resolve dropped"]
+            where line.contains(tag) {
+                if let r = line.range(of: tag) { hunt.append(String(line[r.lowerBound...].prefix(220))) }
+            }
+            guard line.contains("gpu.hang.stuck") || line.contains("gpu.quarantine") else { continue }
             // From the tag on (the boot log prefixes some lines with a timestamp and process).
             let tag = line.contains("gpu.hang.stuck") ? "gpu.hang.stuck" : "gpu.quarantine"
             guard let r = line.range(of: tag) else { continue }
             let entry = String(line[r.lowerBound...].prefix(200))
             if tag == "gpu.hang.stuck" { hangs.append(entry) } else { quarantines.append(entry) }
         }
-        guard !hangs.isEmpty || !quarantines.isEmpty else { return }
-        AVPLog.log("Gráficos: la sesión anterior tuvo \(hangs.count) bloqueo(s) de GPU (gpu.hang.stuck) y "
-                   + "\(quarantines.count) aviso(s) de cuarentena (gpu.quarantine)")
+        guard hangCount > 0 || !hangs.isEmpty || !quarantines.isEmpty || !hunt.isEmpty else {
+            AVPLog.log("Gráficos: la sesión anterior no tuvo ningún cuelgue de GPU")
+            return
+        }
+        AVPLog.log("Gráficos: la sesión anterior tuvo \(hangCount) cuelgue(s) de GPU, \(hangs.count) bloqueo(s) señalados "
+                   + "(gpu.hang.stuck) y \(quarantines.count) aviso(s) de cuarentena (gpu.quarantine)")
+        for e in hunt.prefix(12) { AVPLog.log("  \(e)") }
         func firstDistinct(_ lines: [String]) -> [String] {
             var seen = Set<String>()
             return Array(lines.filter { seen.insert($0).inserted }.prefix(3))

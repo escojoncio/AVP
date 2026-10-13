@@ -601,6 +601,13 @@ final class KleptonCompositor {
     private var cmdErrors = 0
     private var cmdErrorLast = ""
     private var cmdErrorKinds = 0
+    // A queue whose command buffer caused a GPU fault/hang is refused by the driver from then on
+    // ("Ignored (for causing prior/excessive GPU errors)"): build 16 got there after two page faults,
+    // every composite failed, CompositorServices got no frames and visionOS ended the app. Raised in
+    // the completion handler (under cmdLock), consumed on the render thread: a fresh queue (bounded).
+    private var queueRefused = false
+    private var queueRebuilds = 0
+    private var retiredQueues: [MTLCommandQueue] = []   // kept alive: kl_gpu_time knows queues by address
     // Eye picture probe: every `Self.eyeProbeEvery` composites with a picture, a handful of
     // pixels of each texture the composite samples (and of the guest's own eye image when VPKTAA
     // replaces it) are blitted to a shared buffer in a command buffer of their own and printed when
@@ -2301,6 +2308,18 @@ final class KleptonCompositor {
         // reason, and ALVR loops over the array likewise.
         let drawables = frame.queryDrawables()
         guard !drawables.isEmpty else { bailNoDrawable += 1; return 0 }
+        cmdLock.lock()
+        let refused = queueRefused
+        queueRefused = false
+        cmdLock.unlock()
+        if refused, queueRebuilds < 64, let dev = queue?.device, let q = dev.makeCommandQueue() {
+            queueRebuilds += 1
+            if let old = queue { retiredQueues.append(old) }
+            q.label = "klepton.compositor.r\(queueRebuilds)"
+            queue = q
+            kl_gpu_time_watch_compositor(Unmanaged.passUnretained(q).toOpaque())
+            NSLog("[cp] queue replaced after a GPU error on the old one (n=\(queueRebuilds))")
+        }
         guard let cmd = queue?.makeCommandBuffer(), pipeline != nil, sampler != nil else {
             bailNoPipeline += 1
             return 0
@@ -2672,6 +2691,9 @@ final class KleptonCompositor {
             if let e = b.error {
                 self.cmdErrors += 1
                 let d = (e as NSError).localizedDescription
+                // Our own fault/hang, or the refusal that follows it: the queue is spent. An innocent
+                // victim of someone else's hang leaves it usable.
+                if !d.contains("InnocentVictim") && !d.contains("victim of GPU") { self.queueRefused = true }
                 if d != self.cmdErrorLast && self.cmdErrorKinds < 16 {
                     self.cmdErrorLast = d
                     self.cmdErrorKinds += 1

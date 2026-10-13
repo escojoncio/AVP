@@ -1,0 +1,640 @@
+From bbe8c298eddf4fa7cddc2c3bc40ee8c35aea3cbb Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 19:14:36 +0000
+Subject: [PATCH] VPVulkan: a 1x resolve becomes a copy (Metal has no 1x
+ resolve: the eye-pass GPU hangs), run-time hang hunter (pipeline bisection),
+ no quarantine of Metal-affected victims, motion vectors kept on a hang
+
+---
+ gpu/metal2/src/metal_backend.mm | 271 +++++++++++++++++++++++++++++++-
+ gpu/vulkan/src/commands.cpp     |  34 +++-
+ gpu/vulkan/src/commands.h       |   8 +
+ gpu/vulkan/src/motion.cpp       |  12 +-
+ gpu/vulkan/src/pipelines.cpp    |  17 +-
+ gpu/vulkan/tests/vk_tests.cpp   |  80 +++++++++-
+ 6 files changed, 401 insertions(+), 21 deletions(-)
+
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index df22c4e..08fb18a 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -425,6 +425,7 @@ struct MetalBackend::Impl {
+   std::atomic<uint32_t> queueGen{0};
+   uint32_t queueRebuilds = 0;
+   std::atomic<uint32_t> hangReports{0};
++  std::atomic<uint32_t> resolveRefused{0};  // 1x-resolves turned into plain stores (should stay 0)
+   // Pipelines whose encoder hung the GPU: their draws/dispatches are skipped from then on (a lost
+   // pass instead of a lost device). Persisted in <VP_PIPELINE_CACHE_DIR>/quarantine.txt so the next
+   // launch starts with them; VP_QUARANTINE=0 turns it off. The submit thread copies the set only
+@@ -441,6 +442,34 @@ struct MetalBackend::Impl {
+   void loadQuarantine();
+   void quarantineAdd(uint64_t key, const std::string& desc, uint64_t frameIndex);
+   void dumpShaderSource(uint64_t shaderId);
++  // Hang hunter (VP_HANG_HUNT=0 turns it off). When the GPU hangs and nothing proves which encoder did
++  // it (Metal's per-encoder status names victims; timestamps of passes without draws are garbage), the
++  // pipelines of the hung frame are bisected at run time: step 0 skips ALL of them (still hanging =
++  // not a pipeline: an attachment/pass problem), then half of the remaining candidates at a time. A
++  // hang in a frame encoded with the test set skipped puts the culprit in the other half; kHuntClean
++  // frames that complete with draws put it in the skipped half. One candidate left: quarantined for good
++  // (quarantine.txt), its MSL printed into the log. Up to kHuntMax hunts per session (several culprits).
++  static constexpr uint32_t kHuntClean = 12, kHuntMax = 4;
++  struct Hunt {
++    std::mutex m;
++    bool on = true, active = false, stopped = false;
++    bool all = false;  // step 0: skip every draw and dispatch, not only the listed candidates
++    uint32_t hunts = 0, step = 0, clean = 0;
++    uint64_t appliedFrame = UINT64_MAX;  // first frame encoded with the current test set (submit thread)
++    std::vector<uint64_t> cand, test;
++    std::atomic<uint32_t> serial{0};
++  } hunt;
++  std::unordered_set<uint64_t> huntSnapshot;  // submit thread only: the test set being skipped
++  bool huntAll = false;                       // submit thread only: hunt.all at the snapshot
++  uint32_t huntSeen = 0;                      // submit thread only
++  uint64_t huntSkippedDraws = 0;              // submit thread only
++  uint64_t huntSplit(uint64_t frameIndex);    // hunt.m held; returns a culprit to report (after unlocking)
++  void huntCulprit(uint64_t key, uint64_t frameIndex);
++  void huntOnHang(uint64_t frameIndex, const std::vector<uint64_t>& keys);
++  uint64_t huntOnHangLocked(uint64_t frameIndex, const std::vector<uint64_t>& keys);  // hunt.m held
++  void huntOnClean(uint64_t frameIndex);
++  void logShaderSource(uint64_t shaderId);
++  std::string huntKeyName(uint64_t key);
+ 
+   // pipelineMutex guards only the maps (the submit thread takes it every frame, so it is never
+   // held across a Metal compile). archiveMutex guards the session's binary archive: adding to it
+@@ -1206,6 +1235,9 @@ struct EncDiag {
+   uint64_t maxWork = 0;  // render: count x instances; compute: groups
+   NSUInteger color0 = 0, depth = 0;
+   int load = -1, store = -1;  // render: colour 0 (or depth) load/store action
++  uint32_t resolves = 0;      // render: 1 = a colour attachment resolves, 2 = depth/stencil resolves
++  uint32_t hunted = 0;        // draws/dispatches the hang hunter skipped in this encoder
++  std::unordered_set<uint64_t> allKeys;  // every PipelineKey bound (hang hunter; capped at 8192)
+   std::string label;
+   std::vector<id> states;       // distinct pipeline states, first kMaxDiagStates
+   std::vector<uint64_t> keys;   // distinct PipelineKeys, first kMaxDiagKeys (the quarantine's input)
+@@ -1471,6 +1503,7 @@ std::string dumpWrite(const DumpItem& it, uint64_t frame, const std::string& dir
+ void MetalBackend::Impl::loadQuarantine() {
+   const char* off = std::getenv("VP_QUARANTINE");
+   quarantineOn = !(off && *off == '0');
++  if (const char* h = std::getenv("VP_HANG_HUNT"); h && *h == '0') hunt.on = false;
+   const char* dir = std::getenv("VP_PIPELINE_CACHE_DIR");
+   if (dir && *dir) quarantineDir = dir;
+   if (!quarantineOn) {
+@@ -1556,6 +1589,176 @@ void MetalBackend::Impl::dumpShaderSource(uint64_t shaderId) {
+   info("gpu.hang.msl id=" + std::string(name, 16) + " file=" + token((dir / name).string()));
+ }
+ 
++// ---- Hang hunter ---------------------------------------------------------------------------------
++
++std::string MetalBackend::Impl::huntKeyName(uint64_t k) {
++  char hex[24];
++  std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long)k);
++  std::lock_guard lock(pipelineMutex);
++  auto it = pipelines.find(k);
++  return std::string(hex) + "(" + token(it != pipelines.end() ? it->second.label : std::string("?")) + ")";
++}
++
++uint64_t MetalBackend::Impl::huntSplit(uint64_t frameIndex) {
++  hunt.clean = 0;
++  hunt.appliedFrame = UINT64_MAX;
++  hunt.all = false;
++  if (hunt.cand.size() == 1 && hunt.step > 0) {
++    const uint64_t k = hunt.cand[0];
++    hunt.active = false;
++    hunt.test.clear();
++    hunt.cand.clear();
++    // The culprit stays skipped: quarantined (session at once, file too) before the test set is dropped.
++    if (quarantineOn) {
++      {
++        std::lock_guard lock(quarantineMutex);
++        quarantine.emplace(k, "hang_hunt");
++      }
++      ++quarantineSerial;
++    }
++    hunt.serial.fetch_add(1);
++    return k;  // reported (file, MSL) by the caller once hunt.m is released
++  }
++  // Step 0: everything (is it a pipeline at all?); then the first half of what is left.
++  const size_t n = hunt.step == 0 ? hunt.cand.size() : (hunt.cand.size() + 1) / 2;
++  hunt.all = hunt.step == 0;
++  hunt.test.assign(hunt.cand.begin(), hunt.cand.begin() + n);
++  std::string list;
++  for (size_t i = 0; i < hunt.test.size() && i < 12; ++i) list += (i ? "," : "") + huntKeyName(hunt.test[i]);
++  info("gpu.hunt step=" + std::to_string(hunt.step) + " f=" + std::to_string(frameIndex) + " candidates=" +
++       std::to_string(hunt.cand.size()) + " skipping=" + std::to_string(hunt.test.size()) + " [" + list +
++       (hunt.test.size() > 12 ? ",..." : "") + "]");
++  ++hunt.step;
++  hunt.serial.fetch_add(1);
++  return 0;
++}
++
++void MetalBackend::Impl::logShaderSource(uint64_t shaderId) {
++  if (!shaderId) return;
++  MslShader msl;
++  if (!shaders.find(shaderId, msl)) return;
++  char hex[24];
++  std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long)shaderId);
++  info(std::string("gpu.hunt.msl begin id=") + hex + " entry=" + token(msl.entry) + " bytes=" + std::to_string(msl.source.size()));
++  size_t at = 0, lines = 0;
++  while (at < msl.source.size() && lines < 1500) {
++    size_t nl = msl.source.find('\n', at);
++    if (nl == std::string::npos) nl = msl.source.size();
++    info(std::string("gpu.hunt.msl ") + hex + " | " + msl.source.substr(at, std::min<size_t>(nl - at, 600)));
++    at = nl + 1;
++    ++lines;
++  }
++  info(std::string("gpu.hunt.msl end id=") + hex + (at < msl.source.size() ? " (truncated)" : ""));
++}
++
++void MetalBackend::Impl::huntCulprit(uint64_t key, uint64_t frameIndex) {
++  Pipeline pl;
++  bool found = false;
++  {
++    std::lock_guard lock(pipelineMutex);
++    auto it = pipelines.find(key);
++    if (it != pipelines.end()) pl.key = it->second.key, pl.vs = it->second.vs, pl.fs = it->second.fs, pl.cs = it->second.cs,
++                               pl.label = it->second.label, found = true;
++  }
++  char buf[256];
++  std::snprintf(buf, sizeof buf, "label=%s vs=%016llx fs=%016llx cs=%016llx why=hang_hunt f=%llu",
++                found ? token(pl.label).c_str() : "?", (unsigned long long)pl.vs, (unsigned long long)pl.fs,
++                (unsigned long long)pl.cs, (unsigned long long)frameIndex);
++  info(std::string("gpu.hunt culprit pipeline=") + huntKeyName(key) + " " + buf);
++  if (!quarantineOn) {
++    info("gpu.hunt culprit not quarantined (VP_QUARANTINE=0): its draws come back");
++  } else {
++    {
++      std::lock_guard lock(quarantineMutex);
++      suspects.insert(key);  // proven by bisection: straight to quarantine.txt
++      quarantine.erase(key);  // the placeholder huntSplit put in; quarantineAdd writes the real line
++    }
++    quarantineAdd(key, buf, frameIndex);
++  }
++  dumpShaderSource(pl.vs);
++  dumpShaderSource(pl.fs);
++  dumpShaderSource(pl.cs);
++  logShaderSource(pl.vs);
++  logShaderSource(pl.fs);
++  logShaderSource(pl.cs);
++}
++
++void MetalBackend::Impl::huntOnHang(uint64_t frameIndex, const std::vector<uint64_t>& keys) {
++  uint64_t culprit = 0;
++  {
++    std::lock_guard lock(hunt.m);
++    culprit = huntOnHangLocked(frameIndex, keys);
++  }
++  if (culprit) huntCulprit(culprit, frameIndex);
++}
++
++uint64_t MetalBackend::Impl::huntOnHangLocked(uint64_t frameIndex, const std::vector<uint64_t>& keys) {
++  if (!hunt.on || hunt.stopped) return 0;
++  if (!hunt.active) {
++    if (hunt.hunts >= kHuntMax) return 0;
++    std::vector<uint64_t> cand;
++    {
++      std::unordered_set<uint64_t> seen;
++      std::lock_guard q(quarantineMutex);
++      for (uint64_t k : keys)
++        if (k && !quarantine.count(k) && seen.insert(k).second) cand.push_back(k);
++    }
++    if (cand.empty()) {
++      info("gpu.hunt f=" + std::to_string(frameIndex) + " nothing to bisect (no pipelines in the hung frame)");
++      return 0;
++    }
++    ++hunt.hunts;
++    hunt.active = true;
++    hunt.step = 0;
++    hunt.cand = std::move(cand);
++    info("gpu.hunt start n=" + std::to_string(hunt.hunts) + " f=" + std::to_string(frameIndex) + " pipelines=" +
++         std::to_string(hunt.cand.size()));
++    return huntSplit(frameIndex);
++  }
++  if (hunt.appliedFrame == UINT64_MAX || frameIndex < hunt.appliedFrame) return 0;  // encoded before the test
++  if (hunt.test.size() == hunt.cand.size()) {
++    // Every pipeline of the hung frame skipped and it still hangs: the passes themselves (attachments,
++    // load/store/resolve, layered targets) or work outside draws.
++    info("gpu.hunt verdict=not_a_pipeline f=" + std::to_string(frameIndex) + " step=" + std::to_string(hunt.step) +
++         " (hangs with all " + std::to_string(hunt.cand.size()) + " pipelines skipped: see the gpu.hang.enc passes)");
++    hunt.active = false;
++    hunt.stopped = true;
++    hunt.test.clear();
++    hunt.cand.clear();
++    hunt.all = false;
++    hunt.serial.fetch_add(1);
++    return 0;
++  }
++  info("gpu.hunt verdict=hang f=" + std::to_string(frameIndex) + " step=" + std::to_string(hunt.step) +
++       ": not in the skipped " + std::to_string(hunt.test.size()));
++  std::vector<uint64_t> rest;
++  for (uint64_t k : hunt.cand)
++    if (std::find(hunt.test.begin(), hunt.test.end(), k) == hunt.test.end()) rest.push_back(k);
++  hunt.cand = std::move(rest);
++  if (hunt.cand.empty()) {
++    hunt.active = false;
++    hunt.test.clear();
++    hunt.all = false;
++    hunt.serial.fetch_add(1);
++    return 0;
++  }
++  return huntSplit(frameIndex);
++}
++
++void MetalBackend::Impl::huntOnClean(uint64_t frameIndex) {
++  uint64_t culprit = 0;
++  {
++    std::lock_guard lock(hunt.m);
++    if (!hunt.active || hunt.appliedFrame == UINT64_MAX || frameIndex < hunt.appliedFrame) return;
++    if (++hunt.clean < kHuntClean) return;
++    info("gpu.hunt verdict=clean f=" + std::to_string(frameIndex) + " step=" + std::to_string(hunt.step) + ": " +
++         std::to_string(kHuntClean) + " frames without a hang with " + std::to_string(hunt.test.size()) + " skipped");
++    hunt.cand = hunt.test;
++    culprit = huntSplit(frameIndex);
++  }
++  if (culprit) huntCulprit(culprit, frameIndex);
++}
++
+ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
+   {
+     std::lock_guard lock(doneMutex);
+@@ -1568,7 +1771,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     return;
+   }
+   dispatch_semaphore_wait(inFlight, DISPATCH_TIME_FOREVER);
+-  if (queueRefused.exchange(false) && queueRebuilds < 16) {
++  if (queueRefused.exchange(false) && queueRebuilds < 64) {
+     // A fresh queue (fences only order work inside one queue: the frontier's go with the old one,
+     // and those a hung command buffer was to update never signal). The generation moves first: an
+     // old-queue frame completing meanwhile must not ask for yet another queue.
+@@ -1619,6 +1822,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   if (slot.indirect) std::memset(slot.indirect.contents, 0, kIndirectHeader);
+   auto diag = std::make_shared<std::vector<EncDiag>>(compiled.encoders.size());
+   auto noteState = [](EncDiag& g, id st, uint64_t key) {
++    if (key && g.allKeys.size() < 8192) g.allKeys.insert(key);
+     if (key && g.keys.size() < kMaxDiagKeys && std::find(g.keys.begin(), g.keys.end(), key) == g.keys.end())
+       g.keys.push_back(key);
+     if (!st || g.states.size() >= kMaxDiagStates) return;
+@@ -1656,7 +1860,17 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     for (const auto& [k, line] : quarantine) quarantineSnapshot.insert(k);
+     quarantineSeen = qs;
+   }
+-  uint32_t quarantinedNow = 0;
++  // The hang hunter's test set (copied only when it changed); the first frame encoded with it is the
++  // first whose outcome counts.
++  if (const uint32_t hs = hunt.serial.load(); hs != huntSeen) {
++    std::lock_guard lock(hunt.m);
++    huntSnapshot.clear();
++    huntSnapshot.insert(hunt.test.begin(), hunt.test.end());
++    huntAll = hunt.all;
++    hunt.appliedFrame = frameIndex;
++    huntSeen = hs;
++  }
++  uint32_t quarantinedNow = 0, huntedNow = 0;
+   size_t fenceUsed = 0;
+   NSUInteger sampleUsed = 0;
+   // Per core encoder: first start sample and last end sample (NSNotFound = unsampled).
+@@ -2142,6 +2356,18 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+           if (!a.resolveTexture) {
+             ++missingResources;
+             a.storeAction = t.storageMode == MTLStorageModeMemoryless ? MTLStoreActionDontCare : MTLStoreActionStore;
++          } else if (t.sampleCount <= 1 || a.resolveTexture.sampleCount > 1) {
++            // A resolve from a 1x texture (or into an MSAA one) is undefined behaviour in Metal —
++            // build 16 hung the GPU on every eye pass that "resolved" its 1x depth. VPVulkan turns
++            // those into copies; anything that still gets here keeps its samples, no resolve.
++            a.resolveTexture = nil;
++            a.storeAction = t.storageMode == MTLStorageModeMemoryless ? MTLStoreActionDontCare : MTLStoreActionStore;
++            if ((id)a != (id)rp.stencilAttachment && resolveRefused.fetch_add(1) < 8)
++              err("what=resolve_refused f=%llu enc=%u src_samples=%lu dst_samples=%lu format=%lu (a 1x resolve hangs the GPU)",
++                  (unsigned long long)frameIndex, e, (unsigned long)t.sampleCount,
++                  (unsigned long)(src.resolve ? texture(src.resolve).sampleCount : 0), (unsigned long)t.pixelFormat);
++          } else {
++            (*diag)[e].resolves |= ((id)a == (id)rp.depthAttachment || (id)a == (id)rp.stencilAttachment) ? 2 : 1;
+           }
+         }
+       };
+@@ -2233,6 +2459,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+             continue;
+           }
+           const Pipeline* p = pipeline(d.pipeline);
++          if (p && (huntAll || (!huntSnapshot.empty() && huntSnapshot.count(p->key)))) {
++            ++huntedNow;
++            ++(*diag)[e].skipped;
++            ++(*diag)[e].hunted;
++            continue;
++          }
+           if (p && (p->quarantined || (!quarantineSnapshot.empty() && quarantineSnapshot.count(p->key)))) {
+             ++quarantinedNow;
+             ++(*diag)[e].skipped;
+@@ -2395,6 +2627,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       if (isDispatch) {
+         const Dispatch& d = std::get<Dispatch>(cmd);
+         const Pipeline* p = pipeline(d.pipeline);
++        if (p && (huntAll || (!huntSnapshot.empty() && huntSnapshot.count(p->key)))) {
++          ++huntedNow;
++          ++(*diag)[e].skipped;
++          ++(*diag)[e].hunted;
++          continue;
++        }
+         if (p && (p->quarantined || (!quarantineSnapshot.empty() && quarantineSnapshot.count(p->key)))) {
+           ++quarantinedNow;
+           ++(*diag)[e].skipped;
+@@ -2549,6 +2787,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+           (unsigned long long)frameIndex, orphanWaits, firstOrphan.empty() ? "-" : firstOrphan.c_str(), fenceCollisions,
+           fenceReports);
+   }
++  if (huntedNow) {
++    const uint64_t before = huntSkippedDraws;
++    huntSkippedDraws += huntedNow;
++    if (before == 0 || before / 20000 != huntSkippedDraws / 20000)
++      info("gpu.hunt skipped f=" + std::to_string(frameIndex) + " draws=" + std::to_string(huntedNow) +
++           " total=" + std::to_string(huntSkippedDraws));
++  }
+   if (quarantinedNow) {
+     const uint64_t before = quarantinedDraws;
+     quarantinedDraws += quarantinedNow;
+@@ -2623,6 +2868,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         impl->queueRefused = true;
+       // The report: every encoder of the frame, the stuck one(s) marked, their pipelines quarantined.
+       // (An ignored or victim command buffer ran nothing of its own: nothing to name.)
++      if (hang && !ignored && !victim && diag) {
++        std::vector<uint64_t> keys;
++        for (const EncDiag& g : *diag) keys.insert(keys.end(), g.allKeys.begin(), g.allKeys.end());
++        impl->huntOnHang(frameIndex, keys);
++      }
+       if (!ignored && !victim && diag && impl->hangReports.fetch_add(1) < 8) {
+         const size_t n = diag->size();
+         std::vector<std::string> why(n);  // non-empty = stuck, with the reason
+@@ -2686,10 +2936,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+           char buf[400];
+           std::snprintf(buf, sizeof buf,
+                         "gpu.hang.enc f=%llu i=%zu kind=%c label=%s target=%ux%ux%u fmt=%lu depth=%lu load=%d store=%d "
+-                        "items=%u skipped=%u indirect=%u max_work=%llu",
++                        "resolve=%u items=%u skipped=%u indirect=%u max_work=%llu",
+                         (unsigned long long)frameIndex, e, g.kind, token(g.label.empty() ? "-" : g.label).c_str(), g.width,
+-                        g.height, g.layers, (unsigned long)g.color0, (unsigned long)g.depth, g.load, g.store, g.draws,
+-                        g.skipped, g.indirect, (unsigned long long)g.maxWork);
++                        g.height, g.layers, (unsigned long)g.color0, (unsigned long)g.depth, g.load, g.store, g.resolves,
++                        g.draws, g.skipped, g.indirect, (unsigned long long)g.maxWork);
+           std::string line = buf;
+           line += " start_ms=" + (e < raw.size() && encSamples[e].first != NSNotFound ? offset(raw[e].first) : std::string("unsampled"));
+           line += " end_ms=" + (e < raw.size() && encSamples[e].first != NSNotFound ? offset(raw[e].second) : std::string("unsampled"));
+@@ -2711,8 +2961,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         for (size_t e = 0; e < n; ++e) {
+           if (why[e].empty() || e == hintOnly) continue;
+           // Timestamps alone are not proof (build 15: passes with no draws report no end sample and read as
+-          // stuck): reported above, quarantined only on Metal's own faulted/affected verdict.
+-          if (why[e].rfind("time_", 0) == 0) continue;
++          // stuck): reported above, quarantined only on Metal's own FAULTED verdict. "Affected" encoders are
++          // victims (build 15 named the eye output pass, render23, over and over): the hang hunter decides.
++          if (why[e].rfind("time_", 0) == 0 || why[e] == "metal_affected") continue;
+           const EncDiag& g = (*diag)[e];
+           std::vector<std::pair<uint64_t, size_t>> blame;  // key, encoder
+           for (uint64_t k : g.keys) blame.push_back({k, e});
+@@ -2758,6 +3009,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+                     (unsigned long long)frameIndex, h[0], h[1], h[2], (unsigned long long)n);
+       }
+     }
++    if (finished.status == MTLCommandBufferStatusCompleted && diag) {
++      bool drew = false;
++      // Only a frame in which the test set was actually skipped says anything about it.
++      for (const EncDiag& g : *diag) drew |= g.hunted > 0;
++      if (drew) impl->huntOnClean(frameIndex);
++    }
+     {
+       std::lock_guard lock(impl->doneMutex);
+       impl->done.push_back(std::move(d));
+diff --git a/gpu/vulkan/src/commands.cpp b/gpu/vulkan/src/commands.cpp
+index 37149c6..559e154 100644
+--- a/gpu/vulkan/src/commands.cpp
++++ b/gpu/vulkan/src/commands.cpp
+@@ -44,6 +44,31 @@ vpgpu::Copy forcedResolveCopy(const ImageView* src, const ImageView* dst, uint16
+   return c;
+ }
+ 
++bool resolveAsCopy(const ImageView* src) {
++  return src && src->image && (src->image->forcedFrom > 1 || src->image->desc.samples <= 1);
++}
++
++bool resolveCopyUsable(const ImageView* src, const ImageView* dst) {
++  const char* why = nullptr;
++  if (!src || !src->image || !src->image->id || !dst || !dst->image || !dst->image->id) why = "no_image";
++  else if (src->image == dst->image) why = "same_image";
++  else if (src->image->desc.format != dst->image->desc.format) why = "format_differs";
++  else if (src->image->desc.samples != dst->image->desc.samples) why = "samples_differ";
++  static std::atomic<unsigned> copies{0}, refused{0};
++  if (!why) {
++    const unsigned n = copies.fetch_add(1) + 1;
++    if (n <= 4 || n % 5000 == 0)
++      logf("vk.resolve as_copy n=%u src_samples=%u forced_from=%u format=%d %ux%u layers=%u", n,
++           unsigned(src->image->desc.samples), unsigned(src->image->forcedFrom), int(src->image->info.format),
++           src->image->desc.width, src->image->desc.height, unsigned(src->image->desc.layers));
++    return true;
++  }
++  if (refused.fetch_add(1) < 8)
++    logf("vk.resolve dropped why=%s src_format=%d dst_format=%d", why, src && src->image ? int(src->image->info.format) : -1,
++         dst && dst->image ? int(dst->image->info.format) : -1);
++  return false;
++}
++
+ namespace {
+ 
+ vpgpu::ClearValue toClear(const VkClearValue& v, bool depth) {
+@@ -97,12 +122,13 @@ bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolve
+   bool resolve = false;
+   if (resolveIndex != VK_ATTACHMENT_UNUSED && resolveIndex < b.framebuffer->views.size()) {
+     const ImageView* r = b.framebuffer->views[resolveIndex];
+-    if (r && r->image && r->image->id && v->image->forcedFrom > 1) {
+-      // Game MSAA forced to 1x: keep drawing into the (now 1x) source like every other pass
+-      // does, store it, and copy it into the resolve target after this subpass.
++    if (r && r->image && r->image->id && resolveAsCopy(v)) {
++      // Game MSAA forced to 1x, or a 1x attachment the game "resolves": keep drawing into the 1x
++      // source like every other pass does, store it, and copy it into the resolve target after
++      // this subpass (never a Metal resolve of a 1x texture).
+       out.store = vpgpu::StoreAction::Store;
+       if (index < b.clears.size()) out.clear = toClear(b.clears[index], depthFmt);
+-      if (forced) forced->push_back({v, r});
++      if (forced && resolveCopyUsable(v, r)) forced->push_back({v, r});
+       return true;
+     }
+     if (r && r->image && r->image->id) {
+diff --git a/gpu/vulkan/src/commands.h b/gpu/vulkan/src/commands.h
+index dd98ca1..9eecd40 100644
+--- a/gpu/vulkan/src/commands.h
++++ b/gpu/vulkan/src/commands.h
+@@ -27,6 +27,14 @@ struct OpBeginPass {
+ struct ImageView;
+ // Copy standing in for the resolve of a forced-1x MSAA attachment (commands.cpp).
+ vpgpu::Copy forcedResolveCopy(const ImageView* src, const ImageView* dst, uint16_t layers);
++// A resolve done as that copy instead of a Metal resolve: the game's MSAA was forced to 1x, or the
++// game itself "resolves" a single-sample attachment (Source 2 with vr_msaa 0 resolves its 1x depth
++// into a second image). Metal has no 1x resolve: StoreAndMultisampleResolve on a 1x texture is
++// undefined behaviour (build 16: every eye pass with that depth hung the GPU).
++bool resolveAsCopy(const ImageView* src);
++// Whether the stand-in copy can be made: different image, same format and sample count. Logged
++// (once per reason) when not; the resolve is then dropped (the source is still stored).
++bool resolveCopyUsable(const ImageView* src, const ImageView* dst);
+ 
+ struct OpBeginRendering {
+   vpgpu::RenderPassDesc desc;
+diff --git a/gpu/vulkan/src/motion.cpp b/gpu/vulkan/src/motion.cpp
+index ced5cfc..166ab24 100644
+--- a/gpu/vulkan/src/motion.cpp
++++ b/gpu/vulkan/src/motion.cpp
+@@ -260,9 +260,15 @@ bool motionDraw(Device* d, OpDraw& op, int slot) {
+ 
+ void motionFrameSubmitted(Device* d, uint64_t frame) {
+   if (!d || !d->motion) return;
+-  // Every GPU hang so far happened in frames with the eye passes' motion target (builds 12-15): the first one
+-  // turns motion vectors off for good (motion.off), so the passes run exactly as the game made them.
+-  if (!gMotionKilled.load(std::memory_order_relaxed) && vpgpu_metal2_gpu_hangs && vpgpu_metal2_gpu_hangs() > 0) {
++  // Build 16 proved motion vectors innocent (the hangs went on after they were turned off, and the first one
++  // came in a frame with no motion draws): turning them off on a hang is opt-in now
++  // (VPVK_MOTION_OFF_ON_HANG=1). Left on, it would also swap every eye pipeline for its base variant in
++  // the middle of the hang hunter's bisection (metal2), which keys on the pipelines it saw hang.
++  static const bool offOnHang = [] {
++    const char* e = std::getenv("VPVK_MOTION_OFF_ON_HANG");
++    return e && *e == '1';
++  }();
++  if (offOnHang && !gMotionKilled.load(std::memory_order_relaxed) && vpgpu_metal2_gpu_hangs && vpgpu_metal2_gpu_hangs() > 0) {
+     gMotionKilled.store(true);
+     if (const char* dir = std::getenv("VP_PIPELINE_CACHE_DIR"); dir && *dir)
+       if (FILE* f = std::fopen((std::string(dir) + "/motion.off").c_str(), "w")) {
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index d90e0e0..3719639 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -1640,14 +1640,18 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
+     bool resolve = false;
+     if (a.resolveMode != VK_RESOLVE_MODE_NONE && a.resolveImageView) {
+       const ImageView* rv = from<ImageView>(a.resolveImageView);
+-      if (rv && rv->image && rv->image->id && v->image->forcedFrom > 1) {
+-        // Game MSAA forced to 1x: draw into the 1x source, store it, copy it into the resolve
+-        // target after the pass (see forcedResolveCopy in commands.cpp for why not render direct).
++      if (rv && rv->image && rv->image->id && resolveAsCopy(v)) {
++        // Game MSAA forced to 1x, or a 1x attachment the game "resolves" (Source 2's depth with
++        // vr_msaa 0): draw into the 1x source, store it, copy it into the resolve target after the
++        // pass (see forcedResolveCopy in commands.cpp). A Metal resolve of a 1x texture is
++        // undefined: it hung the GPU on every eye pass (build 16).
+         t.store = vpgpu::StoreAction::Store;
+         if (depth) t.clear.depth = a.clearValue.depthStencil.depth, t.clear.stencil = uint8_t(a.clearValue.depthStencil.stencil);
+         else
+           for (int i = 0; i < 4; ++i) t.clear.color[i] = a.clearValue.color.float32[i];
+-        forcedPairs.push_back({v, rv});
++        // Vulkan resolves at the END of the render pass instance: a suspending chunk does not
++        // (the resuming one that finishes the instance does), so no copy between chunks.
++        if (!(ri->flags & VK_RENDERING_SUSPENDING_BIT) && resolveCopyUsable(v, rv)) forcedPairs.push_back({v, rv});
+         return;
+       }
+       if (rv && rv->image && rv->image->id) {
+@@ -1813,8 +1817,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer cb, VkImag
+ 
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst,
+                                                          VkImageLayout dl, uint32_t n, const VkImageResolve* regions) {
+-  // A source forced to 1x (game MSAA off under VPKTAA) resolves as a plain copy.
+-  if (src && from<Image>(src)->forcedFrom > 1 && regions) {
++  // A source forced to 1x (game MSAA off under VPKTAA), or one the game made 1x, resolves as a plain copy
++  // (a Metal resolve of a 1x texture is undefined behaviour).
++  if (src && (from<Image>(src)->forcedFrom > 1 || from<Image>(src)->desc.samples <= 1) && regions) {
+     for (uint32_t i = 0; i < n; ++i) {
+       VkImageCopy c{regions[i].srcSubresource, regions[i].srcOffset, regions[i].dstSubresource, regions[i].dstOffset,
+                     regions[i].extent};
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index e0d367b..fb82bb4 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -1199,6 +1199,84 @@ void testDepthResolve() {
+   vkFreeMemory(c.dev, m, nullptr);
+ }
+ 
++// Source 2 with vr_msaa 0 "resolves" its 1x eye depth into a second image (multiview, suspended and
++// resumed chunks). Metal has no 1x resolve (build 16: every such pass hung the GPU): the attachment is
++// stored and copied into the resolve target once, after the chunk that ends the render pass instance.
++void testResolve1x() {
++  Ctx c;
++  VkDeviceMemory m = alloc(c, 32 << 20, 0);
++  VkImage dep = image(c, VK_FORMAT_D32_SFLOAT_S8_UINT, 64, 2,
++                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, m);
++  VkImage dst = image(c, VK_FORMAT_D32_SFLOAT_S8_UINT, 64, 2,
++                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, m);
++  VkImageView dv, rv;
++  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++  vi.image = dep, vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY, vi.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
++  vi.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 2};
++  vkCreateImageView(c.dev, &vi, nullptr, &dv);
++  vi.image = dst;
++  vkCreateImageView(c.dev, &vi, nullptr, &rv);
++  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++  VkCommandPool pool;
++  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
++  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++  ai.commandPool = pool, ai.commandBufferCount = 1;
++  VkCommandBuffer cb;
++  vkAllocateCommandBuffers(c.dev, &ai, &cb);
++  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++  vkBeginCommandBuffer(cb, &bi);
++  VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++  da.imageView = dv, da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++  da.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT, da.resolveImageView = rv;
++  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
++  ri.renderArea = {{0, 0}, {64, 64}}, ri.layerCount = 1, ri.viewMask = 0x3, ri.pDepthAttachment = &da, ri.pStencilAttachment = &da;
++  ri.flags = VK_RENDERING_SUSPENDING_BIT;
++  vkCmdBeginRendering(cb, &ri);
++  vkCmdEndRendering(cb);
++  ri.flags = VK_RENDERING_RESUMING_BIT;
++  vkCmdBeginRendering(cb, &ri);
++  vkCmdEndRendering(cb);
++  vkEndCommandBuffer(cb);
++  vpgpu::Frame frame;
++  TranslateStats st;
++  translate(*from<CommandBuffer>(cb)->rec, frame, st);
++  const auto& cmds = frame.commands();
++  uint32_t passes = 0, copies = 0;
++  bool resolvesInMetal = false, copyOk = false;
++  for (const auto& cmd : cmds) {
++    if (const auto* p = std::get_if<vpgpu::RenderPass>(&cmd)) {
++      ++passes;
++      resolvesInMetal |= static_cast<bool>(p->desc.depth.resolve) || p->desc.depth.store == vpgpu::StoreAction::Resolve ||
++                         p->desc.depth.store == vpgpu::StoreAction::StoreAndResolve;
++    } else if (const auto* cp = std::get_if<vpgpu::Copy>(&cmd)) {
++      ++copies;
++      copyOk = cp->kind == vpgpu::CopyKind::TextureToTexture && cp->srcTexture.texture == from<Image>(dep)->id &&
++               cp->dstTexture.texture == from<Image>(dst)->id && cp->srcTexture.layerCount == 2;
++    }
++  }
++  CHECK(passes == 2 && !resolvesInMetal);
++  CHECK(copies == 1 && copyOk);
++  // vkCmdResolveImage of a 1x image: a copy too.
++  vkBeginCommandBuffer(cb, &bi);
++  VkImageResolve res{};
++  res.srcSubresource = res.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 2};
++  res.extent = {64, 64, 1};
++  vkCmdResolveImage(cb, dep, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &res);
++  vkEndCommandBuffer(cb);
++  vpgpu::Frame f2;
++  TranslateStats s2;
++  translate(*from<CommandBuffer>(cb)->rec, f2, s2);
++  bool anyPass = false;
++  for (const auto& cmd : f2.commands()) anyPass |= std::holds_alternative<vpgpu::RenderPass>(cmd);
++  CHECK(!anyPass);
++  vkDestroyCommandPool(c.dev, pool, nullptr);
++  vkDestroyImageView(c.dev, dv, nullptr);
++  vkDestroyImageView(c.dev, rv, nullptr);
++  vkDestroyImage(c.dev, dep, nullptr);
++  vkDestroyImage(c.dev, dst, nullptr);
++  vkFreeMemory(c.dev, m, nullptr);
++}
++
+ // VK_KHR_dynamic_rendering_local_read: a barrier inside dynamic rendering, then a draw reading the
+ // depth attachment as a texture (Source 2 soft particles). The pass is split, depth copied, the
+ // pass reopened with its contents loaded and the read rebound to the copy.
+@@ -1683,7 +1761,7 @@ int main(int argc, char** argv) {
+   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
+       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
+       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
+-      {"recipes", testRecipes}, {"alyx", testAlyxSurface}, {"depth_resolve", testDepthResolve},
++      {"recipes", testRecipes}, {"alyx", testAlyxSurface}, {"depth_resolve", testDepthResolve}, {"resolve_1x", testResolve1x},
+       {"local_read", testLocalRead}, {"sync", testSync},
+       {"host_image_copy", testHostImageCopy}, {"motion", testMotion}, {"recipe_keys", testRecipeKeys}};
+   bool ran = false;
+-- 
+2.43.0
+
