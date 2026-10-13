@@ -94,7 +94,7 @@ Cambios B8:
 - `kl_app.c` `kl_guest_display_rate()` (tasa medida) → `pace_plan` en `klvr_platform_klepton.c` (redondeada).
 - `kl_gpu_time.m`: log `[vrr] foveated map (...) N layer(s)`. Textos visibles VPKEngine → VPKEngine.
 
-## Build 9 — VPKEngine: shaders de Alyx al 100 % offline
+## Build 9 (`4c872ed`, CI OK) — VPKEngine: shaders de Alyx al 100 % offline
 Log B8 (VPKEngine): instancia y device OK (WSI de B8 funciona); 125k `vk.err what=msl` + "Error in Init() of
 RenderDeviceMgr001". Diagnóstico offline, sin visor:
 - `scripts/shader-harness.sh <pipelines.foz>`: VPKEngine (ref + patches) en Linux con backend null + fossilize-replay
