@@ -2,17 +2,17 @@
 
 Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en el visor: Steam oficial → descarga →
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
-juego. Gráficos: VPKEngine (por defecto, repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/`) o
-MoltenVK (diagnóstico). Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
+juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/`). MoltenVK
+queda como referencia de diagnóstico (no se usa para jugar ni se arregla nada en él). Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
 IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: build 10, `97d230e`, CI OK).
 
 ## 100 % funcional en el visor
 - Steam: login (contraseña + Steam Guard), propiedad (paquete 134870), descarga build 25487405 en background, Cloud.
 - .p12 como primer paso del launcher (`AVPCertificateGate`); lector PKCS#12 de VPKEngine; firma `req4k` aceptada.
 - Preparación: .deb → libs, 90 libs convertidas y firmadas, `pipelines.foz` (1218 shaders), prewarm de 3038 pipelines.
-- **Con MoltenVK Alyx arranca y se juega**: OpenVR (cabeza + 2 Sense), idioma del sistema (`-language`), overrides
+- **Referencia (MoltenVK, solo diagnóstico): Alyx arranca y se juega** — el pipeline completo está probado: OpenVR (cabeza + 2 Sense), idioma del sistema (`-language`), overrides
   (env, convars forzados vía `alyx-convars.lua`→`game/gameinit.lua`, `video2.txt`, tabla de fidelidad).
-  Rendimiento MoltenVK con foveado `soft`: GPU ~24 ms, ritmo 50/33,3 fps a 100 Hz (governor).
+  Ritmo: 50/33,3 fps a 100 Hz (governor). El rendimiento que cuenta es el de VPKEngine.
 - Launcher (arte de Steam, batería de los Sense), logs en `Documents/Logs Alyx/` (+ copia en la carpeta AVP),
   uno por motor (`klepton-boot-<motor>.log`, `KL_LOG_TAG`), censo Vulkan `census.txt`.
 
@@ -46,7 +46,4 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
 - Ajustes en vivo que faltan: resolución/texturas (convars del juego), anisotrópico (solo afecta a samplers nuevos);
   activar/desactivar foveado requiere reiniciar.
 - Botón PS: no se puede capturar (solo "Button Menu" en `physicalInputProfile`); queda mitigado por la pausa.
-- MetalFX en VPKEngine (`vpvk_config_set_metalfx`) y reactivar el ajuste en la app.
-- Foveado con MoltenVK: ojo izquierdo mal (log `[vrr] … N layer(s)` añadido); baja prioridad.
-- Crash al salir con la corona en MoltenVK (teardown del device en librendersystemvulkan+0x21f9c0); baja prioridad.
 - QR de Steam. Píldoras de batería: verificar mano. Subir 0011–0013 al repo VPKEngine.

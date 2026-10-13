@@ -77,7 +77,7 @@ pieces; VisionQuestPro is not touched.
 3. Timeline semaphores, sync2, per-submit fences (no device-wide waits).
 4. Timestamp queries (MTLCounterSet) → auto-fidelity works.
 5. 16/64-bit integer types, MS texture reads, `vkCmdResolveImage`.
-6. Foveation with `MTLRasterizationRateMap` (fixed, adjustable), MetalFX.
+6. Foveation with `MTLRasterizationRateMap` (fixed, adjustable). No MetalFX (unsuitable for VR).
 
 **Diagnostic switch (hidden, temporary): MoltenVK.** Only to isolate CPU/OpenVR/signing bugs from
 VPKEngine bugs while the gaps are closed. Not a play mode; removed once VPKEngine boots Alyx.
@@ -106,7 +106,7 @@ Enforced on **every** launch, overriding game files, in-game options and Steam C
 ## 7. Settings menu (in the app)
 Render resolution (% / native Vision Pro) · dynamic resolution on/off + range · texture quality
 (pool, cap) · foveation (off / M2 / M5 / custom: sharp zone, periphery, transition) · VPKTAA
-(on, intensity, sharpness) · MetalFX upscaling · anisotropy (x16 default) · language (system if
+(on, intensity, sharpness) · anisotropy (x16 default) · language (system if
 available, else English; voice always English) · FPS HUD · movement defaults · diagnostics
 captures.
 
@@ -116,7 +116,7 @@ captures.
 3. Steam client + download + Cloud.
 4. Preparation pipeline (debs, conversion, signing, pipelines recipe).
 5. Launch + menu + enforcement; first device test (MoltenVK diagnostic switch available).
-6. VPKEngine gaps (§5.1), then native VPKTAA (§5.2), foveation, MetalFX.
+6. VPKEngine gaps (§5.1), then native VPKTAA (§5.2), foveation.
 7. Polish: stutter reports in the log, performance HUD, memory tuning.
 
 ## 9. Credits

@@ -21,7 +21,6 @@ final class AVPSettings: ObservableObject {
     enum Foveation: Int, CaseIterable { case off = 0, m2 = 1, m5 = 2, custom = 3 }
     enum Movement: Int, CaseIterable { case teleport = 0, continuousHead = 2, continuousHand = 3 }
     enum Engine: String, CaseIterable { case vpkengine, moltenvk }
-    enum Upscaling: Int, CaseIterable { case off = 0, spatial = 1 }
 
     /// Vision Pro's native per-eye render size (what visionOS asks for at 100 %).
     static let nativeEye = (width: 3072, height: 2464)
@@ -40,7 +39,6 @@ final class AVPSettings: ObservableObject {
     @Published var vpktaa: Bool { didSet { save() } }
     @Published var vpktaaPercent: Double { didSet { save() } }  // 0...100
     @Published var vpktaaSharpness: Double { didSet { save() } } // 0...1
-    @Published var upscaling: Upscaling { didSet { save() } }
     @Published var anisotropy: Int { didSet { save() } }        // 0, 2, 4, 8, 16
     @Published var engine: Engine { didSet { save() } }
     @Published var systemLanguage: Bool { didSet { save() } }
@@ -70,7 +68,6 @@ final class AVPSettings: ObservableObject {
         vpktaa = d.object(forKey: "avp.vpktaa") as? Bool ?? true
         vpktaaPercent = d.object(forKey: "avp.vpktaaPercent") as? Double ?? 75
         vpktaaSharpness = d.object(forKey: "avp.vpktaaSharp") as? Double ?? 0.3
-        upscaling = .off   // MetalFX: not implemented in either engine yet, no setting shown
         anisotropy = d.object(forKey: "avp.aniso") as? Int ?? 16
         engine = Engine(rawValue: d.string(forKey: "avp.engine") ?? "") ?? .vpkengine
         systemLanguage = d.object(forKey: "avp.sysLang") as? Bool ?? true
@@ -99,7 +96,6 @@ final class AVPSettings: ObservableObject {
         d.set(vpktaa, forKey: "avp.vpktaa")
         d.set(vpktaaPercent, forKey: "avp.vpktaaPercent")
         d.set(vpktaaSharpness, forKey: "avp.vpktaaSharp")
-        d.set(upscaling.rawValue, forKey: "avp.upscaling")
         d.set(anisotropy, forKey: "avp.aniso")
         d.set(engine.rawValue, forKey: "avp.engine")
         d.set(systemLanguage, forKey: "avp.sysLang")
@@ -122,7 +118,7 @@ final class AVPSettings: ObservableObject {
         texturePoolMB = fresh.texturePoolMB; textureCap = fresh.textureCap
         foveation = fresh.foveation; sharpZone = fresh.sharpZone; periphery = fresh.periphery; transition = fresh.transition
         vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
-        upscaling = fresh.upscaling; anisotropy = fresh.anisotropy; engine = fresh.engine
+        anisotropy = fresh.anisotropy; engine = fresh.engine
         systemLanguage = fresh.systemLanguage; refreshHz = fresh.refreshHz; halfRate = fresh.halfRate
         showFps = fresh.showFps; diagCaptures = fresh.diagCaptures; movement = fresh.movement; cloudSync = fresh.cloudSync
         AVPLog.log("Ajustes: valores por defecto")
@@ -275,7 +271,6 @@ final class AVPSettings: ObservableObject {
             ("KL_VPKTAA_SHARP", String(format: "%.2f", vpktaaSharpness)),
             ("VPVK_ANISO", String(anisotropy)),
             ("VPVK_FORCE_1X", taaActive ? "1" : "0"),
-            ("VPVK_METALFX", String(upscaling.rawValue)),
             ("VPVK_TEXTURE_CAP", String(textureCap)),
             ("KL_FPS_HUD", showFps ? "1" : "0"),
             ("KL_CAPTURE", diagCaptures ? "1" : "0"),
@@ -308,7 +303,7 @@ final class AVPSettings: ObservableObject {
         AVPLog.log("Config: \(p.configDir.path): ojo \(eye.width)x\(eye.height) (\(Int(renderPercent)) %), \(refreshHz) Hz"
                    + (halfRate ? " (juego a \(refreshHz / 2))" : "") + ", res. dinámica \(dynamicResolution) [\(dynamicMin)–\(dynamicMax)], "
                    + "texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveation), VPKTAA \(taaActive) \(Int(vpktaaPercent)) % "
-                   + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA), MetalFX \(upscaling), aniso x\(anisotropy), motor \(engine.rawValue), "
+                   + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA), aniso x\(anisotropy), motor \(engine.rawValue), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), FPS \(showFps), capturas \(diagCaptures)")
         return env
     }
@@ -416,7 +411,6 @@ end, nil)
         c.render_scale = 1
         c.anisotropy = Int32(anisotropy)
         c.force_single_sample = taaActive ? 1 : 0
-        c.metalfx = Int32(upscaling.rawValue)
         c.texture_cap = Int32(textureCap)
         let fwd = avp_gfx_config_apply(&c)
         AVPLog.log("Gráficos: ajustes enviados a VPKEngine: \(fwd == 1 ? "sí" : "no (driver no cargado)")")
