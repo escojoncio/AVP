@@ -1,0 +1,443 @@
+// VisionQuestPro: the launcher window. QUEST folder, a card per game, the preparation with its
+// progress, settings (certificate, options) and the logs to share. Once a game is prepared and
+// started, the window becomes Klepton's BootView, which boots it and opens the immersive space.
+
+import SwiftUI
+import UniformTypeIdentifiers
+
+@MainActor
+final class VQModel: ObservableObject {
+    static let shared = VQModel()
+
+    @Published var folderPath: String?
+    @Published var games: [VQGame] = []
+    @Published var message: String?
+    @Published var busy: String?          // the game being prepared
+    @Published var progress: Double = 0
+    @Published var progressText = ""
+    @Published var running = false        // BootView is showing
+    @Published var ended = false          // the game's immersive space has closed
+    @Published var certificate: String? = VQSigner.current
+
+    private init() {
+        VQLog.start()
+        refresh()
+    }
+
+    func refresh() {
+        folderPath = VQFolder.shared.url?.path
+        let found = folderPath == nil ? [] : VQGames.scan()
+        games = found
+    }
+
+    func choose(_ url: URL) {
+        if let problem = VQFolder.shared.choose(url) { message = problem } else { message = nil }
+        refresh()
+    }
+
+    func play(_ game: VQGame) {
+        guard busy == nil else { return }
+        guard VQSigner.current != nil else {
+            message = VQSigner.Problem.missing.errorDescription
+            return
+        }
+        busy = game.id
+        progress = 0
+        progressText = VQL("Preparando…", "Preparing…")
+        message = nil
+        Thread.detachNewThread {
+            do {
+                let prepared = try VQPrepare.prepare(game) { fraction, text in
+                    Task { @MainActor in
+                        self.progress = fraction
+                        self.progressText = text
+                    }
+                }
+                Task { @MainActor in
+                    VQLaunch.choice = VQLaunch.Choice(game: game, prepared: prepared)
+                    self.busy = nil
+                    self.running = true
+                }
+            } catch {
+                VQLog.log("Preparar: \(game.id) falló: \(error.localizedDescription)")
+                let text = error.localizedDescription
+                Task { @MainActor in
+                    self.busy = nil
+                    self.message = text
+                }
+            }
+        }
+    }
+}
+
+/// The launcher window's scene id (dismissed while the game's immersive space is open).
+enum VQMainWindow {
+    static let id = "main"
+}
+
+struct VQRootView: View {
+    @ObservedObject private var model = VQModel.shared
+
+    var body: some View {
+        if model.ended {
+            VQEndedView()
+        } else if model.running {
+            BootView()
+        } else {
+            VQLauncherView()
+        }
+    }
+}
+
+struct VQLauncherView: View {
+    @ObservedObject private var model = VQModel.shared
+    @State private var pickingFolder = false
+    @State private var showSettings = false
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if model.folderPath == nil {
+                    noFolder
+                } else if model.games.isEmpty {
+                    ContentUnavailableView(VQL("No hay juegos", "No games"), systemImage: "shippingbox",
+                                           description: Text(VQL("Copia cada juego (su .apk y su carpeta de datos) en su propia carpeta dentro de QUEST/Juegos.",
+                                                                 "Copy each game (its .apk and its data folder) into its own folder inside QUEST/Juegos.")))
+                } else {
+                    ScrollView {
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 360), spacing: 20)], spacing: 20) {
+                            ForEach(model.games) { game in VQGameCard(game: game) }
+                        }
+                        .padding(24)
+                    }
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                if let message = model.message {
+                    Text(message).font(.callout).foregroundStyle(.orange).padding().glassBackgroundEffect()
+                }
+            }
+            .navigationTitle("VisionQuestPro")
+            .toolbar {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button { model.refresh() } label: { Label(VQL("Actualizar", "Refresh"), systemImage: "arrow.clockwise") }
+                    ShareLink(items: VQLog.shareable) { Label(VQL("Registros", "Logs"), systemImage: "doc.text") }
+                    Button { showSettings = true } label: { Label(VQL("Ajustes", "Settings"), systemImage: "gearshape") }
+                }
+            }
+            .sheet(isPresented: $showSettings) { VQSettingsView() }
+            .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
+                if case .success(let url) = result { model.choose(url) }
+            }
+        }
+    }
+
+    private var noFolder: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "folder.badge.questionmark").font(.system(size: 56))
+            Text(VQL("Elige la carpeta QUEST", "Choose the QUEST folder")).font(.title)
+            Text(VQL("Créala una vez en «En mi Apple Vision Pro» (app Archivos). Dentro irán Juegos, Cache y Partidas, fuera de la app: no se pierden al reinstalarla.",
+                     "Make it once in “On My Apple Vision Pro” (Files app). Juegos, Cache and Partidas go inside it, outside the app: they survive reinstalling it."))
+                .multilineTextAlignment(.center).frame(maxWidth: 560).foregroundStyle(.secondary)
+            Button(VQL("Elegir carpeta", "Choose folder")) { pickingFolder = true }.buttonStyle(.borderedProminent)
+        }
+        .padding(40)
+    }
+}
+
+struct VQGameCard: View {
+    let game: VQGame
+    @ObservedObject private var model = VQModel.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(game.name).font(.title2.bold()).lineLimit(2)
+            Text("\(game.package) · v\(game.version)").font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                tag(game.engine, "cpu")
+                tag(game.graphics, "cube")
+                if game.quest3 { tag("Quest 3", "visionpro") }
+                if !game.obbs.isEmpty { tag("OBB", "archivebox") }
+            }
+            if !game.compatible {
+                ForEach(game.problems, id: \.self) { p in
+                    Label(p, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.orange)
+                }
+            }
+            if model.busy == game.id {
+                ProgressView(value: model.progress) { Text(model.progressText).font(.caption) }
+            } else {
+                Button {
+                    model.play(game)
+                } label: {
+                    Label(VQPrepare.isPrepared(game) ? VQL("Jugar", "Play") : VQL("Preparar y jugar", "Prepare and play"),
+                          systemImage: "play.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!game.compatible || model.busy != nil)
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassBackgroundEffect()
+    }
+
+    private func tag(_ text: String, _ symbol: String) -> some View {
+        Label(text, systemImage: symbol).font(.caption.bold()).padding(.horizontal, 10).padding(.vertical, 5)
+            .background(.thinMaterial, in: Capsule())
+    }
+}
+
+struct VQSettingsView: View {
+    @ObservedObject private var model = VQModel.shared
+    @ObservedObject private var settings = VQSettings.shared
+    @Environment(\.dismiss) private var dismiss
+    @State private var importing = false
+    @State private var p12: Data?
+    @State private var password = ""
+    @State private var result: String?
+    @State private var pickingFolder = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(VQL("Certificado de firma", "Signing certificate")) {
+                    Text(model.certificate ?? VQL("Ninguno", "None")).foregroundStyle(.secondary)
+                    Text(VQL("El .p12 con el que se firmó la app (el de SideStore/iloader). Las librerías convertidas se firman con él en el visor.",
+                             "The .p12 the app was signed with (SideStore/iloader's). Converted libraries are signed with it on the headset."))
+                        .font(.caption)
+                    Button(VQL("Importar .p12…", "Import .p12…")) { importing = true }
+                    if p12 != nil {
+                        SecureField(VQL("Contraseña", "Password"), text: $password)
+                        Button(VQL("Guardar certificado", "Save certificate")) {
+                            do {
+                                result = try VQSigner.store(p12: p12!, password: password)
+                                model.certificate = VQSigner.current
+                                p12 = nil; password = ""
+                            } catch { result = error.localizedDescription }
+                        }
+                    }
+                    if model.certificate != nil {
+                        Button(VQL("Borrar certificado", "Remove certificate"), role: .destructive) {
+                            VQSigner.remove(); model.certificate = nil
+                        }
+                    }
+                    if let result { Text(result).font(.caption) }
+                }
+                Section(VQL("Juego", "Game")) {
+                    Toggle(VQL("Sin conexión (el juego no intenta conectarse)", "Offline (the game does not try to connect)"), isOn: $settings.offline)
+                    Toggle(VQL("Guardar el registro del juego en archivo", "Save the game log to a file"), isOn: $settings.guestLog)
+                    Stepper(VQL("Vigilante de arranque: \(Int(settings.watchdogSeconds)) s", "Boot watchdog: \(Int(settings.watchdogSeconds)) s"),
+                            value: $settings.watchdogSeconds, in: 30...600, step: 30)
+                }
+                Section(VQL("Gráficos", "Graphics")) {
+                    Toggle(VQL("Motor gráfico VPEngine (apagado: MoltenVK)", "VPEngine graphics (off: MoltenVK)"),
+                           isOn: $settings.useVPEngine)
+                    Picker(VQL("Foveado", "Foveation"), selection: $settings.foveation) {
+                        Text(VQL("Apagado", "Off")).tag(VQSettings.Foveation.off)
+                        Text("M2").tag(VQSettings.Foveation.m2)
+                        if VQSettings.isM5 { Text("M5").tag(VQSettings.Foveation.m5) }
+                        Text(VQL("Personalizado", "Custom")).tag(VQSettings.Foveation.custom)
+                    }
+                    if settings.foveation == .custom {
+                        Stepper(VQL("Zona nítida: \(Int(settings.sharpZone * 100)) %", "Sharp zone: \(Int(settings.sharpZone * 100)) %"),
+                                value: $settings.sharpZone, in: 0.05...1, step: 0.05)
+                        Stepper(VQL("Periferia: \(Int(settings.periphery * 100)) %", "Periphery: \(Int(settings.periphery * 100)) %"),
+                                value: $settings.periphery, in: 0.1...1, step: 0.05)
+                        Stepper(VQL("Altura: \(Int(settings.fovHeight * 100)) %", "Height: \(Int(settings.fovHeight * 100)) %"),
+                                value: $settings.fovHeight, in: -0.5...0.5, step: 0.05)
+                    }
+                    Toggle(VQL("MSAA del juego", "Game's MSAA"), isOn: $settings.gameMSAA)
+                    Text(VQL("El antialiasing original del juego. Recomendado activado.",
+                             "The game's own antialiasing. Recommended on."))
+                        .font(.caption)
+                    Toggle(VQL("VPKTAA (experimental)", "VPKTAA (experimental)"), isOn: $settings.vpktaa)
+                    Text(VQL("Antialiasing temporal propio sobre la imagen final del juego. Sin vectores de movimiento del juego puede verse más borroso y con estelas; junto con el MSAA del juego cuesta más GPU.",
+                             "Our own temporal antialiasing on the game's final picture. Without the game's motion vectors it can look blurrier and trail; together with the game's MSAA it costs more GPU."))
+                        .font(.caption)
+                    if settings.vpktaa {
+                        Stepper(VQL("Intensidad del suavizado: \(Int(settings.vpktaaPercent)) %", "Smoothing strength: \(Int(settings.vpktaaPercent)) %"),
+                                value: $settings.vpktaaPercent, in: 0...100, step: 5)
+                        Text(VQL("Cuánto se mezcla cada frame con los anteriores. Más: bordes más limpios y menos parpadeo; también más estela al girar rápido o en objetos que se mueven. Recomendado 60–80 %.",
+                                 "How much each frame is blended with the previous ones. Higher: cleaner edges and less shimmer, but more trailing on fast turns and moving objects. Recommended 60–80 %."))
+                            .font(.caption)
+                        Stepper(VQL("Nitidez: \(Int(settings.vpktaaSharpness * 100)) %", "Sharpness: \(Int(settings.vpktaaSharpness * 100)) %"),
+                                value: $settings.vpktaaSharpness, in: 0...1, step: 0.1)
+                        Text(VQL("Enfoque aplicado después del suavizado, para recuperar el detalle que el TAA difumina. Demasiado alto: halos y bordes que parpadean. Recomendado 20–30 %; 0 % lo desactiva.",
+                                 "Sharpening applied after the smoothing, to recover the detail TAA blurs. Too high: halos and flickering edges. Recommended 20–30 %; 0 % turns it off."))
+                            .font(.caption)
+                    }
+                    Toggle(VQL("Idioma del sistema si el juego lo incluye (si no, inglés)", "System language if the game ships it (else English)"), isOn: $settings.systemLanguage)
+                    Picker(VQL("Postura", "Posture"), selection: $settings.posture) {
+                        Text(VQL("Automática", "Automatic")).tag("auto")
+                        Text(VQL("Sentado", "Seated")).tag("seated")
+                        Text(VQL("De pie", "Standing")).tag("standing")
+                    }
+                    .pickerStyle(.segmented)
+                    Picker("Passthrough", selection: $settings.passthrough) {
+                        Text(VQL("Automático", "Automatic")).tag("auto")
+                        Text(VQL("Siempre VR", "Always VR")).tag("off")
+                        Text(VQL("Siempre mixto", "Always mixed")).tag("on")
+                    }
+                    .pickerStyle(.segmented)
+                    Picker(VQL("Resolución base", "Base resolution"), selection: $settings.resolutionBase) {
+                        Text(VQL("Original", "Original")).tag("original")
+                        Text("Vision Pro").tag("compositor")
+                        Text(VQL("Nativa", "Native")).tag("native")
+                    }
+                    .pickerStyle(.segmented)
+                    Text(VQL("Nativa: densidad real de la pantalla del Vision Pro; la más pesada.", "Native: the Vision Pro panel's real density; the heaviest."))
+                        .font(.caption)
+                    Toggle(VQL("Mostrar FPS", "Show FPS"), isOn: $settings.showFps)
+                    Text(VQL("Panel delante de ti con los fps del juego, los Hz del visor, la resolución de render y si VPKTAA está activo.",
+                             "Panel in front of you with the game's fps, the headset's Hz, the render resolution and whether VPKTAA is on."))
+                        .font(.caption)
+                    Stepper(VQL("Resolución de render: \(Int(settings.renderScale * 100)) %", "Render resolution: \(Int(settings.renderScale * 100)) %"),
+                            value: $settings.renderScale, in: 0.5...1.5, step: 0.05)
+                    Picker(VQL("Filtrado anisotrópico", "Anisotropic filtering"), selection: $settings.anisoLevel) {
+                        Text("Off").tag(0)
+                        Text("x2").tag(2)
+                        Text("x4").tag(4)
+                        Text("x8").tag(8)
+                        Text("x16").tag(16)
+                    }
+                    .pickerStyle(.segmented)
+                    Toggle(VQL("ASW desactivado (todos los frames reales)", "ASW off (every frame real)"), isOn: $settings.aswDisabled)
+                    Toggle(VQL("Precompilar shaders antes de jugar", "Precompile shaders before playing"), isOn: $settings.precompileShaders)
+                    Toggle(VQL("Perfil Quest 3", "Quest 3 profile"), isOn: $settings.quest3Profile)
+                    Toggle(VQL("Forzar Vulkan en juegos Unity", "Force Vulkan in Unity games"), isOn: $settings.forceVulkan)
+                    Toggle(VQL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $settings.diagCaptures)
+                    Toggle(VQL("Diagnóstico de rendimiento", "Performance diagnostics"), isOn: $settings.perfDiag)
+                    Text(VQL("El foveado propio del juego (Quest) está siempre apagado. Foveado y VPKTAA los aplica VPEngine (aún sin efecto con MoltenVK). M5 solo aparece en un Vision Pro M5. Se aplica al lanzar el juego.",
+                             "The game's own (Quest) foveation is always off. Foveation and VPKTAA are applied by VPEngine (no effect yet with MoltenVK). M5 only appears on a Vision Pro M5. Applied when the game launches."))
+                        .font(.caption)
+                }
+                Section(VQL("Carpeta QUEST", "QUEST folder")) {
+                    Text(model.folderPath ?? VQL("No elegida", "Not chosen")).font(.caption)
+                    Button(VQL("Elegir otra…", "Choose another…")) { pickingFolder = true }
+                }
+                // On the section, not the Form: two .fileImporter on one view and only one works.
+                .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { r in
+                    if case .success(let url) = r { model.choose(url) }
+                }
+                Section(VQL("Registros", "Logs")) {
+                    ShareLink(items: VQLog.shareable) { Label(VQL("Compartir registros", "Share logs"), systemImage: "square.and.arrow.up") }
+                    ScrollView {
+                        Text(VQLog.tail(VQLog.appLog)).font(.system(.caption2, design: .monospaced)).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(height: 220)
+                }
+            }
+            .navigationTitle(VQL("Ajustes", "Settings"))
+            .toolbar { Button(VQL("Hecho", "Done")) { dismiss() } }
+            .fileImporter(isPresented: $importing, allowedContentTypes: [UTType(filenameExtension: "p12") ?? .data, .data]) { r in
+                if case .success(let url) = r {
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    p12 = try? Data(contentsOf: url)
+                    if scoped { url.stopAccessingSecurityScopedResource() }
+                    result = p12 == nil ? VQL("No se pudo leer el archivo.", "The file could not be read.") : nil
+                }
+            }
+        }
+        .frame(minWidth: 640, minHeight: 640)
+    }
+}
+
+/// What the player sees while the game boots: name, a quiet animation and a short status. The
+/// boot log still goes to the log file (and to "Ver registro").
+struct VQLoadingView: View {
+    let running: Bool
+    let finished: Bool
+    let succeeded: Bool
+    let openedSpace: Bool
+    let status: String
+    let showLog: () -> Void
+    @State private var pulse = false
+    @ObservedObject private var prewarm = VQPrewarm.shared
+
+    private var failed: Bool { finished && !succeeded }
+    private var phrase: String {
+        if failed { return VQL("No se pudo iniciar el juego", "The game could not start") }
+        if finished || openedSpace { return VQL("Iniciando VR…", "Starting VR…") }
+        if prewarm.active && prewarm.compiling {
+            return VQL("Compilando shaders \(prewarm.done) / \(prewarm.total)", "Compiling shaders \(prewarm.done) / \(prewarm.total)")
+        }
+        if prewarm.active {
+            return VQL("Preparando shaders \(prewarm.done) / \(prewarm.total)", "Preparing shaders \(prewarm.done) / \(prewarm.total)")
+        }
+        if running { return VQL("Cargando juego…", "Loading game…") }
+        return VQL("Preparando…", "Preparing…")
+    }
+
+    var body: some View {
+        VStack(spacing: 28) {
+            Spacer()
+            ZStack {
+                Circle().fill(.thinMaterial).frame(width: 140, height: 140)
+                    .scaleEffect(pulse ? 1.08 : 0.94)
+                    .opacity(pulse ? 0.9 : 0.5)
+                Image(systemName: failed ? "exclamationmark.triangle.fill" : "visionpro")
+                    .font(.system(size: 54, weight: .light))
+                    .foregroundStyle(failed ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.primary))
+            }
+            .animation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true), value: pulse)
+            .onAppear { pulse = true }
+
+            Text(VQLaunch.choice?.game.name ?? "VisionQuestPro")
+                .font(.largeTitle.bold()).multilineTextAlignment(.center).lineLimit(2)
+
+            VStack(spacing: 10) {
+                if !failed {
+                    if prewarm.active && prewarm.total > 0 {
+                        ProgressView(value: Double(prewarm.done), total: Double(prewarm.total)).frame(maxWidth: 360)
+                    } else {
+                        ProgressView().controlSize(.large)
+                    }
+                }
+                Text(phrase).font(.title3).foregroundStyle(.secondary)
+                if failed, !status.isEmpty {
+                    Text(status).font(.callout).foregroundStyle(.orange).multilineTextAlignment(.center)
+                }
+            }
+            Spacer()
+            HStack(spacing: 16) {
+                Button(action: showLog) { Label(VQL("Ver registro", "Show log"), systemImage: "doc.text.magnifyingglass") }
+                    .buttonStyle(.bordered)
+                ShareLink(items: VQLog.shareable) { Label(VQL("Compartir registros", "Share logs"), systemImage: "square.and.arrow.up") }
+                    .buttonStyle(.bordered)
+            }
+            .font(.callout)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(32)
+    }
+}
+
+/// Shown when the game's immersive space has closed. The runtime boots a guest once per process,
+/// so playing again needs the app to start again.
+struct VQEndedView: View {
+    var body: some View {
+        VStack(spacing: 24) {
+            Spacer()
+            Image(systemName: "checkmark.circle").font(.system(size: 60, weight: .light)).foregroundStyle(.secondary)
+            Text(VQLaunch.choice?.game.name ?? "VisionQuestPro").font(.largeTitle.bold()).multilineTextAlignment(.center)
+            Text(VQL("Partida cerrada. Para volver a jugar, cierra la app y ábrela de nuevo.",
+                     "Game closed. To play again, close the app and open it again."))
+                .font(.title3).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            Spacer()
+            HStack(spacing: 16) {
+                ShareLink(items: VQLog.shareable) { Label(VQL("Compartir registros", "Share logs"), systemImage: "square.and.arrow.up") }
+                    .buttonStyle(.bordered)
+                Button {
+                    VQLog.log("Cerrar app tras la partida")
+                    fflush(nil)
+                    exit(0)
+                } label: { Label(VQL("Cerrar app", "Close app"), systemImage: "xmark.circle") }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(32)
+    }
+}
