@@ -1,0 +1,70 @@
+From 1328780e3e33e502ccdf9c735446b4a23a47d7b3 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 15:22:54 +0000
+Subject: [PATCH] VPVulkan: no motion variant for dual-source blending
+ pipelines; Metal guard against dual-source with several render targets
+
+The VPKTAA motion attachment (RG16F) was added to Alyx pipelines that blend
+with SRC1 factors; Metal's validation aborts the process on that
+('Dual source blending is used in combination with multiple render targets')
+during the launcher's pipeline prewarm.
+---
+ gpu/metal2/src/metal_backend.mm | 15 +++++++++++++++
+ gpu/vulkan/src/pipelines.cpp    | 15 +++++++++++++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index eab51ba..491fdf9 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -944,6 +944,21 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
+     for (BlendFactor f : {b.srcColor, b.dstColor, b.srcAlpha, b.dstAlpha})
+       p.blendConstant = p.blendConstant || (c.blendingEnabled && (f == BlendFactor::Constant || f == BlendFactor::OneMinusConstant));
+   }
++  {  // Metal: dual-source blending with more than one render target is a validation abort, not an error.
++    bool dual = false;
++    int targets = 0;
++    for (int i = 0; i < kMaxColorAttachments; ++i) {
++      if (s.colorFormats[i] != Format::Undefined) ++targets;
++      if (!d.colorAttachments[i].blendingEnabled) continue;
++      for (BlendFactor f : {s.blend[i].srcColor, s.blend[i].dstColor, s.blend[i].srcAlpha, s.blend[i].dstAlpha})
++        dual = dual || f == BlendFactor::Src1Color || f == BlendFactor::OneMinusSrc1Color ||
++               f == BlendFactor::Src1Alpha || f == BlendFactor::OneMinusSrc1Alpha;
++    }
++    if (dual && targets > 1) {
++      error = "dual-source blending with " + std::to_string(targets) + " colour attachments (Metal allows one)";
++      return false;
++    }
++  }
+   const FormatInfo& df = formatInfo(s.depthFormat);
+   const MTLPixelFormat dsf = pixelFormat(s.depthFormat);
+   if (df.depth()) d.depthAttachmentPixelFormat = dsf;
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index c4eac43..c7693f0 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -731,6 +731,21 @@ void buildMotionVariants(Device* d, const VkGraphicsPipelineCreateInfo& ci, Pipe
+                          const std::vector<spirv::VertexAttribute>& attrs) {
+   const vpgpu::PipelineState& st = p.state;
+   if (!vpgpu::formatInfo(st.depthFormat).depth() || st.samples != 1) return;  // MSAA eye passes: no motion
++  // Dual-source blending (Src1 factors, kept on attachment 0 when the shader writes index 1) allows a
++  // single render target in Metal: an added motion attachment makes the pipeline invalid (Metal's
++  // validation aborts the process). Such a pipeline gets no variants, so its pass keeps the game's
++  // attachments (passTakesMotion) and VPKTAA treats that pass as having no motion.
++  for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) {
++    using B = vpgpu::BlendFactor;
++    const vpgpu::BlendState& b = st.blend[c];
++    if (!b.enabled) continue;
++    for (B f : {b.srcColor, b.dstColor, b.srcAlpha, b.dstAlpha})
++      if (f == B::Src1Color || f == B::OneMinusSrc1Color || f == B::Src1Alpha || f == B::OneMinusSrc1Alpha) {
++        static std::atomic<unsigned> said{0};
++        if (said.fetch_add(1) < 8) logf("vk.motion no_variant pipeline=%s why=\"dual-source blending\"", st.label.c_str());
++        return;
++      }
++  }
+   int slot = -1;
+   for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
+     if (st.colorFormats[c] == vpgpu::Format::Undefined) {
+-- 
+2.43.0
+
