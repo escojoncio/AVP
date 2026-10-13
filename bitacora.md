@@ -59,7 +59,7 @@ Enlace: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa
 ## Build 7 (en curso) — logs B6 analizados
 Logs B6 (2 partidas MoltenVK, español OK): panel a **100 Hz** (no 90); pacer `ceil(100/45)=3` → fijo 33,3 fps aunque la
 GPU iba a 14 ms al inicio; en partida GPU juego 28–31 ms (foveado off, MSAA 4). Crash 11:39 (misma firma B4,
-librendersystemvulkan+0x21f9c0) sin boot log: lo pisó la partida siguiente. Censo: Alyx NO usa int64/16-bit,
+librendersystemvulkan+0x21f9c0) al SALIR con la corona (confirmado por el usuario): cierre del device en teardown, no en juego; sin boot log (lo pisó la siguiente). Censo: Alyx NO usa int64/16-bit,
 teselación, depth bounds ni mesh → no son pendientes de VPEngine para Alyx.
 Cambios B7:
 - `kl_app.c` pacer: `N = ceil(rate/(pace_hz*1.15) - 0.05)` (100 Hz→50, 90→45, 120→40); extra del governor si ≥31,5 fps.
