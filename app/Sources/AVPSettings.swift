@@ -387,6 +387,23 @@ end, nil)
     }
 
     /// VPKEngine's own settings (vpvk_config_set_* through avp_config.c).
+    /// Pause menu "Volver al juego": what can change with the game running. Foveation shape (not on/off: the
+    /// hook is installed at start), VPKTAA strength/sharpness, the FPS counter, and VPKEngine's own config.
+    func applyLive() {
+        // No setenv here: the compositor and the guest read the environment on other threads, and setenv
+        // racing getenv is a crash. Each live setting goes straight to its owner.
+        KleptonCompositor.fpsHudEnabled = showFps
+        KleptonTAA.reloadSettings(percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
+        switch foveation {
+        case .off: break   // on/off needs a restart (the scene-pass hook is installed at start)
+        case .m2: kl_vrr_set(1, -1, -1, -1)
+        case .m5: kl_vrr_set(0, -1, -1, -1)
+        case .custom: kl_vrr_set(0, Float(sharpZone), Float(min(0.95, sharpZone + transition)), Float(periphery))
+        }
+        applyToVPKEngine()
+        AVPLog.log("Ajustes en vivo: foveado \(foveation), VPKTAA \(Int(vpktaaPercent)) % nitidez \(vpktaaSharpness), FPS \(showFps)")
+    }
+
     func applyToVPKEngine() {
         var c = avp_gfx_config()
         c.foveation_mode = Int32(foveation.rawValue)

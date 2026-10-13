@@ -42,6 +42,11 @@ enum AVPLog {
         try? FileManager.default.removeItem(at: previousLog)
         try? FileManager.default.moveItem(at: appLog, to: previousLog)
         for old in captures { try? FileManager.default.removeItem(at: old) }
+        // Logs of earlier builds' names (untagged, and the engine's old name): they only confuse a shared folder.
+        for name in ["klepton-boot.log", "klepton-boot.prev.log", "klepton-crash.log", "klepton-boot-vpengine.log",
+                     "klepton-boot-vpengine.prev.log", "klepton-crash-vpengine.log"] {
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+        }
         FileManager.default.createFile(atPath: appLog.path, contents: nil)
         handle = try? FileHandle(forWritingTo: appLog)
         let info = Bundle.main.infoDictionary ?? [:]

@@ -50,6 +50,7 @@ final class AVPModel: ObservableObject {
     @Published var launching = false
     @Published var running = false        // BootView is showing
     @Published var ended = false          // the game's immersive space has closed
+    @Published var paused = false         // the game is held (pause menu / space taken by the system); "Volver al juego"
 
     private var launcher: SteamLauncher?
     private var plan: SteamLauncher.InstallPlan?

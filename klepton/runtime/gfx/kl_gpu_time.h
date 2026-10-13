@@ -18,6 +18,11 @@ float kl_gpu_time_frame_ms(unsigned frames_ago, float *compositor, unsigned *fra
 // image is stored top-down (Vulkan), which the callback accounts for.
 void *kl_vrr_grid_ctx(int eye, void *map, float tex_h);
 void *kl_vrr_map_for(int w, int h);
+// Live foveation settings: rebuild the maps from the current KL_VRR_* environment.
+void kl_vrr_reload(void);
+// Live foveation shape without touching the environment: soft (1) or centre (0) map, inner/outer/edge
+// (< 0: that preset's default). Rebuilds the maps.
+void kl_vrr_set(int soft, float inner, float outer, float edge);
 void kl_vrr_s2p(void *ctx, float sx, float sy, float *px, float *py);
 // The frame the guest is recording now (counts from 1; 0 before GPU timing is on).
 unsigned kl_gpu_time_frame(void);

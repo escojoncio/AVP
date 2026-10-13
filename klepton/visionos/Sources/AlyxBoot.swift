@@ -99,6 +99,17 @@ public enum AlyxBoot {
         return rc
     }
 
+    /// Pause menu: the system closed the space (Home/PS, Crown) while the game kept running, paused. Opens it
+    /// again; the compositor starts a new render loop on the same guest.
+    @MainActor static func reopenSpace() async -> Bool {
+        guard let open = openSpace else { return false }
+        let r = await open(id: Immersive.id)
+        NSLog("[cp] openImmersiveSpace (resume) -> \(r)")
+        guard case .opened = r else { return false }
+        Lifecycle.immersiveOpen = true
+        return true
+    }
+
     @MainActor private static func openImmersive() {
         guard let open = openSpace else {
             NSLog("[alyx] no OpenImmersiveSpaceAction captured (AlyxBootHost missing from the launcher window)")

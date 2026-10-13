@@ -571,6 +571,22 @@ final class KleptonControllers {
         }
     }
 
+    /// Left PS hold timer: >= 1 s pauses the game and brings the launcher up (AVP).
+    nonisolated(unsafe) private static var lPSDownAt: TimeInterval = 0
+    nonisolated(unsafe) private static var lPSFired = false
+    nonisolated(unsafe) private static var lPSDown = false
+    static func leftPSHold(_ down: Bool?) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if let d = down { lPSDown = d }
+        if !lPSDown { lPSDownAt = 0; lPSFired = false; return }
+        if lPSDownAt == 0 { lPSDownAt = now; return }
+        if !lPSFired && now - lPSDownAt >= 1.0 {
+            lPSFired = true
+            NSLog("[input] left PS long-press -> pause to the launcher")
+            DispatchQueue.main.async { Lifecycle.pauseToLauncher(reason: "PS izquierdo mantenido") }
+        }
+    }
+
     /// Element names seen pressed at least once, across every controller.
     nonisolated(unsafe) private static var pressSeen = Set<String>()
 
@@ -1170,6 +1186,7 @@ final class KleptonControllers {
             let homeish = (hand == 0 && pressed("Button Menu"))
             let psStart = hand == 0 && psish
             if hand == 1 { Self.rightPSHold(psish) }
+            if hand == 0 { Self.leftPSHold(psish || pressed("Button Menu")) }
 
             var st = KleptonHandState()
             st.fromController = true

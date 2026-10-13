@@ -223,4 +223,9 @@ void kl_guest_stall_check(unsigned stale);
 // which has the memory limit but not Extended Virtual Addressing. Reservations are PROT_NONE and released at once.
 void kl_app_memprobe(const char *resources, const char *container);
 
+
+// Pause / resume the guest's frame loop (held at its next frame boundary). Main thread or any.
+void kl_guest_set_paused(int on);
+int  kl_guest_paused(void);
+
 #endif

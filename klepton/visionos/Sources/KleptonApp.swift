@@ -133,9 +133,74 @@ enum Lifecycle {
     /// The immersive space has ended (compositor loop over). The guest cannot run twice in one
     /// process, so the launcher comes back in its "game ended" state; if the app is already in
     /// the background (nothing left to show it in), exit as before.
+    // AVP pause: the guest's frame loop is held (kl_guest_set_paused) and the launcher shows over the game
+    // with "Volver al juego". `spaceLost`: the system took the immersive space away (Home/PS button, Digital
+    // Crown) — the game is kept, paused, and the space is opened again on resume instead of the app exiting.
+    static var spaceLost = false
+    /// Read by the compositor's render thread when its loop ends: keep (hold) the guest instead of stopping it.
+    static var keepGuestOnSpaceLoss: Bool {
+        #if KL_ALYX_LAUNCHER
+        return gameStarted && !bootFailed && klEnvOn("KL_PAUSE_ON_SPACE_LOSS", default: true)
+        #else
+        return false
+        #endif
+    }
+
+    @MainActor static func pauseToLauncher(reason: String) {
+        guard gameStarted else { return }
+        if AVPModel.shared.paused {   // already paused, window closed meanwhile: just bring it back
+            if let open = reopenLauncher { open(id: AVPMainWindow.id) }
+            return
+        }
+        kl_guest_set_paused(1)
+        AVPModel.shared.paused = true
+        AVPLog.log("Pausa: \(reason) — juego detenido, launcher abierto")
+        if let open = reopenLauncher { open(id: AVPMainWindow.id) }
+    }
+
+    /// "Volver al juego": live settings, then the space (again, if the system closed it), then the guest.
+    @MainActor static func resumeGame(dismiss: () -> Void) async {
+        AVPSettings.shared.applyLive()
+        if spaceLost || !immersiveOpen {
+            AVPLog.log("Pausa: reabriendo el espacio inmersivo")
+            let ok = await AlyxBoot.reopenSpace()
+            AVPLog.log("Pausa: espacio inmersivo \(ok ? "reabierto" : "NO se pudo reabrir")")
+            if !ok { return }
+            spaceLost = false
+        }
+        AVPModel.shared.paused = false
+        kl_guest_set_paused(0)
+        AVPLog.log("Pausa: juego reanudado")
+        dismiss()
+    }
+
+    /// Pause menu "Salir del juego": save VPKEngine's caches and the settings, flush the logs, end the process.
+    @MainActor static func quit() {
+        NSLog("[app] quit from the pause menu")
+        if let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "vpvk_flush_caches") {
+            typealias Flush = @convention(c) () -> Void
+            unsafeBitCast(sym, to: Flush.self)()
+        }
+        UserDefaults.standard.synchronize()
+        fflush(nil)
+        _exit(0)
+    }
+
     @MainActor static func immersiveEnded() {
         immersiveOpen = false
         NSLog("[app] immersive space ended (phase \(lastPhase))")
+        #if KL_ALYX_LAUNCHER
+        // The game is still alive: the system closed the space (Home/PS, Crown). Pause instead of exiting;
+        // the launcher (now, or when the app comes back) offers "Volver al juego".
+        if keepGuestOnSpaceLoss {
+            spaceLost = true
+            kl_guest_set_paused(1)
+            AVPModel.shared.paused = true
+            AVPLog.log("Pausa: el sistema cerró el espacio inmersivo (fase \(lastPhase)) — juego en pausa, no se cierra")
+            if lastPhase != .background, let open = reopenLauncher { open(id: AVPMainWindow.id) }
+            return
+        }
+        #endif
         if lastPhase != .background, let open = reopenLauncher {
             AVPModel.shared.ended = true
             open(id: AVPMainWindow.id)
@@ -181,6 +246,12 @@ enum Lifecycle {
         // the state that would let us skip it is precisely the state this
         // platform lies about.
         if phase == .active { kl_audio_resume() }
+        #if KL_ALYX_LAUNCHER
+        // Back from Home with the game paused and its space gone: bring the launcher (with "Volver al juego") up.
+        if phase == .active, spaceLost, let open = reopenLauncher {
+            Task { @MainActor in open(id: AVPMainWindow.id) }
+        }
+        #endif
         guard phase == .background else { return }
         // Dismissing the launcher window while the game's space runs must not kill the game.
         // If the space really is gone too, immersiveEnded() makes the exit decision.
@@ -191,6 +262,12 @@ enum Lifecycle {
         #if KL_ALYX_LAUNCHER
         guard gameStarted else {
             NSLog("[app] backgrounded in the launcher (no game yet) — not exiting")
+            return
+        }
+        #endif
+        #if KL_ALYX_LAUNCHER
+        if spaceLost || AVPModel.shared.paused {
+            NSLog("[app] backgrounded with the game paused — staying alive")
             return
         }
         #endif

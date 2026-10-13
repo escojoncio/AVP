@@ -19,7 +19,9 @@ struct AVPRootView: View {
 
     var body: some View {
         Group {
-            if model.ended {
+            if model.paused {
+                AVPPausedView()
+            } else if model.ended {
                 AVPEndedView()
             } else if model.running {
                 BootView()
@@ -417,6 +419,68 @@ struct AVPControllerPills: View {
         .padding(.horizontal, 14).padding(.vertical, 8)
         .background(Color.white.opacity(0.08), in: Capsule())
         .accessibilityElement(children: .combine)
+    }
+}
+
+// MARK: - Pause
+
+/// The game is held (left PS held 1 s, or the system closed the space with Home/PS/Crown). Settings changed here
+/// that can apply live do so on "Volver al juego"; the rest are marked as applying on the next start.
+struct AVPPausedView: View {
+    @ObservedObject private var model = AVPModel.shared
+    @Environment(\.dismissWindow) private var dismissWindow
+    @State private var showSettings = false
+    @State private var resuming = false
+
+    var body: some View {
+        GeometryReader { geo in
+            HStack(spacing: 0) {
+                AVPBackdrop()
+                    .frame(width: geo.size.width * 0.6, height: geo.size.height)
+                    .clipped()
+                VStack(alignment: .leading, spacing: 18) {
+                    Text("Half-Life: Alyx").font(.title3.weight(.bold))
+                    Label(AVPL("Juego en pausa", "Game paused"), systemImage: "pause.circle.fill").font(.largeTitle.bold())
+                    Text(AVPL("La partida sigue cargada. Puedes cambiar ajustes gráficos y volver sin reiniciar.",
+                              "Your game is still loaded. Change graphics settings and go back without restarting."))
+                        .foregroundStyle(.secondary)
+                    Button {
+                        resuming = true
+                        Task { @MainActor in
+                            await Lifecycle.resumeGame { dismissWindow(id: AVPMainWindow.id) }
+                            resuming = false
+                        }
+                    } label: {
+                        Label(AVPL("Volver al juego", "Back to the game"), systemImage: "play.fill")
+                    }
+                    .buttonStyle(AVPPillButtonStyle(prominent: true))
+                    .disabled(resuming)
+                    Button { showSettings = true } label: {
+                        Label(AVPL("Ajustes", "Settings"), systemImage: "gearshape")
+                    }
+                    .buttonStyle(AVPPillButtonStyle(prominent: false))
+                    Button(role: .destructive) { Lifecycle.quit() } label: {
+                        Label(AVPL("Salir del juego", "Quit the game"), systemImage: "xmark.circle")
+                    }
+                    .buttonStyle(AVPPillButtonStyle(prominent: false))
+                    Text(AVPL("Al volver se aplican: forma del foveado (preset, zona nítida, periferia, transición), VPKTAA (intensidad y nitidez) y contador de FPS. Activar o desactivar el foveado, motor, resolución, texturas, anisotrópico e idioma se aplican al reiniciar el juego.",
+                              "Applied on return: foveation shape (preset, sharp zone, periphery, transition), VPKTAA (strength and sharpness) and the FPS counter. Turning foveation on or off, engine, resolution, textures, anisotropy and language apply on the next game start."))
+                        .font(.caption).foregroundStyle(.tertiary)
+                    Spacer()
+                    AVPControllerPills(controllers: model.senseControllers)
+                }
+                .padding(28)
+                .frame(width: geo.size.width * 0.4, height: geo.size.height, alignment: .topLeading)
+                .background {
+                    LinearGradient(colors: [Color(red: 0.11, green: 0.12, blue: 0.15), AVPTheme.navy],
+                                   startPoint: .top, endPoint: .bottom)
+                }
+            }
+        }
+        .ignoresSafeArea()
+        .onAppear { model.setBatteryPolling(true) }
+        .onDisappear { model.setBatteryPolling(false) }
+        .sheet(isPresented: $showSettings) { AVPSettingsView() }
     }
 }
 

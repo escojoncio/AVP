@@ -61,75 +61,50 @@ Enlace: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa
   el VPKTAA (depth SAMPLED/STORE + copias en la cola del juego) o el MSAA 0.
 - Opción pendiente si VPKEngine aún no arranca: ajuste experimental VPKTAA con MoltenVK (solo profundidad) para bisectar.
 
-## Build 7 (`874ea87`, CI OK, AVP.ipa en release `visionos`) — logs B6 analizados
-Logs B6 (2 partidas MoltenVK, español OK): panel a **100 Hz** (no 90); pacer `ceil(100/45)=3` → fijo 33,3 fps aunque la
-GPU iba a 14 ms al inicio; en partida GPU juego 28–31 ms (foveado off, MSAA 4). Crash 11:39 (misma firma B4,
-librendersystemvulkan+0x21f9c0) al SALIR con la corona (confirmado por el usuario): cierre del device en teardown, no en juego; sin boot log (lo pisó la siguiente). Censo: Alyx NO usa int64/16-bit,
-teselación, depth bounds ni mesh → no son pendientes de VPKEngine para Alyx.
-Cambios B7:
-- `kl_app.c` pacer: `N = ceil(rate/(pace_hz*1.15) - 0.05)` (100 Hz→50, 90→45, 120→40); extra del governor si ≥31,5 fps.
-  Logs por motor: `KL_LOG_TAG` → `klepton-boot-<motor>.log` / `klepton-crash-<motor>.log` (+ `.prev.log`).
-- `klvr_platform_klepton.c` governor: fallback si ≥32 fps (100 Hz: 50↔33,3); umbrales escalados a 1000/base
-  (late 0,96/0,90, bajar avg>0,90, subir avg<0,75 durante 5 s).
-- `AVPSettings`: `KLVR_PACE_FALLBACK=1` con halfRate, `KL_LOG_TAG=engine`, foveado por defecto `.m2` (clave `avp.fov2`),
-  MetalFX forzado off (no implementado en ningún motor; picker quitado de `AVPSettingsView`).
-- `AVPLauncher`: `AVPCertificateGate` es lo primero mientras no haya .p12 (antes de carpeta/Steam/descarga);
-  `AVPModel.startInstall` exige certificado. `AVPLog.engineLogs` en compartir/espejo.
-- VPKTAA + foveado: `kl_gpu_time.m` foveа también pases 1x con VPKTAA (multiview `renderTargetArrayLength>1`, depth
-  ≥1024, color no RG16F; log `[vrr] foveating 1x`). `VPKTAACore` kernel con `rasterization_rate_map_decoder`
-  (buffer 3 datos del mapa, buffer 4 `uint4` on/capa): reproyecta en pantalla y vuelve a físico para historia/votos;
-  reset al cambiar de mapa. `KleptonTAA.makeInput` toma `kl_vrr_map_for` (log `[taa] eye N is foveated`).
-Riesgos a mirar en el log: sombras en cascada si son layered (se foveaarían), MV de VPKEngine en layout físico o no.
+## B7–B9 (resumen; detalle en `git log -p bitacora.md`)
+- B7: .p12 primero (`AVPCertificateGate`), MetalFX quitado de la UI, pacer `ceil(rate/(hz*1.15))` (100 Hz→50),
+  foveado `.m2` por defecto (`avp.fov2`), VPKTAA consciente del rate map (`VPKTAACore` + `rasterization_rate_map_decoder`),
+  foveado 1x en pases multiview con depth si VPKTAA, logs por motor (`KL_LOG_TAG`).
+- B8: Klepton sirve WSI propio si el driver no tiene VK_KHR_surface (`g_own_wsi`); `pace_plan` con tasa medida.
+- B9: `scripts/shader-harness.sh` (VPKEngine Linux + fossilize-replay sobre el .foz del usuario) y patch 0011:
+  0 errores de traducción (CompositeInsert, MS subpass, dual-source, Modf/FrexpStruct, multiDrawIndirect). 0012: tests.
+- Log B9 (VPKEngine): 3038+274 pipelines OK, luego "Error in Init() of RenderDeviceMgr001" sin ningún vkCreate tras
+  el device (MoltenVK crea texturas por defecto justo ahí).
 
-## Build 8 (`559ff52`, CI OK) — logs B7
-- MoltenVK B7: foveado `soft` OK (físico 67 %), GPU 30→24 ms, ~40 fps sin fijar: `pace_plan` usaba 90 Hz (KL_DISPLAY_HZ
-  forzado) → sin fallback. Usuario: ojo izquierdo mal con foveado (sin diagnosticar; log de capas añadido).
-- VPKEngine (antes VPKEngine) B7: "No se ha podido inicializar Vulkan" antes de vkCreateInstance: VPVulkan no anuncia
-  WSI (`instanceExtensions()` sin VK_KHR_surface; device sin VK_KHR_swapchain) y Source 2 lo exige.
-Cambios B8:
-- `kl_vulkan.c`: `g_own_wsi` (vk_init: driver sin VK_KHR_surface) → `kl_vk_native_wsi=0`; anuncia VK_KHR_surface +
-  VK_EXT_headless_surface (instancia) y VK_KHR_swapchain (device); xlib/xcb/wayland/headless → superficie sintética
-  (`klvk_CreateAnyLinuxSurface`); ramas native WSI de `ours()` con `&& !g_own_wsi`. CreateInstance/CreateDevice ya
-  descartan lo que el driver no tiene.
-- `kl_app.c` `kl_guest_display_rate()` (tasa medida) → `pace_plan` en `klvr_platform_klepton.c` (redondeada).
-- `kl_gpu_time.m`: log `[vrr] foveated map (...) N layer(s)`. Textos visibles VPKEngine → VPKEngine.
-
-## Build 9 (`4c872ed`, CI OK) — VPKEngine: shaders de Alyx al 100 % offline
-Log B8 (VPKEngine): instancia y device OK (WSI de B8 funciona); 125k `vk.err what=msl` + "Error in Init() of
-RenderDeviceMgr001". Diagnóstico offline, sin visor:
-- `scripts/shader-harness.sh <pipelines.foz>`: VPKEngine (ref + patches) en Linux con backend null + fossilize-replay
-  (556da9f, filtro de features desactivado con FZ_NOFILTER) → mismo camino SPIR-V→VPIR→MSL que el visor.
-  `VPVK_DUMP_DIR` vuelca IR/SPIR-V de los fallos. El .foz es del usuario (AVP/Cache): nunca al repo.
-- Resultado: 1218 módulos, 3030 graphics + 8 compute, 5760 traducciones, **0 errores** (antes 125k).
-`vpkengine-patches/0011` (VPVulkan):
-- `spirv/lower.cpp` compositeInsert: operandos invertidos (w3 = Object, w4 = Composite) → 117k errores.
-- subpassLoad MS: operando Sample (w6) o 0. GLSL ModfStruct/FrexpStruct/MatrixInverse sin `vt()` de struct.
-- Dual-source blending: `IoVar.blendIndex` (Decoration Index), verify (solo loc 0), MSL `[[color(0), index(1)]]`,
-  `MslShader.dualSource`; BlendFactor Src1*/SrcAlphaSaturate (core + metal + metal2, static_assert); si el FS no
-  tiene index(1) o attachment≠0, Src1→Src.
-- Features: multiDrawIndirect + drawIndirectFirstInstance (commands.cpp ya expande), maxDrawIndirectCount 1<<30.
-- ctest VPKEngine: 129/149, los mismos 20 fallos previos (goldens MSL desactualizados + gpu_spirv.subpass, ajenos).
-Hipótesis Init: fallaban pipelines de arranque por los shaders. Sin confirmar hasta el log B9. Pendiente si persiste:
-features que MoltenVK daba y VPVulkan no (tessellation, int16/64, largePoints, multiViewport, inheritedQueries).
-No validable offline: compilación Metal del MSL (sale en el log del visor).
-
-## Patch 0012 (solo tests, sin efecto en runtime) [skip ci]
-- Goldens `gpu/shader/msl/tests/*.metal` regenerados (VPMSL_UPDATE=1): solo cabecera `VP_PSZ` y guardas `VP_NO_FDEPTH`.
-- `gpu_spirv.subpass`: el test mapeaba input 1 → color 1 (otra imagen, uvec4); ahora solo {0→0}. VPVulkan nunca
-  llama a `toFramebufferFetch` (lee input attachments como textura/copia, patch 0002): no afectaba a Alyx.
-- ctest VPKEngine con 0011+0012: 149/149.
+## Build 10 — todo lo pendiente
+Causa (7 agentes, 5 independientes coinciden; sondas contra libVPVulkan.so Linux): VPVulkan anunciaba
+`textureCompressionBC=TRUE` sin BC1_RGB/BC2/BC4/BC5/BC6H en `kFormats` → FormatProperties 0, IFP -11; Source 2 los
+comprueba en Init. Inputs de los agentes: `scratchpad/agents/*` (efímero).
+- `vpkengine-patches/0013`: filas BC que faltaban (BC1_RGB→BC1 con alpha=ONE en la vista), VERTEX_BUFFER para formatos
+  de 3 componentes, `vk.format unsupported=N` en el log, structs Features2 sin soporte escritos a FALSE
+  (memory_priority, BDA, descriptor indexing) y DescriptorIndexingProperties rellenas, IFP: sampleCounts 1x para
+  comprimidos/cubo/no renderizables y extent 3D real, `VkSubresourceHostMemcpySizeEXT`. ctest 149/149, harness 0 errores,
+  sonda de secuencia Source 2 sin fallos.
+- Klepton `kl_vk_diag.inc` + `kl_vk_diag_gen.h` (generador `klepton/tools/gen_vk_diag.py`): todo puntero Vulkan
+  devuelto al guest pasa por un thunk que registra VkResult != SUCCESS (una vez por función/resultado + sitio de
+  llamada), handles nulos, y un ring de 64 llamadas que `kl_vulkan_diag_dump` vuelca al salir el message box.
+  `KL_VK_DIAG=0` lo apaga.
+- WSI propio + SDL (`kl_vulkan.c`, `kl_glibc.c`): con `kl_vulkan_own_wsi()`, SDL_CreateWindow sin SDL_WINDOW_VULKAN,
+  SDL_Vulkan_CreateSurface/GetInstanceExtensions/GetVkGetInstanceProcAddr por el loader de Klepton; swapchain con
+  MUTABLE_FORMAT + format list; SurfaceCaps2/Formats2/PresentRectangles/PresentationSupport implementados.
+- Message box del guest: últimos 8 KB de `<game>/hlvr/console.log` al boot log.
+- Pausa: PS izquierdo (o Menu) mantenido 1 s → `Lifecycle.pauseToLauncher` (`kl_guest_set_paused`, espera en
+  `guest_pace_wait`), launcher `AVPPausedView` (Volver / Ajustes / Salir). Espacio cerrado por el sistema (Home/PS/Corona):
+  el compositor NO para el guest (`Lifecycle.keepGuestOnSpaceLoss`, `KleptonCompositor.guestKeptAlive`), se pausa, no se
+  sale; al volver, `AlyxBoot.reopenSpace` abre un espacio nuevo que presenta el mismo guest. `KL_PAUSE_ON_SPACE_LOSS=0`
+  vuelve a lo anterior. Ajustes en vivo al volver (`AVPSettings.applyLive`, sin setenv): forma del foveado
+  (`kl_vrr_set`), VPKTAA (`KleptonTAA.reloadSettings`), FPS (`KleptonCompositor.fpsHudEnabled`), config VPKEngine.
+- Logs de nombres viejos borrados al arrancar (`AVPLog.start`).
+Riesgos sin validar en visor: segundo CompositorLayer sobre el mismo guest; mapa VRR nulo 1–2 frames al reanudar.
 
 ## Siguiente
-Logs B7: (1) MoltenVK: `[guest] pacing`, `pace governor`, `[vrr] foveated map`, `[gputime]`; (2) VPKEngine:
-`klepton-boot-vpkengine.log` + crash; `vk.feature`, `vk.err`, `vk.unimpl`, `[taa]`, `[vrr] foveating 1x`.
+Log B10 con VPKEngine: si sigue "RenderDeviceMgr001", leer `[vk] diag` (ring + errores) y la consola del juego tras el
+message box; buscar `vk.format unsupported`. Probar pausa (PS izq. 1 s), Home/PS con juego abierto y "Volver al juego".
 
 ## Pendiente
-- **Pausa → launcher** (pedido): no cerrar la app al terminar la inmersiva (`KleptonApp.swift` Lifecycle: hoy
-  "no window to return to — exiting"); congelar guest (pacer/stop de frames), abrir launcher con "Volver al juego" y
-  reabrir la inmersiva. Ajustes en vivo al volver: aniso (vpvk_config gen), foveado (invalidar `g_vrr_maps`),
-  VPKTAA pct/sharp (hoy `let` en `KleptonTAA`), FPS HUD; resolución/texturas vía convars del juego (SendToConsole);
-  motor y tamaño máx. marcados "al reiniciar".
-- **Botón PS**: log B6 "Button Menu=free" y el PS no aparece en `physicalInputProfile` (no capturable igual que en
-  VQP, mismo código). Garantizar que PS/corona → fondo = pausa (no salida) + log de elementos/eventos al pulsar PS.
-- VPKEngine arrancando Alyx (necesita log B7). MetalFX (VPKEngine `vpvk_config_set_metalfx`) y luego reactivar el ajuste.
-- QR de Steam. Píldoras de batería: verificar mano.
+- Validar en visor la pausa/reapertura de espacio (B10). Ajustes en vivo aún no cubiertos: resolución/texturas (convars
+  del juego), aniso (solo samplers nuevos).
+- Botón PS: no aparece en `physicalInputProfile` (solo "Button Menu"); el primer press de cada elemento sale en el log
+  (`[cp] button element pressed for the first time`). Con B10 un Home/PS accidental pausa en vez de cerrar.
+- Si BC no basta: identidad GPU (VPVulkan dice Adreno 740 / driver 0.1.0; MoltenVK Apple) — diff A/B en agentes F/C.
+- MetalFX (VPKEngine `vpvk_config_set_metalfx`) y reactivar el ajuste. QR de Steam. Píldoras de batería: verificar mano.
