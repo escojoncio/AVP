@@ -53,7 +53,7 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   (hilo `klfz replay`): "Dual source blending is used in combination with multiple render targets". Pipelines de Alyx
   con factores SRC1 (census: `blend src 1 dst 15`) recibían la variante de movimiento de VPKTAA (+RG16F) en
   `buildMotionVariants`. Los thunks de diagnóstico eran inocentes.
-- VPKEngine `0014`: `buildMotionVariants` no crea variantes si algún blend usa Src1 (`vk.motion no_variant … dual-source
+- VPKEngine `0014`: `buildMotionVariants` no crea variantes si el fragment shader escribe dual-source (`PipelineObj::dualSource`) o algún blend usa Src1 (`vk.motion no_variant … dual-source
   blending`; `passTakesMotion` deja ese pase sin movimiento); `metal2` `buildRender` devuelve error en vez de abortar
   si hay dual-source con >1 render target. `pipelines.cpp` compila en Linux; `vpvk_tests` ya fallaba antes de 0014
   (`std::bad_variant_access`, Release, sin investigar).

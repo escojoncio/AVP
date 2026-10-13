@@ -1,4 +1,4 @@
-From 1328780e3e33e502ccdf9c735446b4a23a47d7b3 Mon Sep 17 00:00:00 2001
+From d3e85266371f66e8a55370626358bf5a40934256 Mon Sep 17 00:00:00 2001
 From: Claude <claude@users.invalid>
 Date: Tue, 13 Oct 2026 15:22:54 +0000
 Subject: [PATCH] VPVulkan: no motion variant for dual-source blending
@@ -10,8 +10,9 @@ with SRC1 factors; Metal's validation aborts the process on that
 during the launcher's pipeline prewarm.
 ---
  gpu/metal2/src/metal_backend.mm | 15 +++++++++++++++
- gpu/vulkan/src/pipelines.cpp    | 15 +++++++++++++++
- 2 files changed, 30 insertions(+)
+ gpu/vulkan/src/pipelines.cpp    | 21 +++++++++++++++++++++
+ gpu/vulkan/src/vpvk.h           |  1 +
+ 3 files changed, 37 insertions(+)
 
 diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
 index eab51ba..491fdf9 100644
@@ -40,10 +41,10 @@ index eab51ba..491fdf9 100644
    const MTLPixelFormat dsf = pixelFormat(s.depthFormat);
    if (df.depth()) d.depthAttachmentPixelFormat = dsf;
 diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
-index c4eac43..c7693f0 100644
+index c4eac43..b9c6a74 100644
 --- a/gpu/vulkan/src/pipelines.cpp
 +++ b/gpu/vulkan/src/pipelines.cpp
-@@ -731,6 +731,21 @@ void buildMotionVariants(Device* d, const VkGraphicsPipelineCreateInfo& ci, Pipe
+@@ -731,6 +731,26 @@ void buildMotionVariants(Device* d, const VkGraphicsPipelineCreateInfo& ci, Pipe
                           const std::vector<spirv::VertexAttribute>& attrs) {
    const vpgpu::PipelineState& st = p.state;
    if (!vpgpu::formatInfo(st.depthFormat).depth() || st.samples != 1) return;  // MSAA eye passes: no motion
@@ -51,6 +52,11 @@ index c4eac43..c7693f0 100644
 +  // single render target in Metal: an added motion attachment makes the pipeline invalid (Metal's
 +  // validation aborts the process). Such a pipeline gets no variants, so its pass keeps the game's
 +  // attachments (passTakesMotion) and VPKTAA treats that pass as having no motion.
++  if (p.dualSource) {
++    static std::atomic<unsigned> said{0};
++    if (said.fetch_add(1) < 8) logf("vk.motion no_variant pipeline=%s why=\"dual-source output\"", st.label.c_str());
++    return;
++  }
 +  for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) {
 +    using B = vpgpu::BlendFactor;
 +    const vpgpu::BlendState& b = st.blend[c];
@@ -65,6 +71,26 @@ index c4eac43..c7693f0 100644
    int slot = -1;
    for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
      if (st.colorFormats[c] == vpgpu::Format::Undefined) {
+@@ -876,6 +896,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
+       collectUsed(*p, o, vpgpu::stage::fragment);
+       // Outputs the shader does not write keep their contents (no blend, write mask none).
+       p->fragmentOutputs = o.msl.colorOutputs;
++      p->dualSource = o.msl.dualSource;
+       // Second-source factors need [[color(0), index(1)]] and only apply to attachment 0 (Metal rejects
+       // the pipeline otherwise): without them they fall back to the first source.
+       for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) {
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index 9841264..318791d 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -248,6 +248,7 @@ struct PipelineObj {
+   bool cullBoth = false;  // VK_CULL_MODE_FRONT_AND_BACK: every triangle is culled
+   float depthBias[3] = {0, 0, 0};  // constant, clamp, slope
+   uint8_t fragmentOutputs = 0xFF;  // colour attachments the fragment shader writes
++  bool dualSource = false;         // the fragment shader writes [[color(0), index(1)]] (Metal: one render target)
+   Device* device = nullptr;
+   std::array<uint64_t, 3> recipeInputs{};  // recipe stage inputs (vertex, fragment, compute)
+   // VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT: Metal bakes write masks, so each mask combination is a
 -- 
 2.43.0
 
