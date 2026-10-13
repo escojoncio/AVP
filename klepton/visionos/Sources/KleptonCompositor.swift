@@ -5755,7 +5755,7 @@ final class LoadingVideoPlayer {
 enum FrameCapture {
     static let enabled: Bool = (getenv("KL_CAPTURE").map { String(cString: $0) } ?? "0") == "1"
     // 2 and 30: the first guest frames (the full-view pink flash at immersive open).
-    static let frames: Set<Int> = [2, 30, 120, 600, 1200]
+    static let frames: Set<Int> = [2, 30, 120, 600, 1200, 2400, 3600]   // 2400/3600: in game (1200 fell on a fade)
     static let maxWidth = 1024
     private static let queue = DispatchQueue(label: "klepton.capture", qos: .utility)
 
