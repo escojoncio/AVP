@@ -92,6 +92,11 @@ struct VPKTAAEyeInput {
     var position: SIMD3<Float>
     var depth: VPKTAADepthInput? = nil
     var motion: VPKTAAMotionInput? = nil
+    /// The foveation map the eye was rasterized through (KL_VRR): colour, depth and history are then in its
+    /// squeezed ("physical") layout. The resolve reprojects in screen space and maps back, so the sharp zone and
+    /// the periphery get the same history weight and sharpening. nil = uniform image.
+    var rateMap: MTLRasterizationRateMap? = nil
+    var rateLayer: Int = 0
 }
 
 /// Counters of one eye since the last `takeStats`, on 1 pixel in 64.
@@ -147,6 +152,18 @@ final class VPKTAACore {
     private let statBuf: MTLBuffer
     private let dummyDepth: MTLTexture
     private let dummyMV: MTLTexture
+    private lazy var vrrDummy: MTLBuffer? = device.makeBuffer(length: 256, options: .storageModeShared)
+    private var vrrBuf: MTLBuffer?
+    private weak var vrrBufMap: MTLRasterizationRateMap?
+    /// The rate map's decoder data for the kernel (copied once per map).
+    private func vrrParams(_ map: MTLRasterizationRateMap) -> MTLBuffer? {
+        if let b = vrrBuf, vrrBufMap === map { return b }
+        let sa = map.parameterBufferSizeAndAlign
+        guard let b = device.makeBuffer(length: max(sa.size, 16), options: .storageModeShared) else { return nil }
+        map.copyParameterData(buffer: b, offset: 0)
+        vrrBuf = b; vrrBufMap = map
+        return b
+    }
 
     private struct EyeState {
         var hist: [MTLTexture] = []
@@ -160,6 +177,7 @@ final class VPKTAACore {
         var prevCropOff = SIMD2<Float>(0, 0)
         var prevJitterOn = false
         var prevHadDepth = false
+        var prevMap: ObjectIdentifier? = nil
     }
     private var eyes = [EyeState(), EyeState()]
     private var views: [ObjectIdentifier: MTLTexture] = [:]
@@ -312,6 +330,8 @@ final class VPKTAACore {
         let dt = input.tangents - st.prevTan
         if (dt * dt).max() > 1e-8 { reset = true }
         if input.crop != st.prevCrop || input.cropOff != st.prevCropOff { reset = true }
+        let mapID = input.rateMap.map { ObjectIdentifier($0) }
+        if mapID != st.prevMap { reset = true }
         let jitterOn = input.jitter != SIMD2<Float>(0, 0)
         if jitterOn != st.prevJitterOn { reset = true }
         if !trans.x.isFinite || !trans.y.isFinite || !trans.z.isFinite { trans = .zero; reset = true }
@@ -396,6 +416,14 @@ final class VPKTAACore {
         enc.setBytes(&p, length: MemoryLayout<VPKTAAParams>.stride, index: 0)
         enc.setBuffer(statBuf, offset: eye * 64, index: 1)
         enc.setBytes(&org, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 2)
+        var vrrOn = SIMD4<UInt32>(0, 0, 0, 0)
+        if let map = input.rateMap, let b = vrrParams(map) {
+            enc.setBuffer(b, offset: 0, index: 3)
+            vrrOn = SIMD4<UInt32>(1, UInt32(map.layerCount > 1 ? min(input.rateLayer, map.layerCount - 1) : 0), 0, 0)
+        } else if let d = vrrDummy {
+            enc.setBuffer(d, offset: 0, index: 3)
+        }
+        enc.setBytes(&vrrOn, length: MemoryLayout<SIMD4<UInt32>>.stride, index: 4)
         enc.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
         if sharpOn {
             enc.memoryBarrier(scope: .textures)
@@ -415,6 +443,7 @@ final class VPKTAACore {
         st.prevFlip = input.flipY
         st.prevCrop = input.crop
         st.prevCropOff = input.cropOff
+        st.prevMap = mapID
         st.prevJitterOn = jitterOn
         st.prevHadDepth = depthOn
         eyes[eye] = st
@@ -509,6 +538,8 @@ final class VPKTAACore {
                                constant Params& p [[buffer(0)]],
                                device atomic_uint* stats [[buffer(1)]],
                                constant uint2& org [[buffer(2)]],
+                               constant rasterization_rate_map_data& vrrData [[buffer(3)]],
+                               constant uint4& vrrOn [[buffer(4)]],
                                uint2 tid [[thread_position_in_grid]],
                                uint2 lid [[thread_position_in_threadgroup]],
                                uint2 tgp [[threadgroup_position_in_grid]],
@@ -535,7 +566,15 @@ final class VPKTAACore {
             float2 size = float2(w, h);
             int2 ip = int2(gid);
             float2 uv = (float2(ip) + 0.5) / size;
-            float2 cuv = (uv - p.cropOff) / p.crop;
+            // Foveated eye (vrrOn.x): this texel is a PHYSICAL one; the camera maths runs on its screen position
+            // and the history lookups go back through the map, so every zone is treated alike.
+            bool fov = vrrOn.x != 0u;
+            float2 uvS = uv;
+            if (fov) {
+                rasterization_rate_map_decoder dec(vrrData);
+                uvS = dec.map_physical_to_screen_coordinates(float2(ip) + 0.5, vrrOn.y) / size;   // map screen = render area, top-left of the texture
+            }
+            float2 cuv = (uvS - p.cropOff) / p.crop;
 
             // Reconstruction at the unjittered centre + YCoCg moments of the 3x3.
             const float wts[9] = { p.wA.x, p.wA.y, p.wA.z, p.wA.w, p.wB.x, p.wB.y, p.wB.z, p.wB.w, p.w8 };
@@ -622,6 +661,10 @@ final class VPKTAACore {
                 }
                 if (hit) {
                     float2 huv = puv * p.crop + p.cropOff;
+                    if (fov) {
+                        rasterization_rate_map_decoder dec(vrrData);
+                        huv = dec.map_screen_to_physical_coordinates(huv * size, vrrOn.y) / size;
+                    }
                     float4 hist4 = sampleCR(histIn, lin, huv, size);
                     if (any(kbad(hist4.rgb))) { hit = false; }
                     else {
@@ -667,7 +710,12 @@ final class VPKTAACore {
                         float2 pv; float pdv;
                         if (!reproject(cuv - mv * abs(p.mvP.xy) * sg, dist, p, pv, pdv)) continue;
                         if (any(pv < 0.0) || any(pv > 1.0)) continue;
-                        float e = abs(luma(histIn.sample(lin, pv * p.crop + p.cropOff, 0).rgb) - lc);
+                        float2 hv = pv * p.crop + p.cropOff;
+                        if (fov) {
+                            rasterization_rate_map_decoder dec(vrrData);
+                            hv = dec.map_screen_to_physical_coordinates(hv * size, vrrOn.y) / size;
+                        }
+                        float e = abs(luma(histIn.sample(lin, hv, 0).rgb) - lc);
                         if (e < best) { best = e; vote = k; }
                     }
                 }

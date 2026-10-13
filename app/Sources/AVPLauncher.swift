@@ -66,6 +66,9 @@ struct AVPLauncherView: View {
                 .padding(.horizontal, 28).padding(.top, 24).padding(.bottom, 12)
             Divider().opacity(0.3)
             Group {
+                if model.certificate == nil {
+                    AVPCertificateGate()   // first step, before folder, Steam and download; gone once imported
+                } else {
                 switch model.phase {
                 case .needFolder: noFolder
                 case .signIn: AVPSignInView()
@@ -79,6 +82,7 @@ struct AVPLauncherView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 case .notOwned: notOwned
                 case .library: AVPLibraryView()
+                }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -303,11 +307,6 @@ struct AVPLibraryView: View {
                 }
             }
             if model.preparing { Text(model.prepText).font(.caption).foregroundStyle(.secondary) }
-            if model.certificate == nil {
-                Text(AVPL("Importa tu certificado (.p12) en Ajustes para poder firmar las librerías.",
-                          "Import your certificate (.p12) in Settings to sign the libraries."))
-                    .foregroundStyle(.orange)
-            }
             if !model.preparing {
                 Button(model.prepared ? AVPL("Comprobar preparación", "Check preparation") : AVPL("Preparar ahora", "Prepare now")) {
                     model.prepare(thenPlay: false)
@@ -513,5 +512,55 @@ struct AVPEndedView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(32)
+    }
+}
+
+/// First screen until a signing certificate is stored: the .p12 the app was signed with, and its password.
+/// Without it the converted libraries cannot be signed, so nothing else (Steam, download) is offered before.
+struct AVPCertificateGate: View {
+    @ObservedObject private var model = AVPModel.shared
+    @State private var importing = false
+    @State private var p12: Data?
+    @State private var fileName = ""
+    @State private var password = ""
+    @State private var result: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Label(AVPL("Certificado de firma", "Signing certificate"), systemImage: "signature").font(.title2.bold())
+            Text(AVPL("Primer paso: importa el .p12 con el que firmaste esta app. Con él se firman en el visor las librerías del juego; sin él no podría arrancar nada de lo que se descargue.",
+                      "First step: import the .p12 you signed this app with. The game's libraries are signed with it on the headset; without it nothing downloaded could run."))
+                .foregroundStyle(.secondary)
+            Button(p12 == nil ? AVPL("Elegir .p12…", "Choose .p12…") : fileName) { importing = true }
+                .buttonStyle(AVPPillButtonStyle(prominent: p12 == nil))
+            if let data = p12 {
+                SecureField(AVPL("Contraseña del .p12", ".p12 password"), text: $password)
+                    .textFieldStyle(.roundedBorder)
+                Button(AVPL("Guardar certificado", "Save certificate")) {
+                    do {
+                        result = try AVPSigner.store(p12: data, password: password)
+                        AVPLog.log("Certificado: importado al inicio (\(fileName))")
+                        model.refreshCertificate()
+                        p12 = nil; password = ""
+                    } catch {
+                        result = error.localizedDescription
+                        AVPLog.log("Certificado: fallo al importar: \(error.localizedDescription)")
+                    }
+                }
+                .buttonStyle(AVPPillButtonStyle(prominent: true))
+            }
+            if let result { Text(result).font(.callout).foregroundStyle(.orange) }
+        }
+        .padding(28)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .fileImporter(isPresented: $importing, allowedContentTypes: [UTType(filenameExtension: "p12") ?? .data, .data]) { r in
+            if case .success(let url) = r {
+                let scoped = url.startAccessingSecurityScopedResource()
+                p12 = try? Data(contentsOf: url)
+                if scoped { url.stopAccessingSecurityScopedResource() }
+                fileName = url.lastPathComponent
+                result = p12 == nil ? AVPL("No se pudo leer el archivo.", "The file could not be read.") : nil
+            }
+        }
     }
 }

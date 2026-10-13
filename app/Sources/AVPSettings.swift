@@ -61,7 +61,7 @@ final class AVPSettings: ObservableObject {
         dynamicMax = d.object(forKey: "avp.dynMax") as? Double ?? 1.0
         texturePoolMB = d.object(forKey: "avp.texPool") as? Int ?? 2560
         textureCap = d.object(forKey: "avp.texCap") as? Int ?? 2048
-        var fov = Foveation(rawValue: d.object(forKey: "avp.fov") as? Int ?? 0) ?? .off
+        var fov = Foveation(rawValue: d.object(forKey: "avp.fov2") as? Int ?? 1) ?? .m2
         if fov == .m5 && !Self.isM5 { fov = .m2 }
         foveation = fov
         sharpZone = d.object(forKey: "avp.fovSharp") as? Double ?? 0.18
@@ -70,7 +70,7 @@ final class AVPSettings: ObservableObject {
         vpktaa = d.object(forKey: "avp.vpktaa") as? Bool ?? true
         vpktaaPercent = d.object(forKey: "avp.vpktaaPercent") as? Double ?? 75
         vpktaaSharpness = d.object(forKey: "avp.vpktaaSharp") as? Double ?? 0.3
-        upscaling = Upscaling(rawValue: d.object(forKey: "avp.upscaling") as? Int ?? 0) ?? .off
+        upscaling = .off   // MetalFX: not implemented in either engine yet, no setting shown
         anisotropy = d.object(forKey: "avp.aniso") as? Int ?? 16
         engine = Engine(rawValue: d.string(forKey: "avp.engine") ?? "") ?? .vpengine
         systemLanguage = d.object(forKey: "avp.sysLang") as? Bool ?? true
@@ -92,7 +92,7 @@ final class AVPSettings: ObservableObject {
         d.set(dynamicMax, forKey: "avp.dynMax")
         d.set(texturePoolMB, forKey: "avp.texPool")
         d.set(textureCap, forKey: "avp.texCap")
-        d.set(foveation.rawValue, forKey: "avp.fov")
+        d.set(foveation.rawValue, forKey: "avp.fov2")
         d.set(sharpZone, forKey: "avp.fovSharp")
         d.set(periphery, forKey: "avp.fovPeriphery")
         d.set(transition, forKey: "avp.fovTransition")
@@ -255,7 +255,8 @@ final class AVPSettings: ObservableObject {
             ("KL_GUEST_PACE_HZ", halfRate ? String(refreshHz / 2) : "0"),
             ("KL_VK_MERGE", "1"),
             ("KL_VK_MERGE_VIS", "1"),
-            ("KLVR_PACE_FALLBACK", "0"),
+            ("KLVR_PACE_FALLBACK", halfRate ? "1" : "0"),   // 50 fps on 100 Hz when the GPU fits, else 33.3
+            ("KL_LOG_TAG", engine.rawValue),
             ("KL_CP_QUALITY", "0.40"),
             ("MVK_CONFIG_USE_MTLHEAP", "0"),
             ("KL_GUEST_BIGALLOC_MMAP", "1048576"),

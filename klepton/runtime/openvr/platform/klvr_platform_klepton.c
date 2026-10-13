@@ -174,7 +174,7 @@ static void pace_plan(float *base, float *fallback) {
     unsigned div = (unsigned)ceil(panel / 60.0 - 0.05);
     if (div < 1) div = 1;
     *base = panel / div;
-    *fallback = panel / (div + 1) >= 39.0f ? panel / (div + 1) : 0;
+    *fallback = panel / (div + 1) >= 32.0f ? panel / (div + 1) : 0;   // 100 Hz: 50 -> 33.3; 90 Hz: none (30)
 }
 // os_proc_available_memory(): visionOS/iOS only, so weak (NULL on the Mac, where the answer is "unknown").
 extern size_t os_proc_available_memory(void) __attribute__((weak_import));
@@ -227,7 +227,7 @@ static void pace_governor(void) {
         // holds more refreshes than at the base, so scale its share to the base frame.
         float per = game + (g_pace_extra ? comp * fb / base : comp);
         sum += per; n++;
-        if (per > (g_pace_extra ? 15.0f : 16.0f)) late++;
+        if (per > (g_pace_extra ? 0.90f : 0.96f) * 1000.0f / base) late++;   // 60: 15/16 ms, 50: 18/19.2 ms
     }
     double now = klvr_plat_now();
     if (!t0) t0 = now;
@@ -238,10 +238,10 @@ static void pace_governor(void) {
     if (!nn) return;
     unsigned want = g_pace_extra;
     if (!g_pace_extra) {                             // at the base: leave at once when it does not fit
-        over = (avg > 15.0 || nl > 0.03 * nn) ? over + 1 : 0;
+        over = (avg > 0.90 * 1000.0 / base || nl > 0.03 * nn) ? over + 1 : 0;
         if (over >= 1) want = 1;
     } else {                                         // at the fallback: up only with clear headroom
-        good = (avg < 12.5 && nl == 0) ? good + 1 : 0;
+        good = (avg < 0.75 * 1000.0 / base && nl == 0) ? good + 1 : 0;
         if (good >= 5) want = 0;
     }
     if (want != g_pace_extra) {

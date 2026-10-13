@@ -54,11 +54,6 @@ struct AVPSettingsView: View {
                 Stepper(AVPL("Mínimo: \(pct(s.dynamicMin))", "Minimum: \(pct(s.dynamicMin))"), value: $s.dynamicMin, in: 0.5...1.0, step: 0.05)
                 Stepper(AVPL("Máximo: \(pct(s.dynamicMax))", "Maximum: \(pct(s.dynamicMax))"), value: $s.dynamicMax, in: 0.6...1.2, step: 0.05)
             }
-            Picker(AVPL("Escalado MetalFX", "MetalFX upscaling"), selection: $s.upscaling) {
-                Text(AVPL("Apagado", "Off")).tag(AVPSettings.Upscaling.off)
-                Text(AVPL("Espacial", "Spatial")).tag(AVPSettings.Upscaling.spatial)
-            }
-            .pickerStyle(.segmented)
         } header: {
             Text(AVPL("Resolución", "Resolution"))
         } footer: {

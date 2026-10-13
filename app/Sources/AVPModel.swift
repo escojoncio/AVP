@@ -206,6 +206,10 @@ final class AVPModel: ObservableObject {
 
     func startInstall() {
         guard let plan, let launcher, let game = AVPFolder.shared.game else { return }
+        // The signing certificate comes first: without it nothing downloaded could ever run.
+        guard certificate != nil else {
+            message = AVPL("Importa primero tu certificado (.p12).", "Import your certificate (.p12) first."); return
+        }
         if let problem = spaceProblem { message = problem; return }
         installTask?.cancel()
         resumeWhenActive = false

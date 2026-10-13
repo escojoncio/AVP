@@ -852,7 +852,23 @@ static id kl_rce(id self, SEL sel, MTLRenderPassDescriptor *d) {
         }
         if (role == 0 && g_vrr_on > 0 && !d.rasterizationRateMap) {
             id<MTLTexture> t = d.colorAttachments[0].texture ? d.colorAttachments[0].texture : d.depthAttachment.texture;
-            if (t && t.sampleCount >= 4 && t.width >= 1024) {
+            // With VPKTAA the game renders 1x (no MSAA scene target to key on): the scene passes are then the
+            // multiview (both eyes, layered) ones with a depth attachment, at eye size. Post passes have no depth,
+            // shadow maps are not layered, and the motion-vector target (RG16F) is left alone.
+            static int taa = -1;
+            if (taa < 0) { const char *v = getenv("KL_VPKTAA"); taa = v && *v == '1'; }
+            id<MTLTexture> dt = d.depthAttachment.texture;
+            id<MTLTexture> ct = d.colorAttachments[0].texture;
+            int scene1x = taa && dt && dt.width >= 1024 && d.renderTargetArrayLength > 1 &&
+                          (dt.textureType == MTLTextureType2DArray || dt.textureType == MTLTextureType2DMultisampleArray) &&
+                          (!ct || ct.pixelFormat != MTLPixelFormatRG16Float);
+            if (t && (t.sampleCount >= 4 || scene1x) && t.width >= 1024) {
+                static int said1x;
+                if (scene1x && t.sampleCount < 4 && !said1x) {
+                    said1x = 1;
+                    fprintf(stderr, "[vrr] foveating 1x layered scene passes (VPKTAA on): first %lux%lu x%lu\n",
+                            (unsigned long)t.width, (unsigned long)t.height, (unsigned long)d.renderTargetArrayLength);
+                }
                 NSUInteger layers = d.renderTargetArrayLength > 1 ? d.renderTargetArrayLength : 1;
                 NSUInteger w = d.renderTargetWidth ? d.renderTargetWidth : t.width;
                 NSUInteger h = d.renderTargetHeight ? d.renderTargetHeight : t.height;

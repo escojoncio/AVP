@@ -24,7 +24,13 @@ enum AVPLog {
     static var censusLog: URL { directory.appendingPathComponent("census.txt") }
     /// The game's own console (Msg output, our AVPFORCE lines from alyx-convars.lua).
     static var consoleLog: URL? { AVPFolder.shared.game?.appendingPathComponent("hlvr/console.log") }
-    private static var all: [URL] { [appLog, previousLog, bootLog, crashLog, errorLog, prewarmLog, censusLog] + (consoleLog.map { [$0] } ?? []) }
+    /// One boot/crash log per graphics engine (kl_app.c, KL_LOG_TAG), plus each one's previous run.
+    static var engineLogs: [URL] {
+        ["vpengine", "moltenvk"].flatMap { e in
+            ["klepton-boot-\(e).log", "klepton-boot-\(e).prev.log", "klepton-crash-\(e).log"].map { directory.appendingPathComponent($0) }
+        }
+    }
+    private static var all: [URL] { [appLog, previousLog, bootLog, crashLog, errorLog, prewarmLog, censusLog] + engineLogs + (consoleLog.map { [$0] } ?? []) }
 
     /// Starts a new log for this session (the previous one is kept as app-previous.txt).
     static func start() {
