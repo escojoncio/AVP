@@ -709,13 +709,21 @@ static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, 
     }
     int soft = vrr_soft(), wide = vrr_mode() == 2;
     float tan20 = 0.364f;
+    char wide_deg[24] = "";
     float in_x, in_y, out_x, out_y, edge, ry[kVrrZones];
     if (wide) {
         // Forward axis = tangent 0: x at left/(left+right) across (cx), y at up/(up+down) from the top (cy). The
-        // centre sits 10 degrees below it, tan(10) = 0.1763 further down; half width tan(30) = 0.5774.
+        // centre sits 10 degrees below it, tan(10) = 0.1763 further down; half width tan(deg / 2): KL_VRR_WIDE_DEG
+        // (30..70, the launcher's "zona nítida"; 60 = PTVisionPro's, tan(30) = 0.5774).
         cy += 0.1763f / span_y;
-        in_x = vrr_env("KL_VRR_INNER", 0.5774f / span_x);
-        in_y = vrr_env("KL_VRR_INNER", 0.5774f / span_y);
+        const char *wd = getenv("KL_VRR_WIDE_DEG");   // launch-time only (not a live value)
+        float deg = wd && *wd ? (float)atof(wd) : 60.0f;
+        if (!(deg >= 30.0f)) deg = 30.0f;
+        if (deg > 70.0f) deg = 70.0f;
+        const float half = tanf(deg * 0.5f * (float)M_PI / 180.0f);
+        snprintf(wide_deg, sizeof wide_deg, " %.0f deg", deg);
+        in_x = vrr_env("KL_VRR_INNER", half / span_x);
+        in_y = vrr_env("KL_VRR_INNER", half / span_y);
         out_x = vrr_env("KL_VRR_OUTER", in_x + 1.0f / kVrrZones);
         out_y = vrr_env("KL_VRR_OUTER", in_y + 1.0f / kVrrZones);
         edge = vrr_env("KL_VRR_EDGE", 0.10f);
@@ -746,8 +754,8 @@ static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, 
             break;
         }
     MTLSize p0 = [map physicalSizeForLayer:0];
-    fprintf(stderr, "[vrr] foveated map (%s) %lu layer(s) %lux%lu: axis at %.0f%% / %.0f%% across, %.0f%% down; full rate within %.0f%%/%.0f%%, "
-            "edge %.2f; physical %lux%lu (%.0f%% of the pixels)\n", soft ? "soft" : wide ? "wide" : "centre", (unsigned long)(layers > 1 ? 2 : 1),
+    fprintf(stderr, "[vrr] foveated map (%s%s) %lu layer(s) %lux%lu: axis at %.0f%% / %.0f%% across, %.0f%% down; full rate within %.0f%%/%.0f%%, "
+            "edge %.2f; physical %lux%lu (%.0f%% of the pixels)\n", soft ? "soft" : wide ? "wide" : "centre", wide_deg, (unsigned long)(layers > 1 ? 2 : 1),
             (unsigned long)w, (unsigned long)h, 100 * cx[0], 100 * cx[1], 100 * cy, 100 * in_x, 100 * in_y, edge, (unsigned long)p0.width,
             (unsigned long)p0.height, 100.0 * p0.width * p0.height / ((double)w * h));
     const char *dump = getenv("KL_VRR_DUMP");

@@ -142,7 +142,7 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   = primer frame >= `VP_DUMP_FRAME` con >= 8 encoders y un pase con capas (el 6000 de la build 21 salió vacío).
 - Capturas también en frames de juego 2400/3600 (`KleptonCompositor` `frames`; 1200 cayó en un fundido a negro).
 
-## Build 23 (sin validar): A/B de la cola de GPU + captura a demanda
+## Build 23 (Logs_Alyx_2_4: sin explosiones con cola 3, fps hundidos): A/B de la cola de GPU + captura a demanda
 - Usuario: con foveado off y VPKTAA off siguen las "explosiones de vértices", solo al mover la cabeza (no son el foveado).
   Hipótesis principal: carrera de datos por 12 command buffers en vuelo (`0024`): con la cabeza quieta dos frames
   llevan los mismos constantes y no se nota. Alternativa: `0023` (clip distance / invariant).
@@ -152,7 +152,27 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   (PNG de ojos y salida del siguiente frame) + `vpgpu_metal2_request_dump` (VPKEngine `0028`: volcado por pase del
   siguiente frame real, `gpu.dump requested f=N`), encontrado con `dlopen(KL_MVK_DYLIB, RTLD_NOLOAD)`.
 
+## Build 24 (sin validar): orden entre command buffers (causa de las explosiones) + zona nítida en grados
+- Logs_Alyx_2_4 (build 23, cola 3, foveado off, VPKTAA off): sin explosiones de vértices; fps 33 en menú, 18-20 en juego
+  y 5-11 en zonas oscuras con linterna (render CPU 20-160 ms: con 3 command buffers en vuelo y ~5 por frame del juego,
+  CPU y GPU se serializan). 0 cuelgues. Explosiones ⇔ 12 en vuelo desde la build 14 (logs 14-17 todos con 12).
+  Queda "algún efecto o sombra" (captura 3600: estantería iluminada por la linterna sin sombra visible).
+- Causa (VPKEngine metal2): recursos sin hazard tracking; el compilador de frames busca hazards por command buffer y
+  solo el PRIMER encoder de cada command buffer esperaba la cola del anterior. Los demás encoders sin barrera interna
+  podían correr mientras el command buffer anterior aún dibujaba (copia/compute que escribe vértices o constantes que
+  un pase del anterior seguía leyendo). En Vulkan la barrera del juego ordena contra TODO lo enviado antes. Con 12 en
+  cola la GPU siempre tiene el siguiente a mano → pasaba a menudo; con 3 casi nunca.
+- VPKEngine `0029`: encoder "vpgpu.join" al inicio de cada command buffer espera toda la cola del anterior y actualiza
+  un fence; todos los encoders lo esperan en la etapa de vértices (`VP_CB_ORDER=0` = regla antigua). Slots reutilizados
+  solo cuando su propio frame terminó (el semáforo cuenta, no identifica). Medida `gpu.order` cada 600 command
+  buffers: `overlapped` (cota superior), `out_of_order`, `slot_busy`, `carried_waits`. Volcado por pase = 12 command
+  buffers seguidos (≈ 2 frames: sombras, escena y post), presupuesto 512 MB.
+- App: cola GPU vuelve a 12 por defecto (clave nueva `avp.gpuQueueDepth24`); Foveado M2/M5 › "Zona nítida" 30-70°
+  (5°, 60 por defecto) → `KL_VRR_WIDE_DEG` (kl_gpu_time.m, al arrancar; log `[vrr] foveated map (wide N deg)`).
+
 ## Siguiente
+- Log build 24: sin explosiones con 12 en vuelo, fps vuelve a ~30; `gpu.order` (overlapped≈0 con cb_order=1).
+  Sombras/efectos: volcado L3 + R3 de 12 command buffers (pases de sombra incluidos).
 - Log build 21: `[vrr] foveated map (wide)` (% de píxeles), `[vrr] foveated scene passes on`, `[cp] periphery
   reconstruction active`, fps (`[openvr] frames`), `[gputime] game avg`, `gpu.hold`/`missing_pipelines`, cero
   `Caused_GPU_Hang`; capturas PNG (`KL_CAPTURE`) y volcado del frame 6000: imagen correcta con MSAA + foveado.

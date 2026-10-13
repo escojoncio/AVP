@@ -37,6 +37,8 @@ final class AVPSettings: ObservableObject {
     @Published var textureCap: Int { didSet { save() } }        // 1024 | 2048 | 4096
     @Published var foveation: Foveation { didSet { save() } }
     @Published var sharpZone: Double { didSet { save() } }      // 0.05...0.6 of the image width
+    /// M2/M5: the sharp zone's width in degrees (30...70, PTVisionPro's 60 by default); the rest at `periphery`.
+    @Published var wideDegrees: Double { didSet { save() } }
     @Published var periphery: Double { didSet { save() } }      // 0.1...1 shading rate at the edge
     @Published var transition: Double { didSet { save() } }     // 0.02...0.5
     @Published var vpktaa: Bool { didSet { save() } }
@@ -50,7 +52,9 @@ final class AVPSettings: ObservableObject {
     @Published var showFps: Bool { didSet { save() } }
     @Published var diagCaptures: Bool { didSet { save() } }
     /// Command buffers VPKEngine lets the game queue ahead of the GPU (VP_FRAMES_IN_FLIGHT): 12 overlaps CPU and
-    /// GPU (faster); 3 is the A/B test for data the game overwrites while the GPU still reads it.
+    /// GPU (faster); 3 is the A/B test (build 23: no vertex explosions with 3, at half the frame rate). Build 24
+    /// orders each command buffer after the whole previous one, so 12 is the default again (new key: a 3 chosen for
+    /// the build-23 test does not stick).
     @Published var gpuQueueDepth: Int { didSet { save() } }     // 3 | 12
     @Published var movement: Movement { didSet { save() } }
     @Published var cloudSync: Bool { didSet { save() } }
@@ -69,6 +73,7 @@ final class AVPSettings: ObservableObject {
         if fov == .m5 && !Self.isM5 { fov = .m2 }
         foveation = fov
         sharpZone = d.object(forKey: "avp.fovSharp") as? Double ?? 0.18
+        wideDegrees = min(70, max(30, d.object(forKey: "avp.fovWideDeg") as? Double ?? 60))
         periphery = d.object(forKey: "avp.fovPeriphery2") as? Double ?? 0.10
         transition = d.object(forKey: "avp.fovTransition") as? Double ?? 0.32
         vpktaa = d.object(forKey: "avp.vpktaa") as? Bool ?? true
@@ -81,7 +86,7 @@ final class AVPSettings: ObservableObject {
         halfRate = d.object(forKey: "avp.halfRate") as? Bool ?? true
         showFps = d.object(forKey: "avp.showFps") as? Bool ?? false
         diagCaptures = d.object(forKey: "avp.diagCaptures") as? Bool ?? false
-        gpuQueueDepth = (d.object(forKey: "avp.gpuQueueDepth") as? Int).map { $0 == 3 ? 3 : 12 } ?? 12
+        gpuQueueDepth = (d.object(forKey: "avp.gpuQueueDepth24") as? Int).map { $0 == 3 ? 3 : 12 } ?? 12
         movement = Movement(rawValue: d.object(forKey: "avp.movement") as? Int ?? 3) ?? .continuousHand
         cloudSync = d.object(forKey: "avp.cloudSync") as? Bool ?? true
         loading = false
@@ -98,6 +103,7 @@ final class AVPSettings: ObservableObject {
         d.set(textureCap, forKey: "avp.texCap")
         d.set(foveation.rawValue, forKey: "avp.fov2")
         d.set(sharpZone, forKey: "avp.fovSharp")
+        d.set(wideDegrees, forKey: "avp.fovWideDeg")
         d.set(periphery, forKey: "avp.fovPeriphery2")
         d.set(transition, forKey: "avp.fovTransition")
         d.set(vpktaa, forKey: "avp.vpktaa")
@@ -110,7 +116,7 @@ final class AVPSettings: ObservableObject {
         d.set(halfRate, forKey: "avp.halfRate")
         d.set(showFps, forKey: "avp.showFps")
         d.set(diagCaptures, forKey: "avp.diagCaptures")
-        d.set(gpuQueueDepth, forKey: "avp.gpuQueueDepth")
+        d.set(gpuQueueDepth, forKey: "avp.gpuQueueDepth24")
         d.set(movement.rawValue, forKey: "avp.movement")
         d.set(cloudSync, forKey: "avp.cloudSync")
     }
@@ -124,7 +130,7 @@ final class AVPSettings: ObservableObject {
         renderPercent = fresh.renderPercent; dynamicResolution = fresh.dynamicResolution
         dynamicMin = fresh.dynamicMin; dynamicMax = fresh.dynamicMax
         texturePoolMB = fresh.texturePoolMB; textureCap = fresh.textureCap
-        foveation = fresh.foveation; sharpZone = fresh.sharpZone; periphery = fresh.periphery; transition = fresh.transition
+        foveation = fresh.foveation; sharpZone = fresh.sharpZone; wideDegrees = fresh.wideDegrees; periphery = fresh.periphery; transition = fresh.transition
         vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
         anisotropy = fresh.anisotropy; engine = fresh.engine
         systemLanguage = fresh.systemLanguage; refreshHz = fresh.refreshHz; halfRate = fresh.halfRate
@@ -316,7 +322,8 @@ final class AVPSettings: ObservableObject {
         case .off:
             env.append(("KL_VRR", "0"))
         case .m2, .m5:
-            env += [("KL_VRR", "1"), ("KL_VRR_MAP", "wide"), ("KL_VRR_EDGE", String(format: "%.3f", presetPeriphery))]
+            env += [("KL_VRR", "1"), ("KL_VRR_MAP", "wide"), ("KL_VRR_EDGE", String(format: "%.3f", presetPeriphery)),
+                    ("KL_VRR_WIDE_DEG", String(format: "%.0f", wideDegrees))]
         case .custom:
             env += [("KL_VRR", "1"), ("KL_VRR_MAP", "custom"),
                     ("KL_VRR_INNER", String(format: "%.3f", sharpZone)),
@@ -353,7 +360,7 @@ final class AVPSettings: ObservableObject {
         try convarsLua().write(to: p.configDir.appendingPathComponent("alyx-convars.lua"), atomically: true, encoding: .utf8)
         AVPLog.log("Config: \(p.configDir.path): ojo \(eye.width)x\(eye.height) (\(Int(renderPercent)) %), \(refreshHz) Hz"
                    + (halfRate ? " (juego a \(refreshHz / 2))" : "") + ", res. dinámica \(dynamicResolution) [\(dynamicMin)–\(dynamicMax)], "
-                   + "texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveation), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % "
+                   + "texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveation) (zona nítida \(Int(wideDegrees))°), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % "
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA), aniso x\(anisotropy), motor \(engine.rawValue), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), FPS \(showFps), capturas \(diagCaptures), "
                    + "cola GPU \(gpuQueueDepth)")

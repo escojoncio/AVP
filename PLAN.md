@@ -78,6 +78,9 @@ pieces; VisionQuestPro is not touched.
 4. Timestamp queries (MTLCounterSet) → auto-fidelity works.
 5. 16/64-bit integer types, MS texture reads, `vkCmdResolveImage`.
 6. Foveation with `MTLRasterizationRateMap` (fixed, adjustable). No MetalFX (unsuitable for VR).
+7. Cross-submission ordering (build 24, patch 0029): with untracked resources every encoder of a
+   command buffer must be ordered after the previous command buffer (Vulkan barriers cover all
+   earlier submissions); 12 command buffers in flight stays the default.
 
 **Diagnostic switch (hidden, temporary): MoltenVK.** Only to isolate CPU/OpenVR/signing bugs from
 VPKEngine bugs while the gaps are closed. Not a play mode; removed once VPKEngine boots Alyx.
