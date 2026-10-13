@@ -15,7 +15,6 @@ typedef struct avp_gfx_config {
     float render_scale;       // 0.5..1.5 (VPKEngine-side scale; the eye size itself is the OpenVR shim's)
     int32_t anisotropy;       // 0 = game's own; 16 = force 16x on mipmapped linear samplers
     int32_t force_single_sample; // 1 = render the game's MSAA targets at 1x (VPKTAA does the AA)
-    int32_t metalfx;          // 0 off, 1 spatial upscaling
     int32_t texture_cap;      // max texture edge VPKEngine lets through (0 = no cap)
 } avp_gfx_config;
 
