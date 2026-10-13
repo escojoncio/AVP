@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/`). MoltenVK
 queda como referencia de diagnóstico (no se usa para jugar ni se arregla nada en él). Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última OK en CI: build 11, `8b1282b`).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última OK en CI: build 16).
 
 ## 100 % funcional en el visor
 - Steam: login (contraseña + Steam Guard), propiedad (paquete 134870), descarga build 25487405 en background, Cloud.
@@ -35,86 +35,40 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
 - `scripts/shader-harness.sh <pipelines.foz>`: VPKEngine en Linux (backend null) + fossilize-replay → mismos
   `vk.err` que el visor en segundos. `VPVK_DUMP_DIR` vuelca IR/SPIR-V de los fallos. El .foz nunca va al repo.
 
-## Build 11 (sin validar): crash en "Precompilar shaders" de la build 10
-- Síntoma (Logs_Alyx_5): `app.txt` acaba en "ajustes enviados a VPKEngine", sin "precompilados N/N"; ni boot log
-  nuevo ni crash log (el prewarm corría sin `kl_fault_install` y con stdout/stderr a ninguna parte). Única novedad
-  en ese camino frente a la build 9: los thunks de `kl_vk_diag.inc` (sospechoso, sin confirmar).
-- `kl_app.c` `kl_app_prewarm_alyx`: log propio `Logs Alyx/klepton-prewarm-<motor>.log`, `kl_fault_install()`
-  (informe a `klepton-crash-<motor>.log`), heartbeat (fase `prewarm`).
-- `kl_vk_diag.inc`: `klvk_diag_suspend()` (contador global, todo `kl_foz_prewarm`) y `t_pipe_replay` → punteros
-  crudos; `kl_fossilize.cpp` `start_replay` resuelve sus `Fns` con `klvk_set_replay_thread(1)`.
-- Guardia anti-bucle: `AVPPrepare.prewarm` deja `<data>/prewarm.inflight` ("<n> <bundlePath>"); 1 fallo → 1 hilo
-  (`kl_app_prewarm_threads` → `kl_foz_set_threads`, también para el replay del juego); 2 → se salta y vuelve a 1.
-- Icono: `app/Assets.xcassets/AppIcon.solidimagestack` (Front palanca / Middle hexágono / Back degradado, 1024²,
-  diseño original; generador fuera del repo), `ASSETCATALOG_COMPILER_APPICON_NAME`.
+## Historial resumido (detalle: `git log -p bitacora.md`)
+- B11: log propio del prewarm + `kl_fault_install`; guardia anti-bucle `prewarm.inflight`; icono.
+- B12 (`0014`): sin variante de movimiento con dual-source blending; `buildRender` devuelve error en vez de abortar.
+- B13 (`0015`–`0017`): indirect leído en GPU (inocuo), `gpu.recover` cola nueva, caché `vpcache` + `warm.stamp`.
+- B14 (`0018`–`0019`): informe `gpu.hang.enc`, cuarentena, traductor v2 (OpKill, `vp_budget`), presupuesto de archives;
+  pantalla de carga inmersiva; Ajustes › Diagnóstico › restablecer cuarentena.
+- B15: archivos binarios Metal desactivados para siempre (`VP_PIPELINE_ARCHIVE=0`), sin prewarm de recetas.
+- B16 (`0020`): vectores de movimiento off tras el 1.er cuelgue (`motion.off`) — refutado en B17.
 
-## Build 12 (sin validar): causa real del crash del precompilado
-- Logs_Alyx_6 (build 11, con el nuevo log): `MTLReportFailure` → abort en `vpgpu::metal2::MetalBackend::Impl::buildRender`
-  (hilo `klfz replay`): "Dual source blending is used in combination with multiple render targets". Pipelines de Alyx
-  con factores SRC1 (census: `blend src 1 dst 15`) recibían la variante de movimiento de VPKTAA (+RG16F) en
-  `buildMotionVariants`. Los thunks de diagnóstico eran inocentes.
-- VPKEngine `0014`: `buildMotionVariants` no crea variantes si el fragment shader escribe dual-source (`PipelineObj::dualSource`) o algún blend usa Src1 (`vk.motion no_variant … dual-source
-  blending`; `passTakesMotion` deja ese pase sin movimiento); `metal2` `buildRender` devuelve error en vez de abortar
-  si hay dual-source con >1 render target. `pipelines.cpp` compila en Linux; `vpvk_tests` ya fallaba antes de 0014
-  (`std::bad_variant_access`, Release, sin investigar).
-
-## Build 13 (sin validar): GPU colgada (sin imagen) + carga lenta
-- Logs_Alyx_7 (build 12): precompilado OK (3312 en 13 s). Juego: primer frame con escena → `Caused_GPU_Hang_Error`
-  (f=247, f=256 `render23`) y después 6737 `SubmissionsIgnored`: audio sí, imagen no. ~67 s de Jugar a la 1.ª imagen.
-- VPKEngine `0015`: args indirectos escritos por la GPU (registro por BufferId/VkDeviceMemory) se leen en la GPU
-  (metal2 kernel `vp_indirect_fix`: count, multiview ×viewCount, clamp; scratch 8 MiB/slot); límites en la ruta CPU
-  (`vk.indirect …`); `gpu.err what=encoder_fault` por encoder; cola Metal nueva tras SubmissionsIgnored
-  (`gpu.recover`, `queueGen`); shadps4 `Indirect` por campos. `0016`: tests depth_resolve (vpvk_tests pasa con
-  `LD_LIBRARY_PATH=.` desde `<build>/vulkan`). `0017`: `vpvk_device_wait_compiles`, colas de librerías núcleos−2,
-  `VP_PIPELINE_ARCHIVE=0`, `archive.inflight`, `gpu.pso.recipe game hits/misses`, recetas de variantes .mv.
-- AVP: `VP_PIPELINE_CACHE_DIR=<Data>/vpcache`; `AVPPipelineCache` (AVPPrepare.swift): `warm.stamp` = sha VPVulkan +
-  lista + versión SO + archive on; con caché completa se salta el prewarm y el juego (`KL_VK_FOZ_GAME_REPLAY=0`);
-  2 sesiones con `archive.inflight` → `archive.off`; misses >25 % → se descarta el stamp (`last.key`).
-  `pipelines.foz` stamp por SHA-256 de `alyx.recipe`. `kl_fossilize.cpp`: espera del driver, rc 1 = no persistido.
-  `kl_image.c`/`kl_dl.c`: ms por librería. Compositor: errores de cmdbuf en `alive`, `[cp] eye probe` (RGBA de los ojos).
-- Todo VPKEngine no-Metal compila y pasa tests en Linux; Metal/Swift solo revisados (Sonnet ×3).
-
-## Build 14 (sin validar): OOM de la 13 + cuelgue GPU sin resolver + pantalla de carga
-- Logs_Alyx_8 (build 13): jetsam (footprint 8,1 GB) al abrir 9 `.metalar` + prewarm de 4505 pipelines en el
-  vkCreateDevice del juego (0017). Cuelgue GPU sigue (f=465, encoder índice 5 de 24, igual que build 12 f=247).
-  Alyx NO hace draws indirectos (sin `vk.indirect`): la hipótesis de 0015 era falsa (0015 se queda, inocuo).
-- VPKEngine `0018`: informe de cuelgue por encoder (`gpu.hang.enc`: tiempos, waits/updaters, pipelines; `gpu.hang.stuck`,
-  MSL en `vpcache/hang/<id>.metal`); culpa solo Faulted/Affected o "started_no_end"/>500 ms/1.º sin muestras con draws;
-  cuarentena: sesión inmediata, a `quarantine.txt` al 2.º cuelgue de la misma clave (1.º → `suspects.txt`);
-  stubs sin compilar; cola nueva tras Hang (gen actual, no InnocentVictim); guarda de fences huérfanas;
-  traductor v2: OpKill = discard + return, presupuesto de bucles por función (`vp_budget` 65536).
-- VPKEngine `0019`: apertura de archives con presupuesto medido (768 MB, suelo 5 GB libres), juego lazy con archives
-  (sin prewarm en vkCreateDevice ni en vkCreatePipelineCache), prewarm acotado sin ellos, RecipeStore ligero, `gpu.mem`.
-- AVP: pantalla de carga en el espacio inmersivo (arte de Steam en caché + "Cargando… N s · fase", fundido al 1.er
-  frame), Ajustes › Diagnóstico › restablecer cuarentena (borra quarantine.txt + suspects.txt), resumen en app.txt de
-  cuelgues/cuarentena de la sesión anterior. Parches 0001-0010: quitados trailers con noreply.
-- Linux: ctest 149/149, vpvk_tests y vpgpu_core_tests OK. Metal/Swift revisados (Sonnet).
-
-## Build 15 (sin validar): el precompilado de la 14 no terminaba
-- Logs_Alyx_9 (build 14): replay del prewarm OK (13,7 s) pero `vpvk_device_wait_compiles` seguía >2 min: traductor v2
-  → caché de shaders del SO fría (`gpu.shader.lib ms_total=1121750`) + guardado serie de `.metalar` (40 ficheros,
-  15 `cannot_pack`). Abrir `pipelines-4.metalar` (95 MB) costó +4,4 GB (`ratio=29.9`): el presupuesto de 0019 no lo
-  puede predecir.
-- AVP: archivos binarios Metal desactivados para siempre (`VP_PIPELINE_ARCHIVE=0`; se borran `*.metalar`,
-  `pipelines.count`, `archive.*`); `kl_fossilize.cpp` no espera al driver sin archives (prewarm = replay, rc 1, el juego
-  repite su replay: flujo de la build 12); `avp_config.c` `vpvk_config_set_prewarm(0)` (sin prewarm de recetas en
-  vkCreateDevice). Se mantienen 0018 (diagnóstico de cuelgue, cuarentena, traductor v2) y la pantalla de carga.
-
-## Build 16 (sin validar): imagen negra por cuelgues de GPU en pases de ojo
-- Logs_Alyx_10 (build 15): arranca; 18 `Caused_GPU_Hang`, 5748 `SubmissionsIgnored`, 16 `gpu.recover` (tope) → eye
-  probe `guest0 00000000` (nada dibujado), HUD ~34 fps. Todos los encoders señalados son pases de ojo 2784x2208x2;
-  los que tienen draws usan variantes `.mv`/`.mvfmt` (vectores de movimiento de VPKTAA). Los pases sin draws salen
-  "stuck" solo por no tener muestra de fin: la culpa por tiempos no es fiable.
-- VPKEngine `0020`: `vpgpu_metal2_gpu_hangs()`; tras el 1.er cuelgue `motionFrameSubmitted` apaga los vectores de
-  movimiento (`motionKilled`, `passTakesMotion` false, `vpvk_motion_get` 0) y escribe `vpcache/motion.off` (siguientes
-  arranques sin ellos); la culpa por tiempos ya no pone en cuarentena (solo Faulted/Affected de Metal).
-- AVP: limpieza única de quarantine.txt/suspects.txt (`quarantine.v2`), log de `motion.off` en app.txt, el botón de
-  Ajustes › Diagnóstico también borra `motion.off`.
+## Build 17 (sin validar): causa de los cuelgues de GPU + crash
+- Logs_Alyx_11 (build 16): los cuelgues siguen tras `vk.motion disabled` (y el 1.º, f=462, fue con 0 draws de movimiento):
+  los vectores de movimiento son inocentes. Todo encoder "stuck" es un pase de ojo 2784x2208x2 con depth
+  Depth32Float_Stencil8; el censo da `depth[... resolve 0x1] stencil[... resolve 0x1]` con imágenes 1x (vr_msaa 0, ninguna
+  `vk.msaa forced`): Source 2 "resuelve" su depth 1x a otra imagen y VPVulkan lo traducía a
+  `StoreAndMultisampleResolve` sobre una textura 1x (UB en Metal → cuelgue; el compositor/TAA que lee ese depth daba
+  PageFault). Crash: la cola del compositor quedó `SubmissionsIgnored` tras 2 PageFault (201 composites fallidos) →
+  CompositorServices sin frames → visionOS cierra la app (sin crash log propio).
+- VPKEngine `0021`: `resolveAsCopy` (fuente 1x o forzada) → Store + copia `vk.forced_resolve` tras la instancia de pase
+  (no tras un chunk SUSPENDING), también en render passes y `vkCmdResolveImage`; `resolveCopyUsable` (formato/muestras;
+  `vk.resolve as_copy|dropped`); metal2 rechaza cualquier resolve desde 1x (`what=resolve_refused`, debe salir 0);
+  `gpu.hang.enc ... resolve=`. Cazador de cuelgues (`VP_HANG_HUNT=0` lo apaga): tras un cuelgue, paso 0 salta TODOS
+  los pipelines del frame colgado (si sigue colgando → `gpu.hunt verdict=not_a_pipeline`), luego bisección (cuelgue =
+  culpable en la otra mitad; 12 frames limpios con saltos = en la mitad saltada) → `gpu.hunt culprit` a quarantine.txt y
+  su MSL en el log (`gpu.hunt.msl`). Cuarentena ya no culpa a encoders "affected" (víctimas). Tope de colas 64.
+  Movimiento ya no se apaga en un cuelgue (`VPVK_MOTION_OFF_ON_HANG=1` para volver a ello). Test `resolve_1x`.
+- AVP: `KleptonCompositor` y `KleptonTAA` cambian de cola tras un error propio (no víctima) (`[cp]/[taa] queue
+  replaced`); limpieza única `quarantine.v3` (quarantine/suspects/motion.off); app.txt resume cuelgues y veredictos
+  `gpu.hunt`/`resolve_refused` de la sesión anterior.
+- Linux: ctest 149/149, vpvk_tests OK (incl. `resolve_1x`). Metal/Swift revisados (Sonnet).
 
 ## Siguiente
-- Log build 16: ¿cesan los cuelgues tras `vk.motion disabled after GPU hang`? Si sí: causa = variantes de movimiento
-  (revisar MSL `.mv` en vpcache/hang/ y el attachment RG16F). Si no: los cuelgues son de otra cosa en los pases de ojo.
-  Rendimiento (34 fps) cuando haya imagen.
+- Log build 17: ¿0 `Caused_GPU_Hang`? Buscar `vk.resolve as_copy`, `resolve_refused` (=0), `gpu.hunt` (si hubo
+  cuelgues: veredicto/culpable + `gpu.hunt.msl`), `[cp] queue replaced`. Con imagen: rendimiento (34 fps en B15).
+- Optimización posible: la copia del depth 1x (≈60 MB/frame) podría evitarse aliasando el destino con la fuente.
 
 ## Pendiente
 - Ajustes en vivo que faltan: resolución/texturas (convars del juego), anisotrópico (solo afecta a samplers nuevos);

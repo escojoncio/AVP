@@ -93,7 +93,12 @@ final class KleptonTAA {
         let out: [MTLTexture]         // per eye, 2D array slice 0, rgba8 sRGB
         let flipY: [Bool]
     }
-    private let queue: MTLCommandQueue?
+    private var queue: MTLCommandQueue?
+    // Same recovery as the compositor's: a VPKTAA command buffer that faulted leaves its queue refused.
+    private var queueRefused = false          // under lock
+    private var queueRebuilds = 0
+    private var retiredQueues: [MTLCommandQueue] = []
+    private var cbErrors = 0                  // under lock
     private let lock = NSLock()
     private var slots: [[MTLTexture]] = []      // slots[k][eye]
     private var slotSize = (0, 0)
@@ -283,6 +288,16 @@ final class KleptonTAA {
                 sources: (Int) -> [(MTLTexture, Int, Bool)]?) {
         guard queue != nil, newest.serial != 0 else { return }
         lock.lock()
+        if queueRefused && !inflight {
+            queueRefused = false
+            if queueRebuilds < 32, let q = device.makeCommandQueue() {
+                queueRebuilds += 1
+                q.label = "VPKTAA.r\(queueRebuilds)"
+                if let old = queue { retiredQueues.append(old) }
+                queue = q
+                NSLog("[taa] queue replaced after a GPU error on the old one (n=\(queueRebuilds))")
+            }
+        }
         if inflight {
             let age = Date().timeIntervalSince(inflightSince)
             lock.unlock()
@@ -388,6 +403,12 @@ final class KleptonTAA {
             guard let self else { return }
             self.lock.lock()
             if okFinal && cb.status == .completed && gen == self.generation { self.published = pub }
+            if let e = cb.error {
+                let d = (e as NSError).localizedDescription
+                if !d.contains("InnocentVictim") && !d.contains("victim of GPU") { self.queueRefused = true }
+                self.cbErrors += 1
+                if self.cbErrors <= 8 { NSLog("[taa] command buffer error #\(self.cbErrors): \(d)") }
+            }
             let ms = max(0, cb.gpuEndTime - cb.gpuStartTime) * 1000
             self.gpuMsSum += ms; self.gpuMsN += 1; self.gpuMsMax = max(self.gpuMsMax, ms)
             self.inflight = false
