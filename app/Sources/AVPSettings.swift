@@ -402,6 +402,6 @@ end, nil)
         c.metalfx = Int32(upscaling.rawValue)
         c.texture_cap = Int32(textureCap)
         let fwd = avp_gfx_config_apply(&c)
-        AVPLog.log("Gráficos: ajustes enviados a VPEngine: \(fwd == 1 ? "sí" : "no (driver no cargado)")")
+        AVPLog.log("Gráficos: ajustes enviados a VPKEngine: \(fwd == 1 ? "sí" : "no (driver no cargado)")")
     }
 }

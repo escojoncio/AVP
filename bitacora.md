@@ -76,6 +76,19 @@ Cambios B7:
   reset al cambiar de mapa. `KleptonTAA.makeInput` toma `kl_vrr_map_for` (log `[taa] eye N is foveated`).
 Riesgos a mirar en el log: sombras en cascada si son layered (se foveaarían), MV de VPEngine en layout físico o no.
 
+## Build 8 — logs B7
+- MoltenVK B7: foveado `soft` OK (físico 67 %), GPU 30→24 ms, ~40 fps sin fijar: `pace_plan` usaba 90 Hz (KL_DISPLAY_HZ
+  forzado) → sin fallback. Usuario: ojo izquierdo mal con foveado (sin diagnosticar; log de capas añadido).
+- VPKEngine (antes VPEngine) B7: "No se ha podido inicializar Vulkan" antes de vkCreateInstance: VPVulkan no anuncia
+  WSI (`instanceExtensions()` sin VK_KHR_surface; device sin VK_KHR_swapchain) y Source 2 lo exige.
+Cambios B8:
+- `kl_vulkan.c`: `g_own_wsi` (vk_init: driver sin VK_KHR_surface) → `kl_vk_native_wsi=0`; anuncia VK_KHR_surface +
+  VK_EXT_headless_surface (instancia) y VK_KHR_swapchain (device); xlib/xcb/wayland/headless → superficie sintética
+  (`klvk_CreateAnyLinuxSurface`); ramas native WSI de `ours()` con `&& !g_own_wsi`. CreateInstance/CreateDevice ya
+  descartan lo que el driver no tiene.
+- `kl_app.c` `kl_guest_display_rate()` (tasa medida) → `pace_plan` en `klvr_platform_klepton.c` (redondeada).
+- `kl_gpu_time.m`: log `[vrr] foveated map (...) N layer(s)`. Textos visibles VPEngine → VPKEngine.
+
 ## Siguiente
 Logs B7: (1) MoltenVK: `[guest] pacing`, `pace governor`, `[vrr] foveated map`, `[gputime]`; (2) VPEngine:
 `klepton-boot-vpengine.log` + crash; `vk.feature`, `vk.err`, `vk.unimpl`, `[taa]`, `[vrr] foveating 1x`.
