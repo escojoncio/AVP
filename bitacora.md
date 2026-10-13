@@ -76,7 +76,7 @@ Cambios B7:
   reset al cambiar de mapa. `KleptonTAA.makeInput` toma `kl_vrr_map_for` (log `[taa] eye N is foveated`).
 Riesgos a mirar en el log: sombras en cascada si son layered (se foveaarían), MV de VPEngine en layout físico o no.
 
-## Build 8 — logs B7
+## Build 8 (`559ff52`, CI OK) — logs B7
 - MoltenVK B7: foveado `soft` OK (físico 67 %), GPU 30→24 ms, ~40 fps sin fijar: `pace_plan` usaba 90 Hz (KL_DISPLAY_HZ
   forzado) → sin fallback. Usuario: ojo izquierdo mal con foveado (sin diagnosticar; log de capas añadido).
 - VPKEngine (antes VPEngine) B7: "No se ha podido inicializar Vulkan" antes de vkCreateInstance: VPVulkan no anuncia
