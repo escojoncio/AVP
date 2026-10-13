@@ -1,0 +1,157 @@
+From 8fdd16c737c2813b9f0c4a6f46ec6b79a5d84729 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 18:42:21 +0000
+Subject: [PATCH] VPVulkan: motion vectors off after the first GPU hang
+ (persisted as motion.off), timestamp-only hang blame no longer quarantines
+
+---
+ gpu/metal2/src/metal_backend.mm | 10 ++++++++++
+ gpu/vulkan/src/commands.cpp     |  2 +-
+ gpu/vulkan/src/motion.cpp       | 33 +++++++++++++++++++++++++++++++--
+ gpu/vulkan/src/vpvk.h           |  1 +
+ 4 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 6e5a6df..df22c4e 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -62,6 +62,8 @@ constexpr MTLResourceOptions kSharedUntracked = MTLResourceStorageModeShared | M
+ constexpr uint64_t kArgRingBytes = 1 << 20;   // per frame slot
+ constexpr uint64_t kArgAlign = 256;           // safe offset alignment for buffer bindings on every GPU
+ constexpr NSUInteger kMaxSamples = 2048;      // timestamp samples per frame slot (2 per sub-encoder)
++// GPU hangs this process caused (not victims, not ignored submissions): read by VPVulkan (motion kill switch).
++std::atomic<uint32_t> gGpuHangs{0};
+ // Indirect draws whose arguments the GPU writes (Draw::indirect): rewritten per frame slot by the
+ // fix-up kernel into Metal's layout. 16-byte diagnostic header, then 20 (indexed) or 16 bytes per
+ // draw: 1 MiB holds ~52k draws a frame.
+@@ -2615,6 +2617,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       // The queue that ran a hung command buffer keeps refusing work ("Ignored (for causing prior/
+       // excessive GPU errors)"): replace it after the hang itself, not only after the first refusal.
+       // A victim of someone else's hang (the compositor's) leaves our queue usable.
++      if (hang && !ignored && !victim) gGpuHangs.fetch_add(1);
+       if ((ignored || hang || finished.error.code == MTLCommandBufferErrorAccessRevoked) && !victim &&
+           gen == impl->queueGen.load())
+         impl->queueRefused = true;
+@@ -2707,6 +2710,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         uint32_t named = 0;
+         for (size_t e = 0; e < n; ++e) {
+           if (why[e].empty() || e == hintOnly) continue;
++          // Timestamps alone are not proof (build 15: passes with no draws report no end sample and read as
++          // stuck): reported above, quarantined only on Metal's own faulted/affected verdict.
++          if (why[e].rfind("time_", 0) == 0) continue;
+           const EncDiag& g = (*diag)[e];
+           std::vector<std::pair<uint64_t, size_t>> blame;  // key, encoder
+           for (uint64_t k : g.keys) blame.push_back({k, e});
+@@ -3574,3 +3580,7 @@ bool MetalBackend::saveArchive() {
+ }
+ 
+ }  // namespace vpgpu::metal2
++
++extern "C" __attribute__((visibility("default"))) uint32_t vpgpu_metal2_gpu_hangs(void) {
++  return vpgpu::metal2::gGpuHangs.load();
++}
+diff --git a/gpu/vulkan/src/commands.cpp b/gpu/vulkan/src/commands.cpp
+index ce54ee5..37149c6 100644
+--- a/gpu/vulkan/src/commands.cpp
++++ b/gpu/vulkan/src/commands.cpp
+@@ -215,7 +215,7 @@ struct Translator {
+   // (otherwise the pass is left as the game made it: adding an attachment some pipeline does not
+   // declare would make that draw invalid).
+   bool passTakesMotion(const Recorder& rec, const Op* at) const {
+-    if (!device || !device->motion) return false;
++    if (!device || !device->motion || motionKilled()) return false;
+     int slot = -2;
+     for (const Op* o = at + 1; o < rec.ops.data() + rec.ops.size(); ++o) {
+       if (std::holds_alternative<OpEndPass>(*o) || std::holds_alternative<OpNextSubpass>(*o)) break;
+diff --git a/gpu/vulkan/src/motion.cpp b/gpu/vulkan/src/motion.cpp
+index 572bd0a..ced5cfc 100644
+--- a/gpu/vulkan/src/motion.cpp
++++ b/gpu/vulkan/src/motion.cpp
+@@ -17,9 +17,14 @@
+ #include <atomic>
+ #include <cstdlib>
+ #include <cstring>
++#include <cstdio>
+ #include <mutex>
++#include <string>
+ #include <unordered_map>
+ 
++// metal2 backend (same binary); weak: absent with the null backend (Linux tests).
++extern "C" __attribute__((weak)) uint32_t vpgpu_metal2_gpu_hangs(void);
++
+ #include "commands.h"
+ #include "vpvk.h"
+ #include "vpvk/motion.h"
+@@ -31,8 +36,20 @@ constexpr int kRing = 4;
+ constexpr float kInvalid = 60000.0f;
+ }  // namespace
+ 
++// Killed after a GPU hang (this session) or by <VP_PIPELINE_CACHE_DIR>/motion.off (an earlier session's hang).
++std::atomic<bool> gMotionKilled{false};
++bool motionKilled() { return gMotionKilled.load(std::memory_order_relaxed); }
++static bool motionOffFile() {
++  const char* dir = std::getenv("VP_PIPELINE_CACHE_DIR");
++  if (!dir || !*dir) return false;
++  const std::string p = std::string(dir) + "/motion.off";
++  if (FILE* f = std::fopen(p.c_str(), "r")) { std::fclose(f); return true; }
++  return false;
++}
++
+ bool motionVectorsEnabled() {
+   if (const char* e = std::getenv("VPVK_MOTION"); e && (*e == '0' || *e == '1')) return *e == '1';
++  if (motionOffFile()) return false;
+   const int on = gMotionOn.load();
+   return on >= 0 ? on == 1 : vpktaaEnabled();
+ }
+@@ -243,6 +260,18 @@ bool motionDraw(Device* d, OpDraw& op, int slot) {
+ 
+ void motionFrameSubmitted(Device* d, uint64_t frame) {
+   if (!d || !d->motion) return;
++  // Every GPU hang so far happened in frames with the eye passes' motion target (builds 12-15): the first one
++  // turns motion vectors off for good (motion.off), so the passes run exactly as the game made them.
++  if (!gMotionKilled.load(std::memory_order_relaxed) && vpgpu_metal2_gpu_hangs && vpgpu_metal2_gpu_hangs() > 0) {
++    gMotionKilled.store(true);
++    if (const char* dir = std::getenv("VP_PIPELINE_CACHE_DIR"); dir && *dir)
++      if (FILE* f = std::fopen((std::string(dir) + "/motion.off").c_str(), "w")) {
++        std::fprintf(f, "GPU hang at frame %llu\n", (unsigned long long)frame);
++        std::fclose(f);
++      }
++    logf("vk.motion disabled after GPU hang (hangs=%u frame=%llu): eye passes without the motion target from now on",
++         vpgpu_metal2_gpu_hangs(), (unsigned long long)frame);
++  }
+   MotionState& m = *d->motion;
+   std::lock_guard<std::mutex> lock(m.m);
+   if (m.cur >= 0 && m.clearedThisFrame) m.ring[m.cur].frame = frame;
+@@ -271,7 +300,7 @@ extern "C" __attribute__((visibility("default"))) void vpvk_config_set_motion_ve
+ extern "C" __attribute__((visibility("default"))) uint64_t vpvk_motion_recording_serial(void) {
+   std::lock_guard<std::mutex> l(gDevMutex);
+   vpvk::Device* d = gDevice;
+-  if (!d || !d->motion) return 0;
++  if (!d || !d->motion || vpvk::motionKilled()) return 0;
+   std::lock_guard<std::mutex> lock(d->motion->m);
+   return d->motion->serial;
+ }
+@@ -280,7 +309,7 @@ extern "C" __attribute__((visibility("default"))) int vpvk_motion_get(uint64_t s
+   if (!out) return 0;
+   std::lock_guard<std::mutex> l(gDevMutex);
+   vpvk::Device* d = gDevice;
+-  if (!d || !d->motion) return 0;
++  if (!d || !d->motion || vpvk::motionKilled()) return 0;
+   vpvk::MotionState& m = *d->motion;
+   std::lock_guard<std::mutex> lock(m.m);
+   const vpvk::MotionState::Target* best = nullptr;
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index 3a31c07..2898671 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -355,6 +355,7 @@ int motionPassBegin(Device*, vpgpu::RenderPassDesc&, uint64_t lastSubmitted);
+ struct OpDraw;
+ bool motionDraw(Device*, OpDraw&, int slot);
+ void motionFrameSubmitted(Device*, uint64_t frame);
++bool motionKilled();  // motion vectors turned off after a GPU hang
+ 
+ // VkResolveModeFlagBits of a depth resolve -> the core's filter (min/max; anything else sample 0).
+ inline vpgpu::Attachment::DepthResolve depthResolveOf(VkResolveModeFlagBits m) {
+-- 
+2.43.0
+
