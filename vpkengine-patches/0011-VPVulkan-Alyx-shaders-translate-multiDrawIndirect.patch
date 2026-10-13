@@ -1,0 +1,351 @@
+From c957ee72752bb9934ef5a452348ffd92ee5ed4a9 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 11:31:20 +0000
+Subject: [PATCH] VPVulkan: Alyx shaders translate (OpCompositeInsert operand
+ order, MS subpass sample, dual-source blending, struct-returning GLSL ops),
+ multiDrawIndirect, VPVK_DUMP_DIR
+
+---
+ gpu/core/include/vpgpu/core/pipeline_cache.h |  3 +-
+ gpu/metal/src/metal_backend.mm               |  5 +-
+ gpu/metal2/src/metal_backend.mm              |  5 +-
+ gpu/shader/ir/include/vpir/ir.h              |  1 +
+ gpu/shader/ir/src/print.cpp                  |  1 +
+ gpu/shader/ir/src/verify.cpp                 |  4 +-
+ gpu/shader/msl/include/vpmsl/msl.h           |  1 +
+ gpu/shader/msl/src/msl.cpp                   |  7 ++-
+ gpu/shader/spirv/src/lower.cpp               | 24 +++++++--
+ gpu/vulkan/src/entry.cpp                     |  2 +
+ gpu/vulkan/src/physical_device.cpp           |  2 +-
+ gpu/vulkan/src/pipelines.cpp                 | 51 +++++++++++++++++++-
+ 12 files changed, 93 insertions(+), 13 deletions(-)
+
+diff --git a/gpu/core/include/vpgpu/core/pipeline_cache.h b/gpu/core/include/vpgpu/core/pipeline_cache.h
+index 90cbdaf..491a9d2 100644
+--- a/gpu/core/include/vpgpu/core/pipeline_cache.h
++++ b/gpu/core/include/vpgpu/core/pipeline_cache.h
+@@ -21,7 +21,8 @@ class Backend;
+ 
+ enum class BlendFactor : uint8_t { Zero, One, SrcColor, OneMinusSrcColor, SrcAlpha, OneMinusSrcAlpha,
+                                    DstColor, OneMinusDstColor, DstAlpha, OneMinusDstAlpha, Constant,
+-                                   OneMinusConstant };
++                                   OneMinusConstant, Src1Color, OneMinusSrc1Color, Src1Alpha, OneMinusSrc1Alpha,
++                                   SrcAlphaSaturate };
+ enum class BlendOp : uint8_t { Add, Subtract, ReverseSubtract, Min, Max };
+ enum class CullMode : uint8_t { None, Front, Back };
+ 
+diff --git a/gpu/metal/src/metal_backend.mm b/gpu/metal/src/metal_backend.mm
+index 785ac3f..164df40 100644
+--- a/gpu/metal/src/metal_backend.mm
++++ b/gpu/metal/src/metal_backend.mm
+@@ -146,7 +146,10 @@ MTLBlendFactor blendFactor(BlendFactor f) {
+       MTLBlendFactorZero, MTLBlendFactorOne, MTLBlendFactorSourceColor, MTLBlendFactorOneMinusSourceColor,
+       MTLBlendFactorSourceAlpha, MTLBlendFactorOneMinusSourceAlpha, MTLBlendFactorDestinationColor,
+       MTLBlendFactorOneMinusDestinationColor, MTLBlendFactorDestinationAlpha,
+-      MTLBlendFactorOneMinusDestinationAlpha, MTLBlendFactorBlendColor, MTLBlendFactorOneMinusBlendColor};
++      MTLBlendFactorOneMinusDestinationAlpha, MTLBlendFactorBlendColor, MTLBlendFactorOneMinusBlendColor,
++      MTLBlendFactorSource1Color, MTLBlendFactorOneMinusSource1Color, MTLBlendFactorSource1Alpha,
++      MTLBlendFactorOneMinusSource1Alpha, MTLBlendFactorSourceAlphaSaturated};
++  static_assert(sizeof map / sizeof *map == size_t(BlendFactor::SrcAlphaSaturate) + 1);
+   return map[static_cast<int>(f)];
+ }
+ 
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 3423b1a..eab51ba 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -159,7 +159,10 @@ MTLBlendFactor blendFactor(BlendFactor f) {
+       MTLBlendFactorZero, MTLBlendFactorOne, MTLBlendFactorSourceColor, MTLBlendFactorOneMinusSourceColor,
+       MTLBlendFactorSourceAlpha, MTLBlendFactorOneMinusSourceAlpha, MTLBlendFactorDestinationColor,
+       MTLBlendFactorOneMinusDestinationColor, MTLBlendFactorDestinationAlpha,
+-      MTLBlendFactorOneMinusDestinationAlpha, MTLBlendFactorBlendColor, MTLBlendFactorOneMinusBlendColor};
++      MTLBlendFactorOneMinusDestinationAlpha, MTLBlendFactorBlendColor, MTLBlendFactorOneMinusBlendColor,
++      MTLBlendFactorSource1Color, MTLBlendFactorOneMinusSource1Color, MTLBlendFactorSource1Alpha,
++      MTLBlendFactorOneMinusSource1Alpha, MTLBlendFactorSourceAlphaSaturated};
++  static_assert(sizeof map / sizeof *map == size_t(BlendFactor::SrcAlphaSaturate) + 1);
+   return map[static_cast<int>(f)];
+ }
+ 
+diff --git a/gpu/shader/ir/include/vpir/ir.h b/gpu/shader/ir/include/vpir/ir.h
+index d38836b..bb6a635 100644
+--- a/gpu/shader/ir/include/vpir/ir.h
++++ b/gpu/shader/ir/include/vpir/ir.h
+@@ -82,6 +82,7 @@ struct IoVar {
+     Type type;
+     Builtin builtin = Builtin::None;
+     uint32_t location = 0;
++    uint32_t blendIndex = 0;                // fragment outputs: 1 = the second source of dual-source blending
+     Interp interp = Interp::Perspective;   // fragment inputs, vertex/mesh outputs
+     Sampling sampling = Sampling::Center;
+     bool perPrimitive = false;              // mesh outputs only
+diff --git a/gpu/shader/ir/src/print.cpp b/gpu/shader/ir/src/print.cpp
+index 57a5e98..e2dcc19 100644
+--- a/gpu/shader/ir/src/print.cpp
++++ b/gpu/shader/ir/src/print.cpp
+@@ -53,6 +53,7 @@ private:
+             s += std::string(" builtin(") + toString(v.builtin) + ")";
+         } else {
+             s += " location(" + std::to_string(v.location) + ")";
++            if (v.blendIndex) s += " index(1)";
+             if (v.interp != Interp::Perspective) s += std::string(" ") + toString(v.interp);
+             if (v.sampling != Sampling::Center) s += std::string(" ") + toString(v.sampling);
+         }
+diff --git a/gpu/shader/ir/src/verify.cpp b/gpu/shader/ir/src/verify.cpp
+index 34bd830..85cd36b 100644
+--- a/gpu/shader/ir/src/verify.cpp
++++ b/gpu/shader/ir/src/verify.cpp
+@@ -72,7 +72,9 @@ private:
+         if (m_.stage == Stage::Compute || m_.stage == Stage::Object || (input && m_.stage == Stage::Mesh))
+             error(dir, v.name, ": this stage only has builtin ", input ? "inputs" : "outputs");
+         if (v.type.isBool()) error(dir, v.name, ": bool cannot cross a stage boundary");
+-        if (!locs.insert(v.location).second) error(dir, v.name, ": duplicate location");
++        if (v.blendIndex > 1 || (v.blendIndex && (input || m_.stage != Stage::Fragment || v.location != 0)))
++            error(dir, v.name, ": blend index 1 is only for fragment output location 0 (dual-source blending)");
++        if (!locs.insert(v.location * 2 + v.blendIndex).second) error(dir, v.name, ": duplicate location");
+         bool interpolated = (input && m_.stage == Stage::Fragment) || (!input && m_.stage != Stage::Fragment);
+         if (v.interp != Interp::Flat && interpolated && !v.type.isFloat())
+             error(dir, v.name, ": integer varyings must be flat");
+diff --git a/gpu/shader/msl/include/vpmsl/msl.h b/gpu/shader/msl/include/vpmsl/msl.h
+index 97262fd..92a91c2 100644
+--- a/gpu/shader/msl/include/vpmsl/msl.h
++++ b/gpu/shader/msl/include/vpmsl/msl.h
+@@ -58,6 +58,7 @@ struct MslShader {
+     // Attachments outside the mask must keep their contents (write mask none): a fetch-only
+     // G-buffer attachment stays intact under the lighting pipeline.
+     uint8_t colorOutputs = 0;
++    bool dualSource = false;  // writes [[color(0), index(1)]] (dual-source blending)
+ };
+ 
+ struct EmitResult {
+diff --git a/gpu/shader/msl/src/msl.cpp b/gpu/shader/msl/src/msl.cpp
+index e52565e..a867fc0 100644
+--- a/gpu/shader/msl/src/msl.cpp
++++ b/gpu/shader/msl/src/msl.cpp
+@@ -171,8 +171,10 @@ public:
+         entry();
+         sh.source = std::move(out_);
+         if (m_.stage == Stage::Fragment)
+-            for (const IoVar& v : m_.outputs)
++            for (const IoVar& v : m_.outputs) {
+                 if (v.builtin == Builtin::None && v.location < 8) sh.colorOutputs |= uint8_t(1u << v.location);
++                if (v.builtin == Builtin::None && v.blendIndex) sh.dualSource = true;
++            }
+         return sh;
+     }
+ 
+@@ -269,7 +271,8 @@ private:
+             std::string attr;
+             if (v.builtin == Builtin::PointSize && m_.stage == Stage::Vertex) attr = "VP_PSZ";
+             else if (v.builtin != Builtin::None) attr = builtinAttr(v.builtin);
+-            else if (m_.stage == Stage::Fragment) attr = "color(" + std::to_string(v.location) + ")";
++            else if (m_.stage == Stage::Fragment)
++                attr = "color(" + std::to_string(v.location) + ")" + (v.blendIndex ? ", index(1)" : "");
+             else attr = "user(loc" + std::to_string(v.location) + ")";
+             std::string member = "    " + typeName(v.type) + " " + ident(v.name) + " [[" + attr + "]];\n";
+             if (isFragDepth(v)) member = "#ifndef VP_NO_FDEPTH\n" + member + "#endif\n";
+diff --git a/gpu/shader/spirv/src/lower.cpp b/gpu/shader/spirv/src/lower.cpp
+index 8c3cd20..92e34e1 100644
+--- a/gpu/shader/spirv/src/lower.cpp
++++ b/gpu/shader/spirv/src/lower.cpp
+@@ -190,6 +190,7 @@ private:
+         if (it == m_.resultType.end()) fail("no type for %" + std::to_string(id));
+         return it->second;
+     }
++    uint32_t curOp_ = 0;   // the SPIR-V opcode being lowered (error messages)
+     Scalar scalarOf(uint32_t typeId) const {
+         const TypeInfo& t = T(typeId);
+         switch (t.kind) {
+@@ -201,7 +202,7 @@ private:
+                 if (t.width == 16) return Scalar::F16;
+                 if (t.width != 32) fail(std::to_string(t.width) + "-bit floats are not supported");
+                 return Scalar::F32;
+-            default: fail("not a scalar type");
++            default: fail("not a scalar type: %" + std::to_string(typeId) + " kind " + std::to_string(int(t.kind)) + (curOp_ ? " in op " + std::to_string(curOp_) : std::string()));
+         }
+     }
+     bool isLeaf(uint32_t typeId) const {
+@@ -1232,6 +1233,9 @@ private:
+                         if (v.location > 7) fail("fragment output location > 7");
+                         iface_.colorOutputs |= uint8_t(1u << v.location);
+                         v.name = "color" + std::to_string(v.location);
++                        // Dual-source blending: Location 0 Index 1 is the second source of colour 0.
++                        uint32_t bi = d && d->has(Deco::Index) ? d->get(Deco::Index) : vd ? vd->get(Deco::Index, 0) : 0;
++                        if (bi) v.blendIndex = 1, v.name += "_src1";
+                     }
+                     if (input) leaf.index = addInput(v);
+                     else leaf.index = addOutput(v);
+@@ -1987,6 +1991,7 @@ private:
+     }
+ 
+     Val value(const Instr& in) {
++        curOp_ = uint32_t(in.op);
+         const uint16_t op = in.op;
+         const uint32_t rtId = w(in, 1);
+         auto one = [](ValueId v) { return Val{{v}}; };
+@@ -2374,8 +2379,10 @@ private:
+         return r;
+     }
+     Val compositeInsert(const Instr& in) {
+-        Val obj = get(w(in, 3));
+-        Val comp = get(w(in, 4));
++        // OpCompositeInsert <type> <result> <Object> <Composite> <indexes...>: word 3 is the value
++        // inserted, word 4 the composite it goes into (`obj` is the composite being rebuilt here).
++        Val obj = get(w(in, 4));
++        Val comp = get(w(in, 3));
+         uint32_t ty = w(in, 1);
+         uint32_t base = 0;
+         for (uint32_t i = 5; i < in.count; ++i) {
+@@ -2532,6 +2539,12 @@ private:
+                 coord = vecOf({ext(coord, 0), ext(coord, 1), viewIndex()}, vpir::kU32.withWidth(3));
+             Inst f;
+             f.op = Op::ImageFetch, f.sym = uint32_t(h.texture), f.type = Type(r.elem, 4), f.args = {coord};
++            if (r.multisampled) {  // subpassLoad(subpassInputMS, sample): the Sample image operand (only one allowed)
++                ValueId smp = u32(0);
++                if (in.count > 6 && (w(in, 5) & ImgOp::Sample)) smp = castBits(get1(w(in, 6)), vpir::kU32);
++                f.args.push_back(smp);
++                f.image = vpir::kImageSample;
++            }
+             return texelResult(h, b_->emit(f), w(in, 1));
+         }
+         coord = intCoord(h, get1(w(in, 4)));
+@@ -2707,10 +2720,13 @@ private:
+         if (w(in, 3) != m_.glslExt) fail("unsupported extended instruction set");
+         uint32_t e = w(in, 4);
+         uint32_t rtId = w(in, 1), id = w(in, 2);
+-        Type t = vt(rtId);
++        // ModfStruct / FrexpStruct return a struct and MatrixInverse a matrix: those cases build their own
++        // result and never use `t` (a placeholder then).
++        Type t = isLeaf(rtId) ? vt(rtId) : vpir::kF32;
+         auto a = [&](uint32_t i) { return get1(w(in, 5 + i)); };
+         auto ai = [&](uint32_t i, Scalar s) { return castBits(a(i), Type(s, typeOfValue(a(i)).width)); };
+         auto res = [&](ValueId v) { define1(id, castBits(v, t)); };
++        if (!isLeaf(rtId) && (e == GLSL_ModfStruct || e == GLSL_FrexpStruct)) t = typeOfValue(a(0));
+         auto sv = [&](float f) { return splat(t, floatBits(f)); };
+         Type it(Scalar::I32, t.width), ut(Scalar::U32, t.width);
+         switch (e) {
+diff --git a/gpu/vulkan/src/entry.cpp b/gpu/vulkan/src/entry.cpp
+index 2994bb6..517bf3a 100644
+--- a/gpu/vulkan/src/entry.cpp
++++ b/gpu/vulkan/src/entry.cpp
+@@ -300,6 +300,8 @@ void vpvk::haveFeatures(VkPhysicalDeviceFeatures* f) {
+   f->imageCubeArray = VK_TRUE;
+   f->independentBlend = VK_TRUE;
+   f->sampleRateShading = VK_TRUE;
++  f->multiDrawIndirect = VK_TRUE;          // commands.cpp expands every draw of an indirect batch
++  f->drawIndirectFirstInstance = VK_TRUE;  // (firstInstance included) at submit
+   f->dualSrcBlend = VK_TRUE;
+   f->depthClamp = VK_TRUE;
+   f->depthBiasClamp = VK_TRUE;
+diff --git a/gpu/vulkan/src/physical_device.cpp b/gpu/vulkan/src/physical_device.cpp
+index a648d0d..61ed8ee 100644
+--- a/gpu/vulkan/src/physical_device.cpp
++++ b/gpu/vulkan/src/physical_device.cpp
+@@ -74,7 +74,7 @@ VkPhysicalDeviceProperties makeProps() {
+   l.subTexelPrecisionBits = 8;
+   l.mipmapPrecisionBits = 8;
+   l.maxDrawIndexedIndexValue = 0xFFFFFFFFu;
+-  l.maxDrawIndirectCount = 1;
++  l.maxDrawIndirectCount = 1u << 30;  // multiDrawIndirect: expanded at submit (commands.cpp)
+   l.maxSamplerLodBias = 15.99f;
+   l.maxSamplerAnisotropy = 16;
+   l.maxViewports = 1;
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index 5881ef8..c4eac43 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -7,6 +7,12 @@
+ // kind (Buffer, ConstantBuffer, Texture, Sampler, StorageTexture). Push constants take the next
+ // ConstantBuffer slot and vertex buffers the Buffer slots after the descriptors. Every stage of
+ // every pipeline made from the layout agrees on them.
++#include <cctype>
++#include <cstdio>
++#include <cstdlib>
++#include <map>
++
++#include "vpir/text.h"
+ #include <chrono>
+ #include <cstdio>
+ #include <algorithm>
+@@ -90,7 +96,11 @@ vpgpu::BlendFactor blendFactor(VkBlendFactor f) {
+     case VK_BLEND_FACTOR_CONSTANT_ALPHA: return B::Constant;
+     case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR:
+     case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA: return B::OneMinusConstant;
+-    case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE: return B::One;  // not in the core: closest
++    case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE: return B::SrcAlphaSaturate;
++    case VK_BLEND_FACTOR_SRC1_COLOR: return B::Src1Color;
++    case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR: return B::OneMinusSrc1Color;
++    case VK_BLEND_FACTOR_SRC1_ALPHA: return B::Src1Alpha;
++    case VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA: return B::OneMinusSrc1Alpha;
+     default: return B::One;
+   }
+ }
+@@ -199,7 +209,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateShaderModule(VkDevice dv, con
+   m->module = spirv::parse(ci->pCode, ci->codeSize / 4, m->error);
+   if (!m->module) logf("vk.err what=spirv_parse error=\"%s\"", m->error.c_str());
+   const Device* d = dv ? from<Device>(dv) : nullptr;
+-  if (m->module && d && d->recipes && d->recipes->enabled()) {
++  if (m->module && ((d && d->recipes && d->recipes->enabled()) || std::getenv("VPVK_DUMP_DIR"))) {
+     m->words.assign(ci->pCode, ci->pCode + ci->codeSize / 4);
+     m->hash = spirvHash(m->words.data(), m->words.size());
+   }
+@@ -559,6 +569,22 @@ TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerO
+   }
+   vpmsl::EmitResult e = vpmsl::emitMsl(mod);
+   if (!e.errors.empty()) {
++    if (const char* dd = std::getenv("VPVK_DUMP_DIR")) {  // harness: IR + SPIR-V of the first failures per message
++      static std::mutex dm; static std::map<std::string, std::pair<int, int>> per;  // message -> (id, count)
++      std::lock_guard<std::mutex> lk(dm);
++      auto ins = per.emplace(e.errors[0], std::make_pair(int(per.size()) + 1, 0));
++      int& n = ins.first->second.second;
++      if (n < 3) {
++        std::string base = std::string(dd) + "/f" + std::to_string(ins.first->second.first) + "_" + std::to_string(n);
++        if (FILE* f = std::fopen((base + ".txt").c_str(), "w")) {
++          for (auto& x : e.errors) std::fprintf(f, "// %s\n", x.c_str());
++          std::fprintf(f, "%s\n", vpir::print(mod).c_str());
++          std::fclose(f);
++        }
++        if (FILE* f = std::fopen((base + ".entry").c_str(), "w")) { std::fprintf(f, "%s %d\n", opt.entry.c_str(), int(opt.stage)); std::fclose(f); }
++      }
++      ++n;
++    }
+     errors = std::move(e.errors);
+     return TranslateFail::Msl;
+   }
+@@ -610,6 +636,13 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
+     case TranslateFail::Lower:
+       if (quiet) logf("vk.motion no_variant pipeline=%s stage=%s why=\"%s\"", label.c_str(), vpir::toString(opt.stage), errors[0].c_str());
+       else logf("vk.err what=shader pipeline=%s stage=%s error=\"%s\"", label.c_str(), vpir::toString(opt.stage), errors[0].c_str());
++      if (const char* dd = std::getenv("VPVK_DUMP_DIR"); dd && !quiet && !sm->words.empty()) {
++        std::string safe = label;
++        for (char& ch : safe) if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '.' && ch != '_' && ch != '-') ch = '_';
++        std::string base = std::string(dd) + "/lower_" + safe;
++        if (FILE* f = std::fopen((base + ".spv").c_str(), "wb")) { std::fwrite(sm->words.data(), 4, sm->words.size(), f); std::fclose(f); }
++        if (FILE* f = std::fopen((base + ".entry").c_str(), "w")) { std::fprintf(f, "%s %d\n", opt.entry.c_str(), int(opt.stage)); std::fclose(f); }
++      }
+       return o;
+     case TranslateFail::Msl: {
+       std::lock_guard<std::mutex> lock(gTranslateLog);
+@@ -843,6 +876,20 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
+       collectUsed(*p, o, vpgpu::stage::fragment);
+       // Outputs the shader does not write keep their contents (no blend, write mask none).
+       p->fragmentOutputs = o.msl.colorOutputs;
++      // Second-source factors need [[color(0), index(1)]] and only apply to attachment 0 (Metal rejects
++      // the pipeline otherwise): without them they fall back to the first source.
++      for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c) {
++        auto fix = [&](vpgpu::BlendFactor& f) {
++          using B = vpgpu::BlendFactor;
++          if (o.msl.dualSource && c == 0) return;
++          if (f == B::Src1Color) f = B::SrcColor;
++          else if (f == B::OneMinusSrc1Color) f = B::OneMinusSrcColor;
++          else if (f == B::Src1Alpha) f = B::SrcAlpha;
++          else if (f == B::OneMinusSrc1Alpha) f = B::OneMinusSrcAlpha;
++        };
++        vpgpu::BlendState& bs = st.blend[c];
++        fix(bs.srcColor), fix(bs.dstColor), fix(bs.srcAlpha), fix(bs.dstAlpha);
++      }
+       for (int c = 0; c < vpgpu::kMaxColorAttachments; ++c)
+         if (!(o.msl.colorOutputs & (1u << c))) st.blend[c].writeMask = 0;
+     }
+-- 
+2.43.0
+

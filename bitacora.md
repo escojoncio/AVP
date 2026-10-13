@@ -94,6 +94,25 @@ Cambios B8:
 - `kl_app.c` `kl_guest_display_rate()` (tasa medida) → `pace_plan` en `klvr_platform_klepton.c` (redondeada).
 - `kl_gpu_time.m`: log `[vrr] foveated map (...) N layer(s)`. Textos visibles VPKEngine → VPKEngine.
 
+## Build 9 — VPKEngine: shaders de Alyx al 100 % offline
+Log B8 (VPKEngine): instancia y device OK (WSI de B8 funciona); 125k `vk.err what=msl` + "Error in Init() of
+RenderDeviceMgr001". Diagnóstico offline, sin visor:
+- `scripts/shader-harness.sh <pipelines.foz>`: VPKEngine (ref + patches) en Linux con backend null + fossilize-replay
+  (556da9f, filtro de features desactivado con FZ_NOFILTER) → mismo camino SPIR-V→VPIR→MSL que el visor.
+  `VPVK_DUMP_DIR` vuelca IR/SPIR-V de los fallos. El .foz es del usuario (AVP/Cache): nunca al repo.
+- Resultado: 1218 módulos, 3030 graphics + 8 compute, 5760 traducciones, **0 errores** (antes 125k).
+`vpkengine-patches/0011` (VPVulkan):
+- `spirv/lower.cpp` compositeInsert: operandos invertidos (w3 = Object, w4 = Composite) → 117k errores.
+- subpassLoad MS: operando Sample (w6) o 0. GLSL ModfStruct/FrexpStruct/MatrixInverse sin `vt()` de struct.
+- Dual-source blending: `IoVar.blendIndex` (Decoration Index), verify (solo loc 0), MSL `[[color(0), index(1)]]`,
+  `MslShader.dualSource`; BlendFactor Src1*/SrcAlphaSaturate (core + metal + metal2, static_assert); si el FS no
+  tiene index(1) o attachment≠0, Src1→Src.
+- Features: multiDrawIndirect + drawIndirectFirstInstance (commands.cpp ya expande), maxDrawIndirectCount 1<<30.
+- ctest VPKEngine: 129/149, los mismos 20 fallos previos (goldens MSL desactualizados + gpu_spirv.subpass, ajenos).
+Hipótesis Init: fallaban pipelines de arranque por los shaders. Sin confirmar hasta el log B9. Pendiente si persiste:
+features que MoltenVK daba y VPVulkan no (tessellation, int16/64, largePoints, multiViewport, inheritedQueries).
+No validable offline: compilación Metal del MSL (sale en el log del visor).
+
 ## Siguiente
 Logs B7: (1) MoltenVK: `[guest] pacing`, `pace governor`, `[vrr] foveated map`, `[gputime]`; (2) VPKEngine:
 `klepton-boot-vpkengine.log` + crash; `vk.feature`, `vk.err`, `vk.unimpl`, `[taa]`, `[vrr] foveating 1x`.
