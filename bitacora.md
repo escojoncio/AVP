@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/`). MoltenVK
 queda como referencia de diagnóstico (no se usa para jugar ni se arregla nada en él). Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última OK en CI: build 16).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última OK en CI: build 20).
 
 ## 100 % funcional en el visor
 - Steam: login (contraseña + Steam Guard), propiedad (paquete 134870), descarga build 25487405 en background, Cloud.
@@ -111,10 +111,34 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   instancing de multiview/base instance, offsets de vertex buffers dinámicos, `0023` (invariant/clip). Rendimiento:
   foveado nativo en VPKEngine (rate map en todos los pases de ojo + compute), alias de la copia del depth.
 
+## Build 21 (sin validar): MSAA x4 de referencia + foveado M2 de P.T. + VPKTAA solo en la periferia (fase 1)
+- `AVPSettings`: el juego siempre a MSAA 4x (`gameMSAA`, `temporalTAA` = false: `VPVK_FORCE_1X=0`, `VPVK_MOTION=0`,
+  `KL_VPKTAA=0`, VPKEngine `vpktaa_enabled=0`, `force_single_sample=0`); foveado de Klepton reactivado con VPKEngine
+  (`foveationUsable = gameMSAA >= 4`: con MSAA todos los pases de ojo llevan el mapa, camino validado con MoltenVK).
+- Presets M2/M5 = foveado probado en PTVisionPro: `KL_VRR_MAP=wide` (`kl_gpu_time.m` `vrr_mode`/`vrr_rates_near`):
+  zona 100 % de 60° (tan 30 / span) alrededor del eje de mirada de cada ojo (tangente 0), centro 10° por debajo
+  (cy += 0,1763/span_y), rampa de 1 zona, zona = tasa de su punto más cercano (no corta el centro); periferia =
+  `KL_VRR_EDGE` = ajuste "Calidad de la periferia" 10-65 % (`presetPeriphery`, clave `avp.fovPeriphery2`, def. 10 %),
+  en vivo (`kl_vrr_set(2, -1, -1, edge)`; primer arg de `kl_vrr_set` = modo 0 centre/1 soft/2 wide). Log: `[vrr]
+  foveated map (wide) ... physical WxH (N% of the pixels)`.
+- VPKTAA periferia fase 1: `kl_reproject.c` `kl_eye_recon`/`kl_eye_sample_main` (en `kl_reproject_f` y `_depth_f`):
+  donde el ojo se magnifica (`mag` = texels/píxel por `fwidth`) por debajo de 0,75×`reconRef` (pleno a 0,45×;
+  `reconRef` = ancho de ojo / 3072, así el centro nunca entra): Catmull-Rom 9 taps acotado al 2x2 (sin ringing)
+  mezclado con bilineal según nitidez + suavizado a lo largo del borde (gradiente de luma 2x2). Uniformes nuevos
+  `recon_on/strength/sharp/ref` (C y MSL, al final del struct). `KleptonCompositor.reconOn/Strength/Sharp/Ref` (env
+  `KL_CP_RECON*`, refrescados en `writeConfig` y `applyLive`); HUD "VPKTAA periferia". Defaults VPKTAA 80 %,
+  nitidez 100 % (claves nuevas `avp.reconPercent/reconSharp`).
+- Riesgo conocido: los pipelines grabados en `klfz` desde la build 9 son de 1x; los de 4x pueden compilarse en frío en
+  la 1.ª partida (holds, `0025` los limita) y quedan grabados para la siguiente.
+- Revisión adversarial (Sonnet): sin bugs; aplicado su aviso (umbral relativo a la resolución del centro).
+
 ## Siguiente
-- Log build 18: imagen correcta? (`[cp] eye probe` no negro), fps (`[openvr] frames`), `[gputime] game avg` > 0,
-  `[vrr] foveating 1x`, `gpu.cfg frames_in_flight=12`, `vk.rendering suspend_resume`, `gpu.attachment view`, cero
-  `Caused_GPU_Hang` (si hay: `gpu.hunt`). Activar capturas (Ajustes › Diagnóstico) si la imagen sigue mal.
+- Log build 21: `[vrr] foveated map (wide)` (% de píxeles), `[vrr] foveated scene passes on`, `[cp] periphery
+  reconstruction active`, fps (`[openvr] frames`), `[gputime] game avg`, `gpu.hold`/`missing_pipelines`, cero
+  `Caused_GPU_Hang`; capturas PNG (`KL_CAPTURE`) y volcado del frame 6000: imagen correcta con MSAA + foveado.
+- Logs de la build 20 (si llegan): capturas sin foveado → si las "explosiones de vértices" siguen, no eran el foveado.
+- Fase 2 VPKTAA periferia: acumulación temporal solo en la periferia (jitter + movimiento de cámara por depth + pose,
+  profundidad linealizada z = 0.95 - 0.0375/d).
 
 ## Plan acordado (siguiente chat)
 - Imagen de referencia: MSAA x4 por defecto para Alyx (VPVK_FORCE_1X=0, vr_msaa 4); el hook KL_VRR foveaba bien
@@ -127,7 +151,7 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   rate map (estándar para juegos sin soporte del motor); quad views en VPKEngine (repetir el fotograma de ojo con
   proyección ampliada + objetivos propios) = investigación posterior.
 - Decisión del usuario: el juego se renderiza tal cual con MSAA; el foveado (rate map) baja la periferia; VPKTAA se
-  aplica a la periferia foveada (suavizar los bloques): fase 1 filtro espacial de reconstrucción en el unwarp del
+  aplica a la periferia foveada (suavizar los bloques): fase 1 (hecha, build 21) filtro espacial de reconstrucción en el unwarp del
   compositor (bicúbico/adaptativo a bordes, sin vectores); fase 2 acumulación temporal solo en periferia con jitter +
   movimiento de cámara (depth + pose). El centro se controla con la resolución del launcher (ya existe).
 - Foveado nativo de VPKEngine: rate map en TODOS los pases de ojo (también solo-color y compute que escriben la
