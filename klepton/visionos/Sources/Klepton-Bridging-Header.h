@@ -25,6 +25,9 @@
 #import "kl_audio.h"
 // ...and one for host video (NativeVideoPlayer cutscenes): kl_hostvideo.
 #import "kl_hostvideo.h"
+// ...and by one for GPU time: the compositor's queue is timed with the guest's,
+// so the game's auto-fidelity sees the whole GPU frame (kl_gpu_time.m).
+#import "kl_gpu_time.h"
 // ...and by two for the flat guest's window. kl_present says WHAT SHAPE
 // of picture the guest is producing — one flat image wants a WindowGroup, an
 // eye pair wants the ImmersiveSpace — and kl_mono is what a window then talks
@@ -43,9 +46,7 @@
 #import "kl_vulkan.h"
 // VisionQuestPro: the launcher's C side (APK reader, in-process klepton-ld) and
 // VPEngine's signature (runtime/vp_codesign.h, vp_pkcs12.h, from VPEngine at build time).
-#import "vq_apk.h"
-#import "vq_config.h"
-#import "vq_harvest.h"
+#import "avp_native.h"
 #import "vp_codesign.h"
 #import "vp_pkcs12.h"
 #include <dlfcn.h>

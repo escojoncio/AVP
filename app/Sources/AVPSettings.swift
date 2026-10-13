@@ -1,0 +1,402 @@
+// AVP: the settings that rule over the game. All of them live in the app (UserDefaults, the
+// Settings screen); none is ever read back from a text file. On EVERY launch they are written
+// into the config folder (AlyxBoot's configDir) and pushed to VPEngine, overriding whatever the
+// game's own files, its Options menu or Steam Cloud left behind:
+//
+//   alyx-env.txt                      KEY=VALUE for Klepton / the OpenVR shim / VPEngine
+//   video2.txt                        the game's video settings (from video2-visionpro-demo.txt)
+//   vr_fidelity_levels_override.csv   the fidelity table (one level, or a range for dynamic res)
+//   alyx-convars.lua                  re-applies the forced convars at every spawn and every few seconds
+//
+// The keys follow Glovebox's packages/alyx/defaults/DEMO.txt and engine/gb/build.py defaults().
+
+import Combine
+import Foundation
+
+final class AVPSettings: ObservableObject {
+    static let shared = AVPSettings()
+
+    // MARK: Values
+
+    enum Foveation: Int, CaseIterable { case off = 0, m2 = 1, m5 = 2, custom = 3 }
+    enum Movement: Int, CaseIterable { case teleport = 0, continuousHead = 2, continuousHand = 3 }
+    enum Engine: String, CaseIterable { case vpengine, moltenvk }
+    enum Upscaling: Int, CaseIterable { case off = 0, spatial = 1 }
+
+    /// Vision Pro's native per-eye render size (what visionOS asks for at 100 %).
+    static let nativeEye = (width: 3072, height: 2464)
+
+    /// Render resolution as a percentage of the native eye size (50...130).
+    @Published var renderPercent: Double { didSet { save() } }
+    @Published var dynamicResolution: Bool { didSet { save() } }
+    @Published var dynamicMin: Double { didSet { save() } }     // render target scale, 0.5...1.0
+    @Published var dynamicMax: Double { didSet { save() } }     // 0.6...1.2
+    @Published var texturePoolMB: Int { didSet { save() } }     // 1536...2816
+    @Published var textureCap: Int { didSet { save() } }        // 1024 | 2048 | 4096
+    @Published var foveation: Foveation { didSet { save() } }
+    @Published var sharpZone: Double { didSet { save() } }      // 0.05...0.6 of the image width
+    @Published var periphery: Double { didSet { save() } }      // 0.1...1 shading rate at the edge
+    @Published var transition: Double { didSet { save() } }     // 0.02...0.5
+    @Published var vpktaa: Bool { didSet { save() } }
+    @Published var vpktaaPercent: Double { didSet { save() } }  // 0...100
+    @Published var vpktaaSharpness: Double { didSet { save() } } // 0...1
+    @Published var upscaling: Upscaling { didSet { save() } }
+    @Published var anisotropy: Int { didSet { save() } }        // 0, 2, 4, 8, 16
+    @Published var engine: Engine { didSet { save() } }
+    @Published var systemLanguage: Bool { didSet { save() } }
+    @Published var refreshHz: Int { didSet { save() } }         // 90 | 100
+    @Published var halfRate: Bool { didSet { save() } }         // the game renders every 2nd display frame
+    @Published var showFps: Bool { didSet { save() } }
+    @Published var diagCaptures: Bool { didSet { save() } }
+    @Published var movement: Movement { didSet { save() } }
+    @Published var cloudSync: Bool { didSet { save() } }
+
+    private var loading = true
+
+    private init() {
+        let d = UserDefaults.standard
+        renderPercent = d.object(forKey: "avp.renderPercent") as? Double ?? 90
+        dynamicResolution = d.object(forKey: "avp.dynRes") as? Bool ?? false
+        dynamicMin = d.object(forKey: "avp.dynMin") as? Double ?? 0.7
+        dynamicMax = d.object(forKey: "avp.dynMax") as? Double ?? 1.0
+        texturePoolMB = d.object(forKey: "avp.texPool") as? Int ?? 2560
+        textureCap = d.object(forKey: "avp.texCap") as? Int ?? 2048
+        var fov = Foveation(rawValue: d.object(forKey: "avp.fov") as? Int ?? 0) ?? .off
+        if fov == .m5 && !Self.isM5 { fov = .m2 }
+        foveation = fov
+        sharpZone = d.object(forKey: "avp.fovSharp") as? Double ?? 0.18
+        periphery = d.object(forKey: "avp.fovPeriphery") as? Double ?? 0.35
+        transition = d.object(forKey: "avp.fovTransition") as? Double ?? 0.32
+        vpktaa = d.object(forKey: "avp.vpktaa") as? Bool ?? true
+        vpktaaPercent = d.object(forKey: "avp.vpktaaPercent") as? Double ?? 75
+        vpktaaSharpness = d.object(forKey: "avp.vpktaaSharp") as? Double ?? 0.3
+        upscaling = Upscaling(rawValue: d.object(forKey: "avp.upscaling") as? Int ?? 0) ?? .off
+        anisotropy = d.object(forKey: "avp.aniso") as? Int ?? 16
+        engine = Engine(rawValue: d.string(forKey: "avp.engine") ?? "") ?? .vpengine
+        systemLanguage = d.object(forKey: "avp.sysLang") as? Bool ?? true
+        refreshHz = d.object(forKey: "avp.refreshHz") as? Int ?? 90
+        halfRate = d.object(forKey: "avp.halfRate") as? Bool ?? true
+        showFps = d.object(forKey: "avp.showFps") as? Bool ?? false
+        diagCaptures = d.object(forKey: "avp.diagCaptures") as? Bool ?? false
+        movement = Movement(rawValue: d.object(forKey: "avp.movement") as? Int ?? 3) ?? .continuousHand
+        cloudSync = d.object(forKey: "avp.cloudSync") as? Bool ?? true
+        loading = false
+    }
+
+    private func save() {
+        guard !loading else { return }
+        let d = UserDefaults.standard
+        d.set(renderPercent, forKey: "avp.renderPercent")
+        d.set(dynamicResolution, forKey: "avp.dynRes")
+        d.set(dynamicMin, forKey: "avp.dynMin")
+        d.set(dynamicMax, forKey: "avp.dynMax")
+        d.set(texturePoolMB, forKey: "avp.texPool")
+        d.set(textureCap, forKey: "avp.texCap")
+        d.set(foveation.rawValue, forKey: "avp.fov")
+        d.set(sharpZone, forKey: "avp.fovSharp")
+        d.set(periphery, forKey: "avp.fovPeriphery")
+        d.set(transition, forKey: "avp.fovTransition")
+        d.set(vpktaa, forKey: "avp.vpktaa")
+        d.set(vpktaaPercent, forKey: "avp.vpktaaPercent")
+        d.set(vpktaaSharpness, forKey: "avp.vpktaaSharp")
+        d.set(upscaling.rawValue, forKey: "avp.upscaling")
+        d.set(anisotropy, forKey: "avp.aniso")
+        d.set(engine.rawValue, forKey: "avp.engine")
+        d.set(systemLanguage, forKey: "avp.sysLang")
+        d.set(refreshHz, forKey: "avp.refreshHz")
+        d.set(halfRate, forKey: "avp.halfRate")
+        d.set(showFps, forKey: "avp.showFps")
+        d.set(diagCaptures, forKey: "avp.diagCaptures")
+        d.set(movement.rawValue, forKey: "avp.movement")
+        d.set(cloudSync, forKey: "avp.cloudSync")
+    }
+
+    func resetToDefaults() {
+        for k in UserDefaults.standard.dictionaryRepresentation().keys where k.hasPrefix("avp.") && k != "avp.folderBookmark"
+            && k != "avp.signatureVariant" {
+            UserDefaults.standard.removeObject(forKey: k)
+        }
+        let fresh = AVPSettings.makeDefaults()
+        renderPercent = fresh.renderPercent; dynamicResolution = fresh.dynamicResolution
+        dynamicMin = fresh.dynamicMin; dynamicMax = fresh.dynamicMax
+        texturePoolMB = fresh.texturePoolMB; textureCap = fresh.textureCap
+        foveation = fresh.foveation; sharpZone = fresh.sharpZone; periphery = fresh.periphery; transition = fresh.transition
+        vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
+        upscaling = fresh.upscaling; anisotropy = fresh.anisotropy; engine = fresh.engine
+        systemLanguage = fresh.systemLanguage; refreshHz = fresh.refreshHz; halfRate = fresh.halfRate
+        showFps = fresh.showFps; diagCaptures = fresh.diagCaptures; movement = fresh.movement; cloudSync = fresh.cloudSync
+        AVPLog.log("Ajustes: valores por defecto")
+    }
+
+    private static func makeDefaults() -> AVPSettings { AVPSettings() }
+
+    /// First Apple Vision Pro (M2) is RealityDevice14,x; a later one is taken as an M5. Unknown: M2.
+    static let isM5: Bool = {
+        for name in ["hw.machine", "hw.model"] {
+            var size = 0
+            guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { continue }
+            var buf = [CChar](repeating: 0, count: size)
+            guard sysctlbyname(name, &buf, &size, nil, 0) == 0 else { continue }
+            let m = String(cString: buf)
+            if m.contains("RealityDevice14") { return false }
+            if m.contains("RealityDevice") { return true }
+        }
+        return ProcessInfo.processInfo.physicalMemory >= 24 * 1024 * 1024 * 1024
+    }()
+
+    // MARK: Derived
+
+    /// The per-eye render size the OpenVR shim reports (KLVR_EYE_SIZE): the percentage of the
+    /// native size, rounded to a multiple of 96 (what the game's render targets tile best at; the
+    /// default 90 % gives the validated 2784x2208).
+    var eyeSize: (width: Int, height: Int) {
+        let p = max(0.5, min(1.3, renderPercent / 100))
+        func r(_ v: Int) -> Int { max(96, Int((Double(v) * p / 96).rounded()) * 96) }
+        return (r(Self.nativeEye.width), r(Self.nativeEye.height))
+    }
+
+    /// The game's MSAA: always off with VPKTAA (it does the antialiasing), else 4x.
+    var gameMSAA: Int { vpktaa ? 0 : 4 }
+
+    /// The Steam language name the game is started with: the system's when Alyx has its text,
+    /// else English. Voices are always English (Alyx ships English voices only).
+    func gameLanguage(gameDir: URL?) -> (name: String, reason: String) {
+        guard systemLanguage else { return ("english", "opción desactivada") }
+        let pref = Locale(identifier: Locale.preferredLanguages.first ?? "en-US")
+        let code = (pref.language.languageCode?.identifier ?? "en").lowercased()
+        let region = (pref.region?.identifier ?? "").uppercased()
+        let latam: Set<String> = ["MX", "AR", "CO", "CL", "PE", "VE", "UY", "PY", "BO", "EC", "GT", "CR", "PA", "DO", "HN", "NI", "SV", "PR", "CU", "US", "419"]
+        let script = pref.language.script?.identifier ?? ""
+        let name: String?
+        switch code {
+        case "en": name = "english"
+        case "es": name = latam.contains(region) ? "latam" : "spanish"
+        case "fr": name = "french"
+        case "de": name = "german"
+        case "it": name = "italian"
+        case "ja": name = "japanese"
+        case "ko": name = "koreana"
+        case "ru": name = "russian"
+        case "pl": name = "polish"
+        case "pt": name = region == "BR" ? "brazilian" : "portuguese"
+        case "zh": name = (script == "Hant" || ["TW", "HK", "MO"].contains(region)) ? "tchinese" : "schinese"
+        case "uk": name = "ukrainian"
+        case "tr": name = "turkish"
+        case "th": name = "thai"
+        case "cs": name = "czech"
+        case "nl": name = "dutch"
+        case "hu": name = "hungarian"
+        default: name = nil
+        }
+        guard let name else { return ("english", "sistema en '\(code)', no es un idioma de Steam") }
+        if name == "english" { return ("english", "sistema en inglés") }
+        // Whether this build carries the language: its text files (hlvr/resource/*_<lang>.*).
+        if let gameDir {
+            let resource = gameDir.appendingPathComponent("hlvr/resource", isDirectory: true)
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: resource.path)) ?? []
+            let has = files.contains { $0.lowercased().contains("_\(name).") }
+            if !has { return ("english", "el juego no incluye '\(name)'") }
+        }
+        return (name, "idioma del sistema")
+    }
+
+    // MARK: Writing the config (every launch)
+
+    struct ConfigPaths {
+        let gameDir: URL
+        let configDir: URL
+        let dataDir: URL
+        let pipelines: URL
+    }
+
+    /// The convars the app forces, with their values (launch arguments and the Lua re-apply).
+    func forcedConvars() -> [(String, String)] {
+        var c: [(String, String)] = [
+            ("vr_fidelity_level_auto", dynamicResolution ? "1" : "0"),
+            ("vr_msaa", String(gameMSAA)),
+            ("vr_symmetric_fov", "0"),
+            ("r_texture_stream_max_resolution", String(textureCap)),
+            ("r_texture_pool_size", String(texturePoolMB)),
+            ("r_texture_budget_dynamic", "0"),
+            ("r_texture_stream_resolution_bias_min", "1.0"),
+            ("r_texture_stream_throttle_count", "6"),
+            ("r_texture_stream_throttle_amount", "20"),
+        ]
+        if !dynamicResolution { c.append(("vr_fidelity_level", "0")) }
+        return c
+    }
+
+    /// Writes the four files into `p.configDir`. Returns the env lines (also applied with setenv).
+    @discardableResult
+    func writeConfig(_ p: ConfigPaths) throws -> [(String, String)] {
+        let fm = FileManager.default
+        try fm.createDirectory(at: p.configDir, withIntermediateDirectories: true)
+        let klfz = p.dataDir.appendingPathComponent("klfz", isDirectory: true)
+        try fm.createDirectory(at: klfz, withIntermediateDirectories: true)
+        // The game's own Vulkan device settings, for warming the pipeline cache before the game
+        // starts; the headset's own record replaces it from the second launch.
+        let info = klfz.appendingPathComponent("device-info.json")
+        if !fm.fileExists(atPath: info.path), let bundled = Bundle.main.url(forResource: "device-info", withExtension: "json") {
+            try? fm.copyItem(at: bundled, to: info)
+        }
+
+        let lang = gameLanguage(gameDir: p.gameDir)
+        let eye = eyeSize
+        var args = forcedConvars().map { "+\($0.0) \($0.1)" }.joined(separator: " ")
+        args += " +log_verbosity VR max -language \(lang.name)"
+
+        var env: [(String, String)] = [
+            ("KL_ALYX_PROFILE_ARGS", args),
+            ("KLVR_EYE_SIZE", "\(eye.width),\(eye.height)"),
+            ("KL_DISPLAY_HZ", String(refreshHz)),
+            ("KL_GUEST_PACE_HZ", halfRate ? String(refreshHz / 2) : "0"),
+            ("KL_VK_MERGE", "1"),
+            ("KL_VK_MERGE_VIS", "1"),
+            ("KLVR_PACE_FALLBACK", "0"),
+            ("KL_CP_QUALITY", "0.40"),
+            ("MVK_CONFIG_USE_MTLHEAP", "0"),
+            ("KL_GUEST_BIGALLOC_MMAP", "1048576"),
+            ("KL_HANDS", "0"),
+            ("KL_MEM_TOTAL_MB", "16384"),
+            ("KL_ALYX_NEWPLAYER_ARGS", "+hlvr_movetype_default \(movement.rawValue)"),
+            ("KL_VK_FOZ_REPLAY", "\(p.pipelines.path):\(klfz.path)"),
+            ("KL_VK_FOZ_REPLAY_BLOCK", "1"),
+            ("KL_VK_FOZ_THREADS", "6"),
+            ("KL_VK_FOZ_RECORD", "auto"),
+            ("KL_VK_DEVICE_INFO", "auto"),
+            ("KL_VK_CENSUS", "1"),
+            ("KL_VPKTAA", vpktaa ? "1" : "0"),
+            ("KL_VPKTAA_PCT", String(format: "%.0f", vpktaaPercent)),
+            ("KL_VPKTAA_SHARP", String(format: "%.2f", vpktaaSharpness)),
+            ("VPVK_ANISO", String(anisotropy)),
+            ("VPVK_FORCE_1X", vpktaa ? "1" : "0"),
+            ("VPVK_METALFX", String(upscaling.rawValue)),
+            ("VPVK_TEXTURE_CAP", String(textureCap)),
+            ("KL_FPS_HUD", showFps ? "1" : "0"),
+            ("KL_CAPTURE", diagCaptures ? "1" : "0"),
+        ]
+        // Foveation: Klepton's rasterization-rate map (kl_gpu_time.m) and VPEngine's own.
+        switch foveation {
+        case .off:
+            env.append(("KL_VRR", "0"))
+        case .m2:
+            env += [("KL_VRR", "1"), ("KL_VRR_MAP", "soft")]
+        case .m5:
+            env += [("KL_VRR", "1"), ("KL_VRR_MAP", "fov")]
+        case .custom:
+            env += [("KL_VRR", "1"), ("KL_VRR_MAP", "custom"),
+                    ("KL_VRR_INNER", String(format: "%.3f", sharpZone)),
+                    ("KL_VRR_OUTER", String(format: "%.3f", min(0.95, sharpZone + transition))),
+                    ("KL_VRR_EDGE", String(format: "%.3f", periphery))]
+        }
+        if diagCaptures, let logs = AVPFolder.shared.logs {
+            env += [("KL_CAPTURE_DIR", logs.path), ("VP_DUMP_FRAME", "600"), ("VP_DUMP_DIR", logs.path)]
+        }
+        if let driver = AVPLaunch.driverPath { env.append(("KL_MVK_DYLIB", driver)) }
+
+        var text = "# Written by AVP at every launch from the app's settings. Do not edit: the app rewrites it.\n"
+        for (k, v) in env { text += "\(k)=\(v)\n" }
+        try text.write(to: p.configDir.appendingPathComponent("alyx-env.txt"), atomically: true, encoding: .utf8)
+        try videoSettings().write(to: p.configDir.appendingPathComponent("video2.txt"), atomically: true, encoding: .utf8)
+        try fidelityTable().write(to: p.configDir.appendingPathComponent("vr_fidelity_levels_override.csv"), atomically: true, encoding: .utf8)
+        try convarsLua().write(to: p.configDir.appendingPathComponent("alyx-convars.lua"), atomically: true, encoding: .utf8)
+        AVPLog.log("Config: \(p.configDir.path): ojo \(eye.width)x\(eye.height) (\(Int(renderPercent)) %), \(refreshHz) Hz"
+                   + (halfRate ? " (juego a \(refreshHz / 2))" : "") + ", res. dinámica \(dynamicResolution) [\(dynamicMin)–\(dynamicMax)], "
+                   + "texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveation), VPKTAA \(vpktaa) \(Int(vpktaaPercent)) % "
+                   + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA), MetalFX \(upscaling), aniso x\(anisotropy), motor \(engine.rawValue), "
+                   + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), FPS \(showFps), capturas \(diagCaptures)")
+        return env
+    }
+
+    /// video2-visionpro-demo.txt with the app's texture settings.
+    func videoSettings() -> String {
+        var text = (Bundle.main.url(forResource: "video2-visionpro-demo", withExtension: "txt"))
+            .flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? "\"video.cfg\"\n{\n}\n"
+        func set(_ key: String, _ value: String) {
+            let pattern = "(\"setting\\.\(NSRegularExpression.escapedPattern(for: key))\"\\s+\")([^\"]*)\""
+            guard let re = try? NSRegularExpression(pattern: pattern) else { return }
+            let range = NSRange(text.startIndex..., in: text)
+            if let m = re.firstMatch(in: text, range: range), let r = Range(m.range(at: 2), in: text) {
+                text.replaceSubrange(r, with: value)
+            } else if let end = text.range(of: "}", options: .backwards) {
+                text.insert(contentsOf: "\t\"setting.\(key)\"\t\t\"\(value)\"\n", at: end.lowerBound)
+            }
+        }
+        set("r_texture_stream_max_resolution", String(textureCap))
+        set("r_texture_stream_resolution_bias_min", "1.000000")
+        set("r_texturefilteringquality", anisotropy >= 16 ? "5" : anisotropy >= 8 ? "4" : anisotropy >= 2 ? "3" : "1")
+        return text
+    }
+
+    /// The fidelity table: one fixed level (scale 1.0: the render size is KLVR_EYE_SIZE), or with
+    /// dynamic resolution, levels from `dynamicMin` to `dynamicMax` the game's auto-fidelity moves between.
+    func fidelityTable() -> String {
+        let header = "hlvr,default,vr_msaa,vr_render_target_scale,min_gpu_memory,min_width,min_height,r_ssao,r_post_bloom,"
+            + "sc_disable_spotlight_shadows,r_high_quality_shadows,vr_single_light_fast_path_sun_cascade_0_texels_per_world,"
+            + "vr_single_light_fast_path_sun_cascade_1_texels_per_world,\n"
+        func row(_ level: Int, _ isDefault: Bool, _ scale: Double) -> String {
+            "\(level),\(isDefault ? 1 : 0),\(gameMSAA),\(String(format: "%.2f", scale)),,,,1,1,1,0,3,0,\n"
+        }
+        var out = header
+        if dynamicResolution {
+            let lo = min(dynamicMin, dynamicMax), hi = max(dynamicMin, dynamicMax)
+            let steps = max(1, Int(((hi - lo) / 0.05).rounded()))
+            for i in 0...steps {
+                let s = lo + (hi - lo) * Double(i) / Double(steps)
+                out += row(i, i == steps, s)
+            }
+        } else {
+            out += row(0, true, 1.0)
+        }
+        return out + "end,,,,,,,,,,,,,\n"
+    }
+
+    /// Glovebox's read-back hooks (app-convars.lua) plus the enforcement: at every spawn, and every
+    /// 5 s after it, any forced convar the game (Options menu, a saved config, Steam Cloud) changed is set back.
+    func convarsLua() -> String {
+        var lua = (Bundle.main.url(forResource: "app-convars", withExtension: "lua"))
+            .flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? ""
+        let pairs = forcedConvars().map { "  { \"\($0.0)\", \"\($0.1)\" }," }.joined(separator: "\n")
+        lua += """
+
+-- AVP: the app rules over the game. These convars are set back whenever they differ.
+local AVP_FORCED = {
+\(pairs)
+}
+local function avp_enforce(tag)
+  for _, kv in ipairs(AVP_FORCED) do
+    local cur = tostring(Convars:GetStr(kv[1]))
+    if cur ~= kv[2] and (tonumber(cur) == nil or tonumber(cur) ~= tonumber(kv[2])) then
+      SendToConsole(kv[1] .. " " .. kv[2]); Msg("AVPFORCE " .. tag .. " " .. kv[1] .. " " .. cur .. " -> " .. kv[2] .. "\\n")
+    end
+  end
+end
+ListenToGameEvent("player_activate", function()
+  avp_enforce("spawn")
+  local w = Entities:First()
+  if w then w:SetThink(function() avp_enforce("tick"); return 5.0 end, "avpforce", 5.0) end
+end, nil)
+
+"""
+        return lua
+    }
+
+    /// VPEngine's own settings (vpvk_config_set_* through avp_config.c).
+    func applyToVPEngine() {
+        var c = avp_gfx_config()
+        c.foveation_mode = Int32(foveation.rawValue)
+        c.sharp_zone = Float(sharpZone)
+        c.periphery = Float(periphery)
+        c.transition = Float(transition)
+        c.vpktaa_enabled = vpktaa ? 1 : 0
+        c.vpktaa_percent = Float(vpktaaPercent)
+        c.vpktaa_sharpness = Float(vpktaaSharpness)
+        c.render_scale = 1
+        c.anisotropy = Int32(anisotropy)
+        c.force_single_sample = vpktaa ? 1 : 0
+        c.metalfx = Int32(upscaling.rawValue)
+        c.texture_cap = Int32(textureCap)
+        let fwd = avp_gfx_config_apply(&c)
+        AVPLog.log("Gráficos: ajustes enviados a VPEngine: \(fwd == 1 ? "sí" : "no (driver no cargado)")")
+    }
+}

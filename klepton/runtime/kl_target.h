@@ -60,6 +60,11 @@ typedef enum {
     // handle threaded through onStart/onResume/onSurface*. Half-Life on Xash3D
     // (hl1, com.drbeef.lambda1vr) is here; kl_jkxr keeps JKXR's own data layout.
     KL_GUEST_GLES3JNI,
+    // A Linux glibc guest (runtime/linux): Half-Life: Alyx. No Java door at
+    // all — Valve's launcher ELF is entered at its e_entry on a guest thread
+    // (kl_alyx_run), runs its own main loop, and paces itself on the OpenVR
+    // shim's WaitGetPoses.
+    KL_GUEST_LINUX,
 } kl_guest_kind;
 
 typedef struct {

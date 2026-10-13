@@ -1,0 +1,550 @@
+From acc9e5706765508316a76df5a3879bcf8d5e4b59 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 04:26:44 +0000
+Subject: [PATCH 02/10] VPVulkan: VK_KHR_dynamic_rendering_local_read (in-pass
+ barriers split the pass, attachments read through copies)
+
+A vkCmdPipelineBarrier inside a render pass or dynamic rendering is recorded (OpLocalRead). When
+a later draw of that pass reads one of its attachments as a texture or input attachment, the
+translation stores the pass, copies each attachment read into a driver-owned texture of the same
+shape (one per image, kept until the image is destroyed), reopens the pass loading its contents
+and rebinds the reads to the copies. Metal cannot sample an attachment of the open encoder, and
+framebuffer fetch reads colour only while Source 2's soft particles (spritecard, 136 of Alyx's
+recorded pipelines) read the multiview depth/stencil attachment, so this is the exact path.
+Barriers with no such read cost nothing. vkCmdSetRenderingAttachmentLocationsKHR /
+InputAttachmentIndicesKHR accept the identity mapping (a remap is logged).
+
+Test: gpu_vulkan.local_read.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
+---
+ gpu/vulkan/CMakeLists.txt          |  2 +-
+ gpu/vulkan/src/commands.cpp        | 96 +++++++++++++++++++++++++++++-
+ gpu/vulkan/src/commands.h          | 18 +++++-
+ gpu/vulkan/src/entry.cpp           | 23 ++++++-
+ gpu/vulkan/src/physical_device.cpp |  1 +
+ gpu/vulkan/src/pipelines.cpp       | 36 +++++++++++
+ gpu/vulkan/src/vpvk.h              |  3 +
+ gpu/vulkan/tests/vk_tests.cpp      | 96 +++++++++++++++++++++++++++++-
+ 8 files changed, 264 insertions(+), 11 deletions(-)
+
+diff --git a/gpu/vulkan/CMakeLists.txt b/gpu/vulkan/CMakeLists.txt
+index 6b448fc..021ddcb 100644
+--- a/gpu/vulkan/CMakeLists.txt
++++ b/gpu/vulkan/CMakeLists.txt
+@@ -33,7 +33,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
+     target_compile_definitions(vpvk_tests PRIVATE VPVK_SPIRV_TESTS="${CMAKE_CURRENT_SOURCE_DIR}/../shader/spirv/tests")
+     add_dependencies(vpvk_tests VPVulkan)
+     target_compile_options(vpvk_tests PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+-    foreach(t exports physical memory passes submit pipeline recipes alyx depth_resolve)
++    foreach(t exports physical memory passes submit pipeline recipes alyx depth_resolve local_read)
+       add_test(NAME gpu_vulkan.${t} COMMAND vpvk_tests ${t} $<TARGET_FILE:VPVulkan>)
+     endforeach()
+   endif()
+diff --git a/gpu/vulkan/src/commands.cpp b/gpu/vulkan/src/commands.cpp
+index 725a515..8b88226 100644
+--- a/gpu/vulkan/src/commands.cpp
++++ b/gpu/vulkan/src/commands.cpp
+@@ -153,6 +153,9 @@ uint32_t layersOf(const Image* im, const VkImageSubresourceRange& r) {
+ struct Translator {
+   vpgpu::Frame& frame;
+   TranslateStats& st;
++  Device* device = nullptr;
++  // Attachments of the open pass read by draws after an in-pass barrier: image -> its copy.
++  std::vector<std::pair<vpgpu::TextureId, vpgpu::TextureId>> localCopies;
+   bool passOpen = false;
+   vpgpu::RenderPassDesc current;  // the open core pass (reopened with Load after a split)
+   const OpBeginPass* pass = nullptr;
+@@ -229,7 +232,10 @@ struct Translator {
+         keepAll = hasInPassClear(rec, &op);
+         pendingResolves = br->resolveCopies;
+         open(br->desc);
++      } else if (std::holds_alternative<OpLocalRead>(op)) {
++        localRead(rec, &op);
+       } else if (std::holds_alternative<OpNextSubpass>(op)) {
++        localCopies.clear();
+         close();
+         flushResolves();
+         ++subpass;
+@@ -237,6 +243,7 @@ struct Translator {
+         if (pass && beginPass(*pass, subpass, desc, &pendingResolves)) open(std::move(desc));
+         else ++st.dropped;
+       } else if (std::holds_alternative<OpEndPass>(op)) {
++        localCopies.clear();
+         close();
+         flushResolves();
+         pass = nullptr;
+@@ -383,15 +390,88 @@ struct Translator {
+     }
+   }
+ 
+-  // Does the pass that starts at `begin` contain a vkCmdClearAttachments?
++  // Does the pass that starts at `begin` contain a vkCmdClearAttachments, or an in-pass barrier
++  // followed by a draw that reads an attachment (both split it, so every attachment must be stored
++  // before the split)?
+   static bool hasInPassClear(const Recorder& rec, const Op* begin) {
++    bool barrier = false;
+     for (const Op* o = begin + 1; o < rec.ops.data() + rec.ops.size(); ++o) {
+       if (std::holds_alternative<OpEndPass>(*o)) return false;
+       if (std::holds_alternative<OpClearAttachments>(*o)) return true;
++      if (std::holds_alternative<OpLocalRead>(*o)) barrier = true;
++      if (const auto* d = std::get_if<OpDraw>(o); d && barrier && !d->images.empty()) return true;
+     }
+     return false;
+   }
+ 
++  // An in-pass barrier. Draws after it may read the attachments (input attachments, or the
++  // attachment image bound as a texture). Metal cannot sample a texture that is an attachment of
++  // the encoder, and framebuffer fetch reads colour only (Source 2's soft particles read depth),
++  // so: the pass is split (contents stored), each attachment those draws read is copied into a
++  // driver-owned texture of the same shape, the pass reopens loading its contents, and the reads
++  // are rebound to the copies (see draw()). Exact, at the cost of one store/load and a copy.
++  void localRead(const Recorder& rec, const Op* at) {
++    if (!passOpen) return;
++    std::vector<const Image*> read;
++    auto attachmentImage = [&](uint32_t index) -> const Image* {
++      const vpgpu::TextureId t = index < vpgpu::kMaxColorAttachments ? current.colors[index].texture : current.depth.texture;
++      if (!t) return nullptr;
++      for (const Op* o = at + 1; o < rec.ops.data() + rec.ops.size(); ++o) {
++        if (std::holds_alternative<OpEndPass>(*o) || std::holds_alternative<OpNextSubpass>(*o)) break;
++        const auto* d = std::get_if<OpDraw>(o);
++        if (!d) continue;
++        for (const Image* im : d->images)
++          if (im->id == t) return im;
++      }
++      return nullptr;
++    };
++    for (uint32_t i = 0; i <= vpgpu::kMaxColorAttachments; ++i)
++      if (const Image* im = attachmentImage(i)) read.push_back(im);
++    ++st.localReads;
++    if (read.empty() || !device) return;
++    frame.endRenderPass();
++    passOpen = false;
++    for (const Image* im : read) {
++      if (!im->localReadCopy) {
++        vpgpu::TextureDesc d = im->desc;
++        d.usage = vpgpu::usage::sampled;
++        d.transient = false, d.persistent = true, d.mutableFormat = false;
++        d.label = "vk.local_read";
++        std::lock_guard<std::mutex> lock(device->resourceMutex);
++        im->localReadCopy = device->gpu->createTexture(d);
++      }
++      if (!im->localReadCopy) continue;
++      for (uint16_t m = 0; m < im->desc.mips; ++m) {
++        vpgpu::Copy c;
++        c.kind = vpgpu::CopyKind::TextureToTexture;
++        const uint32_t w = std::max(1u, im->desc.width >> m), h = std::max(1u, im->desc.height >> m);
++        c.srcTexture = {im->id, m, 0, im->desc.layers, 0, 0, 0, w, h, 1};
++        c.dstTexture = {im->localReadCopy, m, 0, im->desc.layers, 0, 0, 0, w, h, 1};
++        c.label = "vk.local_read";
++        frame.copy(std::move(c));
++        ++st.copies;
++      }
++      localCopies.push_back({im->id, im->localReadCopy});
++    }
++    reopen();
++  }
++
++  // Reads of attachments copied by localRead() go to the copies.
++  void rebindLocalReads(vpgpu::Draw& d) const {
++    for (const auto& [from, to] : localCopies) {
++      for (vpgpu::Access& a : d.bindings) {
++        if (a.range.kind != vpgpu::ResourceRange::Kind::Texture || a.range.index != from.index ||
++            a.range.generation != from.generation)
++          continue;
++        a.range.index = to.index, a.range.generation = to.generation;
++        // The attachment's own view (an aspect or layer view) is replaced by the copy itself.
++        d.views.erase(std::remove_if(d.views.begin(), d.views.end(),
++                                     [&](const vpgpu::ViewBinding& v) { return v.kind == a.kind && v.slot == a.slot; }),
++                      d.views.end());
++      }
++    }
++  }
++
+   static const uint8_t* indirectData(const Buffer* b, VkDeviceSize offset, VkDeviceSize size) {
+     if (!b || !b->memory || !b->memory->host || offset + size > b->size) return nullptr;
+     return b->memory->host + b->offset + offset;
+@@ -402,6 +482,16 @@ struct Translator {
+       ++st.skippedDraws;
+       return;
+     }
++    if (!localCopies.empty()) {
++      OpDraw copy = d;
++      copy.images.clear();
++      rebindLocalReads(copy.draw);
++      return drawResolved(copy);
++    }
++    drawResolved(d);
++  }
++
++  void drawResolved(const OpDraw& d) {
+     if (!d.indirect) {
+       frame.draw(d.draw);
+       ++st.draws;
+@@ -468,8 +558,8 @@ struct Translator {
+ 
+ }  // namespace
+ 
+-void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st) {
+-  Translator t{frame, st};
++void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, Device* device) {
++  Translator t{frame, st, device};
+   t.run(rec);
+   t.close();
+ }
+diff --git a/gpu/vulkan/src/commands.h b/gpu/vulkan/src/commands.h
+index d161d84..4c36af7 100644
+--- a/gpu/vulkan/src/commands.h
++++ b/gpu/vulkan/src/commands.h
+@@ -33,6 +33,9 @@ struct OpBeginRendering {
+   std::vector<vpgpu::Copy> resolveCopies;
+ };
+ struct OpNextSubpass {};
++// A pipeline barrier inside a render pass / dynamic rendering (VK_KHR_dynamic_rendering_local_read,
++// subpass self-dependencies): later draws may read what earlier draws wrote to the attachments.
++struct OpLocalRead {};
+ struct OpEndPass {};
+ struct OpCopyBuffer {
+   const Buffer* src = nullptr;
+@@ -96,6 +99,8 @@ struct OpDraw {
+   uint32_t indirectCount = 0, indirectStride = 0;
+   uint32_t viewCount = 1;
+   bool ok = true;  // false: the pipeline or a binding was missing (counted as skipped)
++  // After an in-pass barrier only: attachments of the open pass this draw reads as textures.
++  std::vector<const Image*> images;
+ };
+ struct OpDispatch {
+   vpgpu::Dispatch dispatch;
+@@ -108,7 +113,7 @@ struct OpExecute {
+   const Recorder* secondary = nullptr;
+ };
+ 
+-using Op = std::variant<OpBeginPass, OpBeginRendering, OpNextSubpass, OpEndPass, OpCopyBuffer, OpUpload,
++using Op = std::variant<OpBeginPass, OpBeginRendering, OpNextSubpass, OpLocalRead, OpEndPass, OpCopyBuffer, OpUpload,
+                         OpFillBuffer, OpClearColor, OpClearDepth, OpClearAttachments, OpCopyBufferToImage,
+                         OpCopyImageToBuffer, OpCopyImage, OpBlitImage, OpDraw, OpDispatch, OpExecute>;
+ 
+@@ -158,6 +163,9 @@ struct BoundState {
+   uint32_t targetWidth = 0, targetHeight = 0;  // render area of the open pass (scissor clamp)
+   uint32_t subpass = 0;
+   const RenderPassObj* pass = nullptr;
++  // Images attached to the open pass, and whether an in-pass barrier was recorded in it.
++  std::vector<const Image*> passImages;
++  bool localRead = false;
+ };
+ 
+ struct Recorder {
+@@ -179,12 +187,16 @@ struct Recorder {
+ 
+ struct TranslateStats {
+   uint32_t passes = 0, copies = 0, clears = 0, draws = 0, dispatches = 0, skippedDraws = 0,
+-           skippedDispatches = 0, dropped = 0;
++           skippedDispatches = 0, dropped = 0, localReads = 0;
+ };
+ 
+ // Appends the recorded work to `frame`. Ops whose resources are not bound yet are dropped
+ // (counted in `dropped`, a vk.err line is the caller's job).
+-void translate(const Recorder&, vpgpu::Frame& frame, TranslateStats& stats);
++// `device` creates the local-read copies (null: tests without one skip them).
++void translate(const Recorder&, vpgpu::Frame& frame, TranslateStats& stats, Device* device = nullptr);
++
++// vkCmdPipelineBarrier(2) inside a pass (entry.cpp).
++void recordInPassBarrier(Recorder&);
+ 
+ // Records a draw/dispatch with the current state (pipelines.cpp).
+ OpDraw makeDraw(Recorder&, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,
+diff --git a/gpu/vulkan/src/entry.cpp b/gpu/vulkan/src/entry.cpp
+index 45e5e31..44c2027 100644
+--- a/gpu/vulkan/src/entry.cpp
++++ b/gpu/vulkan/src/entry.cpp
+@@ -689,6 +689,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyImage(VkDevice dv, VkImage im,
+   if (!im) return;
+   Image* i = from<Image>(im);
+   if (i->id) from<Device>(dv)->gpu->destroy(i->id);
++  if (i->localReadCopy) from<Device>(dv)->gpu->destroy(i->localReadCopy);
+   delete i;
+ }
+ 
+@@ -1059,6 +1060,15 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyFramebuffer(VkDevice, VkFramebuf
+   delete from<Framebuffer>(fb);
+ }
+ 
++// A barrier inside a pass orders earlier attachment writes before later reads of them (subpass
++// self-dependency, dynamic_rendering_local_read): commands.cpp splits the pass there if a later
++// draw reads an attachment.
++void vpvk::recordInPassBarrier(Recorder& r) {
++  if (!r.inPass) return;
++  r.bound.localRead = true;
++  r.ops.emplace_back(OpLocalRead{});
++}
++
+ // ---------------------------------------------------------------------------------------------
+ // Command pools and buffers (deferred lists, translated at submit)
+ // ---------------------------------------------------------------------------------------------
+@@ -1150,6 +1160,11 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer cb,
+   r.bound.subpass = 0;
+   r.bound.targetWidth = uint32_t(op.area.offset.x) + op.area.extent.width;
+   r.bound.targetHeight = uint32_t(op.area.offset.y) + op.area.extent.height;
++  r.bound.passImages.clear();
++  r.bound.localRead = false;
++  if (op.framebuffer)
++    for (const ImageView* v : op.framebuffer->views)
++      if (v && v->image) r.bound.passImages.push_back(v->image);
+   r.ops.emplace_back(std::move(op));
+   r.inPass = true;
+ }
+@@ -1164,6 +1179,8 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer cb) {
+   Recorder& r = *from<CommandBuffer>(cb)->rec;
+   r.ops.emplace_back(OpEndPass{});
+   r.inPass = false;
++  r.bound.passImages.clear();
++  r.bound.localRead = false;
+ }
+ 
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass2(VkCommandBuffer cb, const VkSubpassEndInfo*) {
+@@ -1173,7 +1190,9 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass2(VkCommandBuffer cb, c
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier(
+     VkCommandBuffer cb, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, uint32_t,
+     const VkMemoryBarrier*, uint32_t, const VkBufferMemoryBarrier*, uint32_t, const VkImageMemoryBarrier*) {
+-  ++from<CommandBuffer>(cb)->rec->barriers;  // the core places barriers from real hazards
++  Recorder& r = *from<CommandBuffer>(cb)->rec;
++  ++r.barriers;  // the core places barriers from real hazards
++  recordInPassBarrier(r);
+ }
+ 
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdCopyBuffer(VkCommandBuffer cb, VkBuffer src, VkBuffer dst,
+@@ -1300,7 +1319,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q, uint32_t n,
+   for (uint32_t i = 0; i < n; ++i)
+     for (uint32_t j = 0; j < si[i].commandBufferCount; ++j) {
+       const CommandBuffer* c = from<CommandBuffer>(si[i].pCommandBuffers[j]);
+-      translate(*c->rec, frame, st);
++      translate(*c->rec, frame, st, d);
+       barriers += c->rec->barriers;
+       ++cbs;
+     }
+diff --git a/gpu/vulkan/src/physical_device.cpp b/gpu/vulkan/src/physical_device.cpp
+index cd5edb1..310230f 100644
+--- a/gpu/vulkan/src/physical_device.cpp
++++ b/gpu/vulkan/src/physical_device.cpp
+@@ -265,6 +265,7 @@ std::vector<VkExtensionProperties> deviceExtensions() {
+           // with a format list, which vkCreateImage handles.
+           {VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME, 1},
+           {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, 1},
++          {VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME, 1},
+           {VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, 1},
+           {VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME, 1},
+           {VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_EXTENSION_NAME, 1},
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index 832a9ba..b1c306b 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -10,6 +10,7 @@
+ #include <chrono>
+ #include <cstdio>
+ #include <algorithm>
++#include <atomic>
+ #include <bit>
+ #include <cstdlib>
+ #include <cstring>
+@@ -1148,6 +1149,13 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
+     logSkip("unbound_descriptor", p);
+     return op;
+   }
++  if (r.bound.localRead)  // attachments read after an in-pass barrier (commands.cpp localRead)
++    for (const vpgpu::Access& a : d.bindings)
++      for (const Image* im : r.bound.passImages)
++        if (a.range.kind == vpgpu::ResourceRange::Kind::Texture && im->id &&
++            a.range.index == im->id.index && a.range.generation == im->id.generation &&
++            std::find(op.images.begin(), op.images.end(), im) == op.images.end())
++          op.images.push_back(im);
+   for (const spirv::VertexBufferBinding& vb : p->vertexBuffers) {
+     const BoundState::VB& b = r.bound.vertex[vb.binding < 16 ? vb.binding : 0];
+     if (!b.buffer || !b.buffer->id) continue;  // unused by the shader or not bound
+@@ -1324,6 +1332,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
+   for (const auto& [src, dst] : forcedPairs) op.resolveCopies.push_back(forcedResolveCopy(src, dst, std::max<uint16_t>(d.layerCount, 1)));
+   r.bound.targetWidth = uint32_t(ri->renderArea.offset.x) + ri->renderArea.extent.width;
+   r.bound.targetHeight = uint32_t(ri->renderArea.offset.y) + ri->renderArea.extent.height;
++  r.bound.passImages.clear();
++  r.bound.localRead = false;
++  auto attached = [&](const VkRenderingAttachmentInfo* a) {
++    if (a && a->imageView && from<ImageView>(a->imageView)->image) r.bound.passImages.push_back(from<ImageView>(a->imageView)->image);
++  };
++  for (uint32_t i = 0; i < ri->colorAttachmentCount; ++i) attached(&ri->pColorAttachments[i]);
++  attached(ri->pDepthAttachment);
++  attached(ri->pStencilAttachment);
+   r.ops.emplace_back(std::move(op));
+   r.inPass = true;
+ }
+@@ -1331,6 +1347,25 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer cb) {
+   Recorder& r = rec(cb);
+   r.ops.emplace_back(OpEndPass{});
+   r.inPass = false;
++  r.bound.passImages.clear();
++  r.bound.localRead = false;
++}
++
++// VK_KHR_dynamic_rendering_local_read. Attachment locations / input indices: shaders address
++// attachments by the order given at vkCmdBeginRendering here, the identity mapping these default to;
++// a remap is logged (not applied).
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetRenderingAttachmentLocationsKHR(VkCommandBuffer,
++                                                                               const VkRenderingAttachmentLocationInfoKHR* li) {
++  for (uint32_t i = 0; li && li->pColorAttachmentLocations && i < li->colorAttachmentCount; ++i)
++    if (li->pColorAttachmentLocations[i] != i && li->pColorAttachmentLocations[i] != VK_ATTACHMENT_UNUSED) {
++      static std::atomic<unsigned> n{0};
++      if (n.fetch_add(1) < 8) logf("vk.unimpl attachment_location_remap att=%u loc=%u", i, li->pColorAttachmentLocations[i]);
++    }
++}
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdSetRenderingInputAttachmentIndicesKHR(VkCommandBuffer,
++                                                                                  const VkRenderingInputAttachmentIndexInfoKHR*) {
++  // Input attachments are read through their descriptors (the image view bound to the input
++  // attachment binding), so the index mapping has nothing to change.
+ }
+ 
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdClearAttachments(VkCommandBuffer cb, uint32_t n, const VkClearAttachment* a,
+@@ -1507,6 +1542,7 @@ PFN_vkVoidFunction lookupPhase3(const char* name) {
+       F(vkCmdSetDepthBounds), F(vkCmdSetStencilCompareMask), F(vkCmdSetStencilWriteMask), F(vkCmdDraw), F(vkCmdDrawIndexed),
+       F(vkCmdDrawIndirect), F(vkCmdDrawIndexedIndirect), F(vkCmdDispatch), F(vkCmdDispatchIndirect), F(vkCmdNextSubpass),
+       F(vkCmdNextSubpass2), F(vkCmdBeginRendering), F(vkCmdEndRendering), F(vkCmdClearAttachments),
++      F(vkCmdSetRenderingAttachmentLocationsKHR), F(vkCmdSetRenderingInputAttachmentIndicesKHR),
+       F(vkCmdClearDepthStencilImage), F(vkCmdExecuteCommands), F(vkCmdUpdateBuffer), F(vkCmdCopyImageToBuffer),
+       F(vkCmdCopyImage), F(vkCmdBlitImage), F(vkCmdResolveImage), F(vkCmdSetEvent), F(vkCmdResetEvent), F(vkCmdWaitEvents),
+       F(vkCreateQueryPool), F(vkDestroyQueryPool), F(vkGetQueryPoolResults), F(vkResetQueryPool), F(vkCmdResetQueryPool),
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index 1766703..79026b5 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -76,6 +76,9 @@ struct Image {
+   VkDeviceSize offset = 0;
+   vpgpu::TextureId id;  // created on bind (or at creation for memoryless use)
+   uint8_t forcedFrom = 0;  // >1: the game asked for this many samples, created 1x (forceSingleSample)
++  // VK_KHR_dynamic_rendering_local_read: copy of this attachment that draws after an in-pass
++  // barrier read instead of the attachment itself (created on first need, destroyed with the image).
++  mutable vpgpu::TextureId localReadCopy;
+ };
+ 
+ struct ImageView {
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index 462235d..7c2bfb6 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -835,7 +835,7 @@ const char* const kAlyxExts[] = {
+     "VK_EXT_host_image_copy", "VK_KHR_multiview"};
+ 
+ // Extensions of the capture not implemented yet (emptied as they land).
+-const std::vector<std::string> kAlyxPending = {"VK_KHR_dynamic_rendering_local_read", "VK_EXT_host_image_copy"};
++const std::vector<std::string> kAlyxPending = {"VK_EXT_host_image_copy"};
+ bool pending(const char* e) {
+   for (const auto& p : kAlyxPending)
+     if (p == e) return true;
+@@ -1022,6 +1022,97 @@ void testDepthResolve() {
+   vkFreeMemory(c.dev, m, nullptr);
+ }
+ 
++// VK_KHR_dynamic_rendering_local_read: a barrier inside dynamic rendering, then a draw reading the
++// depth attachment as a texture (Source 2 soft particles). The pass is split, depth copied, the
++// pass reopened with its contents loaded and the read rebound to the copy.
++void testLocalRead() {
++  Ctx c;
++  VkDeviceMemory m = alloc(c, 32 << 20, 0);
++  VkImage col = image(c, VK_FORMAT_B10G11R11_UFLOAT_PACK32, 64, 2, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, m);
++  VkImage dep = image(c, VK_FORMAT_D32_SFLOAT_S8_UINT, 64, 2,
++                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, m);
++  VkImageView cv, dv;
++  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
++  vi.image = col, vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY, vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
++  vkCreateImageView(c.dev, &vi, nullptr, &cv);
++  vi.image = dep, vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
++  vkCreateImageView(c.dev, &vi, nullptr, &dv);
++  VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++  VkCommandPool pool;
++  vkCreateCommandPool(c.dev, &pi, nullptr, &pool);
++  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++  ai.commandPool = pool, ai.commandBufferCount = 1;
++  VkCommandBuffer cb;
++  vkAllocateCommandBuffers(c.dev, &ai, &cb);
++  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++  vkBeginCommandBuffer(cb, &bi);
++  VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
++  ca.imageView = cv, ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++  da.imageView = dv, da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
++  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
++  ri.renderArea = {{0, 0}, {64, 64}}, ri.viewMask = 3, ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca;
++  ri.pDepthAttachment = ri.pStencilAttachment = &da;
++  vkCmdBeginRendering(cb, &ri);
++  Recorder& r = *from<CommandBuffer>(cb)->rec;
++  const vpgpu::TextureId depthId = from<Image>(dep)->id;
++  auto draw = [&](bool readsDepth) {
++    OpDraw d;
++    d.draw.count = 3;
++    if (readsDepth) {
++      vpgpu::Access a{vpgpu::ResourceRange::wholeTexture(depthId), vpgpu::stage::fragment, false};
++      a.kind = vpgpu::BindKind::Texture, a.slot = 2;
++      d.draw.bindings.push_back(a);
++      d.draw.views.push_back({vpgpu::BindKind::Texture, 2, depthId});
++      if (r.bound.localRead) d.images.push_back(from<Image>(dep));
++    }
++    r.ops.emplace_back(std::move(d));
++  };
++  draw(false);  // opaque
++  VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++                       VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, nullptr, 0, nullptr);
++  draw(true);  // soft particle
++  vkCmdEndRendering(cb);
++  vkEndCommandBuffer(cb);
++  vpgpu::Frame frame;
++  TranslateStats st;
++  translate(r, frame, st, from<Device>(c.dev));
++  const auto& cmds = frame.commands();
++  CHECK(st.localReads == 1 && cmds.size() == 3);
++  if (cmds.size() == 3) {
++    const auto* p0 = std::get_if<vpgpu::RenderPass>(&cmds[0]);
++    const auto* cp = std::get_if<vpgpu::Copy>(&cmds[1]);
++    const auto* p1 = std::get_if<vpgpu::RenderPass>(&cmds[2]);
++    CHECK(p0 && p0->desc.depth.store == vpgpu::StoreAction::Store);  // kept for the second half
++    CHECK(cp && cp->srcTexture.texture == depthId && cp->dstTexture.texture == from<Image>(dep)->localReadCopy &&
++          cp->srcTexture.layerCount == 2);
++    CHECK(p1 && p1->desc.depth.load == vpgpu::LoadAction::Load && p1->draws.size() == 1);
++    if (p1 && p1->draws.size() == 1) {
++      CHECK(p1->draws[0].bindings[0].range.index == from<Image>(dep)->localReadCopy.index);
++      CHECK(p1->draws[0].views.empty());
++    }
++  }
++  // Without a draw reading an attachment the barrier costs nothing.
++  vkBeginCommandBuffer(cb, &bi);
++  vkCmdBeginRendering(cb, &ri);
++  draw(false);
++  vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++                       VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, nullptr, 0, nullptr);
++  draw(false);
++  vkCmdEndRendering(cb);
++  vkEndCommandBuffer(cb);
++  vpgpu::Frame f2;
++  TranslateStats s2;
++  translate(r, f2, s2, from<Device>(c.dev));
++  CHECK(f2.commands().size() == 1);
++  vkDestroyCommandPool(c.dev, pool, nullptr);
++  vkDestroyImageView(c.dev, cv, nullptr);
++  vkDestroyImageView(c.dev, dv, nullptr);
++  vkDestroyImage(c.dev, col, nullptr);
++  vkDestroyImage(c.dev, dep, nullptr);
++  vkFreeMemory(c.dev, m, nullptr);
++}
++
+ }  // namespace
+ 
+ int main(int argc, char** argv) {
+@@ -1029,7 +1120,8 @@ int main(int argc, char** argv) {
+   const std::vector<std::pair<const char*, std::function<void()>>> groups = {
+       {"exports", testExports}, {"physical", testPhysical}, {"memory", testMemory},
+       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
+-      {"recipes", testRecipes}, {"alyx", testAlyxSurface}, {"depth_resolve", testDepthResolve}};
++      {"recipes", testRecipes}, {"alyx", testAlyxSurface}, {"depth_resolve", testDepthResolve},
++      {"local_read", testLocalRead}};
+   bool ran = false;
+   for (const auto& [name, fn] : groups) {
+     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
+-- 
+2.43.0
+

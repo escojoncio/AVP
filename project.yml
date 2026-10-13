@@ -1,7 +1,8 @@
-# VisionQuestPro for Apple Vision Pro, as an XcodeGen project: `xcodegen generate` writes
-# VisionQuestPro.xcodeproj. Built by .github/workflows/visionos.yml, which first makes
-# klepton/build/xros/libklepton.a (Klepton's runtime), MoltenVK and the VPEngine checkout (vpengine/).
-name: VisionQuestPro
+# AVP (Half-Life: Alyx on Apple Vision Pro) as an XcodeGen project: `xcodegen generate` writes
+# AVP.xcodeproj. Built by .github/workflows/visionos.yml, which first makes
+# klepton/build/xros/libklepton.a (Klepton's runtime), build/deps (LuaJIT, SDL3 + sdl2-compat,
+# Fossilize), MoltenVK, build/VPVulkan.framework and the patched VPEngine checkout (vpengine/).
+name: AVP
 options:
   deploymentTarget:
     visionOS: "26.0"
@@ -14,13 +15,22 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
     DEVELOPMENT_TEAM: ""
 targets:
-  VisionQuestPro:
+  AVP:
     type: application
     platform: visionOS
     scheme: {}
     sources:
       - path: app/Sources
       - path: app/Native
+      - path: app/Steam/SteamLauncherKit
+      - path: app/Steam/CSteamSupport
+        compilerFlags: ["-DZSTD_NO_TRACE", "-w"]
+        excludes:
+          - "**/*.h"
+          - "**/LICENSE*"
+          - "**/*.txt"
+      - path: app/Resources
+        buildPhase: resources
       - path: klepton/visionos/Sources
         excludes:
           - "*.h"
@@ -40,19 +50,37 @@ targets:
         embed: true
         link: false
         codeSign: true
+      - framework: build/deps/Frameworks/SDL3.framework
+        embed: true
+        codeSign: true
+      - framework: build/deps/Frameworks/SDL2.framework
+        embed: true
+        link: false
+        codeSign: true
     settings:
       base:
-        PRODUCT_NAME: VisionQuestPro
+        PRODUCT_NAME: AVP
         PRODUCT_BUNDLE_IDENTIFIER: com.kdt.livecontainer
         INFOPLIST_FILE: klepton/visionos/Info.plist
         GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: VisionQuestPro
+        INFOPLIST_KEY_CFBundleDisplayName: AVP
         INFOPLIST_KEY_GCSupportsControllerUserInteraction: YES
-        CODE_SIGN_ENTITLEMENTS: app/VisionQuestPro.entitlements
+        CODE_SIGN_ENTITLEMENTS: app/AVP.entitlements
         CODE_SIGN_STYLE: Automatic
         SWIFT_OBJC_BRIDGING_HEADER: klepton/visionos/Sources/Klepton-Bridging-Header.h
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS:
+          - $(inherited)
+          - KL_APP_ALYX
+          - KL_ALYX_LAUNCHER
+        GCC_PREPROCESSOR_DEFINITIONS:
+          - $(inherited)
+          - KL_APP_ALYX=1
+          - KL_ALYX_LAUNCHER=1
         HEADER_SEARCH_PATHS:
           - $(SRCROOT)/klepton/runtime
+          - $(SRCROOT)/klepton/runtime/linux
+          - $(SRCROOT)/klepton/runtime/openvr
+          - $(SRCROOT)/klepton/runtime/openvr/src
           - $(SRCROOT)/klepton/runtime/jni
           - $(SRCROOT)/klepton/runtime/libc
           - $(SRCROOT)/klepton/runtime/gfx
@@ -62,21 +90,40 @@ targets:
           - $(SRCROOT)/klepton/runtime/diag
           - $(SRCROOT)/klepton/visionos/Sources
           - $(SRCROOT)/klepton/vendor-moltenvk/out/include
+          - $(SRCROOT)/build/deps/include
           - $(SRCROOT)/app/Native
+          - $(SRCROOT)/app/Steam/CSteamSupport/include
+          - $(SRCROOT)/app/Steam/CSteamSupport/lzma
+          - $(SRCROOT)/app/Steam/CSteamSupport/zstd
           - $(SRCROOT)/vpengine/runtime
           - $(inherited)
+        FRAMEWORK_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/build/deps/Frameworks
         LIBRARY_SEARCH_PATHS:
           - $(SRCROOT)/klepton/build/xros
+          - $(SRCROOT)/build/deps/lib
         OTHER_LDFLAGS:
           - -lklepton
-          - -framework Metal
+          - -lluajit
+          - -lfossilize
+          - -lc++
+          - -liconv
           - -lz
+          - -lcompression
+          - -framework Metal
+          - -framework MetalFX
+          - -framework QuartzCore
+          - -framework CompositorServices
+          - -framework ARKit
+          - -framework GameController
+          - -framework CoreHaptics
           - -framework AudioToolbox
+          - -framework AVFoundation
           - -framework VideoToolbox
           - -framework CoreMedia
           - -framework CoreVideo
           - -framework IOSurface
-          - -framework AVFoundation
           - -framework Security
           - -framework CoreFoundation
           - -framework Foundation

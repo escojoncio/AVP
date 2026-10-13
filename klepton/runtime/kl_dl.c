@@ -20,7 +20,11 @@
 #include "kl_aaudio.h"
 #include "kl_openxr.h"
 
-#define KL_MAX_IMAGES 64
+// 256, not 64: Half-Life: Alyx alone maps ~80 images (69 game libraries, the
+// guest C++ runtime and a few system libraries), and a registration past the
+// cap was dropped silently — the image loaded but no later import could bind
+// to it and no dlsym could find it.
+#define KL_MAX_IMAGES 256
 typedef struct { char soname[128]; kl_image *img; } entry;
 static entry  g_imgs[KL_MAX_IMAGES];
 static int    g_nimgs = 0;
@@ -29,6 +33,16 @@ static char   g_dlerr[256];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void kl_set_library_path(const char *dir) { snprintf(g_libdir, sizeof g_libdir, "%s", dir); }
+
+// Extra DT_NEEDED search directories after g_libdir (a Linux guest keeps its
+// C++ runtime and system libraries in a sysroot beside the game's bin dir), and
+// a hook naming sonames some personality serves itself (libc.so.6 for glibc).
+static char g_extra_dirs[4][512];
+static int  g_nextra;
+void kl_add_library_path(const char *dir) {
+    if (g_nextra < 4) snprintf(g_extra_dirs[g_nextra++], sizeof g_extra_dirs[0], "%s", dir);
+}
+int (*kl_soname_served_hook)(const char *soname);
 
 static const char *basename_of(const char *p) {
     const char *s = strrchr(p, '/');
@@ -323,7 +337,7 @@ static int kl_dep_is_shim_served(const char *name) {
     };
     for (unsigned i = 0; i < sizeof shim / sizeof shim[0]; i++)
         if (!strcmp(name, shim[i])) return 1;
-    return 0;
+    return kl_soname_served_hook ? kl_soname_served_hook(name) : 0;
 }
 
 // FMOD's Android platform layer (the AudioTrack/AudioManager output, and the
@@ -348,12 +362,33 @@ static void kl_maybe_jni_onload(const char *path, kl_image *img) {
             b, r);
 }
 
+// Libraries whose dependencies are being loaded right now, by real basename. A
+// DT_NEEDED cycle (Alyx's libfreetype <-> libharfbuzz) otherwise recurses until
+// the stack overflows — a SIGSEGV with no frame left to report it from.
+static __thread char g_inprog[32][128];
+static __thread int g_ninprog;
+
 kl_image *kl_load_recursive(const char *path) {
     kl_image *have = kl_find_image(path);
-    if (have) return have;                       // cycle guard / already loaded
+    if (have) return have;                       // already loaded
+    {
+        char real[1024];
+        if (realpath(path, real)) {
+            // A symlinked soname (libavcodec.so.58 -> libavcodec.so.58.91.100)
+            // is the same image under a second name.
+            if ((have = kl_find_image(real))) { kl_register_image(path, have); return have; }
+            const char *rb = basename_of(real);
+            for (int i = 0; i < g_ninprog; i++)
+                if (!strcmp(g_inprog[i], rb)) return NULL;     // cycle: caller continues
+        }
+    }
 
     char names[32][128];
     int nn = kl_list_needed(path, names, 32);
+    char real_self[1024];
+    if (!realpath(path, real_self)) snprintf(real_self, sizeof real_self, "%s", path);
+    int pushed = g_ninprog < 32;
+    if (pushed) snprintf(g_inprog[g_ninprog++], 128, "%s", basename_of(real_self));
     if (kl_env_on("KL_TRACE_NEEDED", 1)) {
         fprintf(stderr, "  [dl] %s: %d DT_NEEDED\n", path, nn);
         for (int i = 0; i < nn; i++) fprintf(stderr, "  [dl]     needs %s\n", names[i]);
@@ -389,7 +424,12 @@ kl_image *kl_load_recursive(const char *path) {
         }
         char full[1024];
         if (strchr(names[i], '/')) snprintf(full, sizeof full, "%s", names[i]);
-        else snprintf(full, sizeof full, "%s/%s", g_libdir, names[i]);
+        else {
+            snprintf(full, sizeof full, "%s/%s", g_libdir, names[i]);
+            for (int d = 0; d < g_nextra && !kl_can_load(full); d++)
+                snprintf(full, sizeof full, "%s/%s", g_extra_dirs[d], names[i]);
+            if (!kl_can_load(full)) snprintf(full, sizeof full, "%s/%s", g_libdir, names[i]);
+        }
         // Framework-aware, NOT a raw access() on "<dir>/libfoo.so": on device the
         // guest libraries ship as translated frameworks (libfoo.framework/libfoo),
         // so a plain access() finds NONE of them and every bundled dependency is
@@ -406,16 +446,26 @@ kl_image *kl_load_recursive(const char *path) {
         }
         if (kl_env_on("KL_TRACE_NEEDED", 1))
             fprintf(stderr, "  [dl]     %s -> loading (%s)\n", names[i], full);
+        int cyclic = 0;
+        {
+            char r2[1024];
+            if (realpath(full, r2))
+                for (int k = 0; k < g_ninprog; k++) cyclic |= !strcmp(g_inprog[k], basename_of(r2));
+        }
+        if (cyclic) continue;                    // mid-load up the stack; binds later
         if (!kl_load_recursive(full)) {
             fprintf(stderr, "  [klepton] dependency %s of %s failed to load: %s\n",
                     names[i], path, kl_error());
+            if (pushed) g_ninprog--;
             return NULL;
         }
     }
+    if (pushed) g_ninprog--;
 
-    kl_image *img = kl_load_auto(path);
+    kl_image *img = kl_load_auto(real_self);
     if (!img) return NULL;
     kl_register_image(path, img);
+    if (strcmp(basename_of(path), basename_of(real_self))) kl_register_image(real_self, img);
     kl_run_init(img);
     kl_maybe_jni_onload(path, img);
     return img;
@@ -1025,4 +1075,12 @@ int klb_dladdr(const void *addr, kl_dl_info *info) {
         }
     }
     return 0;
+}
+
+// Registry walk for host drivers (m_alyx's gap report): the i-th registered
+// image and its soname, or NULL past the end.
+kl_image *kl_registry_at(int i, const char **soname) {
+    if (i < 0 || i >= g_nimgs) return NULL;
+    if (soname) *soname = g_imgs[i].soname;
+    return g_imgs[i].img;
 }

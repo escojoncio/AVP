@@ -14,11 +14,14 @@
 // dependency, not as a guest that mysteriously fails to render.
 #include <dlfcn.h>
 #include <pthread.h>
+#include <CommonCrypto/CommonDigest.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
+#include <TargetConditionals.h>
 
 #include "kl_vulkan.h"
 #include "kl_env.h"
@@ -56,8 +59,10 @@ int   kl_vulkan_is_handle(const void *h) { (void)h; return 0; }
 void *kl_vulkan_sym(const char *n) { (void)n; return NULL; }
 void *kl_vulkan_lookup(const char *n) { (void)n; return NULL; }
 int   kl_vulkan_available(void) { return 0; }
+const char *kl_vulkan_driver_path(void) { return NULL; }
 void  kl_vulkan_stats(unsigned *p, unsigned *c) { if (p) *p = 0; if (c) *c = 0; }
 int   kl_vulkan_guest_active(void) { return 0; }
+int   kl_vulkan_gpu_ids(unsigned *v, unsigned *d) { (void)v; (void)d; return 0; }
 unsigned long long kl_vulkan_eye_image(int s, int e, unsigned w, unsigned h, int srgb) {
     (void)s; (void)e; (void)w; (void)h; (void)srgb; return 0;
 }
@@ -76,6 +81,11 @@ unsigned long long kl_vulkan_layer_image(int k, int s, int e, unsigned w, unsign
 void *kl_vulkan_layer_mtl_texture(int k, int s, int e, int *w, int *h) {
     (void)k; (void)s; (void)e; if (w) *w = 0; if (h) *h = 0; return NULL;
 }
+unsigned long long kl_vulkan_eye_depth_image(int s, int e, unsigned w, unsigned h) { (void)s; (void)e; (void)w; (void)h; return 0; }
+unsigned long long kl_vulkan_eye_depth_half(int e, unsigned w, unsigned h) { (void)e; (void)w; (void)h; return 0; }
+unsigned long long kl_vulkan_eye_depth_staging(int s, int e, unsigned long long b, void **m) { (void)s; (void)e; (void)b; if (m) *m = NULL; return 0; }
+void kl_vulkan_set_eye_depth_map(int s, int e, float a, float b, unsigned w, unsigned h, unsigned p) { (void)s; (void)e; (void)a; (void)b; (void)w; (void)h; (void)p; }
+void *kl_vulkan_eye_depth_mtl(int s, int e, int *w, int *h, float *a, float *b) { (void)s; (void)e; (void)w; (void)h; (void)a; (void)b; return NULL; }
 void  kl_vulkan_layer_rekey(int old_key, int new_key) { (void)old_key; (void)new_key; }
 int   kl_vulkan_layer_written(int key) { (void)key; return 0; }
 unsigned long long kl_vulkan_spacewarp_image(int s, int e, int k, unsigned w, unsigned h,
@@ -90,7 +100,7 @@ unsigned kl_vulkan_spacewarp_writes(int s, int k) { (void)s; (void)k; return 0; 
 int  kl_vulkan_eye_depth_get(int s, int e, unsigned long long t, kl_vulkan_eye_depth *o) {
     (void)s; (void)e; (void)t; if (o) memset(o, 0, sizeof *o); return 0;
 }
-void *kl_vulkan_eye_depth_mtl(int s, int *w, int *h, int *l, int *f) {
+void *kl_vulkan_taa_depth_mtl(int s, int *w, int *h, int *l, int *f) {
     (void)s; if (w) *w = 0; if (h) *h = 0; if (l) *l = 0; if (f) *f = 0; return NULL;
 }
 void kl_vulkan_eye_depth_tag(int s, unsigned long long t) { (void)s; (void)t; }
@@ -131,6 +141,8 @@ void *kl_vulkan_xr_image_mtl(unsigned long long img) { (void)img; return NULL; }
 // defined, which it is not here.
 #define VK_USE_PLATFORM_METAL_EXT 1
 #include <vulkan/vulkan.h>
+#include "kl_vk_pipe_hooks.h"   // the pipeline recorder/replayer add-on (kl_fossilize.cpp)
+#include "kl_gpu_time.h"         // per-frame GPU time: each guest queue's MTLCommandQueue is handed over once
 #include "kl_glfb.h"
 
 #include <zlib.h>
@@ -161,25 +173,43 @@ static void *mvk_try(const char *path) {
     return h;
 }
 
+// The path of the Vulkan driver mvk_open loaded (VPVulkan.framework or MoltenVK), for anything
+// else that must load the SAME driver (the glibc personality's SDL_Vulkan_LoadLibrary redirect).
+static char g_mvk_path[1024];
+static void *mvk_try_rec(const char *path) {
+    void *h = mvk_try(path);
+    if (h) snprintf(g_mvk_path, sizeof g_mvk_path, "%s", path);
+    return h;
+}
+
 static void *mvk_open(void) {
     const char *explicit = kl_env_str("KL_MVK_DYLIB", NULL);
-    if (explicit) return mvk_try(explicit);
+    if (explicit) return mvk_try_rec(explicit);
 
     const char *dir = kl_env_str("KL_MVK_DIR", MVK_VENDORED_DIR);
     char path[1024];
     snprintf(path, sizeof path, "%s/libMoltenVK.dylib", dir);
-    void *h = mvk_try(path);
+    void *h = mvk_try_rec(path);
     if (h) return h;
     snprintf(path, sizeof path, "%s/MoltenVK.framework/MoltenVK", dir);
-    if ((h = mvk_try(path))) return h;
+    if ((h = mvk_try_rec(path))) return h;
     // The bundle case: @rpath resolves to <exec dir>/Frameworks, which is where
     // an embedded framework lands and the ONLY place AMFI will accept code from.
-    if ((h = mvk_try("@rpath/MoltenVK.framework/MoltenVK"))) return h;
-    return mvk_try("MoltenVK.framework/MoltenVK");
+    if ((h = mvk_try_rec("@rpath/MoltenVK.framework/MoltenVK"))) return h;
+    return mvk_try_rec("MoltenVK.framework/MoltenVK");
 }
 
 static void *g_mvk;
 static PFN_vkGetInstanceProcAddr real_gipa;
+
+// Pipeline-object hooks (kl_vk_pipe_hooks.h): an add-on records every sampler, layout, module,
+// render pass and pipeline the guest creates, and replays recorded ones at device creation.
+static const klvk_pipe_hooks *g_pipe_hooks;
+static __thread int t_pipe_replay;   // this thread belongs to the replayer
+void klvk_set_pipe_hooks(const klvk_pipe_hooks *h) { g_pipe_hooks = h; }
+void klvk_set_replay_thread(int on) { t_pipe_replay = on; }
+#define PIPE_HOOK(fn, ...) do { if (g_pipe_hooks && g_pipe_hooks->fn && !t_pipe_replay) g_pipe_hooks->fn(__VA_ARGS__); } while (0)
+static PFN_vkVoidFunction VKAPI_CALL klvk_GetDeviceProcAddr(VkDevice dev, const char *name);
 static PFN_vkGetDeviceProcAddr   real_gdpa;
 static int g_init_done, g_avail;
 
@@ -269,6 +299,7 @@ static void vk_init(void) {
 }
 
 int kl_vulkan_available(void) { vk_init(); return g_avail; }
+const char *kl_vulkan_driver_path(void) { vk_init(); return g_mvk_path[0] ? g_mvk_path : NULL; }
 
 // ---------------------------------------------------------------------------
 // State
@@ -365,6 +396,29 @@ static klvk_device *dev_of_queue(VkQueue q) {
     return g_ndev ? g_devs[0] : NULL;
 }
 
+// kl_foz_prewarm's device and instance, once its replay is done (runtime/linux/kl_fossilize.cpp): out of the layer's
+// books and destroyed. The game's own device has to be g_devs[0], the one eye images, the compositor and queue lookups
+// use, and nothing of the prewarm may be left for a handle of the game's to collide with.
+void klvk_retire_device(VkInstance inst, VkDevice dev) {
+    klvk_device *d = NULL;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_ndev; i++)
+        if (g_devs[i]->dev == dev) {
+            d = g_devs[i];
+            memmove(&g_devs[i], &g_devs[i + 1], (size_t)(g_ndev - i - 1) * sizeof *g_devs);
+            g_ndev--;
+            break;
+        }
+    pthread_mutex_unlock(&g_lock);
+    PFN_vkDestroyDevice dd = (PFN_vkDestroyDevice)real_gipa(inst, "vkDestroyDevice");
+    if (dd && dev) dd(dev, NULL);
+    free(d);
+    PFN_vkDestroyInstance di = (PFN_vkDestroyInstance)real_gipa(inst, "vkDestroyInstance");
+    if (di && inst) di(inst, NULL);
+    if (g_instance == inst) g_instance = VK_NULL_HANDLE;
+    VKI("prewarm device and instance retired; %d device(s) left\n", g_ndev);
+}
+
 // ---------------------------------------------------------------------------
 // PNG (top-down; Vulkan images already are). kl_glfb.c has its own writer and
 // it is NOT shared, deliberately: that one flips GL's bottom-up rows and is
@@ -440,6 +494,9 @@ static void ext_add(extlist *l, const char *n) {
     l->names[l->n++] = n;
 }
 
+const char *kl_vk_extra_instance_exts[8];
+int kl_vk_native_wsi;
+
 static int ext_supported(const VkExtensionProperties *have, uint32_t nhave,
                          const char *want) {
     for (uint32_t i = 0; i < nhave; i++)
@@ -461,6 +518,7 @@ static VkResult klvk_EnumerateInstanceExtensionProperties(
 
     uint32_t n = 0;
     real(layer, &n, NULL);
+    VKT("vkEnumerateInstanceExtensionProperties(%s): %u from MoltenVK\n", layer ? layer : "NULL", n);
     VkExtensionProperties *tmp = calloc(n + 2, sizeof *tmp);
     if (!tmp) return VK_ERROR_OUT_OF_HOST_MEMORY;
     real(layer, &n, tmp);
@@ -471,6 +529,19 @@ static VkResult klvk_EnumerateInstanceExtensionProperties(
     if (!layer && !ext_supported(tmp, n, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)) {
         snprintf(tmp[n].extensionName, sizeof tmp[n].extensionName, "%s",
                  VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
+        tmp[n].specVersion = 6;
+        n++;
+    }
+
+    // A personality can advertise extra instance extensions its guest gates
+    // on (a Linux guest wants a Linux WSI name before it will go on to create
+    // a surface through SDL). They are dropped at vkCreateInstance, like any
+    // name MoltenVK does not have.
+    for (int i = 0; !layer && kl_vk_extra_instance_exts[i]; i++) {
+        if (ext_supported(tmp, n, kl_vk_extra_instance_exts[i])) continue;
+        tmp = realloc(tmp, (n + 1) * sizeof *tmp);
+        memset(&tmp[n], 0, sizeof tmp[n]);
+        snprintf(tmp[n].extensionName, sizeof tmp[n].extensionName, "%s", kl_vk_extra_instance_exts[i]);
         tmp[n].specVersion = 6;
         n++;
     }
@@ -487,11 +558,141 @@ static VkResult klvk_EnumerateInstanceExtensionProperties(
     return r;
 }
 
+// ---- The guest's own instance and device settings, as it asked for them (KL_VK_DEVICE_INFO=<file>|auto) ----
+// Pipelines compile to the same MSL only on a device made the same way, so a replay that runs before the game (the
+// launcher warming the Metal cache with no guest at all: kl_foz_prewarm) needs these: written as JSON at
+// vkCreateDevice, "auto" being device-info.json in the pipeline recorder's folder (KL_VK_FOZ_DIR, else
+// $HOME/Documents/klfz). Feature structs go out as their bytes after the sType/pNext header; one this table does not
+// know is listed by sType with size 0.
+static struct { uint32_t api, app_ver, eng_ver; char app[64], eng[64]; char *ext[64]; uint32_t n; } g_inst_info;
+
+// The Vulkan census (KL_VK_CENSUS): what the guest asks of Vulkan, once per distinct item, to the log.
+#include <stdarg.h>
+#include "kl_vk_census.inc"
+
+static void devinfo_note_instance(const VkInstanceCreateInfo *ci) {
+    if (!ci) return;
+    for (uint32_t i = 0; i < g_inst_info.n; i++) free(g_inst_info.ext[i]);
+    g_inst_info.n = 0;  // the latest instance's
+    const VkApplicationInfo *a = ci->pApplicationInfo;
+    if (a) {
+        g_inst_info.api = a->apiVersion; g_inst_info.app_ver = a->applicationVersion; g_inst_info.eng_ver = a->engineVersion;
+        snprintf(g_inst_info.app, sizeof g_inst_info.app, "%s", a->pApplicationName ? a->pApplicationName : "");
+        snprintf(g_inst_info.eng, sizeof g_inst_info.eng, "%s", a->pEngineName ? a->pEngineName : "");
+    }
+    for (uint32_t i = 0; i < ci->enabledExtensionCount && g_inst_info.n < 64; i++)
+        g_inst_info.ext[g_inst_info.n++] = strdup(ci->ppEnabledExtensionNames[i]);
+}
+
+static const struct { VkStructureType t; size_t size; } k_feature_structs[] = {
+#define F(T, S) { VK_STRUCTURE_TYPE_##T, sizeof(S) }
+    F(PHYSICAL_DEVICE_FEATURES_2, VkPhysicalDeviceFeatures2),
+    F(PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, VkPhysicalDeviceVulkan11Features),
+    F(PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, VkPhysicalDeviceVulkan12Features),
+    F(PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, VkPhysicalDeviceVulkan13Features),
+    F(PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES, VkPhysicalDevice16BitStorageFeatures),
+    F(PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES, VkPhysicalDevice8BitStorageFeatures),
+    F(PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES, VkPhysicalDeviceShaderFloat16Int8Features),
+    F(PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES, VkPhysicalDeviceDescriptorIndexingFeatures),
+    F(PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES, VkPhysicalDeviceTimelineSemaphoreFeatures),
+    F(PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES, VkPhysicalDeviceBufferDeviceAddressFeatures),
+    F(PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES, VkPhysicalDeviceHostQueryResetFeatures),
+    F(PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES, VkPhysicalDeviceScalarBlockLayoutFeatures),
+    F(PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES, VkPhysicalDeviceImagelessFramebufferFeatures),
+    F(PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES, VkPhysicalDeviceUniformBufferStandardLayoutFeatures),
+    F(PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES, VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures),
+    F(PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES, VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures),
+    F(PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES, VkPhysicalDeviceVulkanMemoryModelFeatures),
+    F(PHYSICAL_DEVICE_MULTIVIEW_FEATURES, VkPhysicalDeviceMultiviewFeatures),
+    F(PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES, VkPhysicalDeviceSamplerYcbcrConversionFeatures),
+    F(PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES, VkPhysicalDeviceVariablePointersFeatures),
+    F(PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, VkPhysicalDeviceShaderDrawParametersFeatures),
+    F(PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES, VkPhysicalDeviceProtectedMemoryFeatures),
+    F(PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES, VkPhysicalDeviceDynamicRenderingFeatures),
+    F(PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES, VkPhysicalDeviceSynchronization2Features),
+    F(PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES, VkPhysicalDeviceMaintenance4Features),
+    F(PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES, VkPhysicalDeviceImageRobustnessFeatures),
+    F(PHYSICAL_DEVICE_INLINE_UNIFORM_BLOCK_FEATURES, VkPhysicalDeviceInlineUniformBlockFeatures),
+    F(PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES, VkPhysicalDevicePipelineCreationCacheControlFeatures),
+    F(PHYSICAL_DEVICE_PRIVATE_DATA_FEATURES, VkPhysicalDevicePrivateDataFeatures),
+    F(PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES, VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures),
+    F(PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES, VkPhysicalDeviceShaderIntegerDotProductFeatures),
+    F(PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES, VkPhysicalDeviceShaderTerminateInvocationFeatures),
+    F(PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES, VkPhysicalDeviceSubgroupSizeControlFeatures),
+    F(PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES, VkPhysicalDeviceTextureCompressionASTCHDRFeatures),
+    F(PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES, VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeatures),
+    F(PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, VkPhysicalDeviceRobustness2FeaturesEXT),
+    F(PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT, VkPhysicalDeviceExtendedDynamicStateFeaturesEXT),
+    F(PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, VkPhysicalDeviceExtendedDynamicState2FeaturesEXT),
+    F(PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, VkPhysicalDeviceCustomBorderColorFeaturesEXT),
+    F(PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT, VkPhysicalDeviceDepthClipEnableFeaturesEXT),
+    F(PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT, VkPhysicalDeviceTexelBufferAlignmentFeaturesEXT),
+    F(PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT, VkPhysicalDevice4444FormatsFeaturesEXT),
+    F(PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT, VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT),
+    F(PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT, VkPhysicalDeviceShaderAtomicFloatFeaturesEXT),
+    // Alyx's own (Source 2 on MoltenVK, 2026-10-05): multiview, dynamic rendering, these two
+    F(PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR),
+    F(PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT, VkPhysicalDeviceHostImageCopyFeaturesEXT),
+#ifdef VK_VERSION_1_4
+    F(PHYSICAL_DEVICE_VULKAN_1_4_FEATURES, VkPhysicalDeviceVulkan14Features),
+#endif
+#undef F
+};
+
+static void devinfo_hex(FILE *f, const void *p, size_t n) {
+    for (size_t i = 0; i < n; i++) fprintf(f, "%02x", ((const unsigned char *)p)[i]);
+}
+
+static void devinfo_write(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci) {
+    const char *e = getenv("KL_VK_DEVICE_INFO");
+    if (!e || !*e || !ci) return;
+    char path[1024];
+    const char *dir = getenv("KL_VK_FOZ_DIR");  // the pipeline recorder's folder, as kl_fossilize.cpp finds it
+    if (!strcmp(e, "auto") && dir && *dir) snprintf(path, sizeof path, "%s/device-info.json", dir);
+    else if (!strcmp(e, "auto")) snprintf(path, sizeof path, "%s/Documents/klfz/device-info.json", getenv("HOME") ? getenv("HOME") : ".");
+    else snprintf(path, sizeof path, "%s", e);
+    FILE *f = fopen(path, "w");
+    if (!f) { VKI("device info: cannot write %s\n", path); return; }
+    VkPhysicalDeviceProperties pr = {0};
+    PFN_vkGetPhysicalDeviceProperties gp = (PFN_vkGetPhysicalDeviceProperties)real_gipa(g_instance, "vkGetPhysicalDeviceProperties");
+    if (gp && phys) gp(phys, &pr);
+    fprintf(f, "{\"v\": 1, \"gpu\": \"%s\", \"driver\": %u, \"gpu_api\": %u,\n", pr.deviceName, pr.driverVersion, pr.apiVersion);
+    fprintf(f, " \"instance\": {\"api\": %u, \"app\": \"%s\", \"app_version\": %u, \"engine\": \"%s\", \"engine_version\": %u, \"extensions\": [",
+            g_inst_info.api, g_inst_info.app, g_inst_info.app_ver, g_inst_info.eng, g_inst_info.eng_ver);
+    for (uint32_t i = 0; i < g_inst_info.n; i++) fprintf(f, "%s\"%s\"", i ? ", " : "", g_inst_info.ext[i]);
+    fprintf(f, "]},\n \"device\": {\"extensions\": [");
+    for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) fprintf(f, "%s\"%s\"", i ? ", " : "", ci->ppEnabledExtensionNames[i]);
+    fprintf(f, "],\n  \"queues\": [");
+    for (uint32_t i = 0; i < ci->queueCreateInfoCount; i++)
+        fprintf(f, "%s{\"family\": %u, \"count\": %u, \"flags\": %u}", i ? ", " : "", ci->pQueueCreateInfos[i].queueFamilyIndex,
+                ci->pQueueCreateInfos[i].queueCount, ci->pQueueCreateInfos[i].flags);
+    fprintf(f, "],\n  \"enabled_features\": ");
+    if (ci->pEnabledFeatures) { fputc('"', f); devinfo_hex(f, ci->pEnabledFeatures, sizeof *ci->pEnabledFeatures); fputc('"', f); }
+    else fprintf(f, "null");
+    fprintf(f, ",\n  \"pnext\": [");
+    unsigned n = 0, unknown = 0;
+    for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext, n++) {
+        size_t size = 0;
+        for (size_t k = 0; k < sizeof k_feature_structs / sizeof *k_feature_structs; k++)
+            if (k_feature_structs[k].t == b->sType) { size = k_feature_structs[k].size; break; }
+        fprintf(f, "%s\n   {\"sType\": %u, \"size\": %zu, \"data\": \"", n ? "," : "", (unsigned)b->sType, size);
+        if (size > sizeof *b) devinfo_hex(f, (const char *)b + sizeof *b, size - sizeof *b);
+        else unknown++;
+        fputc('"', f); fputc('}', f);
+    }
+    fprintf(f, "]}}\n");
+    fclose(f);
+    VKI("device info: %u instance + %u device extension(s), %u pNext struct(s) (%u not in the table) -> %s\n",
+        g_inst_info.n, ci->enabledExtensionCount, n, unknown, path);
+}
+
 static VkResult klvk_CreateInstance(const VkInstanceCreateInfo *ci,
                                     const VkAllocationCallbacks *alloc,
                                     VkInstance *out) {
     vk_init();
     if (!g_avail) return VK_ERROR_INITIALIZATION_FAILED;
+    devinfo_note_instance(ci);
+    census_instance(ci);
     PFN_vkCreateInstance real = (PFN_vkCreateInstance)real_gipa(NULL, "vkCreateInstance");
     PFN_vkEnumerateInstanceExtensionProperties enum_ext =
         (PFN_vkEnumerateInstanceExtensionProperties)
@@ -508,6 +709,27 @@ static VkResult klvk_CreateInstance(const VkInstanceCreateInfo *ci,
         const char *e = ci->ppEnabledExtensionNames[i];
         if (!strcmp(e, VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)) {
             VKT("instance ext %s -> ours (MoltenVK has no Android WSI)\n", e);
+            continue;
+        }
+        // A personality-advertised WSI name stands for "a window surface":
+        // the one this host has is Metal (what SDL's Vulkan surface uses).
+        int extra = 0;
+        for (int k = 0; kl_vk_extra_instance_exts[k]; k++) extra |= !strcmp(e, kl_vk_extra_instance_exts[k]);
+        if (extra) {
+            if (!have || ext_supported(have, nhave, "VK_EXT_metal_surface")) {
+                int dup = 0;
+                for (unsigned k = 0; k < keep.n; k++) dup |= !strcmp(keep.names[k], "VK_EXT_metal_surface");
+                if (!dup) ext_add(&keep, "VK_EXT_metal_surface");
+            }
+            // ...and a headless one: SDL's offscreen video driver (the Alyx
+            // app on visionOS, where there is no window to present to) makes
+            // its Vulkan surface with VK_EXT_headless_surface.
+            if (have && ext_supported(have, nhave, "VK_EXT_headless_surface")) {
+                int dup = 0;
+                for (unsigned k = 0; k < keep.n; k++) dup |= !strcmp(keep.names[k], "VK_EXT_headless_surface");
+                if (!dup) ext_add(&keep, "VK_EXT_headless_surface");
+            }
+            VKT("instance ext %s -> VK_EXT_metal_surface (+ headless)\n", e);
             continue;
         }
         if (have && !ext_supported(have, nhave, e)) {
@@ -589,6 +811,50 @@ static void dev_resolve(klvk_device *d) {
 #undef R
 }
 
+
+// KL_VK_FAKE_MINMAX=1 — the headset's MoltenVK reports samplerFilterMinmax = 0
+// and no SAMPLED_IMAGE_FILTER_MINMAX format bit (the Mac's reports both), and
+// Source 2's render device init refuses the headset's GPU; that one feature is
+// the only capability difference between the two (KL_VK_DUMP_CAPS diff). This
+// advertises it and strips the reduction mode from the samplers that ask for
+// it (they then filter as weighted average — the probe, not the final fix).
+static int klvk_fake_minmax(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("KL_VK_FAKE_MINMAX", 0);
+    return on;
+}
+static void klvk_minmax_features(void *pnext) {
+    if (!klvk_fake_minmax()) return;
+    for (VkBaseOutStructure *b = pnext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+            ((VkPhysicalDeviceVulkan12Features *)b)->samplerFilterMinmax = VK_TRUE;
+}
+static void klvk_minmax_props(void *pnext) {
+    if (!klvk_fake_minmax()) return;
+    for (VkBaseOutStructure *b = pnext; b; b = b->pNext) {
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES) {
+            ((VkPhysicalDeviceSamplerFilterMinmaxProperties *)b)->filterMinmaxSingleComponentFormats = VK_TRUE;
+            ((VkPhysicalDeviceSamplerFilterMinmaxProperties *)b)->filterMinmaxImageComponentMapping = VK_TRUE;
+        }
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES) {
+            ((VkPhysicalDeviceVulkan12Properties *)b)->filterMinmaxSingleComponentFormats = VK_TRUE;
+            ((VkPhysicalDeviceVulkan12Properties *)b)->filterMinmaxImageComponentMapping = VK_TRUE;
+        }
+    }
+}
+static void klvk_minmax_format(VkFormatProperties *p) {
+    if (!klvk_fake_minmax() || !p) return;
+    if (p->optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+        p->optimalTilingFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
+}
+// Unlink one struct type from a const pNext chain, in place.
+static void klvk_unlink(const void *head_pnext_owner, VkStructureType t) {
+    VkBaseOutStructure *prev = (VkBaseOutStructure *)head_pnext_owner;
+    while (prev && prev->pNext) {
+        if (prev->pNext->sType == t) { prev->pNext = prev->pNext->pNext; continue; }
+        prev = prev->pNext;
+    }
+}
 static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
                                   const VkAllocationCallbacks *alloc, VkDevice *out) {
     PFN_vkCreateDevice real = (PFN_vkCreateDevice)real_gipa(g_instance, "vkCreateDevice");
@@ -600,6 +866,17 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     // NULL physicalDevice (its GPU select left it null), and MoltenVK would make
     // a device on nothing. Give it the real GPU so it gets a working VkDevice.
     phys = KLVK_PHYS_OR_SUB(phys, "CreateDevice");
+    // as the guest asked, before anything below edits it
+    devinfo_write(phys, ci);
+    census_device(phys, ci);
+    if (ci && g_pipe_hooks && g_pipe_hooks->device_info) g_pipe_hooks->device_info(ci);
+    if (klvk_fake_minmax() && ci)
+        for (VkBaseOutStructure *b = (VkBaseOutStructure *)ci->pNext; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES &&
+                ((VkPhysicalDeviceVulkan12Features *)b)->samplerFilterMinmax) {
+                ((VkPhysicalDeviceVulkan12Features *)b)->samplerFilterMinmax = VK_FALSE;
+                VKI("CreateDevice: samplerFilterMinmax requested — cleared (KL_VK_FAKE_MINMAX)\n");
+            }
 
     uint32_t nhave = 0;
     VkExtensionProperties *have = NULL;
@@ -667,6 +944,7 @@ static VkResult klvk_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInf
     pthread_mutex_unlock(&g_lock);
 
     VKI("vkCreateDevice ok — %u extension(s), queue family %u\n", keep.n, d->queue_family);
+    if (g_pipe_hooks && g_pipe_hooks->device_created) g_pipe_hooks->device_created(d->dev, klvk_GetDeviceProcAddr);
     return VK_SUCCESS;
 }
 
@@ -1246,6 +1524,47 @@ int kl_vulkan_display_luid(uint8_t out[8]) {
     return 1;
 }
 
+// The GPU's Vulkan vendor and device ids, read before the guest has an instance (a throwaway one of our own): for
+// Alyx's video settings (kl_alyx_app.c), which the game throws away for its automatic setup unless the file's
+// VendorID/DeviceID equal the GPU's. MoltenVK's device id for an Apple GPU combines the OS version with the GPU
+// family (seen: 0x1B00020A on a Mac, 0x1B00000A on an M5 Vision Pro, both at OS 27.0), so it can change with an OS
+// update as well as differ between M2 and M5. Returns 1 and fills both, or 0 without MoltenVK.
+// Safe to call before the app has pointed KL_MVK_DIR at MoltenVK: a failed load here is forgotten, so the guest's
+// own first Vulkan call loads it again.
+int kl_vulkan_gpu_ids(unsigned *vendor, unsigned *device) {
+    int first = !g_init_done;
+    vk_init();
+    if (!g_avail) { if (first) g_init_done = 0; return 0; }
+    if (!vendor || !device) return 0;
+    PFN_vkCreateInstance ci = (PFN_vkCreateInstance)real_gipa(NULL, "vkCreateInstance");
+    if (!ci) return 0;
+    VkApplicationInfo app;
+    memset(&app, 0, sizeof app);
+    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.apiVersion = VK_API_VERSION_1_0;
+    VkInstanceCreateInfo info;
+    memset(&info, 0, sizeof info);
+    info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    info.pApplicationInfo = &app;
+    VkInstance inst = VK_NULL_HANDLE;
+    if (ci(&info, NULL, &inst) != VK_SUCCESS || !inst) return 0;
+    PFN_vkEnumeratePhysicalDevices en = (PFN_vkEnumeratePhysicalDevices)real_gipa(inst, "vkEnumeratePhysicalDevices");
+    PFN_vkGetPhysicalDeviceProperties gp = (PFN_vkGetPhysicalDeviceProperties)real_gipa(inst, "vkGetPhysicalDeviceProperties");
+    PFN_vkDestroyInstance di = (PFN_vkDestroyInstance)real_gipa(inst, "vkDestroyInstance");
+    uint32_t n = 1;
+    VkPhysicalDevice pd = VK_NULL_HANDLE;
+    int ok = 0;
+    if (en && gp && en(inst, &n, &pd) >= 0 && pd) {
+        VkPhysicalDeviceProperties pr;
+        gp(pd, &pr);
+        *vendor = pr.vendorID;
+        *device = pr.deviceID;
+        ok = 1;
+    }
+    if (di) di(inst, NULL);
+    return ok;
+}
+
 // The live instance's first physical device — the substitute for a guest that
 // reaches a vkGetPhysicalDevice*/vkCreateDevice call with a NULL handle. AC Nexus
 // (Unity) does exactly that: its GfxDeviceVulkan runs a whole battery of device
@@ -1379,20 +1698,56 @@ static void eye_publish_mtl(int stage, int eye, int layers) {
 // that into a clean failure. Locked - guest worker threads create both at once -
 // and FAIL-OPEN if it ever fills, so a legitimate view is never wrongly refused.
 #define KLVK_IMG_REG_MAX 16384
-static VkImage g_img_reg[KLVK_IMG_REG_MAX];
-static int g_img_reg_n;
+// An open-addressing set rather than a list: klvk_img_reg_has runs on every
+// barrier and blit, and a linear scan of thousands of images under the lock
+// was the layer's largest self cost in an Alyx profile (1.25% of samples).
+#define KLVK_IMG_REG_CAP 32768                       // power of two, 2x MAX
+#define KLVK_IMG_TOMB ((VkImage)(uintptr_t)1)
+static VkImage g_img_set[KLVK_IMG_REG_CAP];
+static int g_img_reg_n, g_img_tomb, g_img_full;
 static pthread_mutex_t g_img_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned klvk_img_hash_slot(VkImage img) {
+    uint64_t h = (uint64_t)(uintptr_t)img * 0x9E3779B97F4A7C15ull;
+    return (unsigned)(h >> 49) & (KLVK_IMG_REG_CAP - 1);
+}
+static void klvk_img_rehash(void) {                  // lock held
+    static VkImage old[KLVK_IMG_REG_CAP];
+    memcpy(old, g_img_set, sizeof old);
+    memset(g_img_set, 0, sizeof g_img_set);
+    g_img_tomb = 0;
+    for (int i = 0; i < KLVK_IMG_REG_CAP; i++) {
+        if (!old[i] || old[i] == KLVK_IMG_TOMB) continue;
+        unsigned j = klvk_img_hash_slot(old[i]);
+        while (g_img_set[j]) j = (j + 1) & (KLVK_IMG_REG_CAP - 1);
+        g_img_set[j] = old[i];
+    }
+}
 static void klvk_img_reg_add(VkImage img) {
-    if (!img) return;
+    if (!img || img == KLVK_IMG_TOMB) return;
     pthread_mutex_lock(&g_img_reg_lock);
-    if (g_img_reg_n < KLVK_IMG_REG_MAX) g_img_reg[g_img_reg_n++] = img;
+    if (g_img_reg_n >= KLVK_IMG_REG_MAX) { g_img_full = 1; pthread_mutex_unlock(&g_img_reg_lock); return; }
+    if (g_img_reg_n + g_img_tomb >= KLVK_IMG_REG_CAP * 3 / 4) klvk_img_rehash();
+    unsigned j = klvk_img_hash_slot(img);
+    int tomb = -1;
+    for (;;) {
+        VkImage v = g_img_set[j];
+        if (v == img) break;                                   // already there
+        if (v == KLVK_IMG_TOMB && tomb < 0) tomb = (int)j;
+        if (!v) {
+            if (tomb >= 0) { j = (unsigned)tomb; g_img_tomb--; }
+            g_img_set[j] = img;
+            g_img_reg_n++;
+            break;
+        }
+        j = (j + 1) & (KLVK_IMG_REG_CAP - 1);
+    }
     pthread_mutex_unlock(&g_img_reg_lock);
 }
 static void klvk_img_reg_del(VkImage img) {
-    if (!img) return;
+    if (!img || img == KLVK_IMG_TOMB) return;
     pthread_mutex_lock(&g_img_reg_lock);
-    for (int i = 0; i < g_img_reg_n; i++)
-        if (g_img_reg[i] == img) { g_img_reg[i] = g_img_reg[--g_img_reg_n]; break; }
+    for (unsigned j = klvk_img_hash_slot(img); g_img_set[j]; j = (j + 1) & (KLVK_IMG_REG_CAP - 1))
+        if (g_img_set[j] == img) { g_img_set[j] = KLVK_IMG_TOMB; g_img_tomb++; g_img_reg_n--; break; }
     pthread_mutex_unlock(&g_img_reg_lock);
 }
 
@@ -1498,11 +1853,12 @@ static const char *klvk_img_tag(VkImage img) {
     return "trk";
 }
 static int klvk_img_reg_has(VkImage img) {
+    if (!img || img == KLVK_IMG_TOMB) return 0;
     int found = 0;
     pthread_mutex_lock(&g_img_reg_lock);
-    if (g_img_reg_n >= KLVK_IMG_REG_MAX) found = 1;   /* full -> fail open */
-    else for (int i = 0; i < g_img_reg_n; i++)
-        if (g_img_reg[i] == img) { found = 1; break; }
+    if (g_img_full) found = 1;                        /* full -> fail open */
+    else for (unsigned j = klvk_img_hash_slot(img); g_img_set[j]; j = (j + 1) & (KLVK_IMG_REG_CAP - 1))
+        if (g_img_set[j] == img) { found = 1; break; }
     pthread_mutex_unlock(&g_img_reg_lock);
     return found;
 }
@@ -1718,6 +2074,48 @@ void kl_vulkan_layer_rekey(int old_key, int new_key) {
     }
 }
 
+// Retired eye/layer images, destroyed once KLVK_RETIRE_FRAMES frames have been
+// published since (klvk_retire_sweep, from kl_vulkan_frame_done).
+#define KLVK_RETIRE_FRAMES 120
+static uint64_t g_frame_serial;
+static struct { klvk_device *d; VkImage img; VkDeviceMemory mem; VkBuffer buf; void *tex; uint64_t at; } g_retired[64];
+static pthread_mutex_t g_retired_mu = PTHREAD_MUTEX_INITIALIZER;
+static void klvk_retire_any(klvk_device *d, VkImage img, VkBuffer buf, VkDeviceMemory mem, void *tex) {
+    if (!d || (!img && !buf && !tex)) return;
+    pthread_mutex_lock(&g_retired_mu);
+    int i = 0;
+    while (i < 64 && (g_retired[i].img || g_retired[i].buf || g_retired[i].tex)) i++;
+    if (i < 64) {
+        g_retired[i].d = d; g_retired[i].img = img; g_retired[i].buf = buf; g_retired[i].mem = mem; g_retired[i].tex = tex;
+        g_retired[i].at = __atomic_load_n(&g_frame_serial, __ATOMIC_ACQUIRE);
+    } else {
+        static int said;
+        if (!said++) VKI("retired-image list full: an old eye image is kept\n");
+    }
+    pthread_mutex_unlock(&g_retired_mu);
+}
+static void klvk_retire(klvk_device *d, VkImage img, VkDeviceMemory mem) { klvk_retire_any(d, img, VK_NULL_HANDLE, mem, NULL); }
+// A depth staging buffer and the texture view over it (KL_CP_DEPTH): the compositor may be sampling it this instant.
+static void klvk_retire_buffer(klvk_device *d, VkBuffer buf, VkDeviceMemory mem, void *tex) {
+    klvk_retire_any(d, VK_NULL_HANDLE, buf, mem, tex);
+}
+static void klvk_retire_sweep(void) {
+    uint64_t now = __atomic_load_n(&g_frame_serial, __ATOMIC_ACQUIRE);
+    static unsigned freed;
+    pthread_mutex_lock(&g_retired_mu);
+    for (int i = 0; i < 64; i++) {
+        if ((!g_retired[i].img && !g_retired[i].buf && !g_retired[i].tex) || now < g_retired[i].at + KLVK_RETIRE_FRAMES) continue;
+        klvk_device *d = g_retired[i].d;
+        if (g_retired[i].tex) kl_mtl_release(g_retired[i].tex);
+        if (g_retired[i].buf && d->DestroyBuffer) d->DestroyBuffer(d->dev, g_retired[i].buf, NULL);
+        if (g_retired[i].img && d->DestroyImage) d->DestroyImage(d->dev, g_retired[i].img, NULL);
+        if (g_retired[i].mem && d->FreeMemory) d->FreeMemory(d->dev, g_retired[i].mem, NULL);
+        memset(&g_retired[i], 0, sizeof g_retired[i]);
+        if (freed++ % 24 == 0) VKI("freed retired eye images: %u so far\n", freed);
+    }
+    pthread_mutex_unlock(&g_retired_mu);
+}
+
 unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
                                          unsigned w, unsigned h, int srgb, int layers) {
     if (!kl_vulkan_guest_active()) return 0;
@@ -1740,24 +2138,29 @@ unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
     }
     klvk_img_slot *slot = is_eye ? &g_eye[stage][eye] : &slots[stage * 2 + eye];
 
-    VkFormat fmt = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    VkFormat fmt = layer_key == KLVK_DEPTH_LAYER ? VK_FORMAT_R32_SFLOAT
+                 : srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     // A cached image is only the right answer if it is the image that was
     // ASKED for. RE4 sets up its eye layer twice — 2290x2400, then 2748x2880
     // once UE4 applies its own pixel density — and the size was not consulted,
     // so the second layer was handed the first one's storage and the engine
     // rendered a 2748x2880 frame into a 2290x2400 image.
     //
-    // The old image is NOT destroyed. It is the GL path's rule for the GL path's
-    // reason: a compositor or a capture may be sampling it on another thread this
-    // instant, and freeing storage under them is a worse failure than holding a
-    // few images that no longer describe anything. This happens at startup, once
-    // per stage.
+    // The old image is not destroyed at once: a compositor or a capture may be
+    // sampling it on another thread this instant. It used to be kept for good,
+    // on the grounds that this happened once per stage at startup; with Source 2's
+    // auto-fidelity changing the eye size every few seconds it leaked 6 images per
+    // change (1.36 GB in 70 s on the headset on 2026-09-29, until the memory limit
+    // ended the game). Now it is freed KLVK_RETIRE_FRAMES frames later (klvk_retire).
     if (slot->img && (slot->w != w || slot->h != h ||
                       slot->layers != (uint32_t)layers || slot->fmt != fmt)) {
-        VKI("layer %d stage %d %s: was %ux%u (%u layer(s)), now %ux%u (%d) — "
-            "allocating fresh; the old image is kept, not freed\n",
-            layer_key, stage, eye ? "eye 1" : "eye 0",
-            slot->w, slot->h, slot->layers, w, h, layers);
+        static unsigned said;
+        if (said++ < 12)
+            VKI("layer %d stage %d %s: was %ux%u (%u layer(s)), now %ux%u (%d) — "
+                "allocating fresh; the old image is freed %d frames from now\n",
+                layer_key, stage, eye ? "eye 1" : "eye 0",
+                slot->w, slot->h, slot->layers, w, h, layers, KLVK_RETIRE_FRAMES);
+        klvk_retire(d, slot->img, slot->mem);
         slot->img = VK_NULL_HANDLE;
         slot->mem = VK_NULL_HANDLE;
     }
@@ -2453,7 +2856,7 @@ int kl_vulkan_eye_depth_get(int stage, int eye, unsigned long long want_tag,
     return ok;
 }
 
-void *kl_vulkan_eye_depth_mtl(int stage, int *w, int *h, int *layers, int *fmt) {
+void *kl_vulkan_taa_depth_mtl(int stage, int *w, int *h, int *layers, int *fmt) {
     kl_vulkan_eye_depth i;
     int ok = kl_vulkan_eye_depth_get(stage, 0, 0, &i);
     if (w) *w = ok ? i.w : 0;
@@ -2468,6 +2871,118 @@ void kl_vulkan_eye_depth_tag(int stage, unsigned long long serial) {
     pthread_mutex_lock(&g_ed_rec_mu);
     for (int e = 0; e < 2; e++) g_ed[stage][e].info.tag = serial;
     pthread_mutex_unlock(&g_ed_rec_mu);
+}
+
+// ---- The game's depth for the compositor (KL_CP_DEPTH; see kl_vulkan.h) ----
+static struct { VkBuffer buf; VkDeviceMemory mem; unsigned long long size; void *mapped; void *tex; unsigned tw, th, tpitch; } g_dstage[KLVK_EYE_STAGES][2];
+static struct { float m22, m23; unsigned w, h, pitch; int valid; } g_dmap[KLVK_EYE_STAGES][2];
+static pthread_mutex_t g_dstage_mu = PTHREAD_MUTEX_INITIALIZER;   // the game's thread grows, the compositor's makes views
+
+// KL_CP_DEPTH at half resolution: one D32S8 image per eye (not per stage: it only lives between the blit that fills it
+// and the copy that empties it, both in the same submit), the blit target for the game's depth before it goes to the
+// half-size staging. A new size retires the old image KLVK_RETIRE_FRAMES later.
+unsigned long long kl_vulkan_eye_depth_half(int eye, unsigned w, unsigned h) {
+    static struct { VkImage img; VkDeviceMemory mem; unsigned w, h; } half[2];
+    if (eye < 0 || eye > 1 || !w || !h || !g_devs[0]) return 0;
+    klvk_device *d = g_devs[0];
+    if (half[eye].img && (half[eye].w != w || half[eye].h != h)) {
+        klvk_retire(d, half[eye].img, half[eye].mem);
+        half[eye].img = VK_NULL_HANDLE; half[eye].mem = VK_NULL_HANDLE;
+    }
+    if (!half[eye].img) {
+        half[eye].img = klvk_image_alloc(d, VK_FORMAT_D32_SFLOAT_S8_UINT, w, h, 1, 1,
+                                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, &half[eye].mem);
+        half[eye].w = w; half[eye].h = h;
+        if (half[eye].img) VKI("eye %d half-resolution depth image %ux%u (KL_CP_DEPTH_HALF)\n", eye, w, h);
+    }
+    return (uint64_t)(uintptr_t)half[eye].img;
+}
+unsigned long long kl_vulkan_eye_depth_image(int stage, int eye, unsigned w, unsigned h) {
+    return kl_vulkan_layer_image(KLVK_DEPTH_LAYER, stage, eye, w, h, 0, 1);
+}
+
+static uint64_t klvk_depth_staging_locked(klvk_device *d, void *stv, int stage, int eye, unsigned long long bytes, void **mapped);
+unsigned long long kl_vulkan_eye_depth_staging(int stage, int eye, unsigned long long bytes, void **mapped) {
+    if (mapped) *mapped = NULL;
+    if (!kl_vulkan_guest_active() || stage < 0 || stage >= KLVK_EYE_STAGES || eye < 0 || eye > 1 || !bytes) return 0;
+    klvk_device *d = g_devs[0];
+    typeof(g_dstage[0][0]) *st = &g_dstage[stage][eye];
+    pthread_mutex_lock(&g_dstage_mu);
+    uint64_t r = klvk_depth_staging_locked(d, st, stage, eye, bytes, mapped);
+    pthread_mutex_unlock(&g_dstage_mu);
+    return r;
+}
+static uint64_t klvk_depth_staging_locked(klvk_device *d, void *stv, int stage, int eye, unsigned long long bytes, void **mapped) {
+    typeof(g_dstage[0][0]) *st = stv;
+    if (st->buf && st->size >= bytes) { if (mapped) *mapped = st->mapped; return (uint64_t)(uintptr_t)st->buf; }
+    if (st->buf) {                     // grown: the old buffer (and its view) go the retired images' way, later
+        klvk_retire_buffer(d, st->buf, st->mem, st->tex);
+        memset(st, 0, sizeof *st);
+    }
+    VkBufferCreateInfo bi = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes,
+                              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    if (d->CreateBuffer(d->dev, &bi, NULL, &st->buf) != VK_SUCCESS) { st->buf = VK_NULL_HANDLE; return 0; }
+    VkMemoryRequirements mr;
+    d->GetBufferMemoryRequirements(d->dev, st->buf, &mr);
+    // Host-visible: unified memory on Apple silicon, so it costs nothing, and it lets the Mac read depth back.
+    uint32_t mt = mem_type(d, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt == UINT32_MAX) mt = mem_type(d, mr.memoryTypeBits, 0);
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = mt };
+    if (d->AllocateMemory(d->dev, &ai, NULL, &st->mem) != VK_SUCCESS ||
+        d->BindBufferMemory(d->dev, st->buf, st->mem, 0) != VK_SUCCESS) {
+        d->DestroyBuffer(d->dev, st->buf, NULL); memset(st, 0, sizeof *st); return 0;
+    }
+    st->size = bytes;
+    if (d->MapMemory(d->dev, st->mem, 0, VK_WHOLE_SIZE, 0, &st->mapped) != VK_SUCCESS) st->mapped = NULL;
+    if (mapped) *mapped = st->mapped;
+    VKI("depth staging stage %d eye %d: %llu bytes%s\n", stage, eye, bytes, st->mapped ? " (host-visible)" : "");
+    return (uint64_t)(uintptr_t)st->buf;
+}
+
+void kl_vulkan_set_eye_depth_map(int stage, int eye, float m22, float m23, unsigned w, unsigned h, unsigned pitch) {
+    if (stage < 0 || stage >= KLVK_EYE_STAGES || eye < 0 || eye > 1) return;
+    g_dmap[stage][eye].m22 = m22; g_dmap[stage][eye].m23 = m23;
+    g_dmap[stage][eye].w = w; g_dmap[stage][eye].h = h; g_dmap[stage][eye].pitch = pitch;
+    __atomic_store_n(&g_dmap[stage][eye].valid, 1, __ATOMIC_RELEASE);
+}
+
+void *kl_vulkan_eye_depth_mtl(int stage, int eye, int *w, int *h, float *m22, float *m23) {
+    if (w) *w = 0;
+    if (h) *h = 0;
+    if (stage < 0 || stage >= KLVK_EYE_STAGES || eye < 0 || eye > 1) return NULL;
+    if (!__atomic_load_n(&g_dmap[stage][eye].valid, __ATOMIC_ACQUIRE)) return NULL;
+    if (m22) *m22 = g_dmap[stage][eye].m22;
+    if (m23) *m23 = g_dmap[stage][eye].m23;
+    // pitch 0: the copy went on into the R32F layer image (KL_CP_DEPTH_IMAGE=1); otherwise sample the staging
+    // buffer where the depth copy left it, through a texture view made once per buffer and size.
+    unsigned dw = g_dmap[stage][eye].w, dh = g_dmap[stage][eye].h, dp = g_dmap[stage][eye].pitch;
+    if (!dp) return kl_vulkan_layer_mtl_texture(KLVK_DEPTH_LAYER, stage, eye, w, h);
+    typeof(g_dstage[0][0]) *st = &g_dstage[stage][eye];
+    pthread_mutex_lock(&g_dstage_mu);
+    if (!st->buf) { pthread_mutex_unlock(&g_dstage_mu); return NULL; }
+    if (st->tex && (st->tw != dw || st->th != dh || st->tpitch != dp)) {
+        klvk_retire_buffer(g_devs[0], VK_NULL_HANDLE, VK_NULL_HANDLE, st->tex);   // the view alone; see klvk_retire_any
+        st->tex = NULL;
+    }
+    if (!st->tex) {
+        typedef void (*pfn_get_mtl_buffer_mvk)(VkBuffer, void **);
+        static pfn_get_mtl_buffer_mvk get_buf;
+        if (!get_buf) get_buf = (pfn_get_mtl_buffer_mvk)mvk_sym("vkGetMTLBufferMVK");
+        void *mb = NULL;
+        if (get_buf) get_buf(st->buf, &mb);
+        st->tex = mb ? kl_mtl_buffer_texture_r32f(mb, dw, dh, dp * 4) : NULL;
+        st->tw = dw; st->th = dh; st->tpitch = dp;
+        static int said;
+        if (said++ < 4) VKI("depth view stage %d eye %d: %ux%u pitch %u over the staging buffer: %s\n",
+                            stage, eye, dw, dh, dp, st->tex ? "ok" : "FAILED");
+    }
+    if (w) *w = (int)dw;
+    if (h) *h = (int)dh;
+    void *t = st->tex;
+    pthread_mutex_unlock(&g_dstage_mu);
+    return t;
 }
 
 // Diagnostic/bridge: the MTLTexture behind the wild-handle scratch — the single
@@ -3002,6 +3517,12 @@ void kl_vulkan_capture_eyes(unsigned frame, int stage) {
     if (every < 1) every = 1;
     if (frame % (unsigned)every) return;
     if (stage < 0 || stage >= KLVK_EYE_STAGES) return;
+    // KL_VK_OUT_MAX: stop after this many captured frames (each is two PNGs),
+    // so a long run cannot fill the device.
+    static unsigned taken;
+    int max = kl_env_int("KL_VK_OUT_MAX", 0);
+    if (max > 0 && taken >= (unsigned)max) return;
+    taken++;
     static int all = -1;
     if (all < 0) all = kl_env_on("KL_VK_OUT_ALL", 0);
 
@@ -3057,7 +3578,6 @@ void kl_vulkan_capture_eyes(unsigned frame, int stage) {
 // nothing has yet measured. `KL_VK_FRAME_SYNC=0` removes the wait and keeps the
 // serial — the A/B for "is the compositor showing a torn frame?", and the shape
 // the timeline-semaphore version would have.
-static uint64_t g_frame_serial;
 
 unsigned long long kl_vulkan_frame_serial(void) {
     return __atomic_load_n(&g_frame_serial, __ATOMIC_ACQUIRE);
@@ -3219,9 +3739,27 @@ void kl_vulkan_frame_done(int stage) {
     // guest's queue BEFORE the idle wait below, which then also covers the copy.
     klvk_ed_frame_done(d, stage);
     if (kl_env_on("KL_VK_FRAME_SYNC", 1) && d && d->queue) {
+        struct timespec w0, w1;
+        clock_gettime(CLOCK_UPTIME_RAW, &w0);
         VkResult r = d->QueueWaitIdle ? d->QueueWaitIdle(d->queue)
                    : d->DeviceWaitIdle ? d->DeviceWaitIdle(d->dev)
                                        : VK_SUCCESS;
+        clock_gettime(CLOCK_UPTIME_RAW, &w1);
+        // The GPU-bound share of a synced frame, which the shim's "after"
+        // otherwise lumps in with the game's CPU work.
+        {
+            static double sum, worst, since;
+            static int n;
+            double ms = (w1.tv_sec - w0.tv_sec) * 1e3 + (w1.tv_nsec - w0.tv_nsec) / 1e6;
+            double now = w1.tv_sec + w1.tv_nsec / 1e9;
+            sum += ms; n++; if (ms > worst) worst = ms;
+            if (!since) since = now;
+            if (now - since >= 5.0) {
+                VKI("frame-end queue wait (GPU finishing the frame) avg %.1f / worst %.1f ms over %d frames\n",
+                    sum / n, worst, n);
+                sum = worst = 0; n = 0; since = now;
+            }
+        }
         if (r != VK_SUCCESS) {
             static int said;
             if (!said++)
@@ -3229,7 +3767,8 @@ void kl_vulkan_frame_done(int stage) {
                     "compositor may sample an eye the GPU is still writing\n", (int)r);
         }
     }
-    __atomic_add_fetch(&g_frame_serial, 1, __ATOMIC_RELEASE);
+    census_frame(__atomic_add_fetch(&g_frame_serial, 1, __ATOMIC_RELEASE));
+    klvk_retire_sweep();
 }
 
 static VkResult klvk_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) {
@@ -3450,12 +3989,95 @@ static void VKAPI_CALL klvk_CmdClearColorImage(VkCommandBuffer cb, VkImage img,
 static int emu_on(void);    // defined below (target/env gate for the mirror + probes)
 static int probe_on(void);
 static int klvk_astc_sub_has(VkImage img);   // KL_VK_ASTC_RGBA8 test; defined below
+// KL_VK_XFORM_TRACE=1 (diagnostic): the guest's RGBA32F images (the per-instance "transform texture" is one) and
+// every buffer->image upload into them, region by region — is any part of the per-frame instance data mis-copied?
+static VkImage g_xf_img[16]; static uint32_t g_xf_w[16], g_xf_h[16]; static int g_nxf;
+static int xftrace_on(void) { static int v = -1; if (v < 0) v = kl_env_on("KL_VK_XFORM_TRACE", 0); return v; }
+static int xf_find(VkImage img) { for (int i = 0; i < g_nxf; i++) if (g_xf_img[i] == img) return i; return -1; }
+// KL_VK_EYEDRAW=1 (diagnostic, with KL_VK_XFORM_TRACE=1): for every draw with the eyeball pipeline, what it reads
+// from the transform texture: its per-instance texel coordinate (vertex binding 1, half2) and that texel's header as
+// the engine uploaded it (the latest upload into the transform texture recorded in the same command buffer).
+static int eyedraw_on(void) { static int v = -1; if (v < 0) v = kl_env_on("KL_VK_EYEDRAW", 0); return v; }
+#define KLED_CB 16384
+static struct { void *cb; uint64_t pipe, vb1, vb1off, xbuf, xoff; uint32_t xrows; } g_ed_cb[KLED_CB];
+static uint64_t g_ed_pipes[64]; static int g_ned_pipes;
+static uint64_t g_ed_mod[8]; static int g_ned_mod;
+#define KLED_DRAWS 512
+static struct { uint64_t vb1, vb1off, xbuf, xoff; uint32_t xrows, first, count; } g_ed_draw[KLED_DRAWS];
+static int g_ned_draw;
+static int ed_slot(void *cb) {          // g_lock held; open addressing on the handle
+    unsigned h = (unsigned)(((uintptr_t)cb >> 4) * 2654435761u) % KLED_CB;
+    for (int n = 0; n < KLED_CB; n++, h = (h + 1) % KLED_CB) {
+        if (g_ed_cb[h].cb == cb) return (int)h;
+        if (!g_ed_cb[h].cb) { g_ed_cb[h].cb = cb; return (int)h; }
+    }
+    memset(&g_ed_cb[h], 0, sizeof g_ed_cb[h]); g_ed_cb[h].cb = cb; return (int)h;
+}
+#define KLEDC 8192
+static struct { uint64_t dst, src, so, dof, sz; } g_edc[KLEDC]; static unsigned g_edc_n;
+static struct { uint64_t dof, sz; uint8_t *data; } g_eds_inst[64]; static unsigned g_eds_n;   // recent instance-stream copies
+static struct { uint32_t rows; float *data; } g_eds_xf;                   // latest transform-texture upload, rows x 1024 x 4
+static int g_ed_near;                                                     // draws to print after an eye draw
+static uint64_t g_ed_lastvb1off[8]; static int g_ed_nlast;                // the last few draws' instance offsets
+static int ed_is_eye_pipe(uint64_t p) { for (int i = 0; i < g_ned_pipes; i++) if (g_ed_pipes[i] == p) return 1; return 0; }
+static void VKAPI_CALL klvk_CmdCopyBufferToImage2(VkCommandBuffer cb, const VkCopyBufferToImageInfo2 *ci) {
+    static PFN_vkCmdCopyBufferToImage2 real;
+    if (!real) { real = (PFN_vkCmdCopyBufferToImage2)mvk_sym("vkCmdCopyBufferToImage2");
+                 if (!real) real = (PFN_vkCmdCopyBufferToImage2)mvk_sym("vkCmdCopyBufferToImage2KHR"); }
+    if (xftrace_on() && ci) {
+        int k = xf_find(ci->dstImage);
+        static unsigned said, any;
+        if (!any++) fprintf(stderr, "[xform] the guest uses vkCmdCopyBufferToImage2\n");
+        if (k >= 0) for (uint32_t i = 0; i < ci->regionCount; i++) if (said < 400) { said++;
+            const VkBufferImageCopy2 *r = &ci->pRegions[i];
+            fprintf(stderr, "[xform] copy2 -> img#%d %ux%u: region %u/%u bufOff %llu rowLen %u imgH %u  at (%d,%d) extent %ux%u\n",
+                k, g_xf_w[k], g_xf_h[k], i, ci->regionCount, (unsigned long long)r->bufferOffset, r->bufferRowLength,
+                r->bufferImageHeight, r->imageOffset.x, r->imageOffset.y, r->imageExtent.width, r->imageExtent.height); }
+    }
+    if (real) real(cb, ci);
+}
+
+
 static void VKAPI_CALL klvk_CmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer buf,
         VkImage img, VkImageLayout l, uint32_t n, const VkBufferImageCopy *r) {
     static PFN_vkCmdCopyBufferToImage real;
     if (!real) real = (PFN_vkCmdCopyBufferToImage)mvk_sym("vkCmdCopyBufferToImage");
     if (KLVK_IMG_BAD(img)) { VKI("vkCmdCopyBufferToImage: REFUSING (img %#llx unknown)\n",
         (unsigned long long)(uintptr_t)img); return; }
+    // KL_VK_XFORM_BARRIER=1 (diagnostic): a full barrier in front of every upload into the transform texture, so no
+    // draw still reading the previous pass's per-instance data can overlap the overwrite (write-after-read)
+    static int xfbar = -1; if (xfbar < 0) xfbar = kl_env_on("KL_VK_XFORM_BARRIER", 0);
+    if (xfbar && xf_find(img) >= 0) {
+        static PFN_vkCmdPipelineBarrier pb;
+        if (!pb) pb = (PFN_vkCmdPipelineBarrier)mvk_sym("vkCmdPipelineBarrier");
+        VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+        VkImageMemoryBarrier ib = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .oldLayout = l, .newLayout = l,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = img,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        if (pb) pb(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 1, &ib);
+    }
+    if (eyedraw_on() && r && n && xf_find(img) >= 0) {
+        extern void klvk_ed_snap_xf(uint64_t buf, uint64_t off, uint32_t rows);
+        klvk_ed_snap_xf((uint64_t)(uintptr_t)buf, r[0].bufferOffset, r[0].imageExtent.height);
+        pthread_mutex_lock(&g_lock);
+        int k = ed_slot(cb);
+        g_ed_cb[k].xbuf = (uint64_t)(uintptr_t)buf; g_ed_cb[k].xoff = r[0].bufferOffset; g_ed_cb[k].xrows = r[0].imageExtent.height;
+        pthread_mutex_unlock(&g_lock);
+    }
+    if (xftrace_on() && r) {
+        int k = xf_find(img);
+        if (k >= 0) {
+            static unsigned said;
+            for (uint32_t i = 0; i < n; i++) if (said < 400) { said++;
+                fprintf(stderr, "[xform] copy -> img#%d %ux%u: region %u/%u bufOff %llu rowLen %u imgH %u  at (%d,%d) extent %ux%u mip %u layer %u\n",
+                    k, g_xf_w[k], g_xf_h[k], i, n, (unsigned long long)r[i].bufferOffset, r[i].bufferRowLength, r[i].bufferImageHeight,
+                    r[i].imageOffset.x, r[i].imageOffset.y, r[i].imageExtent.width, r[i].imageExtent.height,
+                    r[i].imageSubresource.mipLevel, r[i].imageSubresource.baseArrayLayer); }
+        }
+    }
     // KL_VK_ASTC_RGBA8 test: this image was created RGBA8 in place of ASTC. The
     // guest's ASTC-block upload would overrun the RGBA8 store (4x the bytes), so SKIP
     // it and clear to solid GREEN. World turns green => the ASTC albedo reaches
@@ -3607,13 +4229,77 @@ static int klvk_astc_sub_has(VkImage img) {
     pthread_mutex_unlock(&g_astc_sub_lock);
     return found;
 }
+// KL_VK_MSAA_TRACE=1 (diagnostic, off by default): every multisampled image the guest creates (size, layers, format,
+// samples, usage incl. TRANSIENT_ATTACHMENT 0x40) and the memory it is bound to (type index and property flags;
+// LAZILY_ALLOCATED 0x10 is what MoltenVK backs with memoryless storage). The question it answers: does the game
+// ask for tile-only MSAA attachments, and do they get real memory anyway.
+static int g_msaa_trace = -1;
+static int msaa_trace_on(void) { if (g_msaa_trace < 0) g_msaa_trace = kl_env_on("KL_VK_MSAA_TRACE", 0); return g_msaa_trace; }
+enum { kMsaaImgs = 256, kMsaaMems = 8192 };
+static struct { VkImage img; uint32_t w, h, layers, samples, fmt, usage; } g_msaa_imgs[kMsaaImgs];
+static int g_msaa_nimg;
+static struct { VkDeviceMemory mem; uint32_t type; VkDeviceSize size; } g_msaa_mems[kMsaaMems];
+static int g_msaa_nmem;
+static VkDeviceSize g_msaa_live;            // what the game holds in vkAllocateMemory blocks (trace only)
+static pthread_mutex_t g_msaa_mu = PTHREAD_MUTEX_INITIALIZER;
+
+// KL_VK_MSAA_MEMORYLESS=1: back the game's multisampled colour and depth attachments with Metal memoryless (tile-only)
+// storage instead of real memory. Alyx's stereo scene pass clears them, resolves them inside the pass and stores
+// neither (storeOp DONT_CARE; KL_VK_RP_TRACE), so their contents never need memory: 435 MB at 2784x2208 x2 x4x.
+// The image is created as a TRANSIENT attachment (vkCreateImage above) and its dedicated allocation is moved to
+// MoltenVK's LAZILY_ALLOCATED memory type, which MoltenVK backs with MTLStorageModeMemoryless. Memoryless storage
+// only works inside one Metal encoder, so this relies on KL_VK_MERGE keeping the pass's suspend/resume chunks in one
+// encoder; kl_gpu_time.m counts any chunk that is not (an "unmerged load", [ml] lines) and keeps it legal.
+static void live_add(VkDeviceMemory mem, VkDeviceSize size);   // KL_VK_REPORT_USAGE (klvk_cap_heaps)
+static void live_del(VkDeviceMemory mem);
+static int g_msaa_ml = -1;
+static int msaa_ml_on(void) { if (g_msaa_ml < 0) g_msaa_ml = kl_env_on("KL_VK_MSAA_MEMORYLESS", 0); return g_msaa_ml; }
+enum { kMlImgs = 32 };
+static VkImage g_ml_imgs[kMlImgs];
+static int g_ml_nimg;
+static void ml_add(VkImage img, VkImageUsageFlags was, const VkImageCreateInfo *ci) {
+    pthread_mutex_lock(&g_msaa_mu);
+    if (g_ml_nimg < kMlImgs) g_ml_imgs[g_ml_nimg++] = img;
+    pthread_mutex_unlock(&g_msaa_mu);
+    fprintf(stderr, "[ml] image %#llx %ux%u layers %u samples %u fmt %d: usage %#x -> %#x (transient)\n",
+            (unsigned long long)(uintptr_t)img, ci->extent.width, ci->extent.height, ci->arrayLayers,
+            (unsigned)ci->samples, (int)ci->format, was, ci->usage);
+}
+// The game does not use dedicated allocations for these: it allocates a block of exactly the image's size right after
+// asking for its requirements. So the requirements are noted here and the next allocation of that exact size (whose
+// type the image accepts) is the one moved to the memoryless type; the bind that follows is checked ([ml] bind).
+static struct { VkImage img; VkDeviceSize size; uint32_t bits; int open; } g_ml_req[kMlImgs];
+static int g_ml_nreq;
+static void ml_note_req(VkDevice dev, VkImage img, const VkMemoryRequirements *mr);
+static VkDeviceMemory g_ml_mem[kMlImgs];
+static int g_ml_nmem;
+static int ml_has(VkImage img) {
+    int hit = 0;
+    pthread_mutex_lock(&g_msaa_mu);
+    for (int i = 0; i < g_ml_nimg; i++) if (g_ml_imgs[i] == img) { hit = 1; break; }
+    pthread_mutex_unlock(&g_msaa_mu);
+    return hit;
+}
+
 static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInfo *ci,
         const VkAllocationCallbacks *alloc, VkImage *out) {
     static PFN_vkCreateImage real;
     if (!real && real_gdpa) real = (PFN_vkCreateImage)real_gdpa(dev, "vkCreateImage");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    census_image(ci);   // as the guest asked, before any fix-up below
     int did_astc_sub = 0;
     VkImageCreateInfo mod;
+    // KL_VK_MSAA_MEMORYLESS: a multisampled colour/depth attachment becomes a transient attachment (its other usages
+    // dropped), so its memory can be Metal memoryless storage (see ml_add / klvk_AllocateMemory).
+    int ml_pending = 0; VkImageUsageFlags ml_usage_was = 0;
+    if (ci && ci->samples > 1 && (ci->usage & 0x30u) && msaa_ml_on()) {
+        if (ci != &mod) { mod = *ci; ci = &mod; }
+        ml_usage_was = mod.usage;
+        // colour or depth/stencil only, + TRANSIENT. KL_VK_MSAA_ML_INPUT=1 keeps INPUT_ATTACHMENT (MoltenVK then offers
+        // no memoryless type for the image: types 0x1/0x3, measured 2026-10-03).
+        mod.usage = (mod.usage & (0x10u | 0x20u | (kl_env_on("KL_VK_MSAA_ML_INPUT", 0) ? 0x80u : 0u))) | 0x40u;
+        ml_pending = 1;
+    }
     if (ci && (ci->usage & 0x80u) && kl_env_on("KL_STRIP_INPUT_ATT", 0)) {
         // No render pass in this guest uses an input attachment (census: inputAtts 0),
         // yet its temp render targets carry INPUT_ATTACHMENT usage — which makes
@@ -3672,7 +4358,74 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
             mod.usage = want;
         }
     }
+    // Simulator (or KL_VK_FORMAT_PRECHECK=1): the simulator's Metal device lacks
+    // formats/usages the headset has, and MoltenVK then builds a texture
+    // descriptor with MTLPixelFormatInvalid, which Metal ABORTS on instead of
+    // returning an error (Alyx: "MTLTextureDescriptor has invalid pixelFormat
+    // (0)" in MVKImagePlane::initSubresources). Ask first, and treat a "not
+    // supported" as the rejection handled below — a depth format falls back to
+    // plain D32, anything else to RGBA8. Off on device, where it costs a query.
+    static int precheck = -1;
+    if (precheck < 0) {
+#if defined(TARGET_OS_SIMULATOR) && TARGET_OS_SIMULATOR
+        precheck = kl_env_on("KL_VK_FORMAT_PRECHECK", 1);
+#else
+        precheck = kl_env_on("KL_VK_FORMAT_PRECHECK", 0);
+#endif
+    }
+    if (precheck && ci && out) {
+        klvk_device *pd = dev_find(dev);
+        static PFN_vkGetPhysicalDeviceImageFormatProperties gifp;
+        if (!gifp) gifp = (PFN_vkGetPhysicalDeviceImageFormatProperties)
+                              real_gipa(g_instance, "vkGetPhysicalDeviceImageFormatProperties");
+        VkImageFormatProperties ifp;
+        VkResult fr = pd && gifp ? gifp(pd->phys, ci->format, ci->imageType, ci->tiling, ci->usage,
+                                         ci->flags, &ifp) : VK_ERROR_INITIALIZATION_FAILED;
+        // Too big for this device (the simulator stops at 8192; Alyx asks for
+        // 8194 somewhere): clamp rather than let Metal abort.
+        if (fr == VK_SUCCESS && (ci->extent.width > ifp.maxExtent.width ||
+                                 ci->extent.height > ifp.maxExtent.height)) {
+            static int said;
+            if (said < 8) { said++;
+                VKI("vkCreateImage: %ux%u (format %d) exceeds this device's %ux%u — clamped\n",
+                    ci->extent.width, ci->extent.height, (int)ci->format,
+                    ifp.maxExtent.width, ifp.maxExtent.height); fflush(stderr); }
+            if (ci != &mod) { mod = *ci; ci = &mod; }
+            if (mod.extent.width > ifp.maxExtent.width) mod.extent.width = ifp.maxExtent.width;
+            if (mod.extent.height > ifp.maxExtent.height) mod.extent.height = ifp.maxExtent.height;
+        }
+        // A sample count the device cannot do (the simulator has no 2x MSAA):
+        // single-sampled instead. Pipelines built for 2x will then mismatch,
+        // which MoltenVK reports as an error rather than an abort.
+        if (fr == VK_SUCCESS && !(ifp.sampleCounts & ci->samples)) {
+            static int said;
+            if (said < 4) { said++;
+                VKI("vkCreateImage: %d samples not supported for format %d here — 1 sample\n",
+                    (int)ci->samples, (int)ci->format); fflush(stderr); }
+            if (ci != &mod) { mod = *ci; ci = &mod; }
+            mod.samples = VK_SAMPLE_COUNT_1_BIT;
+        }
+        if (fr == VK_ERROR_FORMAT_NOT_SUPPORTED) {
+            static int said;
+            int depth = ci->format >= VK_FORMAT_D16_UNORM && ci->format <= VK_FORMAT_D32_SFLOAT_S8_UINT;
+            if (said < 16) { said++;
+                VKI("vkCreateImage: format %d usage %#x flags %#x %ux%u not supported here — %s\n",
+                    (int)ci->format, ci->usage, ci->flags, ci->extent.width, ci->extent.height,
+                    depth ? "substituting D32_SFLOAT" : "RGBA8 fallback"); fflush(stderr); }
+            if (depth) {
+                mod = *ci;
+                mod.format = VK_FORMAT_D32_SFLOAT;
+                mod.pNext = NULL;
+                mod.flags &= ~0x8u;
+                ci = &mod;
+            } else {
+                *out = VK_NULL_HANDLE;
+                goto rejected;
+            }
+        }
+    }
     VkResult r = real(dev, ci, alloc, out);
+    if (0) { rejected: r = VK_ERROR_FORMAT_NOT_SUPPORTED; }
     // MoltenVK rejects some formats outright (Wanderer: VK_FORMAT_ASTC_8x8_UNORM/
     // SRGB come back VK_ERROR_FEATURE_NOT_PRESENT) and leaves *out NULL. A null
     // image is not inert: the guest does not check, and the next call on it —
@@ -3712,6 +4465,27 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
         }
     }
     if (r == VK_SUCCESS && out) klvk_img_reg_add(*out);
+    if (r == VK_SUCCESS && out && ml_pending) ml_add(*out, ml_usage_was, ci);
+    if (r == VK_SUCCESS && out && ci && ci->samples > 1 && msaa_trace_on()) {
+        pthread_mutex_lock(&g_msaa_mu);
+        if (g_msaa_nimg < kMsaaImgs) {
+            int k = g_msaa_nimg++;
+            g_msaa_imgs[k].img = *out; g_msaa_imgs[k].w = ci->extent.width; g_msaa_imgs[k].h = ci->extent.height;
+            g_msaa_imgs[k].layers = ci->arrayLayers; g_msaa_imgs[k].samples = ci->samples;
+            g_msaa_imgs[k].fmt = (uint32_t)ci->format; g_msaa_imgs[k].usage = ci->usage;
+        }
+        pthread_mutex_unlock(&g_msaa_mu);
+        fprintf(stderr, "[msaa] image %#llx %ux%u layers %u samples %u fmt %d usage %#x%s flags %#x\n",
+                (unsigned long long)(uintptr_t)*out, ci->extent.width, ci->extent.height, ci->arrayLayers,
+                (unsigned)ci->samples, (int)ci->format, ci->usage, (ci->usage & 0x40u) ? " (TRANSIENT)" : "", ci->flags);
+    }
+    if (r == VK_SUCCESS && out && xftrace_on() && ci && ci->format == VK_FORMAT_R32G32B32A32_SFLOAT &&
+        ci->imageType == VK_IMAGE_TYPE_2D && g_nxf < 16) {
+        g_xf_img[g_nxf] = *out; g_xf_w[g_nxf] = ci->extent.width; g_xf_h[g_nxf] = ci->extent.height;
+        fprintf(stderr, "[xform] RGBA32F image #%d %ux%u mips %u layers %u usage %#x tiling %d\n", g_nxf, ci->extent.width,
+                ci->extent.height, ci->mipLevels, ci->arrayLayers, ci->usage, (int)ci->tiling);
+        g_nxf++;
+    }
     if (r == VK_SUCCESS && out && ci)
         klvk_img_info_add(*out, ci->format, ci->extent.width, ci->extent.height);
     if (r == VK_SUCCESS && out && *out && did_astc_sub) klvk_astc_sub_add(*out);
@@ -3765,6 +4539,34 @@ static void VKAPI_CALL klvk_GetImageMemoryRequirements(VkDevice dev, VkImage img
         return;
     }
     if (real) real(dev, img, mr);
+    if (mr && msaa_ml_on() && g_ml_nimg && ml_has(img)) ml_note_req(dev, img, mr);
+}
+static int ml_lazy_type(VkDevice dev, uint32_t bits, int say) {
+    static PFN_vkGetPhysicalDeviceMemoryProperties gmp;
+    if (!gmp) gmp = (PFN_vkGetPhysicalDeviceMemoryProperties)real_gipa(g_instance, "vkGetPhysicalDeviceMemoryProperties");
+    klvk_device *pd = dev_find(dev);
+    if (!pd || !gmp) return -1;
+    VkPhysicalDeviceMemoryProperties mp; gmp(pd->phys, &mp);
+    int lazy = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        if (say) fprintf(stderr, "[ml] memory type %u: heap %u props %#x%s\n", i, mp.memoryTypes[i].heapIndex,
+                         mp.memoryTypes[i].propertyFlags, (bits >> i) & 1 ? " (the image accepts it)" : "");
+        if (lazy < 0 && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) && ((bits >> i) & 1)) lazy = (int)i;
+    }
+    return lazy;
+}
+static void ml_note_req(VkDevice dev, VkImage img, const VkMemoryRequirements *mr) {
+    static int said;
+    int lazy = ml_lazy_type(dev, mr->memoryTypeBits, !said++);
+    pthread_mutex_lock(&g_msaa_mu);
+    int k = -1;
+    for (int i = 0; i < g_ml_nreq; i++) if (g_ml_req[i].img == img) k = i;
+    if (k < 0 && g_ml_nreq < kMlImgs) k = g_ml_nreq++;
+    if (k >= 0) { g_ml_req[k].img = img; g_ml_req[k].size = mr->size; g_ml_req[k].bits = mr->memoryTypeBits; g_ml_req[k].open = lazy >= 0; }
+    pthread_mutex_unlock(&g_msaa_mu);
+    fprintf(stderr, "[ml] image %#llx needs %.1f MB, types %#x: %s\n", (unsigned long long)(uintptr_t)img,
+            mr->size / 1048576.0, mr->memoryTypeBits, lazy >= 0 ? "the next allocation of that size goes memoryless" :
+            "no LAZILY_ALLOCATED type among them; stays in real memory");
 }
 
 // A thin pass-through over MoltenVK's vkCreateImageView that LOGS the guest's
@@ -3817,6 +4619,16 @@ static void VKAPI_CALL klvk_DestroyImage(VkDevice dev, VkImage img,
     klvk_img_info_del(img);
     klvk_depth_info_del(img);
     klvk_shadow_forget(img);
+    if (img && msaa_trace_on()) {            // which multisampled images the game lets go (e.g. after a vr_msaa change)
+        pthread_mutex_lock(&g_msaa_mu);
+        for (int i = 0; i < g_msaa_nimg; i++) if (g_msaa_imgs[i].img == img) {
+            fprintf(stderr, "[msaa] destroy image %#llx %ux%u layers %u samples %u fmt %u\n", (unsigned long long)(uintptr_t)img,
+                    g_msaa_imgs[i].w, g_msaa_imgs[i].h, g_msaa_imgs[i].layers, g_msaa_imgs[i].samples, g_msaa_imgs[i].fmt);
+            g_msaa_imgs[i] = g_msaa_imgs[--g_msaa_nimg];
+            break;
+        }
+        pthread_mutex_unlock(&g_msaa_mu);
+    }
     if (real) real(dev, img, alloc);
 }
 
@@ -3920,18 +4732,34 @@ static double kl_pipe_ms(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
+// Which thread the game compiles on, and how many compiles overlap: a compile on
+// the render thread is a frame stall, one on a worker is not.
+static int g_pipe_inflight, g_pipe_maxinflight;
+// This thread's last guest graphics create, per pipeline (for the slow-pipeline log, KL_VK_FOZ_SLOW_MS).
+static __thread double t_pipe_last_ms;
 static void kl_pipe_report(const char *kind, unsigned n, double dt_ms) {
     g_pipe_ns += (unsigned long long)(dt_ms * 1e6);
     unsigned long long tot = g_pipe_gfx + g_pipe_comp;
+    // Slow guest batches: a warm Metal cache answers in a few ms, a cold compile
+    // takes 100+ (330-580 ms on the headset), so these count the misses.
+    static unsigned over50, over100;
+    static double slowest;
+    if (dt_ms > 50.0) over50++;
+    if (dt_ms > 100.0) over100++;
+    if (dt_ms > slowest) slowest = dt_ms;
     static unsigned long long last;
-    if (tot - last >= 50 || dt_ms > 250.0) {
+    if (tot - last >= 50 || dt_ms > 100.0) {
         last = tot;
+        char tn[64] = "";
+        pthread_getname_np(pthread_self(), tn, sizeof tn);
         VKI("pipeline warmup: %llu graphics + %llu compute = %llu compiled, "
-            "%.1f s in the compiler so far (last %s batch of %u took %.0f ms)\n",
-            g_pipe_gfx, g_pipe_comp, tot, (double)g_pipe_ns / 1e9, kind, n, dt_ms);
+            "%.1f s in the compiler so far (last %s batch of %u took %.0f ms, thread '%s', max %d at once; "
+            "%u batches over 50 ms, %u over 100 ms, slowest %.0f ms)\n",
+            g_pipe_gfx, g_pipe_comp, tot, (double)g_pipe_ns / 1e9, kind, n, dt_ms, tn, g_pipe_maxinflight,
+            over50, over100, slowest);
     }
 }
-static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines(VkDevice dev,
+static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines_body(VkDevice dev,
         VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *ci,
         const VkAllocationCallbacks *alloc, VkPipeline *out) {
     static PFN_vkCreateGraphicsPipelines real;
@@ -3950,6 +4778,27 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines(VkDevice dev,
     // max-value index (0xFFFF/0xFFFFFFFF) in strip data restarts the primitive —
     // which is precisely what that reserved index means. List topologies ignore
     // the flag and MoltenVK accepts them, so they are left untouched.
+    // Multisample census (KL_VK_MS_CENSUS=1): how many pipelines render with
+    // MSAA, and how many ask for alpha-to-coverage (Source 2 foliage) - the
+    // evidence for "is MSAA / A2C actually in effect through MoltenVK".
+    {
+        static int census = -1;
+        static unsigned total, ms, a2c, a2c_ms1, a2o;
+        if (census < 0) census = kl_env_on("KL_VK_MS_CENSUS", 0);
+        if (census && ci) {
+            for (uint32_t i = 0; i < n; i++) {
+                const VkPipelineMultisampleStateCreateInfo *m = ci[i].pMultisampleState;
+                total++;
+                if (!m) continue;
+                if (m->rasterizationSamples > 1) ms++;
+                if (m->alphaToCoverageEnable) { a2c++; if (m->rasterizationSamples <= 1) a2c_ms1++; }
+                if (m->alphaToOneEnable) a2o++;
+            }
+            if ((total & (total - 1)) == 0 || total % 256 < n)
+                VKI("pipeline census: %u graphics pipelines, %u multisampled, %u alpha-to-coverage "
+                    "(%u of them single-sampled), %u alpha-to-one\n", total, ms, a2c, a2c_ms1, a2o);
+        }
+    }
     VkGraphicsPipelineCreateInfo *mod = NULL;
     VkPipelineInputAssemblyStateCreateInfo *ias = NULL;
     int fixed = 0;
@@ -4004,19 +4853,25 @@ static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines(VkDevice dev,
         fflush(stderr);
     }
     double t0 = kl_pipe_ms();
+    int inflight = __atomic_add_fetch(&g_pipe_inflight, 1, __ATOMIC_RELAXED);
+    if (inflight > g_pipe_maxinflight) g_pipe_maxinflight = inflight;
     VkResult r = real ? real(dev, cache, n, use, alloc, out)
                       : VK_ERROR_INITIALIZATION_FAILED;
+    __atomic_sub_fetch(&g_pipe_inflight, 1, __ATOMIC_RELAXED);
     if (pipe_trace) { VKI("pipe-trace: DONE through #%llu (r=%d)\n", g_pipe_enter, (int)r); fflush(stderr); }
     free(mod); free(ias);
     if (fixed) { static int said; if (said < 8) { said++;
         VKI("CreateGraphicsPipelines: forced primitiveRestartEnable=TRUE on %d "
             "strip pipeline(s) MoltenVK would otherwise reject (invisible "
             "geometry)\n", fixed); } }
-    g_pipe_gfx += n;
-    kl_pipe_report("gfx", n, kl_pipe_ms() - t0);
+    if (!t_pipe_replay) {
+        g_pipe_gfx += n;
+        t_pipe_last_ms = (kl_pipe_ms() - t0) / (n ? n : 1);
+        kl_pipe_report("gfx", n, t_pipe_last_ms * (n ? n : 1));
+    }
     return r;
 }
-static VkResult VKAPI_CALL klvk_CreateComputePipelines(VkDevice dev,
+static VkResult VKAPI_CALL klvk_CreateComputePipelines_body(VkDevice dev,
         VkPipelineCache cache, uint32_t n, const VkComputePipelineCreateInfo *ci,
         const VkAllocationCallbacks *alloc, VkPipeline *out) {
     static PFN_vkCreateComputePipelines real;
@@ -4025,8 +4880,10 @@ static VkResult VKAPI_CALL klvk_CreateComputePipelines(VkDevice dev,
     double t0 = kl_pipe_ms();
     VkResult r = real ? real(dev, cache, n, ci, alloc, out)
                       : VK_ERROR_INITIALIZATION_FAILED;
-    g_pipe_comp += n;
-    kl_pipe_report("compute", n, kl_pipe_ms() - t0);
+    if (!t_pipe_replay) {
+        g_pipe_comp += n;
+        kl_pipe_report("compute", n, kl_pipe_ms() - t0);
+    }
     return r;
 }
 
@@ -4258,7 +5115,7 @@ static void VKAPI_CALL klvk_CmdBeginRenderPass2(VkCommandBuffer cb,
 // not found"); this shows whether the passes that DO get built use input
 // attachments / multiple subpasses (the MoltenVK-thorny shapes) and whether any
 // creation fails outright.
-static VkResult VKAPI_CALL klvk_CreateRenderPass(VkDevice dev,
+static VkResult VKAPI_CALL klvk_CreateRenderPass_body(VkDevice dev,
         const VkRenderPassCreateInfo *ci, const VkAllocationCallbacks *a,
         VkRenderPass *out) {
     static PFN_vkCreateRenderPass real;
@@ -4310,7 +5167,7 @@ static VkResult VKAPI_CALL klvk_CreateRenderPass(VkDevice dev,
     free(ed_atts);
     return r;
 }
-static VkResult VKAPI_CALL klvk_CreateRenderPass2(VkDevice dev,
+static VkResult VKAPI_CALL klvk_CreateRenderPass2_body(VkDevice dev,
         const VkRenderPassCreateInfo2 *ci, const VkAllocationCallbacks *a,
         VkRenderPass *out) {
     static PFN_vkCreateRenderPass2 real;
@@ -4440,6 +5297,29 @@ static void VKAPI_CALL klvk_CmdBeginRendering(VkCommandBuffer cb,
         real = (PFN_vkCmdBeginRendering)mvk_sym("vkCmdBeginRendering");
         if (!real) real = (PFN_vkCmdBeginRendering)mvk_sym("vkCmdBeginRenderingKHR");
     }
+    census_begin_rendering(ri);
+    // KL_VK_RP_TRACE=<frame>: every vkCmdBeginRendering of that guest frame (kl_gpu_time's count), with the
+    // command buffer it is recorded in, suspend/resume flags, and each attachment's load/store/resolve ops.
+    {
+        static int at = -2;
+        if (at == -2) { const char *e = getenv("KL_VK_RP_TRACE"); at = e && *e ? atoi(e) : -1; }
+        if (at >= 0 && ri && (int)kl_gpu_time_frame() == at) {
+            char line[512];
+            int u = snprintf(line, sizeof line, "  [rp] f%d cb %p area %ux%u+%d+%d layers %u view 0x%x flags 0x%x",
+                             at, (void *)cb, ri->renderArea.extent.width, ri->renderArea.extent.height,
+                             ri->renderArea.offset.x, ri->renderArea.offset.y, ri->layerCount, ri->viewMask, ri->flags);
+            for (uint32_t i = 0; i < ri->colorAttachmentCount && ri->pColorAttachments && u < 440; i++) {
+                const VkRenderingAttachmentInfo *a = &ri->pColorAttachments[i];
+                u += snprintf(line + u, sizeof line - u, " | c%u ld%d st%d rs%d%s", i, a->loadOp, a->storeOp,
+                              a->resolveMode, a->resolveImageView ? "+rv" : "");
+            }
+            if (ri->pDepthAttachment && ri->pDepthAttachment->imageView && u < 440)
+                snprintf(line + u, sizeof line - u, " | z ld%d st%d rs%d%s", ri->pDepthAttachment->loadOp,
+                         ri->pDepthAttachment->storeOp, ri->pDepthAttachment->resolveMode,
+                         ri->pDepthAttachment->resolveImageView ? "+rv" : "");
+            fprintf(stderr, "%s\n", line);
+        }
+    }
     if (klvk_trace() && ri) {
         klvk_trace_log("[dynr] begin area %ux%u layers %u colorAtts %u depth %s\n",
             ri->renderArea.extent.width, ri->renderArea.extent.height,
@@ -4554,7 +5434,8 @@ static int emu_on(void) {
 }
 // Buffer/memory-binding tracking is needed by BOTH the probe and the emu fix
 // (the fix has to know which VkDeviceMemory + offset a source buffer occupies).
-static int track_on(void) { return probe_on() || emu_on(); }
+static int ubodump_on(void) { static int v = -1; if (v < 0) v = getenv("KL_VK_UBO_DUMP") != NULL; return v; }
+static int track_on(void) { static int v = -1; if (v < 0) v = probe_on() || emu_on() || ubodump_on() || kl_env_on("KL_VK_EYEDRAW", 0); return v; }
 
 // KL_VK_EMU_PROBE (default OFF) — the 2D-mirror source readback diagnostic
 // (see klvk_mirror_gpu_copy). Purely observational and OFF unless explicitly set,
@@ -4676,7 +5557,66 @@ static VkResult VKAPI_CALL klvk_AllocateMemory(VkDevice dev,
         const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *a, VkDeviceMemory *out) {
     static PFN_vkAllocateMemory real;
     if (!real && real_gdpa) real = (PFN_vkAllocateMemory)real_gdpa(dev, "vkAllocateMemory");
+    VkMemoryAllocateInfo ml_ai;
+    if (ai && msaa_ml_on() && g_ml_nimg) {
+        const VkMemoryDedicatedAllocateInfo *ded = NULL;
+        for (const VkBaseInStructure *b = ai->pNext; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) ded = (const void *)b;
+        if (ded && ded->image && ml_has(ded->image)) {
+            static PFN_vkGetPhysicalDeviceMemoryProperties gmp;
+            if (!gmp) gmp = (PFN_vkGetPhysicalDeviceMemoryProperties)real_gipa(g_instance, "vkGetPhysicalDeviceMemoryProperties");
+            klvk_device *pd = dev_find(dev);
+            int lazy = -1;
+            if (pd && gmp) {
+                VkPhysicalDeviceMemoryProperties mp; gmp(pd->phys, &mp);
+                for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+                    if (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) { lazy = (int)i; break; }
+            }
+            if (lazy >= 0) {
+                ml_ai = *ai; ml_ai.memoryTypeIndex = (uint32_t)lazy;
+                fprintf(stderr, "[ml] image %#llx: dedicated %.1f MB moved from memory type %u to %d (LAZILY_ALLOCATED, memoryless)\n",
+                        (unsigned long long)(uintptr_t)ded->image, ai->allocationSize / 1048576.0, ai->memoryTypeIndex, lazy);
+                ai = &ml_ai;
+            } else {
+                static int said; if (!said++) fprintf(stderr, "[ml] no LAZILY_ALLOCATED memory type; MSAA stays in real memory\n");
+            }
+        } else if (!ded) {
+            // not dedicated: the next allocation of a noted image's exact size (see g_ml_req)
+            int k = -1;
+            pthread_mutex_lock(&g_msaa_mu);
+            for (int i = 0; i < g_ml_nreq; i++)
+                if (g_ml_req[i].open && g_ml_req[i].size == ai->allocationSize && ((g_ml_req[i].bits >> ai->memoryTypeIndex) & 1)) { k = i; break; }
+            if (k >= 0) g_ml_req[k].open = 0;
+            VkImage img = k >= 0 ? g_ml_req[k].img : VK_NULL_HANDLE; uint32_t bits = k >= 0 ? g_ml_req[k].bits : 0;
+            pthread_mutex_unlock(&g_msaa_mu);
+            int lazy = k >= 0 ? ml_lazy_type(dev, bits, 0) : -1;
+            if (lazy >= 0) {
+                ml_ai = *ai; ml_ai.memoryTypeIndex = (uint32_t)lazy;
+                fprintf(stderr, "[ml] allocation of %.1f MB (image %#llx's size) moved from memory type %u to %d (memoryless)\n",
+                        ai->allocationSize / 1048576.0, (unsigned long long)(uintptr_t)img, ai->memoryTypeIndex, lazy);
+                ai = &ml_ai;
+            }
+        }
+    }
     VkResult r = real ? real(dev, ai, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+    if (r == VK_SUCCESS && out && ai) live_add(*out, ai->allocationSize);
+    if (r == VK_SUCCESS && out && ai == &ml_ai) {
+        pthread_mutex_lock(&g_msaa_mu);
+        if (g_ml_nmem < kMlImgs) g_ml_mem[g_ml_nmem++] = *out;
+        pthread_mutex_unlock(&g_msaa_mu);
+    }
+    if (r == VK_SUCCESS && ai && out && msaa_trace_on()) {
+        pthread_mutex_lock(&g_msaa_mu);
+        if (g_msaa_nmem < kMsaaMems) {
+            g_msaa_mems[g_msaa_nmem].mem = *out; g_msaa_mems[g_msaa_nmem].type = ai->memoryTypeIndex;
+            g_msaa_mems[g_msaa_nmem].size = ai->allocationSize; g_msaa_nmem++;
+        }
+        g_msaa_live += ai->allocationSize;
+        if (ai->allocationSize >= (16u << 20))
+            fprintf(stderr, "[msaa] allocate memory %#llx %.1f MB type %u (live %.0f MB)\n", (unsigned long long)(uintptr_t)*out,
+                    ai->allocationSize / 1048576.0, ai->memoryTypeIndex, g_msaa_live / 1048576.0);
+        pthread_mutex_unlock(&g_msaa_mu);
+    }
     if (r != VK_SUCCESS)
         VKI("vkAllocateMemory FAILED result %d size %llu typeIndex %u\n", (int)r,
             ai ? (unsigned long long)ai->allocationSize : 0, ai ? ai->memoryTypeIndex : 0);
@@ -4692,11 +5632,62 @@ static VkResult VKAPI_CALL klvk_AllocateMemory(VkDevice dev,
     }
     return r;
 }
+// With KL_VK_MSAA_TRACE: every vkFreeMemory of 16 MB or more, with the live total of what the game holds, so a
+// vr_msaa change shows whether the old attachments' memory goes back or stays in the game's own blocks.
+static void VKAPI_CALL klvk_FreeMemory(VkDevice dev, VkDeviceMemory mem, const VkAllocationCallbacks *a) {
+    static PFN_vkFreeMemory real;
+    if (!real && real_gdpa) real = (PFN_vkFreeMemory)real_gdpa(dev, "vkFreeMemory");
+    if (mem && msaa_trace_on()) {
+        pthread_mutex_lock(&g_msaa_mu);
+        for (int i = g_msaa_nmem - 1; i >= 0; i--) if (g_msaa_mems[i].mem == mem) {
+            VkDeviceSize sz = g_msaa_mems[i].size;
+            g_msaa_live -= sz;
+            if (sz >= (16u << 20))
+                fprintf(stderr, "[msaa] free memory %#llx %.1f MB type %u (live %.0f MB)\n", (unsigned long long)(uintptr_t)mem,
+                        sz / 1048576.0, g_msaa_mems[i].type, g_msaa_live / 1048576.0);
+            g_msaa_mems[i] = g_msaa_mems[--g_msaa_nmem];
+            break;
+        }
+        pthread_mutex_unlock(&g_msaa_mu);
+    }
+    live_del(mem);
+    if (real) real(dev, mem, a);
+}
 static VkResult VKAPI_CALL klvk_BindImageMemory(VkDevice dev, VkImage img,
         VkDeviceMemory mem, VkDeviceSize off) {
     static PFN_vkBindImageMemory real;
     if (!real && real_gdpa) real = (PFN_vkBindImageMemory)real_gdpa(dev, "vkBindImageMemory");
+    if (g_ml_nmem) {   // a memoryless allocation may only hold the transient image it was made for
+        int lazy_mem = 0;
+        pthread_mutex_lock(&g_msaa_mu);
+        for (int i = 0; i < g_ml_nmem; i++) if (g_ml_mem[i] == mem) lazy_mem = 1;
+        pthread_mutex_unlock(&g_msaa_mu);
+        if (lazy_mem) fprintf(stderr, "[ml] bind image %#llx to memoryless memory: %s\n", (unsigned long long)(uintptr_t)img,
+                              ml_has(img) ? "ok (transient MSAA)" : "NOT a transient MSAA image (would be wrong)");
+    }
     VkResult r = real ? real(dev, img, mem, off) : VK_ERROR_INITIALIZATION_FAILED;
+    if (r == VK_SUCCESS && msaa_trace_on()) {
+        int hit = -1, m = -1;
+        pthread_mutex_lock(&g_msaa_mu);
+        for (int i = 0; i < g_msaa_nimg; i++) if (g_msaa_imgs[i].img == img) { hit = i; break; }
+        if (hit >= 0) for (int i = g_msaa_nmem - 1; i >= 0; i--) if (g_msaa_mems[i].mem == mem) { m = i; break; }
+        uint32_t type = m >= 0 ? g_msaa_mems[m].type : ~0u;
+        VkDeviceSize size = m >= 0 ? g_msaa_mems[m].size : 0;
+        pthread_mutex_unlock(&g_msaa_mu);
+        if (hit >= 0) {
+            uint32_t props = ~0u;
+            klvk_device *pd = dev_find(dev);
+            static PFN_vkGetPhysicalDeviceMemoryProperties gmp;
+            if (!gmp) gmp = (PFN_vkGetPhysicalDeviceMemoryProperties)real_gipa(g_instance, "vkGetPhysicalDeviceMemoryProperties");
+            if (pd && gmp && type != ~0u) {
+                VkPhysicalDeviceMemoryProperties mp; gmp(pd->phys, &mp);
+                if (type < mp.memoryTypeCount) props = mp.memoryTypes[type].propertyFlags;
+            }
+            fprintf(stderr, "[msaa] bind image %#llx -> memory type %u props %#x%s, allocation %.1f MB at +%llu\n",
+                    (unsigned long long)(uintptr_t)img, type, props, props != ~0u && (props & 0x10u) ? " (LAZILY_ALLOCATED)" : "",
+                    size / 1048576.0, (unsigned long long)off);
+        }
+    }
     if (r != VK_SUCCESS)
         VKI("vkBindImageMemory FAILED result %d image %#llx\n", (int)r,
             (unsigned long long)(uintptr_t)img);
@@ -4797,6 +5788,7 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceProperties2(
         VkPhysicalDevice pd, VkPhysicalDeviceProperties2 *props) {
     KLVK_WHO("vkGetPhysicalDeviceProperties2");
     if (!props) return;
+    census_properties2_query(props);
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceProperties2");
     static PFN_vkGetPhysicalDeviceProperties2 real;
     static int tried;
@@ -4814,6 +5806,7 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceProperties2(
         if (v1) v1(pd, &props->properties);
     }
     klvk_spoof_props(&props->properties);
+    klvk_minmax_props(props->pNext);
 
     // Make the deviceLUID Unity reads here EQUAL the one ovrp_GetDisplayAdapterId2
     // handed it, so OculusXR's "which enumerated device is the VR GPU?" match
@@ -4871,7 +5864,9 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceFeatures2(
         if (!real) real = (PFN_vkGetPhysicalDeviceFeatures2)
             real_gipa(g_instance, "vkGetPhysicalDeviceFeatures2KHR"); } }
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceFeatures2");
+    census_features2_query(f);
     if (real) real(pd, f);
+    if (f) klvk_minmax_features(f->pNext);
 }
 static void VKAPI_CALL klvk_GetPhysicalDeviceFeatures(
         VkPhysicalDevice pd, VkPhysicalDeviceFeatures *f) {
@@ -4882,6 +5877,123 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceFeatures(
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceFeatures");
     if (real) real(pd, f);
 }
+// KL_VK_REPORT_USAGE=1: answer VK_EXT_memory_budget's heapUsage for the device-local heap with what the game really
+// holds (the sum of its live vkAllocateMemory blocks), not MoltenVK's figure. Source 2 sizes its texture streaming
+// to "used of budget" and logs it at start ("Dedicated GPU Memory: 93 MB used of 10,922 MB budget" on MoltenVK,
+// with ~4.8 GB actually allocated), so without this its streamer never sees pressure at any budget.
+static _Atomic uint64_t g_vk_live;
+enum { kLiveSlots = 1 << 16 };
+static struct { VkDeviceMemory mem; VkDeviceSize size; } g_live[kLiveSlots];
+static pthread_mutex_t g_live_mu = PTHREAD_MUTEX_INITIALIZER;
+static int report_usage_on(void) { static int on = -1; if (on < 0) on = kl_env_on("KL_VK_REPORT_USAGE", 0); return on; }
+static int budget_os_on(void);
+static void live_add(VkDeviceMemory mem, VkDeviceSize size) {
+    if ((!report_usage_on() && !budget_os_on()) || !mem) return;
+    uint32_t h = (uint32_t)(((uintptr_t)mem >> 4) * 2654435761u) & (kLiveSlots - 1);
+    pthread_mutex_lock(&g_live_mu);
+    for (uint32_t k = 0; k < kLiveSlots; k++, h = (h + 1) & (kLiveSlots - 1))
+        if (!g_live[h].mem) { g_live[h].mem = mem; g_live[h].size = size; atomic_fetch_add(&g_vk_live, size); break; }
+    pthread_mutex_unlock(&g_live_mu);
+}
+static void live_del(VkDeviceMemory mem) {
+    if ((!report_usage_on() && !budget_os_on()) || !mem) return;
+    uint32_t h = (uint32_t)(((uintptr_t)mem >> 4) * 2654435761u) & (kLiveSlots - 1);
+    pthread_mutex_lock(&g_live_mu);
+    for (uint32_t k = 0; k < kLiveSlots && g_live[h].mem; k++, h = (h + 1) & (kLiveSlots - 1))
+        if (g_live[h].mem == mem) {
+            atomic_fetch_sub(&g_vk_live, g_live[h].size);
+            // backward-shift delete keeps the probe chains intact
+            uint32_t i = h;
+            for (;;) {
+                uint32_t j = (i + 1) & (kLiveSlots - 1);
+                if (!g_live[j].mem) break;
+                uint32_t want = (uint32_t)(((uintptr_t)g_live[j].mem >> 4) * 2654435761u) & (kLiveSlots - 1);
+                if (((j - want) & (kLiveSlots - 1)) >= ((j - i) & (kLiveSlots - 1))) { g_live[i] = g_live[j]; i = j; }
+                else break;
+            }
+            g_live[i].mem = VK_NULL_HANDLE; g_live[i].size = 0;
+            break;
+        }
+    pthread_mutex_unlock(&g_live_mu);
+}
+
+// KL_VK_HEAP_MB=<n>: report at most n MB for each device-local heap (and as
+// its VK_EXT_memory_budget budget). Engines size their GPU budgets from these
+// numbers, and MoltenVK on a big Mac reports most of system memory — Alyx's
+// graphics footprint followed it. On a headset the real heap is smaller;
+// this lets the Mac rehearse that, and lets the app stay under a jetsam limit.
+//
+// KL_VK_BUDGET_OS=1 (default on for the visionOS device build): the VK_EXT_memory_budget budget of each
+// device-local heap is what this process can still get (os_proc_available_memory, the jetsam allowance left)
+// plus what the game already holds, less KL_VK_BUDGET_RESERVE_MB (default 512) for everything that is not
+// a Vulkan allocation; heapUsage is the game's live allocations (as KL_VK_REPORT_USAGE). Unified memory: the
+// "GPU heap" is the process's memory, so this is the number the streamer must respect to avoid a jetsam kill.
+#if TARGET_OS_VISION || TARGET_OS_IOS
+#include <os/proc.h>
+static uint64_t klvk_os_avail(void) { return (uint64_t)os_proc_available_memory(); }
+#else
+static uint64_t klvk_os_avail(void) { return 0; }
+#endif
+static int budget_os_on(void) {
+    static int on = -1;
+#if TARGET_OS_VISION || TARGET_OS_IOS
+    if (on < 0) on = kl_env_on("KL_VK_BUDGET_OS", 1);
+#else
+    if (on < 0) on = kl_env_on("KL_VK_BUDGET_OS", 0);
+#endif
+    return on;
+}
+static void klvk_cap_heaps(VkPhysicalDeviceMemoryProperties *m, void *pnext) {
+    static long cap = -2;
+    if (cap == -2) { const char *e = getenv("KL_VK_HEAP_MB"); cap = e ? atol(e) : -1; }
+    if (m && budget_os_on()) {
+        for (VkBaseOutStructure *b = pnext; b; b = b->pNext)
+            if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT) {
+                VkPhysicalDeviceMemoryBudgetPropertiesEXT *bp = (void *)b;
+                static long reserve = -1;
+                if (reserve < 0) { const char *e = getenv("KL_VK_BUDGET_RESERVE_MB"); reserve = e ? atol(e) : 512; }
+                uint64_t live = atomic_load(&g_vk_live), avail = klvk_os_avail();
+                uint64_t rsv = (uint64_t)reserve << 20;
+                uint64_t budget = live + (avail > rsv ? avail - rsv : 0);
+                if (cap > 0 && budget > ((uint64_t)cap << 20)) budget = (uint64_t)cap << 20;
+                for (uint32_t i = 0; i < m->memoryHeapCount; i++) {
+                    if (!(m->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+                    if (avail) bp->heapBudget[i] = budget < m->memoryHeaps[i].size ? budget : m->memoryHeaps[i].size;
+                    bp->heapUsage[i] = live;
+                }
+                static unsigned n;
+                if (n++ % 600 == 0)
+                    fprintf(stderr, "[vkmem] budget from the OS: %llu MB available to the process, %llu MB held by the "
+                            "game -> budget %llu MB (query %u)\n", (unsigned long long)(avail >> 20),
+                            (unsigned long long)(live >> 20), (unsigned long long)(bp->heapBudget[0] >> 20), n);
+            }
+        // The heap sizes themselves still take KL_VK_HEAP_MB below; the budget is already answered.
+        if (cap > 0)
+            for (uint32_t i = 0; i < m->memoryHeapCount; i++)
+                if ((m->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && m->memoryHeaps[i].size > ((VkDeviceSize)cap << 20))
+                    m->memoryHeaps[i].size = (VkDeviceSize)cap << 20;
+        return;
+    }
+    if (!m || (cap <= 0 && !report_usage_on())) return;
+    VkDeviceSize c = cap > 0 ? (VkDeviceSize)cap << 20 : ~(VkDeviceSize)0;
+    for (uint32_t i = 0; i < m->memoryHeapCount; i++)
+        if ((m->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && m->memoryHeaps[i].size > c)
+            m->memoryHeaps[i].size = c;
+    for (VkBaseOutStructure *b = pnext; b; b = b->pNext)
+        if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT) {
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT *bp = (void *)b;
+            for (uint32_t i = 0; i < m->memoryHeapCount; i++)
+                if (bp->heapBudget[i] > c) bp->heapBudget[i] = c;
+            if (report_usage_on()) {
+                uint64_t live = atomic_load(&g_vk_live);
+                for (uint32_t i = 0; i < m->memoryHeapCount; i++)
+                    if ((m->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && bp->heapUsage[i] < live) bp->heapUsage[i] = live;
+                static unsigned n;
+                if (n++ % 600 == 0) fprintf(stderr, "[vkmem] reporting heap usage %llu MB of a %llu MB budget (query %u)\n",
+                                            (unsigned long long)(live >> 20), (unsigned long long)(bp->heapBudget[0] >> 20), n);
+            }
+        }
+}
 static void VKAPI_CALL klvk_GetPhysicalDeviceMemoryProperties(
         VkPhysicalDevice pd, VkPhysicalDeviceMemoryProperties *m) {
     KLVK_WHO("vkGetPhysicalDeviceMemoryProperties");
@@ -4890,6 +6002,7 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceMemoryProperties(
         real_gipa(g_instance, "vkGetPhysicalDeviceMemoryProperties"); }
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceMemoryProperties");
     if (real) real(pd, m);
+    klvk_cap_heaps(m, NULL);
 }
 // LDR ASTC block formats occupy VK_FORMAT_ASTC_4x4_UNORM_BLOCK(157) ..
 // VK_FORMAT_ASTC_12x12_SRGB_BLOCK(184) contiguously.
@@ -4927,6 +6040,7 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceFormatProperties(
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceFormatProperties");
     if (real) real(pd, fmt, p);
     klvk_astc_patch_features(fmt, p);
+    klvk_minmax_format(p);
 }
 static void VKAPI_CALL klvk_GetPhysicalDeviceFormatProperties2(
         VkPhysicalDevice pd, VkFormat fmt, VkFormatProperties2 *p) {
@@ -4938,6 +6052,7 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceFormatProperties2(
     pd = KLVK_PHYS_OR_SUB(pd, "GetPhysicalDeviceFormatProperties2");
     if (real) real(pd, fmt, p);
     if (p) klvk_astc_patch_features(fmt, &p->formatProperties);
+    if (p) klvk_minmax_format(&p->formatProperties);
 }
 // The two device-enumeration queries Unity runs while VALIDATING a physical
 // device (layers, then extensions) — the phase where AC Nexus was passing NULL.
@@ -5007,12 +6122,13 @@ static void VKAPI_CALL klvk_GetPhysicalDeviceMemoryProperties2(
                 real_gipa(g_instance, "vkGetPhysicalDeviceMemoryProperties2KHR");
         }
     }
-    if (real) { real(pd, props); return; }
+    if (real) { real(pd, props); klvk_cap_heaps(&props->memoryProperties, props->pNext); return; }
     PFN_vkGetPhysicalDeviceMemoryProperties v1 = real_gipa
         ? (PFN_vkGetPhysicalDeviceMemoryProperties)
               real_gipa(g_instance, "vkGetPhysicalDeviceMemoryProperties")
         : NULL;
     if (v1) v1(pd, &props->memoryProperties);
+    klvk_cap_heaps(&props->memoryProperties, NULL);
 }
 
 static VkResult VKAPI_CALL klvk_GetPhysicalDeviceImageFormatProperties2(
@@ -5036,6 +6152,122 @@ static VkResult VKAPI_CALL klvk_GetPhysicalDeviceImageFormatProperties2(
 // KL_TRACE: which thread submits guest work. Compared with [thr] createRT this
 // shows whether Unity creates its temp render targets on the same thread that
 // records/submits the frame, or a different one (the temp-RT race hypothesis).
+static _Atomic unsigned long g_fs_submit, g_fs_submit_fenced;
+static void fs_report(void);
+static void klvk_gpu_watch(VkQueue q) {
+    static VkQueue seen[8];
+    static _Atomic int nseen;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    int n = nseen;
+    for (int i = 0; i < n; i++) if (seen[i] == q) return;
+    pthread_mutex_lock(&mu);
+    int have = 0;
+    for (int i = 0; i < nseen; i++) if (seen[i] == q) have = 1;
+    if (!have && nseen < 8) {
+        klvk_device *d = dev_of_queue(q);
+        PFN_vkExportMetalObjectsEXT export_ext = d && real_gdpa
+            ? (PFN_vkExportMetalObjectsEXT)real_gdpa(d->dev, "vkExportMetalObjectsEXT") : NULL;
+        VkExportMetalCommandQueueInfoEXT cq = {
+            .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_COMMAND_QUEUE_INFO_EXT,
+            .queue = q,
+        };
+        VkExportMetalObjectsInfoEXT info = {
+            .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+            .pNext = &cq,
+        };
+        if (export_ext) export_ext(d->dev, &info);
+        if (cq.mtlCommandQueue) kl_gpu_time_watch((void *)cq.mtlCommandQueue);
+        else VKI("no MTLCommandQueue behind guest queue %p; its GPU time is not measured\n", (void *)q);
+        seen[nseen] = q;
+        nseen = nseen + 1;
+    }
+    pthread_mutex_unlock(&mu);
+}
+static const void *ed_ptr(uint64_t buf, uint64_t off) {    // g_lock held; NULL unless [off, off+256) is inside the mapping
+    struct probe_buf *e = probe_buf_find((VkBuffer)(uintptr_t)buf);
+    struct probe_mem *m = e ? probe_mem_find(e->mem) : NULL;
+    if (!m || !m->mapped || e->memoff < m->map_off || off + 256 > e->size) return NULL;
+    uint64_t at = e->memoff - m->map_off + off;
+    if (m->map_size != VK_WHOLE_SIZE && at + 256 > m->map_size) return NULL;
+    return (const char *)m->mapped + at;
+}
+void klvk_ed_snap_xf(uint64_t buf, uint64_t off, uint32_t rows) {
+    pthread_mutex_lock(&g_lock);
+    if (rows > 64) rows = 64;
+    const void *sp = ed_ptr(buf, off);
+    struct probe_buf *e = probe_buf_find((VkBuffer)(uintptr_t)buf);
+    if (sp && e && off + (uint64_t)rows * 16384 <= e->size) {
+        free(g_eds_xf.data); g_eds_xf.data = malloc((size_t)rows * 16384);
+        if (g_eds_xf.data) { memcpy(g_eds_xf.data, sp, (size_t)rows * 16384); g_eds_xf.rows = rows; }
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+static void ed_print_draw(const char *tag, uint64_t vb1off) {   // g_lock held
+    const uint8_t *src = NULL;
+    for (unsigned c = 0; c < 64 && c < g_eds_n && !src; c++) {
+        unsigned q = (g_eds_n - 1 - c) % 64;
+        if (g_eds_inst[q].data && vb1off >= g_eds_inst[q].dof && vb1off + 4 <= g_eds_inst[q].dof + g_eds_inst[q].sz)
+            src = g_eds_inst[q].data + (vb1off - g_eds_inst[q].dof);
+    }
+    if (!src) { fprintf(stderr, "[eyedraw] %s instance offset %llu: not in a recent instance copy\n", tag, (unsigned long long)vb1off); return; }
+    _Float16 hu, hv; memcpy(&hu, src, 2); memcpy(&hv, src + 2, 2);
+    float tx = (float)hu * 1024.0f, ty = (float)hv * 1024.0f; int ix = (int)tx, iy = (int)ty;
+    char line[2048]; int o = snprintf(line, sizeof line, "[eyedraw] %s instance offset %llu: texel (%.2f, %.2f)", tag, (unsigned long long)vb1off, tx, ty);
+    if (g_eds_xf.data && iy >= 0 && (uint32_t)iy < g_eds_xf.rows && ix >= 0 && ix + 4 <= 1024) {
+        const float *t = g_eds_xf.data + ((size_t)iy * 1024 + (size_t)ix) * 4;
+        uint32_t yb, zb; memcpy(&yb, &t[12 + 1], 4); memcpy(&zb, &t[12 + 2], 4);
+        o += snprintf(line + o, sizeof line - o, " | t0 %.3g %.3g %.3g %.3g | t3 x %.3g y %#x z %#x (index %u) w %.3g",
+                      t[0], t[1], t[2], t[3], t[12], yb, zb, zb & 0xffff, t[15]);
+    } else o += snprintf(line + o, sizeof line - o, " | header row %d not in the latest upload (%u rows)", iy, g_eds_xf.rows);
+    fprintf(stderr, "%s\n", line);
+}
+static void klvk_eyedraw_report(void) {
+    if (!eyedraw_on()) return;
+    static int said;
+    pthread_mutex_lock(&g_lock);
+    for (int d = 0; d < g_ned_draw && said < 200; d++) {
+        const uint16_t *uv = ed_ptr(g_ed_draw[d].vb1, g_ed_draw[d].vb1off + 4ull * g_ed_draw[d].first);
+        if (!uv) {
+            uint64_t want = g_ed_draw[d].vb1off + 4ull * g_ed_draw[d].first;
+            unsigned lim = g_edc_n < KLEDC ? g_edc_n : KLEDC;
+            for (unsigned c = 0; c < lim && !uv; c++) {
+                int k = (int)((g_edc_n - 1 - c) % KLEDC);
+                if (g_ed_draw[d].vb1 && g_edc[k].dst == g_ed_draw[d].vb1 && want >= g_edc[k].dof && want + 4 <= g_edc[k].dof + g_edc[k].sz) {
+                    uv = ed_ptr(g_edc[k].src, g_edc[k].so + (want - g_edc[k].dof));
+                    if (said < 200) fprintf(stderr, "[eyedraw]   slot %llu from copy src %#llx +%llu (region dst %llu size %llu)%s\n",
+                        (unsigned long long)want, (unsigned long long)g_edc[k].src, (unsigned long long)g_edc[k].so,
+                        (unsigned long long)g_edc[k].dof, (unsigned long long)g_edc[k].sz, uv ? "" : " — staging not readable");
+                }
+            }
+        }
+        if (!uv) {
+            struct probe_buf *e = probe_buf_find((VkBuffer)(uintptr_t)g_ed_draw[d].vb1);
+            struct probe_mem *m = e ? probe_mem_find(e->mem) : NULL;
+            fprintf(stderr, "[eyedraw] draw first %u count %u: instance stream buf %#llx off %llu not readable (tracked %d, size %llu, usage %#x, mem %d, mapped %d; %d bufs tracked)\n",
+                    g_ed_draw[d].first, g_ed_draw[d].count, (unsigned long long)g_ed_draw[d].vb1, (unsigned long long)g_ed_draw[d].vb1off,
+                    e != NULL, e ? (unsigned long long)e->size : 0ull, e ? (unsigned)e->usage : 0u, m != NULL, m && m->mapped, g_probe_nbuf);
+            said++; continue;
+        }
+        for (uint32_t i = 0; i < g_ed_draw[d].count && i < 4; i++) {
+            _Float16 hu, hv; memcpy(&hu, uv + 2 * i, 2); memcpy(&hv, uv + 2 * i + 1, 2);
+            float u = (float)hu, v = (float)hv, tx = u * 1024.0f, ty = v * 1024.0f;
+            int ix = (int)tx, iy = (int)ty;
+            char line[4096]; int o = snprintf(line, sizeof line, "[eyedraw] draw first %u inst %u: uv (%.6f, %.6f) -> texel (%.2f, %.2f); upload rows %u",
+                                             g_ed_draw[d].first, i, u, v, tx, ty, g_ed_draw[d].xrows);
+            if (iy >= 0 && (uint32_t)iy < g_ed_draw[d].xrows && ix >= 0 && ix + 8 < 1024 && g_ed_draw[d].xbuf) {
+                const float *row = ed_ptr(g_ed_draw[d].xbuf, g_ed_draw[d].xoff + ((uint64_t)iy * 1024 + (uint64_t)ix) * 16);
+                if (row) for (int t = 0; t < 8 && o < (int)sizeof line - 200; t++) {
+                    uint32_t zb; memcpy(&zb, &row[4 * t + 2], 4);
+                    o += snprintf(line + o, sizeof line - o, " | t%d %.3g %.3g z=%#x %.3g", t, row[4 * t], row[4 * t + 1], zb, row[4 * t + 3]);
+                }
+            } else if (o < (int)sizeof line - 64) o += snprintf(line + o, sizeof line - o, " | (header row not in the latest upload)");
+            fprintf(stderr, "%s\n", line); said++;
+        }
+    }
+    g_ned_draw = 0;
+    pthread_mutex_unlock(&g_lock);
+}
+static void klvk_ubodump_frame(void);
 static VkResult VKAPI_CALL klvk_QueueSubmit(VkQueue q, uint32_t n,
         const VkSubmitInfo *si, VkFence fence) {
     static PFN_vkQueueSubmit real;
@@ -5048,7 +6280,21 @@ static VkResult VKAPI_CALL klvk_QueueSubmit(VkQueue q, uint32_t n,
                 klvk_tid(), n, cb, fence != VK_NULL_HANDLE);
         }
     }
+    census_submit(n, si);
+    if (kl_vulkan_guest_active()) klvk_gpu_watch(q);
+    klvk_ubodump_frame();
+    if (eyedraw_on() && kl_env_on("KL_VK_EYEDRAW_SUBMIT", 0)) klvk_eyedraw_report();
     VkResult r = real ? real(q, n, si, fence) : VK_ERROR_INITIALIZATION_FAILED;
+    // KL_VK_SUBMIT_WAITIDLE=1 (diagnostic only, costs the whole CPU/GPU overlap): idle the queue after every
+    // guest submit, so no per-frame buffer can be rewritten while the GPU still reads it — the A/B for a sync race.
+    {
+        static int wi = -1; static PFN_vkQueueWaitIdle qwi;
+        if (wi < 0) { wi = kl_env_on("KL_VK_SUBMIT_WAITIDLE", 0);
+                      if (wi && real_gdpa) qwi = (PFN_vkQueueWaitIdle)real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkQueueWaitIdle"); }
+        if (wi && qwi && r == VK_SUCCESS) qwi(q);
+    }
+    g_fs_submit++; if (fence) g_fs_submit_fenced++;
+    if (kl_env_on("KL_VK_FENCESTATS", 0)) fs_report();
     // Same thread, same queue, right after the guest's work: copy every wanted
     // overlay texture into its persistent shadow (see klvk_shadow_pump).
     if (r == VK_SUCCESS) klvk_shadow_pump();
@@ -5089,6 +6335,86 @@ static VkResult VKAPI_CALL klvk_GetPhysicalDeviceFragmentShadingRatesKHR(
 // A count of 0 means the portability-enumeration gate ate the device; a count of
 // 1+ means the engine rejected it on a property the dump then names. Faithful
 // forward otherwise, so every other target is unaffected.
+
+// KL_VK_DUMP_CAPS=1: a vulkaninfo-shaped report of what the guest will see —
+// the core features, the 1.1/1.2/1.3 feature structs, key limits, heaps and
+// the support of the formats a PC engine leans on — so two hosts can be
+// diffed line by line (Source 2 refused the headset's device with no reason).
+static void klvk_dump_caps(VkInstance inst, VkPhysicalDevice pd) {
+    PFN_vkGetPhysicalDeviceFeatures2 gf2 = (PFN_vkGetPhysicalDeviceFeatures2)real_gipa(inst, "vkGetPhysicalDeviceFeatures2");
+    if (!gf2) gf2 = (PFN_vkGetPhysicalDeviceFeatures2)real_gipa(inst, "vkGetPhysicalDeviceFeatures2KHR");
+    PFN_vkGetPhysicalDeviceProperties gp = (PFN_vkGetPhysicalDeviceProperties)real_gipa(inst, "vkGetPhysicalDeviceProperties");
+    PFN_vkGetPhysicalDeviceFormatProperties gfp = (PFN_vkGetPhysicalDeviceFormatProperties)real_gipa(inst, "vkGetPhysicalDeviceFormatProperties");
+    PFN_vkGetPhysicalDeviceMemoryProperties gmp = (PFN_vkGetPhysicalDeviceMemoryProperties)real_gipa(inst, "vkGetPhysicalDeviceMemoryProperties");
+    PFN_vkEnumerateDeviceExtensionProperties gde = (PFN_vkEnumerateDeviceExtensionProperties)real_gipa(inst, "vkEnumerateDeviceExtensionProperties");
+    if (gf2) {
+        VkPhysicalDeviceVulkan13Features f13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+        VkPhysicalDeviceVulkan12Features f12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13 };
+        VkPhysicalDeviceVulkan11Features f11 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &f12 };
+        VkPhysicalDeviceFeatures2 f = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f11 };
+        gf2(pd, &f);
+        const VkBool32 *b = (const VkBool32 *)&f.features;
+        fprintf(stderr, "[caps] core features:");
+        for (unsigned i = 0; i < sizeof f.features / sizeof(VkBool32); i++) fprintf(stderr, "%s%u=%u", i % 11 ? " " : "\n[caps]   ", i, b[i]);
+        fprintf(stderr, "\n");
+        #define DUMPSTRUCT(tag, st, first) do { const VkBool32 *q = (const VkBool32 *)&(st).first; \
+            unsigned n = (unsigned)((sizeof (st) - offsetof(__typeof__(st), first)) / sizeof(VkBool32)); \
+            fprintf(stderr, "[caps] %s:", tag); \
+            for (unsigned i = 0; i < n; i++) fprintf(stderr, "%s%u=%u", i % 11 ? " " : "\n[caps]   ", i, q[i]); \
+            fprintf(stderr, "\n"); } while (0)
+        DUMPSTRUCT("vk11", f11, storageBuffer16BitAccess);
+        DUMPSTRUCT("vk12", f12, samplerMirrorClampToEdge);
+        DUMPSTRUCT("vk13", f13, robustImageAccess);
+    }
+    if (gp) {
+        VkPhysicalDeviceProperties p; gp(pd, &p);
+        const VkPhysicalDeviceLimits *l = &p.limits;
+        fprintf(stderr, "[caps] limits: img2D %u img3D %u imgCube %u layers %u texelBuf %u ubo %u ssbo %u push %u "
+                "allocs %u samplers %u perStageSamplers %u perStageUBO %u perStageSSBO %u perStageImages %u perStageStorageImg %u perStageRes %u "
+                "setSamplers %u setUBO %u setSSBO %u setImages %u setStorageImg %u attachments %u colorAtt %u "
+                "vp %u viewport %ux%u fb %ux%u fbLayers %u sampleCounts c%#x d%#x s%#x anisotropy %.0f "
+                "timestamps %u tsPeriod %.2f cs %ux%ux%u inv %u shared %u\n",
+                l->maxImageDimension2D, l->maxImageDimension3D, l->maxImageDimensionCube, l->maxImageArrayLayers,
+                l->maxTexelBufferElements, l->maxUniformBufferRange, l->maxStorageBufferRange, l->maxPushConstantsSize,
+                l->maxMemoryAllocationCount, l->maxSamplerAllocationCount, l->maxPerStageDescriptorSamplers,
+                l->maxPerStageDescriptorUniformBuffers, l->maxPerStageDescriptorStorageBuffers, l->maxPerStageDescriptorSampledImages,
+                l->maxPerStageDescriptorStorageImages, l->maxPerStageResources, l->maxDescriptorSetSamplers,
+                l->maxDescriptorSetUniformBuffers, l->maxDescriptorSetStorageBuffers, l->maxDescriptorSetSampledImages,
+                l->maxDescriptorSetStorageImages, l->maxFragmentOutputAttachments, l->maxColorAttachments,
+                l->maxViewports, l->maxViewportDimensions[0], l->maxViewportDimensions[1],
+                l->maxFramebufferWidth, l->maxFramebufferHeight, l->maxFramebufferLayers,
+                l->framebufferColorSampleCounts, l->framebufferDepthSampleCounts, l->framebufferStencilSampleCounts,
+                l->maxSamplerAnisotropy, l->timestampComputeAndGraphics, l->timestampPeriod,
+                l->maxComputeWorkGroupSize[0], l->maxComputeWorkGroupSize[1], l->maxComputeWorkGroupSize[2],
+                l->maxComputeWorkGroupInvocations, l->maxComputeSharedMemorySize);
+    }
+    if (gmp) {
+        VkPhysicalDeviceMemoryProperties m; gmp(pd, &m);
+        for (uint32_t i = 0; i < m.memoryHeapCount; i++)
+            fprintf(stderr, "[caps] heap %u: %llu MB flags %#x\n", i, (unsigned long long)(m.memoryHeaps[i].size >> 20), m.memoryHeaps[i].flags);
+        for (uint32_t i = 0; i < m.memoryTypeCount; i++)
+            fprintf(stderr, "[caps] memtype %u: heap %u flags %#x\n", i, m.memoryTypes[i].heapIndex, m.memoryTypes[i].propertyFlags);
+    }
+    if (gfp) {
+        static const int fmts[] = { 37, 43, 44, 50, 64, 91, 97, 100, 109, 122, 123, 124, 125, 126, 127, 128, 129, 130,
+                                    131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146,
+                                    147, 148, 157, 158, 184, 1000054000 };
+        for (unsigned i = 0; i < sizeof fmts / sizeof fmts[0]; i++) {
+            VkFormatProperties fp; memset(&fp, 0, sizeof fp);
+            gfp(pd, (VkFormat)fmts[i], &fp);
+            fprintf(stderr, "[caps] format %d: linear %#x optimal %#x buffer %#x\n", fmts[i],
+                    fp.linearTilingFeatures, fp.optimalTilingFeatures, fp.bufferFeatures);
+        }
+    }
+    if (gde) {
+        uint32_t n = 0; gde(pd, NULL, &n, NULL);
+        VkExtensionProperties *e = calloc(n ? n : 1, sizeof *e);
+        if (e) { gde(pd, NULL, &n, e);
+                 for (uint32_t i = 0; i < n; i++) fprintf(stderr, "[caps] devext %s\n", e[i].extensionName);
+                 free(e); }
+    }
+}
+
 static VkResult VKAPI_CALL klvk_EnumeratePhysicalDevices(
         VkInstance inst, uint32_t *count, VkPhysicalDevice *devs) {
     KLVK_WHO("vkEnumeratePhysicalDevices");
@@ -5134,6 +6460,8 @@ static VkResult VKAPI_CALL klvk_EnumeratePhysicalDevices(
         }
     }
     VkResult rr = real(inst, count, devs);
+    { static int dumped;
+      if (devs && count && *count && !dumped && kl_env_on("KL_VK_DUMP_CAPS", 0)) { dumped = 1; klvk_dump_caps(inst, devs[0]); } }
     // Every FETCH (devs != NULL), not just the first: AC Nexus enumerates on a
     // throwaway instance, destroys it, makes a second, and reaches device init
     // with a NULL physicalDevice — so the question "what did enumerate hand the
@@ -5231,6 +6559,29 @@ static void VKAPI_CALL klvk_CmdDrawIndexed(void *cb, uint32_t indexCount,
     static void (*real)(void *, uint32_t, uint32_t, uint32_t, int32_t, uint32_t);
     if (!real && real_gdpa) real = (void (*)(void *, uint32_t, uint32_t, uint32_t, int32_t, uint32_t))
         real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkCmdDrawIndexed");
+    if (eyedraw_on()) {
+        pthread_mutex_lock(&g_lock);
+        int k = ed_slot(cb);
+        static int printed;
+        if (printed < 400) {
+            if (ed_is_eye_pipe(g_ed_cb[k].pipe)) {
+                for (int j = 0; j < g_ed_nlast; j++) { ed_print_draw("   before", g_ed_lastvb1off[j]); printed++; }
+                ed_print_draw("EYE", g_ed_cb[k].vb1off + 4ull * firstInstance); printed++;
+                g_ed_near = 3; g_ed_nlast = 0;
+            } else {
+                if (g_ed_near > 0) { g_ed_near--; ed_print_draw("   after", g_ed_cb[k].vb1off + 4ull * firstInstance); printed++; }
+                if (g_ed_nlast < 3) g_ed_lastvb1off[g_ed_nlast++] = g_ed_cb[k].vb1off + 4ull * firstInstance;
+                else { g_ed_lastvb1off[0] = g_ed_lastvb1off[1]; g_ed_lastvb1off[1] = g_ed_lastvb1off[2]; g_ed_lastvb1off[2] = g_ed_cb[k].vb1off + 4ull * firstInstance; }
+            }
+        }
+        if (ed_is_eye_pipe(g_ed_cb[k].pipe) && g_ned_draw < KLED_DRAWS) {
+            g_ed_draw[g_ned_draw].vb1 = g_ed_cb[k].vb1; g_ed_draw[g_ned_draw].vb1off = g_ed_cb[k].vb1off;
+            g_ed_draw[g_ned_draw].xbuf = g_ed_cb[k].xbuf; g_ed_draw[g_ned_draw].xoff = g_ed_cb[k].xoff;
+            g_ed_draw[g_ned_draw].xrows = g_ed_cb[k].xrows; g_ed_draw[g_ned_draw].first = firstInstance;
+            g_ed_draw[g_ned_draw].count = instanceCount; g_ned_draw++;
+        }
+        pthread_mutex_unlock(&g_lock);
+    }
     // KL_VK_DRAW_GUARD (default OFF): the skip below drops a draw whenever it
     // cannot find a live MTLBuffer for the index binding. That decision rests on
     // g_cb_idx, a 64-slot, UNLOCKED table that is never drained (no
@@ -5274,6 +6625,7 @@ static void VKAPI_CALL klvk_CmdBindPipeline(void *cb, uint32_t bindPoint, uint64
     if (!pipeline) { static int said; if (said < 8) { said++;
         VKI("vkCmdBindPipeline: NULL pipeline bound (bindPoint %u) — a following "
             "draw will dereference null in MoltenVK\n", bindPoint); } }
+    if (eyedraw_on() && bindPoint == 0) { pthread_mutex_lock(&g_lock); g_ed_cb[ed_slot(cb)].pipe = pipeline; pthread_mutex_unlock(&g_lock); }
     if (real) real(cb, bindPoint, pipeline);
 }
 // Defined in the 2D-mirror block below; used here to record the bind-time GPU copy.
@@ -5317,6 +6669,11 @@ static void VKAPI_CALL klvk_CmdBindVertexBuffers(void *cb, uint32_t first,
             VKI("vkCmdBindVertexBuffers: NULL vertex buffer at binding %u — a draw "
                 "using it will dereference null in MoltenVK\n", first + i); }
         break;
+    }
+    if (eyedraw_on() && buffers && first <= 1 && first + count > 1) {
+        pthread_mutex_lock(&g_lock);
+        int k = ed_slot(cb); g_ed_cb[k].vb1 = buffers[1 - first]; g_ed_cb[k].vb1off = offsets ? offsets[1 - first] : 0;
+        pthread_mutex_unlock(&g_lock);
     }
     if (real) real(cb, first, count, buffers, offsets);
 }
@@ -5420,6 +6777,29 @@ static void VKAPI_CALL klvk_CmdCopyBuffer(VkCommandBuffer cb, VkBuffer src, VkBu
     // "has data" => UVs are uploaded fine (gray is then ASTC decode or the mirror
     // copy, not missing UVs); "ZERO" => UV texcoords are absent => collapsed UVs.
     if (emu_on() && regions && rc) klvk_probe_uv_staging(src, dst, rc, regions);
+    if (eyedraw_on() && regions && rc) {
+        pthread_mutex_lock(&g_lock);
+        struct probe_buf *e = probe_buf_find(dst);
+        if (e && e->size == 8388608)
+            for (uint32_t i = 0; i < rc; i++) {
+                const void *sp = ed_ptr((uint64_t)(uintptr_t)src, regions[i].srcOffset);
+                { static int said; if (said < 12) { said++;
+                    struct probe_buf *se = probe_buf_find(src); struct probe_mem *sm = se ? probe_mem_find(se->mem) : NULL;
+                    fprintf(stderr, "[eyedraw] instance copy src %#llx +%llu -> dst +%llu size %llu: src tracked %d size %llu memoff %llu mem %d mapped %d map_off %llu map_size %llu -> %s\n",
+                        (unsigned long long)(uintptr_t)src, (unsigned long long)regions[i].srcOffset, (unsigned long long)regions[i].dstOffset,
+                        (unsigned long long)regions[i].size, se != NULL, se ? (unsigned long long)se->size : 0ull, se ? (unsigned long long)se->memoff : 0ull,
+                        sm != NULL, sm && sm->mapped, sm ? (unsigned long long)sm->map_off : 0ull, sm ? (unsigned long long)sm->map_size : 0ull, sp ? "ok" : "NULL"); } }
+                if (sp && regions[i].size <= (4u << 20)) {
+                    unsigned q = g_eds_n++ % 64;
+                    free(g_eds_inst[q].data); g_eds_inst[q].data = malloc(regions[i].size);
+                    if (g_eds_inst[q].data) { memcpy(g_eds_inst[q].data, sp, regions[i].size); g_eds_inst[q].dof = regions[i].dstOffset; g_eds_inst[q].sz = regions[i].size; }
+                }
+                int k = g_edc_n++ % KLEDC;
+                g_edc[k].dst = (uint64_t)(uintptr_t)dst; g_edc[k].src = (uint64_t)(uintptr_t)src;
+                g_edc[k].so = regions[i].srcOffset; g_edc[k].dof = regions[i].dstOffset; g_edc[k].sz = regions[i].size;
+            }
+        pthread_mutex_unlock(&g_lock);
+    }
     if (real) real(cb, src, dst, rc, regions);
 }
 static void VKAPI_CALL klvk_CmdUpdateBuffer(VkCommandBuffer cb, VkBuffer dst,
@@ -6252,11 +7632,190 @@ static uint32_t *klvk_spirv_mirror_rewrite(const uint32_t *in, size_t nwords,
 // vkCreateShaderModule — gated SPIR-V rewrite. emu_on() false, or a module with
 // no texel-buffer image, is EXACT passthrough. A rewrite MoltenVK rejects falls
 // back to the original module (buggy but never a hard failure).
-static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
+// ---------------------------------------------------------------------------
+// EYE CUBEMAP FIX (KL_VK_EYE_ENVGUARD, default ON) — Half-Life: Alyx's NPC eyes
+// flashed solid red / green / blue / magenta on the headset (Olga at the alley
+// gate, Chapter 1: 43 of 400 frames on the Mac).
+//
+// Every material shader in this Vulkan build unpacks the per-object value its
+// vertex shader passes on (flat, location 7) as two fields: cubemap record =
+// v >> 8 (tint / box / normalization, a 144-entry array in the scene's light
+// constant buffer) and cube-array layer = v & 255. The vr_eyeball pixel shader
+// alone is stale: it indexes the record array with the raw v (always >= 256
+// for an eye) and samples layer 0. So it reads ~97 KB into a uniform buffer
+// bound for 36-64 KB. PC GPUs bounds-check constant-buffer reads and return
+// zeros there (D3D guarantees it; NVIDIA, AMD and Adreno do it in hardware),
+// so on PC the eyes merely lose their reflection. Metal does not bounds-check
+// constant buffers: the read lands in whatever the ring buffer holds next —
+// random tints, identity-matrix rows, huge values — hence the flashes.
+//
+// This rewrites that one shader to decode v the way the rest of the build
+// does: record = v >> 8 for its nine table reads, layer = float(v & 255) for
+// its two cube-array samples; and, as a safety net, its cubemap-reflection
+// term is zeroed (the PC result) if a decoded record were still >= 144.
+// The module is recognised by size + SHA-1 (the combo Chapter 1 uses) and
+// patched only if every id the rewrite relies on has the expected shape;
+// anything else is left untouched and logged.
+#define KLVK_EYE_PS_WORDS  (46924u / 4u)
+static const char *KLVK_EYE_PS_SHA1 = "47da31f1c09e08ca18b8f8bb6c18a9a8bae7d741";
+static uint32_t *klvk_eye_envguard(const uint32_t *w, size_t nw, size_t *out_nw) {
+    enum { IDX = 3142, LOAD = 11487, TERM = 11175, COORD_A = 14604, COORD_B = 14605, ZERO_F = 2572,
+           T_INT = 12, T_UINT = 11, T_FLOAT = 13, T_VEC3 = 24, T_VEC4 = 29,
+           CUBES = 3424, T_CUBES = 216, INT0 = 2571, INT1 = 2574, GLSL450 = 1 };
+    if (nw < 5 || w[0] != 0x07230203u) return NULL;
+    uint32_t tbool = 0; size_t firstfn = 0;
+    int loads = 0, chains = 0, coords = 0, fadds = 0, ok_uint = 0, ok_vec3 = 0, other_uses = 0;
+    int ok_int = 0, ok_cubes = 0, ok_consts = 0, ok_glsl = 0, have_v3int = 0, cube_var = 0;
+    for (size_t i = 5; i < nw; ) {
+        uint32_t op = w[i] & 0xffffu, wc = w[i] >> 16;
+        if (!wc || i + wc > nw) return NULL;
+        if (op == 20) tbool = w[i + 1];                                                   // OpTypeBool
+        if (op == 21 && w[i + 1] == T_UINT && w[i + 2] == 32 && w[i + 3] == 0) ok_uint = 1;
+        if (op == 23 && w[i + 1] == T_VEC3 && w[i + 2] == T_FLOAT && w[i + 3] == 3) ok_vec3 = 1;
+        if (op == 23 && w[i + 2] == T_INT && w[i + 3] == 3) have_v3int = 1;                // (then we'd reuse it; not expected)
+        if (op == 21 && w[i + 1] == T_INT && w[i + 2] == 32 && w[i + 3] == 1) ok_int = 1;
+        if (op == 25 && w[i + 1] == T_CUBES && w[i + 3] == 3 && w[i + 5] == 1) ok_cubes = 1;   // Cube, arrayed
+        if (op == 59 && w[i + 2] == CUBES) cube_var = 1;
+        if (op == 43 && w[i + 1] == T_INT && ((w[i + 2] == INT0 && w[i + 3] == 0) || (w[i + 2] == INT1 && w[i + 3] == 1))) ok_consts++;
+        if (op == 11 && w[i + 1] == GLSL450) ok_glsl = 1;
+        if (op == 54 && !firstfn) firstfn = i;                                            // first OpFunction
+        if (op == 61 && wc == 4 && w[i + 3] == IDX) { loads++; if (w[i + 1] != T_UINT || w[i + 2] != LOAD) return NULL; }
+        if (op == 65) { for (uint32_t k = 4; k < wc; k++) if (w[i + k] == LOAD) chains++; }   // OpAccessChain index
+        else if (op != 61) { for (uint32_t k = 1; k < wc; k++) if (w[i + k] == LOAD) other_uses++; }
+        if (op == 80 && wc == 7 && w[i + 1] == T_VEC4 && (w[i + 2] == COORD_A || w[i + 2] == COORD_B) && w[i + 6] == ZERO_F) coords++;
+        if (op == 129 && wc == 5 && w[i + 1] == T_VEC3 && (w[i + 3] == TERM || w[i + 4] == TERM)) fadds++;
+        i += wc;
+    }
+    if (!tbool || !firstfn || !ok_uint || !ok_vec3 || loads != 1 || chains != 9 || other_uses || coords != 2 || fadds != 1 ||
+        !ok_int || !ok_cubes || !cube_var || ok_consts != 2 || !ok_glsl || have_v3int)
+        return NULL;
+    uint32_t bound = w[3];
+    const uint32_t c8 = bound++, c255 = bound++, c144 = bound++, zero3 = bound++;
+    const uint32_t rec = bound++, lay_u = bound++, lay = bound++;
+    const uint32_t t_v3int = bound++, img = bound++, sz = bound++, cnt = bound++, cntm1 = bound++, cntm1u = bound++, lay_c = bound++;
+    uint32_t *o = malloc((nw + 64) * 4);
+    if (!o) return NULL;
+    size_t n = firstfn;
+    memcpy(o, w, firstfn * 4);
+    o[n++] = (4u << 16) | 43; o[n++] = T_UINT; o[n++] = c8;   o[n++] = 8;               // OpConstant %uint 8
+    o[n++] = (4u << 16) | 43; o[n++] = T_UINT; o[n++] = c255; o[n++] = 255;             // OpConstant %uint 255
+    o[n++] = (4u << 16) | 43; o[n++] = T_UINT; o[n++] = c144; o[n++] = 144;             // OpConstant %uint 144
+    o[n++] = (3u << 16) | 46; o[n++] = T_VEC3; o[n++] = zero3;                          // OpConstantNull %v3float
+    o[n++] = (4u << 16) | 23; o[n++] = t_v3int; o[n++] = T_INT; o[n++] = 3;             // OpTypeVector %int 3
+    for (size_t i = firstfn; i < nw; ) {
+        uint32_t op = w[i] & 0xffffu, wc = w[i] >> 16;
+        size_t at = n;
+        if (op == 129 && wc == 5 && w[i + 1] == T_VEC3 && (w[i + 3] == TERM || w[i + 4] == TERM)) {
+            uint32_t cond = bound++, sel = bound++;
+            o[n++] = (5u << 16) | 176; o[n++] = tbool;  o[n++] = cond; o[n++] = rec; o[n++] = c144;          // OpULessThan
+            o[n++] = (6u << 16) | 169; o[n++] = T_VEC3; o[n++] = sel; o[n++] = cond; o[n++] = TERM; o[n++] = zero3;  // OpSelect
+            at = n;
+            memcpy(o + n, w + i, wc * 4); n += wc;
+            for (size_t k = at + 3; k < n; k++) if (o[k] == TERM) o[k] = sel;
+        } else {
+            memcpy(o + n, w + i, wc * 4); n += wc;
+            if (op == 65) for (size_t k = at + 4; k < n; k++) if (o[k] == LOAD) o[k] = rec;     // table reads: record
+            if (op == 80 && wc == 7 && (o[at + 2] == COORD_A || o[at + 2] == COORD_B)) o[at + 6] = lay;  // layer
+        }
+        if (op == 61 && wc == 4 && w[i + 3] == IDX) {                                   // right after the one load of v
+            o[n++] = (5u << 16) | 194; o[n++] = T_UINT;  o[n++] = rec;   o[n++] = LOAD; o[n++] = c8;     // v >> 8
+            o[n++] = (5u << 16) | 199; o[n++] = T_UINT;  o[n++] = lay_u; o[n++] = LOAD; o[n++] = c255;   // v & 255
+            // clamped to the cube array's real layer count (Metal does not clamp an array index either)
+            o[n++] = (4u << 16) | 61;  o[n++] = T_CUBES; o[n++] = img;  o[n++] = CUBES;                 // the cube array
+            o[n++] = (5u << 16) | 103; o[n++] = t_v3int; o[n++] = sz;   o[n++] = img; o[n++] = INT0;     // OpImageQuerySizeLod
+            o[n++] = (5u << 16) | 81;  o[n++] = T_INT;   o[n++] = cnt;  o[n++] = sz;  o[n++] = 2;        // .z = layers
+            o[n++] = (5u << 16) | 130; o[n++] = T_INT;   o[n++] = cntm1; o[n++] = cnt; o[n++] = INT1;    // layers - 1
+            o[n++] = (4u << 16) | 124; o[n++] = T_UINT;  o[n++] = cntm1u; o[n++] = cntm1;                // as uint
+            o[n++] = (7u << 16) | 12;  o[n++] = T_UINT;  o[n++] = lay_c; o[n++] = GLSL450; o[n++] = 38;  // UMin
+            o[n++] = lay_u; o[n++] = cntm1u;
+            o[n++] = (4u << 16) | 112; o[n++] = T_FLOAT; o[n++] = lay;   o[n++] = lay_c;                 // float(...)
+        }
+        i += wc;
+    }
+    o[3] = bound;
+    *out_nw = n;
+    return o;
+}
+
+static VkResult VKAPI_CALL klvk_CreateShaderModule_body(VkDevice dev,
         const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *alloc,
         VkShaderModule *out) {
     static PFN_vkCreateShaderModule real;
     if (!real && real_gdpa) real = (PFN_vkCreateShaderModule)real_gdpa(dev, "vkCreateShaderModule");
+    // KL_VK_SPV_LOG=<file>: the SHA-1 and size of every SPIR-V module the guest creates, to match them
+    // against a pipeline recording (the game's Fossilize database).
+    {
+        static FILE *spvlog; static int spvinit;
+        if (!spvinit) { spvinit = 1; const char *e = getenv("KL_VK_SPV_LOG"); if (e && *e) spvlog = fopen(e, "a"); }
+        if (spvlog && ci && ci->pCode) {
+            unsigned char md[CC_SHA1_DIGEST_LENGTH];
+            CC_SHA1(ci->pCode, (CC_LONG)ci->codeSize, md);
+            char hex[2 * CC_SHA1_DIGEST_LENGTH + 1];
+            for (int i = 0; i < CC_SHA1_DIGEST_LENGTH; i++) snprintf(hex + 2 * i, 3, "%02x", md[i]);
+            fprintf(spvlog, "%s %zu\n", hex, ci->codeSize);
+            fflush(spvlog);
+            const char *dir = getenv("KL_VK_SPV_DUMP");     // ...and the modules themselves, as <sha1>.spv
+            if (dir && *dir) {
+                char path[1024]; snprintf(path, sizeof path, "%s/%s.spv", dir, hex);
+                FILE *o = fopen(path, "wb"); if (o) { fwrite(ci->pCode, 1, ci->codeSize, o); fclose(o); }
+            }
+        }
+    }
+    // KL_VK_EYE_ENVGUARD (default ON): the eye cubemap fix, see klvk_eye_envguard above
+    static int eyefix = -1; if (eyefix < 0) eyefix = kl_env_on("KL_VK_EYE_ENVGUARD", 1);
+    if (eyefix && ci && ci->pCode && real && ci->codeSize == KLVK_EYE_PS_WORDS * 4u) {
+        unsigned char md[CC_SHA1_DIGEST_LENGTH]; char hex[41];
+        CC_SHA1(ci->pCode, (CC_LONG)ci->codeSize, md);
+        for (int i = 0; i < CC_SHA1_DIGEST_LENGTH; i++) snprintf(hex + 2 * i, 3, "%02x", md[i]);
+        if (strcmp(hex, KLVK_EYE_PS_SHA1) == 0) {
+            size_t nw = 0;
+            uint32_t *g = klvk_eye_envguard(ci->pCode, ci->codeSize / 4, &nw);
+            if (g) {
+                VkShaderModuleCreateInfo m = *ci; m.pCode = g; m.codeSize = nw * 4;
+                VkResult r = real(dev, &m, alloc, out);
+                free(g);
+                static int said; if (said < 4) { said++;
+                    fprintf(stderr, "  [vk] eye cubemap fix on the vr_eyeball pixel shader: %s\n",
+                            r == VK_SUCCESS ? "applied" : "rejected by MoltenVK; original used"); }
+                if (r == VK_SUCCESS) return r;
+            } else {
+                static int said; if (said < 4) { said++;
+                    fprintf(stderr, "  [vk] eye cubemap fix: vr_eyeball pixel shader did not have the expected shape; left alone\n"); }
+            }
+        }
+    }
+    // KL_VK_SPV_REPLACE=<sha1>=<file.spv> (diagnostic): swap one guest shader module for a patched copy
+    {
+        static const char *rep = (const char *)1;
+        if (rep == (const char *)1) rep = getenv("KL_VK_SPV_REPLACE");
+        if (rep && ci && ci->pCode && real && strlen(rep) > 41 && rep[40] == '=') {
+            unsigned char md[CC_SHA1_DIGEST_LENGTH]; char hex[41];
+            CC_SHA1(ci->pCode, (CC_LONG)ci->codeSize, md);
+            for (int i = 0; i < CC_SHA1_DIGEST_LENGTH; i++) snprintf(hex + 2 * i, 3, "%02x", md[i]);
+            // several pairs, comma-separated: <sha1>=<file>,<sha1>=<file>
+            char pick[600] = "";
+            for (const char *p = rep; p && *p; ) {
+                const char *e = strchr(p, ','); size_t len = e ? (size_t)(e - p) : strlen(p);
+                if (len > 41 && len < sizeof pick && strncmp(hex, p, 40) == 0) { memcpy(pick, p, len); pick[len] = 0; break; }
+                p = e ? e + 1 : NULL;
+            }
+            if (pick[0]) {
+                FILE *f = fopen(pick + 41, "rb");
+                if (f) {
+                    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+                    uint32_t *code = malloc((size_t)n);
+                    if (code && fread(code, 1, (size_t)n, f) == (size_t)n) {
+                        VkShaderModuleCreateInfo m = *ci; m.pCode = code; m.codeSize = (size_t)n;
+                        VkResult r = real(dev, &m, alloc, out);
+                        fprintf(stderr, "[spvrep] module %s replaced by %s: result %d\n", hex, pick + 41, (int)r);
+                        free(code); fclose(f);
+                        return r;
+                    }
+                    free(code); fclose(f);
+                }
+            }
+        }
+    }
     if (!emu_on() || !ci || !ci->pCode || (ci->codeSize & 3u) || !real)
         return real ? real(dev, ci, alloc, out) : VK_ERROR_INITIALIZATION_FAILED;
     size_t nwords = ci->codeSize / 4;
@@ -6284,7 +7843,7 @@ static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
 
 // vkCreateDescriptorSetLayout — UNIFORM_TEXEL_BUFFER bindings become SAMPLED_IMAGE
 // so the layout matches the rewritten shader. Exact passthrough when emu off.
-static VkResult VKAPI_CALL klvk_CreateDescriptorSetLayout(VkDevice dev,
+static VkResult VKAPI_CALL klvk_CreateDescriptorSetLayout_body(VkDevice dev,
         const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *alloc,
         VkDescriptorSetLayout *out) {
     static PFN_vkCreateDescriptorSetLayout real;
@@ -6332,6 +7891,7 @@ static VkResult VKAPI_CALL klvk_CreateDescriptorPool(VkDevice dev,
         VkDescriptorPool *out) {
     static PFN_vkCreateDescriptorPool real;
     if (!real && real_gdpa) real = (PFN_vkCreateDescriptorPool)real_gdpa(dev, "vkCreateDescriptorPool");
+    census_descriptor_pool(ci);
     if (!emu_on() || !ci || ci->poolSizeCount == 0 || !ci->pPoolSizes || !real)
         return real ? real(dev, ci, alloc, out) : VK_ERROR_INITIALIZATION_FAILED;
     int any = 0;
@@ -6377,9 +7937,110 @@ static void klvk_probe_img_binding(VkImageView v) {
             "%u tiny(1x1 default?), %u unknown-view\n", real_n, astc_n, tiny_n, null_n); }
 }
 
+// KL_VK_UBO_DUMP=<dir> (diagnostic, with KL_VK_UBO_TRACE=<binding>): at every guest submit, write the bytes of
+// every distinct uniform-buffer range written into that binding this frame to <dir>/f<frame>_<n>.bin (host-visible
+// memory the guest has mapped only), with the frame number the GPU-time frame counter uses (KL_GPU_SNAP's).
+static struct { VkBuffer b; VkDeviceSize off, range; } g_ubo_seen[64];
+static int g_nubo_seen;
+static void klvk_ubodump_note(VkBuffer b, VkDeviceSize off, VkDeviceSize range) {
+    if (!ubodump_on()) return;
+    pthread_mutex_lock(&g_lock);
+    int dup = 0;
+    for (int i = 0; i < g_nubo_seen; i++) if (g_ubo_seen[i].b == b && g_ubo_seen[i].off == off) dup = 1;
+    if (!dup && g_nubo_seen < 64) { g_ubo_seen[g_nubo_seen].b = b; g_ubo_seen[g_nubo_seen].off = off; g_ubo_seen[g_nubo_seen].range = range; g_nubo_seen++; }
+    pthread_mutex_unlock(&g_lock);
+}
+static void klvk_ubodump_frame(void) {
+    if (!ubodump_on()) return;
+    extern unsigned kl_gpu_time_frame(void);
+    static unsigned last = ~0u; static int from = -1, to;
+    if (from < 0) { const char *w = getenv("KL_VK_UBO_DUMP_FRAMES"); from = 0; to = 1 << 30;
+                    if (w) sscanf(w, "%d:%d", &from, &to); }
+    unsigned f = kl_gpu_time_frame();
+    if (f == last) return;                       // once per frame: at the first submit of the next frame
+    unsigned fr = last; last = f;
+    pthread_mutex_lock(&g_lock);
+    if ((int)fr >= from && (int)fr <= to && fr != ~0u)
+        for (int i = 0; i < g_nubo_seen; i++) {
+            struct probe_buf *e = probe_buf_find(g_ubo_seen[i].b);
+            struct probe_mem *m = e ? probe_mem_find(e->mem) : NULL;
+            if (!m || !m->mapped) continue;
+            const char *src = (const char *)m->mapped + (e->memoff - m->map_off) + g_ubo_seen[i].off;
+            char path[600]; snprintf(path, sizeof path, "%s/f%u_%d.bin", getenv("KL_VK_UBO_DUMP"), fr, i);
+            FILE *fp = fopen(path, "wb");
+            if (fp) { fwrite(src, 1, (size_t)(g_ubo_seen[i].range > 65536 ? 65536 : g_ubo_seen[i].range), fp); fclose(fp); }
+        }
+    g_nubo_seen = 0;
+    pthread_mutex_unlock(&g_lock);
+}
+
+// KL_VK_SAMPLER_TRACE=<binding> (diagnostic): which samplers the guest writes into that descriptor binding, and
+// with what filtering — logged as a histogram (sampler filters, write count). Samplers are remembered at creation,
+// descriptor-update templates by their entries for that binding; both update paths are watched.
+#define KLST_MAX 4096
+static struct { VkSampler s; uint8_t mag, min, mip, aniso, cmp, au; float maxAniso; unsigned writes; } g_st[KLST_MAX];
+static int g_nst;
+static struct { VkDescriptorUpdateTemplate t; size_t off, stride; uint32_t count, arr; } g_stt[1024];
+static VkDescriptorSetLayout g_st_layout;
+static struct { VkDescriptorUpdateTemplate t; size_t off; } g_stu[1024]; static int g_nstu;   // KL_VK_UBO_TRACE=<binding>   // KL_VK_SAMPLER_TRACE_NB=<n>: only the layout with n bindings incl. 289
+static int g_nstt;
+static int klst_binding(void) {
+    static int b = -2;
+    if (b == -2) { const char *e = getenv("KL_VK_SAMPLER_TRACE"); b = e && *e ? atoi(e) : -1; }
+    return b;
+}
+static void klst_note_sampler(VkSampler s, const VkSamplerCreateInfo *ci) {
+    if (klst_binding() < 0 || !ci) return;
+    pthread_mutex_lock(&g_lock);
+    if (g_nst < KLST_MAX) {
+        g_st[g_nst].s = s; g_st[g_nst].mag = (uint8_t)ci->magFilter; g_st[g_nst].min = (uint8_t)ci->minFilter;
+        g_st[g_nst].mip = (uint8_t)ci->mipmapMode; g_st[g_nst].aniso = (uint8_t)ci->anisotropyEnable;
+        g_st[g_nst].maxAniso = ci->maxAnisotropy; g_st[g_nst].cmp = (uint8_t)ci->compareEnable;
+        g_st[g_nst].au = (uint8_t)ci->addressModeU; g_st[g_nst].writes = 0; g_nst++;
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+static void klst_note_write(VkSampler s) {
+    static unsigned total;
+    pthread_mutex_lock(&g_lock);
+    int k = -1;
+    for (int i = 0; i < g_nst; i++) if (g_st[i].s == s) { k = i; break; }
+    if (k >= 0) g_st[k].writes++;
+    total++;
+    if ((total & (total - 1)) == 0 || total % 20000 == 0) {       // at 1, 2, 4, ... and every 20000 writes
+        fprintf(stderr, "[samptrace] binding %d: %u sampler writes so far\n", klst_binding(), total);
+        for (int i = 0; i < g_nst; i++) if (g_st[i].writes)
+            fprintf(stderr, "[samptrace]   sampler %#llx mag %u min %u mip %u aniso %u (%.0f) compare %u addrU %u: %u writes\n",
+                    (unsigned long long)(uintptr_t)g_st[i].s, g_st[i].mag, g_st[i].min, g_st[i].mip, g_st[i].aniso,
+                    g_st[i].maxAniso, g_st[i].cmp, g_st[i].au, g_st[i].writes);
+        if (k < 0) fprintf(stderr, "[samptrace]   (a sampler created before tracing / unknown: %#llx)\n", (unsigned long long)(uintptr_t)s);
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
 static void VKAPI_CALL klvk_UpdateDescriptorSets(VkDevice dev,
         uint32_t writeCount, const VkWriteDescriptorSet *writes,
         uint32_t copyCount, const VkCopyDescriptorSet *copies) {
+    if (klst_binding() >= 0 && copies && copyCount) {
+        static unsigned nc, ncb; nc += copyCount;
+        for (uint32_t i = 0; i < copyCount; i++) {
+            int k = klst_binding() - (int)copies[i].dstBinding;
+            if (k >= 0 && k < (int)copies[i].descriptorCount) ncb++;
+        }
+        static int said; if (said < 6 || (nc & (nc - 1)) == 0) { said++;
+            fprintf(stderr, "[samptrace] descriptor copies: %u (%u touching binding %d); e.g. src binding %u -> dst %u count %u\n",
+                    nc, ncb, klst_binding(), copies[0].srcBinding, copies[0].dstBinding, copies[0].descriptorCount); }
+    }
+    if (klst_binding() >= 0 && writes)
+        for (uint32_t i = 0; i < writeCount; i++)
+            if (writes[i].pImageInfo && (writes[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ||
+                 writes[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)) {
+                // a write may run on into the following (single-element) bindings
+                int b0 = (int)writes[i].dstBinding, k = klst_binding() - b0;
+                static int said; if (said < 16) { said++; fprintf(stderr, "[samptrace] write: binding %d count %u type %d\n",
+                    b0, writes[i].descriptorCount, (int)writes[i].descriptorType); }
+                if (k >= 0 && k < (int)writes[i].descriptorCount) klst_note_write(writes[i].pImageInfo[k].sampler);
+            }
     // PROBE: tally image-sampler bindings (see klvk_probe_img_binding).
     if ((emu_on() || probe_on()) && writes)
         for (uint32_t i = 0; i < writeCount; i++)
@@ -6589,6 +8250,33 @@ static VkResult VKAPI_CALL klvk_CreateDescriptorUpdateTemplate(VkDevice dev,
         real = (PFN_vkCreateDescriptorUpdateTemplate)real_gdpa(dev, "vkCreateDescriptorUpdateTemplate");
         if (!real) real = (PFN_vkCreateDescriptorUpdateTemplate)real_gdpa(dev, "vkCreateDescriptorUpdateTemplateKHR");
     }
+    if (klst_binding() >= 0 && ci && ci->pDescriptorUpdateEntries && real) {
+        VkResult r0 = real(dev, ci, alloc, out);
+        if (r0 == VK_SUCCESS && out && *out && (!kl_env_int("KL_VK_SAMPLER_TRACE_NB", 0) || ci->descriptorSetLayout == g_st_layout))
+            for (uint32_t i = 0; i < ci->descriptorUpdateEntryCount; i++) {
+                const VkDescriptorUpdateTemplateEntry *e = &ci->pDescriptorUpdateEntries[i];
+                {   int ub = kl_env_int("KL_VK_UBO_TRACE", -1), ku = ub - (int)e->dstBinding;
+                    if (ub >= 0 && ku >= 0 && ku < (int)e->descriptorCount && e->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+                        pthread_mutex_lock(&g_lock);
+                        if (g_nstu < 1024) { g_stu[g_nstu].t = *out; g_stu[g_nstu].off = e->offset + (size_t)ku * e->stride; g_nstu++; }
+                        pthread_mutex_unlock(&g_lock);
+                    }
+                }
+                int k = klst_binding() - (int)e->dstBinding;
+                if (e->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || e->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                    static int said; if (said < 16) { said++; fprintf(stderr, "[samptrace] template entry: binding %u count %u off %zu stride %zu\n",
+                        e->dstBinding, e->descriptorCount, e->offset, e->stride); }
+                }
+                if (k >= 0 && k < (int)e->descriptorCount && (e->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ||
+                     e->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)) {
+                    pthread_mutex_lock(&g_lock);
+                    if (g_nstt < 1024) { g_stt[g_nstt].t = *out; g_stt[g_nstt].off = e->offset + (size_t)k * e->stride; g_stt[g_nstt].stride = e->stride;
+                                         g_stt[g_nstt].count = e->descriptorCount; g_stt[g_nstt].arr = e->dstArrayElement; g_nstt++; }
+                    pthread_mutex_unlock(&g_lock);
+                }
+            }
+        return r0;                                   // diagnostic run: the texel-buffer emu is not used for Alyx
+    }
     if (!emu_on() || !ci || !ci->pDescriptorUpdateEntries ||
         ci->descriptorUpdateEntryCount == 0 || !real)
         return real ? real(dev, ci, alloc, out) : VK_ERROR_INITIALIZATION_FAILED;
@@ -6686,6 +8374,39 @@ static void VKAPI_CALL klvk_UpdateDescriptorSetWithTemplate(VkDevice dev,
         if (!real) real = (PFN_vkUpdateDescriptorSetWithTemplate)real_gdpa(dev, "vkUpdateDescriptorSetWithTemplateKHR");
     }
     if (!real) return;
+    if (klst_binding() >= 0 && pData) {
+        // KL_VK_SAMPLER_TRACE_FORCE_POINT=1 (diagnostic): the traced binding always gets a nearest/clamp sampler
+        static int fp = -1; static VkSampler pt;
+        if (fp < 0) {
+            fp = kl_env_on("KL_VK_SAMPLER_TRACE_FORCE_POINT", 0);
+            if (fp) {
+                PFN_vkCreateSampler cs = (PFN_vkCreateSampler)real_gdpa(dev, "vkCreateSampler");
+                VkSamplerCreateInfo sc = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST,
+                    .minFilter = VK_FILTER_NEAREST, .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                    .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                    .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = 16.0f };
+                if (!cs || cs(dev, &sc, NULL, &pt) != VK_SUCCESS) fp = 0;
+                fprintf(stderr, "[samptrace] forcing a point sampler into binding %d: %s\n", klst_binding(), fp ? "on" : "failed");
+            }
+        }
+        for (int i = 0; i < g_nstu; i++) if (g_stu[i].t == tmpl) {
+            const VkDescriptorBufferInfo *bi = (const VkDescriptorBufferInfo *)((const char *)pData + g_stu[i].off);
+            klvk_ubodump_note(bi->buffer, bi->offset, bi->range);
+            static unsigned n, hist[8]; static unsigned long long mn = ~0ull, mx;
+            unsigned long long r = bi->range == VK_WHOLE_SIZE ? 1ull << 40 : bi->range;
+            if (r < mn) mn = r; if (r > mx) mx = r;
+            int bk = r < 4096 ? 0 : r < 16384 ? 1 : r < 32768 ? 2 : r < 36064 ? 3 : r < 65536 ? 4 : 5;
+            hist[bk]++; n++;
+            if ((n & (n - 1)) == 0 || n % 50000 == 0)
+                fprintf(stderr, "[ubotrace] binding %d: %u writes; range min %llu max %llu; <4K %u <16K %u <32K %u <36064 %u <64K %u more %u\n",
+                        kl_env_int("KL_VK_UBO_TRACE", -1), n, mn, mx, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
+        }
+        for (int i = 0; i < g_nstt; i++) if (g_stt[i].t == tmpl) {
+            const VkDescriptorImageInfo *ii = (const VkDescriptorImageInfo *)((const char *)pData + g_stt[i].off);
+            klst_note_write(ii->sampler);
+            if (fp) ((VkDescriptorImageInfo *)ii)->sampler = pt;     // the guest's own staging data, rewritten in place
+        }
+    }
     void *nd = NULL;
     unsigned nsubst = 0;
     if (emu_on() && pData) {
@@ -6847,6 +8568,23 @@ static void VKAPI_CALL klvk_CmdBindDescriptorBuffersEXT(VkCommandBuffer cb,
     if (real) real(cb, bufferCount, pBindingInfos);
 }
 
+static VkResult VKAPI_CALL klvk_CreateSampler_body(VkDevice dev,
+        const VkSamplerCreateInfo *ci, const VkAllocationCallbacks *alloc, VkSampler *out) {
+    static PFN_vkCreateSampler real;
+    if (!real && real_gdpa) real = (PFN_vkCreateSampler)real_gdpa(dev, "vkCreateSampler");
+    if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    if (klvk_fake_minmax() && ci) {
+        int had = 0;
+        for (const VkBaseInStructure *b = ci->pNext; b; b = b->pNext)
+            had |= b->sType == VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO;
+        if (had) {
+            static unsigned n;
+            if (n++ < 8) VKI("CreateSampler: reduction mode stripped (KL_VK_FAKE_MINMAX) — #%u\n", n);
+            klvk_unlink(ci, VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO);
+        }
+    }
+    return real(dev, ci, alloc, out);
+}
 static VkResult VKAPI_CALL klvk_CreateBufferView(VkDevice dev,
         const VkBufferViewCreateInfo *ci, const VkAllocationCallbacks *alloc,
         VkBufferView *out) {
@@ -6903,6 +8641,96 @@ static VkResult VKAPI_CALL klvk_CreateBufferView(VkDevice dev,
     return r;
 }
 
+
+// ---------------------------------------------------------------------------
+// Recording wrappers: the body above, then the pipeline hooks with the guest's create info
+// (kl_vk_pipe_hooks.h). A replayer's own creates come through here too and are skipped.
+// ---------------------------------------------------------------------------
+static VkResult VKAPI_CALL klvk_CreateSampler(VkDevice dev, const VkSamplerCreateInfo *ci,
+        const VkAllocationCallbacks *a, VkSampler *out) {
+    census_sampler(ci);
+    VkResult r = klvk_CreateSampler_body(dev, ci, a, out);
+    if (r == VK_SUCCESS && ci && out) klst_note_sampler(*out, ci);
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(sampler, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev, const VkShaderModuleCreateInfo *ci,
+        const VkAllocationCallbacks *a, VkShaderModule *out) {
+    if (ci) census_spirv(ci->pCode, ci->codeSize);
+    VkResult r = klvk_CreateShaderModule_body(dev, ci, a, out);
+    if (eyedraw_on() && r == VK_SUCCESS && ci && ci->pCode && out) {
+        unsigned char md[CC_SHA1_DIGEST_LENGTH]; char hex[41];
+        CC_SHA1(ci->pCode, (CC_LONG)ci->codeSize, md);
+        for (int i = 0; i < CC_SHA1_DIGEST_LENGTH; i++) snprintf(hex + 2 * i, 3, "%02x", md[i]);
+        if (strcmp(hex, "47da31f1c09e08ca18b8f8bb6c18a9a8bae7d741") == 0 && g_ned_mod < 8) {
+            g_ed_mod[g_ned_mod++] = (uint64_t)(uintptr_t)*out;
+            fprintf(stderr, "[eyedraw] eye pixel shader module %#llx\n", (unsigned long long)(uintptr_t)*out);
+        }
+    }
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(shader_module, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreateDescriptorSetLayout(VkDevice dev, const VkDescriptorSetLayoutCreateInfo *ci,
+        const VkAllocationCallbacks *a, VkDescriptorSetLayout *out) {
+    census_set_layout(ci);
+    VkResult r = klvk_CreateDescriptorSetLayout_body(dev, ci, a, out);
+    if (r == VK_SUCCESS && ci && out && klst_binding() >= 0) {
+        int nb = kl_env_int("KL_VK_SAMPLER_TRACE_NB", 0), has289 = 0;
+        for (uint32_t i = 0; i < ci->bindingCount; i++) has289 |= ci->pBindings[i].binding == 289;
+        if (nb && (int)ci->bindingCount == nb && has289) {
+            g_st_layout = *out;
+            fprintf(stderr, "[samptrace] traced set layout %#llx (%u bindings)\n", (unsigned long long)(uintptr_t)*out, ci->bindingCount);
+        }
+    }
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(set_layout, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreatePipelineLayout(VkDevice dev, const VkPipelineLayoutCreateInfo *ci,
+        const VkAllocationCallbacks *a, VkPipelineLayout *out) {
+    static PFN_vkCreatePipelineLayout real;
+    if (!real && real_gdpa) real = (PFN_vkCreatePipelineLayout)real_gdpa(dev, "vkCreatePipelineLayout");
+    census_pipeline_layout(ci);
+    VkResult r = real ? real(dev, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(pipeline_layout, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreateRenderPass(VkDevice dev, const VkRenderPassCreateInfo *ci,
+        const VkAllocationCallbacks *a, VkRenderPass *out) {
+    census_render_pass(ci);
+    VkResult r = klvk_CreateRenderPass_body(dev, ci, a, out);
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(render_pass, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreateRenderPass2(VkDevice dev, const VkRenderPassCreateInfo2 *ci,
+        const VkAllocationCallbacks *a, VkRenderPass *out) {
+    census_render_pass2(ci);
+    VkResult r = klvk_CreateRenderPass2_body(dev, ci, a, out);
+    if (r == VK_SUCCESS && ci && out) PIPE_HOOK(render_pass2, *out, ci);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreateGraphicsPipelines(VkDevice dev, VkPipelineCache cache, uint32_t n,
+        const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
+    if (ci) for (uint32_t i = 0; i < n; i++) census_graphics_pipeline(&ci[i]);
+    VkResult r = klvk_CreateGraphicsPipelines_body(dev, cache, n, ci, a, out);
+    if (eyedraw_on() && ci && out)
+        for (uint32_t i = 0; i < n; i++) if (out[i])
+            for (uint32_t j = 0; j < ci[i].stageCount; j++)
+                for (int m = 0; m < g_ned_mod; m++)
+                    if ((uint64_t)(uintptr_t)ci[i].pStages[j].module == g_ed_mod[m] && g_ned_pipes < 64) {
+                        g_ed_pipes[g_ned_pipes++] = (uint64_t)(uintptr_t)out[i];
+                        fprintf(stderr, "[eyedraw] eye pipeline %#llx\n", (unsigned long long)(uintptr_t)out[i]);
+                    }
+    if (ci && out) for (uint32_t i = 0; i < n; i++) if (out[i]) PIPE_HOOK(graphics_pipeline, out[i], &ci[i]);
+    if (out) for (uint32_t i = 0; i < n; i++) if (out[i]) PIPE_HOOK(pipeline_time, out[i], t_pipe_last_ms);
+    return r;
+}
+static VkResult VKAPI_CALL klvk_CreateComputePipelines(VkDevice dev, VkPipelineCache cache, uint32_t n,
+        const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
+    if (ci) for (uint32_t i = 0; i < n; i++) census_compute_pipeline(&ci[i]);
+    VkResult r = klvk_CreateComputePipelines_body(dev, cache, n, ci, a, out);
+    if (ci && out) for (uint32_t i = 0; i < n; i++) if (out[i]) PIPE_HOOK(compute_pipeline, out[i], &ci[i]);
+    return r;
+}
 static const entry g_ours[] = {
 #define E(n) { "vk" #n, (PFN_vkVoidFunction)klvk_##n }
     E(CreateInstance), E(EnumerateInstanceExtensionProperties),
@@ -6913,7 +8741,7 @@ static const entry g_ours[] = {
     E(GetPhysicalDeviceSurfaceFormatsKHR), E(GetPhysicalDeviceSurfacePresentModesKHR),
     E(CreateSwapchainKHR), E(DestroySwapchainKHR), E(GetSwapchainImagesKHR),
     E(AcquireNextImageKHR), E(QueuePresentKHR),
-    E(AllocateMemory), E(BindImageMemory),
+    E(AllocateMemory), E(FreeMemory), E(BindImageMemory),
     E(QueueSubmit),
     E(GetPhysicalDeviceProperties),
     E(GetPhysicalDeviceProperties2),
@@ -6935,8 +8763,8 @@ static const entry g_ours[] = {
     E(BeginCommandBuffer),
     E(CmdBindIndexBuffer), E(CmdBindVertexBuffers), E(CmdDrawIndexed),
     E(CmdBindPipeline), E(CmdBindDescriptorSets),
-    E(GetImageMemoryRequirements), E(CreateBufferView),
-    E(CreateShaderModule), E(CreateDescriptorSetLayout), E(CreateDescriptorPool),
+    E(GetImageMemoryRequirements), E(CreateBufferView), E(CreateSampler),
+    E(CreateShaderModule), E(CreateDescriptorSetLayout), E(CreatePipelineLayout), E(CreateDescriptorPool),
     E(UpdateDescriptorSets),
     E(CreateDescriptorUpdateTemplate), E(UpdateDescriptorSetWithTemplate),
     { "vkCreateDescriptorUpdateTemplateKHR", (PFN_vkVoidFunction)klvk_CreateDescriptorUpdateTemplate },
@@ -6947,6 +8775,8 @@ static const entry g_ours[] = {
     E(CmdCopyBuffer), E(CmdUpdateBuffer),
     E(CmdBlitImage), E(CmdResolveImage), E(CmdClearColorImage),
     E(CmdCopyBufferToImage), E(CmdCopyImageToBuffer), E(CmdPipelineBarrier),
+    E(CmdCopyBufferToImage2),
+    { "vkCmdCopyBufferToImage2KHR", (PFN_vkVoidFunction)klvk_CmdCopyBufferToImage2 },
     E(CreateGraphicsPipelines), E(CreateComputePipelines),
     E(CreateFramebuffer), E(CmdBeginRenderPass),
     E(CmdBeginRenderPass2),
@@ -6959,7 +8789,66 @@ static const entry g_ours[] = {
 #undef E
 };
 
+static VkResult VKAPI_CALL klvk_native_GetSwapchainImagesKHR(VkDevice dev, VkSwapchainKHR sc,
+                                                              uint32_t *count, VkImage *images) {
+    PFN_vkGetSwapchainImagesKHR real = (PFN_vkGetSwapchainImagesKHR)real_gdpa(dev, "vkGetSwapchainImagesKHR");
+    VkResult r = real ? real(dev, sc, count, images) : VK_ERROR_INITIALIZATION_FAILED;
+    if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && images && count)
+        for (uint32_t i = 0; i < *count; i++) klvk_img_reg_add(images[i]);
+    return r;
+}
+
+// KL_VK_FENCESTATS=1: fence traffic, printed every ~5 s from the submit path.
+static _Atomic unsigned long g_fs_status_ok, g_fs_status_notready,
+                             g_fs_wait_ok, g_fs_wait_timeout, g_fs_reset;
+static VkResult VKAPI_CALL klvk_fs_GetFenceStatus(VkDevice d, VkFence f) {
+    PFN_vkGetFenceStatus real = (PFN_vkGetFenceStatus)real_gdpa(d, "vkGetFenceStatus");
+    VkResult r = real(d, f);
+    if (r == VK_SUCCESS) g_fs_status_ok++; else g_fs_status_notready++;
+    return r;
+}
+static VkResult VKAPI_CALL klvk_fs_WaitForFences(VkDevice d, uint32_t n, const VkFence *f, VkBool32 all, uint64_t to) {
+    PFN_vkWaitForFences real = (PFN_vkWaitForFences)real_gdpa(d, "vkWaitForFences");
+    VkResult r = real(d, n, f, all, to);
+    if (r == VK_SUCCESS) g_fs_wait_ok++; else g_fs_wait_timeout++;
+    return r;
+}
+static VkResult VKAPI_CALL klvk_fs_ResetFences(VkDevice d, uint32_t n, const VkFence *f) {
+    PFN_vkResetFences real = (PFN_vkResetFences)real_gdpa(d, "vkResetFences");
+    g_fs_reset += n;
+    return real(d, n, f);
+}
+static void fs_report(void) {
+    static uint64_t last;
+    uint64_t now = (uint64_t)time(NULL);
+    if (now - last < 5) return;
+    last = now;
+    fprintf(stderr, "  [fence] submits %lu (fenced %lu) status ok %lu notready %lu wait ok %lu timeout %lu resets %lu\n",
+            g_fs_submit, g_fs_submit_fenced, g_fs_status_ok, g_fs_status_notready, g_fs_wait_ok, g_fs_wait_timeout, g_fs_reset);
+}
+
+// KL_VK_FPS=1: presents per second through the native swapchain.
+static VkResult VKAPI_CALL klvk_native_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR *pi) {
+    static PFN_vkQueuePresentKHR real;
+    if (!real) real = (PFN_vkQueuePresentKHR)real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, "vkQueuePresentKHR");
+    static uint64_t t0, n;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    if (!t0) t0 = now;
+    n++;
+    if (now - t0 >= 5000000000ull) {
+        fprintf(stderr, "  [fps] %.1f presents/s\n", (double)n * 1e9 / (double)(now - t0));
+        t0 = now; n = 0;
+    }
+    return real(q, pi);
+}
+
 static PFN_vkVoidFunction ours(const char *name) {
+    if (kl_env_on("KL_VK_FENCESTATS", 0) && name) {
+        if (!strcmp(name, "vkGetFenceStatus")) return (PFN_vkVoidFunction)klvk_fs_GetFenceStatus;
+        if (!strcmp(name, "vkWaitForFences")) return (PFN_vkVoidFunction)klvk_fs_WaitForFences;
+        if (!strcmp(name, "vkResetFences")) return (PFN_vkVoidFunction)klvk_fs_ResetFences;
+    }
     // KL_TRACE: reveal which render-pass / dynamic-rendering entry points the
     // guest actually resolves, and whether we hand back our wrapper or fall
     // through to the real MoltenVK one. This is how we learn why the compositing
@@ -6974,9 +8863,22 @@ static PFN_vkVoidFunction ours(const char *name) {
                 name, hit ? "OUR wrapper" : "real MoltenVK (passthrough)");
         }
     }
+    // Native WSI (a desktop guest presenting to a real window through a surface
+    // SDL made on MoltenVK): surfaces, swapchains, acquire and present are
+    // MoltenVK's own, not the headless swapchain built for XR guests. The
+    // swapchain's images still have to join the image registry, or every copy,
+    // blit and resolve into them is refused as an unknown image.
+    if (kl_vk_native_wsi && name && !strcmp(name, "vkGetSwapchainImagesKHR"))
+        return (PFN_vkVoidFunction)klvk_native_GetSwapchainImagesKHR;
+    if (kl_vk_native_wsi && name && !strcmp(name, "vkQueuePresentKHR") && kl_env_on("KL_VK_FPS", 0))
+        return (PFN_vkVoidFunction)klvk_native_QueuePresentKHR;
+    if (kl_vk_native_wsi && name &&
+        (strstr(name, "Surface") || strstr(name, "Swapchain") ||
+         !strcmp(name, "vkAcquireNextImageKHR") || !strcmp(name, "vkQueuePresentKHR")))
+        return NULL;
     for (size_t i = 0; i < sizeof g_ours / sizeof *g_ours; i++)
         if (!strcmp(g_ours[i].name, name)) return g_ours[i].fn;
-    return NULL;
+    return census_ours(name);
 }
 
 static PFN_vkVoidFunction VKAPI_CALL klvk_GetInstanceProcAddr(VkInstance inst,
@@ -7011,6 +8913,7 @@ static PFN_vkVoidFunction VKAPI_CALL klvk_GetInstanceProcAddr(VkInstance inst,
                                                               const char *name) {
     vk_init();
     if (!name) return NULL;
+    VKT("gipa(%p, %s)\n", (void *)inst, name);
     if (!strcmp(name, "vkGetInstanceProcAddr"))
         return (PFN_vkVoidFunction)klvk_GetInstanceProcAddr;
     if (!strcmp(name, "vkGetDeviceProcAddr"))

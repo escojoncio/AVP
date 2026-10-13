@@ -65,10 +65,11 @@ static jmp_buf  kld_jmp;
 static char     kld_err[512];
 static uint8_t *kld_map;  static size_t kld_map_len;
 static uint8_t *kld_img, *kld_pool, *kld_out;
+static void *kld_fs, *kld_syms;   // function starts table, --symtab list
 static void kld_cleanup(void) {
     if (kld_map && kld_map != MAP_FAILED) munmap(kld_map, kld_map_len);
-    free(kld_img); free(kld_pool); free(kld_out);
-    kld_map = NULL; kld_img = kld_pool = kld_out = NULL; kld_map_len = 0;
+    free(kld_img); free(kld_pool); free(kld_out); free(kld_fs); free(kld_syms);
+    kld_map = NULL; kld_img = kld_pool = kld_out = NULL; kld_fs = kld_syms = NULL; kld_map_len = 0;
 }
 static void die(const char *fmt, ...) {
     va_list a; va_start(a, fmt);
@@ -150,6 +151,77 @@ static unsigned rewrite_tls(uint8_t *p, size_t n, uint64_t va, unsigned *refused
 // code the runtime loader uses, which matters because `make x18` and
 // `make guest` can only validate one implementation.
 
+// ---------- function starts (LC_FUNCTION_STARTS) ----------
+// Every Xcode-linked Mach-O carries a table of where its functions begin; Apple's tools (symbolication, App Store
+// processing) read it. A stripped guest has no symbol table to give, but its unwind table names every function that
+// has unwind info: .eh_frame_hdr's sorted search table, whose first column is each FDE's initial location. The
+// exported functions of .dynsym (and .symtab, when present) fill in the rest. Only addresses inside executable
+// sections count. Returns ELF vaddrs, sorted and unique, in a malloc'ed array.
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+static uint64_t *function_starts(const uint8_t *f, size_t fsz, const Elf64_Ehdr *eh, const Elf64_Shdr *sh,
+                                 size_t *count) {
+    size_t n = 0, cap = 4096;
+    uint64_t *v = KLD_TRACK(kld_fs, malloc(cap * sizeof *v));
+    if (!v) die("out of memory");
+    #define FS_ADD(a) do { if (n == cap) { cap *= 2; v = KLD_TRACK(kld_fs, realloc(v, cap * sizeof *v)); if (!v) die("out of memory"); } \
+                           v[n++] = (a); } while (0)
+    const char *shstr = eh->e_shstrndx < eh->e_shnum ? (const char *)f + sh[eh->e_shstrndx].sh_offset : NULL;
+    for (int i = 0; i < eh->e_shnum; i++) {
+        const char *name = shstr ? shstr + sh[i].sh_name : "";
+        if (!strcmp(name, ".eh_frame_hdr") && sh[i].sh_offset + 12 <= fsz) {
+            const uint8_t *h = f + sh[i].sh_offset;
+            // version 1; eh_frame_ptr udata4/sdata4 pcrel; fde_count udata4; table datarel|sdata4 (0x3b), the
+            // encodings every GNU/LLVM linker writes. Anything else is skipped rather than misread.
+            if (h[0] == 1 && (h[1] & 0x0f) == 0x0b && h[2] == 0x03 && h[3] == 0x3b) {
+                uint32_t nfde; memcpy(&nfde, h + 8, 4);
+                if (12 + (uint64_t)nfde * 8 <= sh[i].sh_size)
+                    for (uint32_t k = 0; k < nfde; k++) {
+                        int32_t loc; memcpy(&loc, h + 12 + (size_t)k * 8, 4);
+                        FS_ADD(sh[i].sh_addr + (int64_t)loc);
+                    }
+            }
+        }
+        if ((sh[i].sh_type == 11 /* SHT_DYNSYM */ || sh[i].sh_type == 2 /* SHT_SYMTAB */) && sh[i].sh_entsize == 24
+            && sh[i].sh_offset + sh[i].sh_size <= fsz) {
+            for (uint64_t off = 0; off + 24 <= sh[i].sh_size; off += 24) {
+                const uint8_t *e = f + sh[i].sh_offset + off;
+                uint8_t info = e[4]; uint16_t shndx; uint64_t value;
+                memcpy(&shndx, e + 6, 2); memcpy(&value, e + 8, 8);
+                if ((info & 0xf) == 2 /* STT_FUNC */ && shndx != 0 && value) FS_ADD(value);
+            }
+        }
+    }
+    #undef FS_ADD
+    // keep what lies in executable sections
+    size_t m = 0;
+    for (size_t k = 0; k < n; k++)
+        for (int i = 0; i < eh->e_shnum; i++)
+            if (sh[i].sh_type == SHT_PROGBITS && (sh[i].sh_flags & SHF_EXECINSTR) &&
+                v[k] >= sh[i].sh_addr && v[k] < sh[i].sh_addr + sh[i].sh_size) { v[m++] = v[k]; break; }
+    qsort(v, m, sizeof *v, cmp_u64);
+    size_t u = 0;
+    for (size_t k = 0; k < m; k++) if (!u || v[k] != v[u - 1]) v[u++] = v[k];
+    *count = u;
+    return v;
+}
+
+// The table's encoding: ULEB128 deltas, the first from the start of __TEXT (vmaddr 0 here), ending in 0, padded to
+// 8 bytes. Returns the size; writes into out when out is not NULL.
+static size_t function_starts_encode(const uint64_t *va, size_t n, uint64_t shift, uint8_t *out) {
+    size_t len = 0; uint64_t prev = 0;
+    for (size_t k = 0; k < n; k++) {
+        uint64_t d = shift + va[k] - prev; prev = shift + va[k];
+        if (!d) continue;
+        do { uint8_t b = d & 0x7f; d >>= 7; if (d) b |= 0x80; if (out) out[len] = b; len++; } while (d);
+    }
+    if (out) out[len] = 0;
+    len++;
+    return (size_t)align_up(len, 8);
+}
+
 struct platform { const char *name; uint32_t id; uint32_t minos, sdk; };
 static const struct platform PLATFORMS[] = {
     { "macos",       PLATFORM_MACOS,              0x0e0000, 0x0e0000 },  // 14.0
@@ -186,11 +258,15 @@ int main(int argc, char **argv) {
     const char *in = NULL, *out = NULL, *install_name = NULL;
     const struct platform *plat = &PLATFORMS[0];
     int quiet = 0;
+    // --symtab: also write the guest's function names (.dynsym/.symtab STT_FUNC) as LOCAL Mach-O symbols, for tools
+    // that read a symbol table (symbolication, App Store processing). Local, so dyld neither binds nor exports them.
+    int want_symtab = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
         else if (!strcmp(argv[i], "--install-name") && i + 1 < argc) install_name = argv[++i];
         else if (!strcmp(argv[i], "--quiet")) quiet = 1;
+        else if (!strcmp(argv[i], "--symtab")) want_symtab = 1;
         else if (!strcmp(argv[i], "--platform") && i + 1 < argc) {
             const char *w = argv[++i];
             plat = NULL;
@@ -534,7 +610,16 @@ int main(int argc, char **argv) {
     // __DATA. A third segment rather than an extension of __TEXT because the
     // guest's own text-to-data delta is fixed by its `adrp`s: nothing of ours
     // may be inserted between them.
-    uint32_t nsect_text = 2 + ((pool_off && !pool_high) ? 1 : 0);
+    // The guest image in __TEXT is split by what it holds, so only real code is flagged as instructions: __klelf from
+    // the ELF header to the first executable section (headers, symbols, read-only data, unwind tables; the runtime
+    // finds the image by this section's START, kl_image.c), __kltext over the executable sections, and __klconst for
+    // whatever read-only bytes follow them. One section over everything marked it all PURE_INSTRUCTIONS, megabytes of
+    // data that tools which read instruction sections (App Store processing among them) would decode as code.
+    uint64_t img_lo = image_shift + grp[0].vlo, img_hi = image_shift + grp[0].vhi_file;
+    uint64_t code_lo = image_shift + text_lo, code_hi = image_shift + text_hi;
+    if (text_hi <= text_lo || code_lo < img_lo || code_hi > img_hi) code_lo = code_hi = img_hi;   // no code: all data
+    int have_code = code_hi > code_lo, have_tail = img_hi > code_hi;
+    uint32_t nsect_text = 2 + ((pool_off && !pool_high) ? 1 : 0) + have_code + have_tail;
     int      have_x18_seg = pool_off && pool_high;
     uint64_t stat_va = HDR_RESERVE - 64;
     uint32_t sz_text = sizeof(struct segment_command_64) + nsect_text * sizeof(struct section_64);
@@ -544,15 +629,19 @@ int main(int argc, char **argv) {
     uint32_t sz_link = sizeof(struct segment_command_64);
     uint32_t sz_id   = (uint32_t)align_up(sizeof(struct dylib_command) + strlen(iname) + 1, 8);
     uint32_t sz_ld   = (uint32_t)align_up(sizeof(struct dylib_command) + strlen(libsystem) + 1, 8);
-    uint32_t sz_bv   = sizeof(struct build_version_command);
+    // One tool entry, the linker's, as every Xcode-linked binary has; App Store processing has gated on linker
+    // versions before, and a build version with no tool at all is a shape no Apple linker writes. The version is
+    // Xcode 27's ld (27037.1), the one the app binary itself was linked with.
+    uint32_t sz_bv   = sizeof(struct build_version_command) + sizeof(struct build_tool_version);
+    uint32_t sz_sv   = sizeof(struct source_version_command);
+    uint32_t sz_fs   = sizeof(struct linkedit_data_command);
+    // AVP: an EMPTY LC_CODE_SIGNATURE at the end of __LINKEDIT (dataoff 16-aligned, datasize 0). vp_codesign
+    // (VPEngine) fills it in on the headset; it refuses a Mach-O without one.
+    uint32_t sz_cs   = sizeof(struct linkedit_data_command);
     uint32_t sz_enc  = sizeof(struct encryption_info_command_64);
     uint32_t sz_st   = sizeof(struct symtab_command);
     uint32_t sz_dst  = sizeof(struct dysymtab_command);
     uint32_t sz_uuid = sizeof(struct uuid_command);
-    // VisionQuestPro: an EMPTY LC_CODE_SIGNATURE at the end of __LINKEDIT (dataoff
-    // 16-aligned, datasize 0). vp_codesign (VPEngine) fills it in on the headset;
-    // it refuses a Mach-O without one.
-    uint32_t sz_cs   = sizeof(struct linkedit_data_command);
 
     // LC_ENCRYPTION_INFO_64 goes on DEVICE binaries only: the App Store requires it
     // (error 90125 without), but the simulator loader rejects a binary that carries
@@ -560,13 +649,14 @@ int main(int argc, char **argv) {
     int enc = (strstr(plat->name, "sim") == NULL);
     uint32_t ncmds = 3 /* segments */ + 1 /* id */ + 1 /* load libSystem */ +
                      1 /* build version */ + 1 /* symtab */ + 1 /* dysymtab */ + 1 /* uuid */ +
+                     1 /* source version */ + 1 /* function starts */ +
                      1 /* code signature */;
     if (enc) ncmds++;                            /* encryption info */
     // __DATA is only present if the library has a writable group.
     if (ngrp < 2) { ncmds--; sz_data = 0; }
     if (have_x18_seg) ncmds++;
     uint32_t sizeofcmds = sz_text + sz_x18 + sz_data + sz_link + sz_id + sz_ld + sz_bv +
-                          sz_st + sz_dst + sz_uuid + sz_cs;
+                          sz_st + sz_dst + sz_uuid + sz_sv + sz_fs + sz_cs;
     if (enc) sizeofcmds += sz_enc;
     if (sizeof(struct mach_header_64) + sizeofcmds > HDR_RESERVE)
         die("load commands (%u bytes) do not fit below the image shift %#llx",
@@ -575,9 +665,36 @@ int main(int argc, char **argv) {
     // __LINKEDIT holds a minimal (empty) symbol table. There is nothing for
     // dyld to bind — MH_NOUNDEFS — and nothing to export, because the runtime
     // finds the image through its section rather than through dlsym.
-    const uint32_t strsize = 8;
-    // The string table, then the (empty) signature at a 16-byte boundary.
-    uint64_t cs_off = align_up(linkedit_foff + strsize, 16);
+    // __LINKEDIT: the function starts table first, then the (empty) string table.
+    size_t nfs = 0;
+    uint64_t *fs = KLD_TRACK(kld_fs, function_starts(f, (size_t)sb.st_size, eh, sh, &nfs));
+    size_t fs_size = function_starts_encode(fs, nfs, image_shift, NULL);
+    struct ksym { uint64_t va; const char *name; } *syms = NULL;
+    size_t nsyms = 0;
+    uint32_t strsize = 8;
+    if (want_symtab) {
+        size_t cap = 1024; syms = KLD_TRACK(kld_syms, malloc(cap * sizeof *syms));
+        if (!syms) die("out of memory");
+        for (int i = 0; i < eh->e_shnum; i++) {
+            if ((sh[i].sh_type != 11 && sh[i].sh_type != 2) || sh[i].sh_entsize != 24 || sh[i].sh_link >= eh->e_shnum)
+                continue;
+            const char *strs = (const char *)f + sh[sh[i].sh_link].sh_offset;
+            for (uint64_t off = 0; off + 24 <= sh[i].sh_size; off += 24) {
+                const uint8_t *e = f + sh[i].sh_offset + off;
+                uint32_t nm; uint16_t shndx; uint64_t value;
+                memcpy(&nm, e, 4); memcpy(&shndx, e + 6, 2); memcpy(&value, e + 8, 8);
+                if ((e[4] & 0xf) != 2 || !shndx || !value || value < text_lo || value >= text_hi || !strs[nm]) continue;
+                if (nsyms == cap) { cap *= 2; syms = KLD_TRACK(kld_syms, realloc(syms, cap * sizeof *syms)); if (!syms) die("out of memory"); }
+                syms[nsyms].va = value; syms[nsyms].name = strs + nm; nsyms++;
+            }
+        }
+        strsize = 1;
+        for (size_t k = 0; k < nsyms; k++) strsize += (uint32_t)strlen(syms[k].name) + 2;   // "_" + name + NUL
+        strsize = (uint32_t)align_up(strsize, 8);
+    }
+    uint64_t sym_size = (uint64_t)nsyms * sizeof(struct nlist_64);
+    // ...then the (empty) code signature at a 16-byte boundary, last in __LINKEDIT.
+    uint64_t cs_off = align_up(linkedit_foff + fs_size + sym_size + strsize, 16);
     uint64_t linkedit_size = cs_off - linkedit_foff;
     uint64_t total = linkedit_foff + linkedit_size;
 
@@ -626,19 +743,21 @@ int main(int argc, char **argv) {
             sec++;
         }
 
-        strncpy(sec->sectname, "__klelf", 16);
-        strncpy(sec->segname,  "__TEXT",  16);
-        sec->addr = image_shift + grp[0].vlo;
-        sec->size = grp[0].vhi_file - grp[0].vlo;
-        sec->offset = (uint32_t)(seg_foff[0] + (sec->addr - seg_vm[0]));
-        // What the address IS, not what it used to be: the shift is chosen to
-        // put a page boundary at the writable group, so on a 4 KB-aligned guest
-        // this section is no longer 16 KB aligned and claiming 14 would be a
-        // field that disagrees with the addr beside it.
-        sec->align = 0;
-        for (uint64_t a = sec->addr; a && !(a & 1) && sec->align < 14; a >>= 1)
-            sec->align++;
-        sec->flags = S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS;
+        // What each address IS, not what it used to be: the shift is chosen to put a page boundary at the writable
+        // group, so on a 4 KB-aligned guest these are not 16 KB aligned and claiming 14 would be a field that
+        // disagrees with the addr beside it.
+        #define KL_SECT(nm, lo_, hi_, fl) do { \
+            strncpy(sec->sectname, nm, 16); strncpy(sec->segname, "__TEXT", 16); \
+            sec->addr = (lo_); sec->size = (hi_) - (lo_); \
+            sec->offset = (uint32_t)(seg_foff[0] + (sec->addr - seg_vm[0])); \
+            sec->align = 0; \
+            for (uint64_t a_ = sec->addr; a_ && !(a_ & 1) && sec->align < 14; a_ >>= 1) sec->align++; \
+            sec->flags = (fl); sec++; } while (0)
+        KL_SECT("__klelf", img_lo, code_lo, S_REGULAR);
+        if (have_code) KL_SECT("__kltext", code_lo, code_hi,
+                               S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
+        if (have_tail) KL_SECT("__klconst", code_hi, img_hi, S_REGULAR);
+        #undef KL_SECT
         lc += sz_text;
     }
     // __DATA
@@ -718,8 +837,16 @@ int main(int argc, char **argv) {
         struct build_version_command *b = (struct build_version_command *)lc;
         b->cmd = LC_BUILD_VERSION; b->cmdsize = sz_bv;
         b->platform = plat->id; b->minos = plat->minos; b->sdk = plat->sdk;
-        b->ntools = 0;
+        b->ntools = 1;
+        struct build_tool_version *t = (struct build_tool_version *)(b + 1);
+        t->tool = TOOL_LD; t->version = (27037u << 16) | (1u << 8);
         lc += sz_bv;
+    }
+    // LC_SOURCE_VERSION — 0.0, what a linker writes when no -source_version is given.
+    {
+        struct source_version_command *v = (struct source_version_command *)lc;
+        v->cmd = LC_SOURCE_VERSION; v->cmdsize = sz_sv; v->version = 0;
+        lc += sz_sv;
     }
     // LC_ENCRYPTION_INFO_64 — Apple's App Store validation refuses a Mach-O without
     // it ("the encryption info ... is either missing or invalid ... not built with
@@ -739,13 +866,29 @@ int main(int argc, char **argv) {
     {
         struct symtab_command *st = (struct symtab_command *)lc;
         st->cmd = LC_SYMTAB; st->cmdsize = sz_st;
-        st->symoff = 0; st->nsyms = 0;
-        st->stroff = (uint32_t)linkedit_foff; st->strsize = strsize;
+        st->symoff = nsyms ? (uint32_t)(linkedit_foff + fs_size) : 0; st->nsyms = (uint32_t)nsyms;
+        st->stroff = (uint32_t)(linkedit_foff + fs_size + sym_size); st->strsize = strsize;
         lc += sz_st;
 
         struct dysymtab_command *ds = (struct dysymtab_command *)lc;
         ds->cmd = LC_DYSYMTAB; ds->cmdsize = sz_dst;
+        ds->ilocalsym = 0; ds->nlocalsym = (uint32_t)nsyms;
+        ds->iextdefsym = ds->iundefsym = (uint32_t)nsyms;
         lc += sz_dst;
+        if (nsyms) {
+            // __kltext's ordinal: sections count from 1 in load-command order.
+            uint8_t code_sect = (uint8_t)(1 /* __klstat */ + ((pool_off && !pool_high) ? 1 : 0) + 1 /* __klelf */ +
+                                          (have_code ? 1 : 0));
+            struct nlist_64 *nl = (struct nlist_64 *)(o + linkedit_foff + fs_size);
+            char *strtab = (char *)(o + linkedit_foff + fs_size + sym_size);
+            uint32_t at = 1;
+            for (size_t k = 0; k < nsyms; k++) {
+                nl[k].n_un.n_strx = at; nl[k].n_type = N_SECT; nl[k].n_sect = code_sect; nl[k].n_desc = 0;
+                nl[k].n_value = image_shift + syms[k].va;
+                strtab[at++] = '_';
+                size_t len = strlen(syms[k].name); memcpy(strtab + at, syms[k].name, len + 1); at += (uint32_t)len + 1;
+            }
+        }
     }
     // LC_UUID — derived from the content so the same input gives the same
     // output; a random uuid would make the build non-reproducible.
@@ -762,6 +905,14 @@ int main(int argc, char **argv) {
         u->uuid[6] = (u->uuid[6] & 0x0f) | 0x40;      // version 4 shape
         u->uuid[8] = (u->uuid[8] & 0x3f) | 0x80;
         lc += sz_uuid;
+    }
+    // LC_FUNCTION_STARTS — the table at the start of __LINKEDIT.
+    {
+        struct linkedit_data_command *l = (struct linkedit_data_command *)lc;
+        l->cmd = LC_FUNCTION_STARTS; l->cmdsize = sz_fs;
+        l->dataoff = (uint32_t)linkedit_foff; l->datasize = (uint32_t)fs_size;
+        function_starts_encode(fs, nfs, image_shift, o + linkedit_foff);
+        lc += sz_fs;
     }
     // LC_CODE_SIGNATURE — empty, last in __LINKEDIT (see sz_cs).
     {
@@ -834,6 +985,8 @@ int main(int argc, char **argv) {
         printf("  CTR_EL0 reads %u   veneered %u   refused %u   (answering %#llx)\n",
                x18st.ctr_sites, x18st.ctr_patched, x18st.ctr_refused,
                (unsigned long long)kl_x18_ctr_value());
+        printf("  function starts %zu (%zu bytes)\n", nfs, fs_size);
+        if (want_symtab) printf("  local symbols %zu\n", nsyms);
         printf("  total         %llu bytes\n", (unsigned long long)total);
     }
     return 0;

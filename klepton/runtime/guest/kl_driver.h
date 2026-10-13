@@ -111,4 +111,8 @@ void     kl_driver_note_frame(void);
 // the numbers is the one that prints none of them.
 void kl_driver_report(FILE *out);
 
+// The Linux door's entry (runtime/linux/kl_alyx.c's kl_alyx_run), installed by
+// an app that links the Linux guest runtime.
+void kl_driver_set_linux_main(int (*fn)(const char *game, const char *sysroot, int argc, char **argv));
+
 #endif

@@ -1241,10 +1241,15 @@ static double g_predicted_display;
 void kl_ovrp_set_predicted_display_time(double t) {
     if (t > 0.0 && t < 1e9) g_predicted_display = t;
 }
+// Every clock in this file is CLOCK_UPTIME_RAW: mach_absolute_time, the domain
+// of CACurrentMediaTime and of the frontend's presentationTime. CLOCK_MONOTONIC
+// keeps running through sleep on Darwin, so after the headset had slept it
+// disagreed with every display time by the total sleep, and anything mixing
+// the two (the OpenVR shim's clock, fallbacks here) predicted far off.
 double kl_ovrp_predicted_display_time(void) {
     if (g_predicted_display > 0.0) return g_predicted_display;
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
@@ -1403,6 +1408,7 @@ static uint64_t klovrp_GetDesiredEyeTextureFormat(void) {
 // used; a frontend that knows the display's real field of view overwrites it
 // through kl_ovrp_set_eye_frustum.
 static float g_eye_tan[2][4] = {{1, 1, 1, 1}, {1, 1, 1, 1}};
+static int g_eye_tan_set;   // bit per eye published by kl_ovrp_set_eye_frustum
 
 // Eye 0's frustum aspect (width/height in tangent space), 0 while unset.
 float kl_ovrp_eye_tan_aspect(void) {
@@ -1420,7 +1426,12 @@ void kl_ovrp_set_eye_frustum(int eye, float left, float right, float top, float 
     if (!(left > 0) || !(right > 0) || !(top > 0) || !(bottom > 0)) return;
     g_eye_tan[eye][0] = left;  g_eye_tan[eye][1] = right;
     g_eye_tan[eye][2] = top;   g_eye_tan[eye][3] = bottom;
+    __atomic_or_fetch(&g_eye_tan_set, 1 << eye, __ATOMIC_RELEASE);
 }
+// Both eyes' real frustums have been published by the frontend. A guest that
+// reads its projection ONCE at init (Source 2 via OpenVR) must wait for this,
+// or it keeps the 90-degree placeholder for the whole run.
+int kl_ovrp_eye_frustum_ready(void) { return __atomic_load_n(&g_eye_tan_set, __ATOMIC_ACQUIRE) == 3; }
 
 // The two knobs over g_eye_tan, both applied on the READ side.
 //
@@ -1968,7 +1979,7 @@ static void klovrp_posture_feed(float y) {
 // against it is not the offset between two clocks.
 static uint64_t klovrp_mono_ns(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
@@ -2032,7 +2043,7 @@ static klovrp_motion_hist g_head_hist, g_hand_hist[2];
 
 static double klovrp_mono_now(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
@@ -3386,7 +3397,7 @@ void kl_ovrp_ctrl_trace(const char *where, int hand, const float *euler_deg,
         said[slot].t = 0;
     }
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
     uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
     float moved = 0;
     for (int i = 0; i < 3; i++) {
@@ -4366,7 +4377,7 @@ uint64_t klovrp_GetControllerState_impl(int mask, void *out) {
 // frontend side is a different epoch and is deliberately not mixed in.
 static double klovrp_mono(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
@@ -8386,23 +8397,74 @@ static float klovrp_halton(unsigned i, unsigned b) {
 static int g_taa_live;   // set by the compositor: the VPKTAA resolve ran last frame
 void kl_ovrp_set_taa_active(int on) { __atomic_store_n(&g_taa_live, on ? 1 : 0, __ATOMIC_RELEASE); }
 
-static void klovrp_jit_frustum(int eye, float *f) {
-    if (!klovrp_jit_want()) return;
+// The render size the jitter is a sub-pixel of. An OVRPlugin guest's eye swapchain (g_eye_storage_*); an OpenVR
+// guest's recommended render size (kl_vpktaa_set_render_size, from the shim's GetRecommendedRenderTargetSize).
+static int g_jit_rw, g_jit_rh;
+void kl_vpktaa_set_render_size(int w, int h) { g_jit_rw = w; g_jit_rh = h; }
+
+// This frame's offset for `eye` in tangent units (dx right, dy up) given the eye's horizontal and vertical
+// tangent spans; records it as served. 0 (and zeros) while jitter is not on. The probe counts the read.
+static int klovrp_jit_offset(int eye, float span_x, float span_y, float *dx_out, float *dy_out) {
+    *dx_out = *dy_out = 0;
+    if (!klovrp_jit_want() || (unsigned)eye > 1) return 0;
     __atomic_store_n(&g_jit.read, 1, __ATOMIC_RELAXED);
-    if (__atomic_load_n(&g_jit.state, __ATOMIC_ACQUIRE) != 1) return;
-    if (!__atomic_load_n(&g_taa_live, __ATOMIC_ACQUIRE)) return;
-    int w = g_eye_storage_w, h = g_eye_storage_h;
-    if (w <= 0 || h <= 0) return;
-    // f: [2]=up [3]=down [4]=left [5]=right (all positive).
+    if (__atomic_load_n(&g_jit.state, __ATOMIC_ACQUIRE) != 1) return 0;
+    if (!__atomic_load_n(&g_taa_live, __ATOMIC_ACQUIRE)) return 0;
+    int w = g_eye_storage_w > 0 ? g_eye_storage_w : g_jit_rw;
+    int h = g_eye_storage_h > 0 ? g_eye_storage_h : g_jit_rh;
+    if (w <= 0 || h <= 0) return 0;
     unsigned k = (__atomic_load_n(&g_jit.idx, __ATOMIC_RELAXED) % 8u) + 1u;
     float jx = klovrp_halton(k, 2) - 0.5f, jy = klovrp_halton(k, 3) - 0.5f;  // pixels
-    float dx = jx * (f[4] + f[5]) / (float)w;
-    float dy = jy * (f[2] + f[3]) / (float)h;
-    f[4] -= dx; f[5] += dx;   // x range [-l, r] -> [-l+dx, r+dx]
-    f[2] += dy; f[3] -= dy;   // y range [-b, t] -> [-b+dy, t+dy]
+    float dx = jx * span_x / (float)w;
+    float dy = jy * span_y / (float)h;
     pthread_mutex_lock(&g_frames.mu);
     g_jit.last[eye][0] = dx; g_jit.last[eye][1] = dy;
     g_frames.pending.jitter[eye][0] = dx; g_frames.pending.jitter[eye][1] = dy;
+    pthread_mutex_unlock(&g_frames.mu);
+    *dx_out = dx; *dy_out = dy;
+    return 1;
+}
+
+static void klovrp_jit_frustum(int eye, float *f) {
+    // f: [2]=up [3]=down [4]=left [5]=right (all positive).
+    float dx, dy;
+    if (!klovrp_jit_offset(eye, f[4] + f[5], f[2] + f[3], &dx, &dy)) return;
+    f[4] -= dx; f[5] += dx;   // x range [-l, r] -> [-l+dx, r+dx]
+    f[2] += dy; f[3] -= dy;   // y range [-b, t] -> [-b+dy, t+dy]
+}
+
+// The OpenVR path (klvr_system's GetProjectionRaw): the same Halton(2,3) offsets and the same probe as
+// ovrp_GetNodeFrustum2 — on only once the guest re-reads its projection every frame, and only while the VPKTAA
+// resolve runs. Tangent units, dx right, dy up; returns 1 when an offset applies.
+int kl_vpktaa_jitter_tangents(int eye, float *dx, float *dy) {
+    float ddx = 0, ddy = 0;
+    const float *t = klovrp_eye_tan((unsigned)eye > 1 ? 0 : eye);   // l, r, t, b (positive)
+    int on = klovrp_jit_offset(eye, t[0] + t[1], t[2] + t[3], &ddx, &ddy);
+    if (dx) *dx = ddx;
+    if (dy) *dy = ddy;
+    return on;
+}
+
+// The offset the guest holds for `eye` right now (the last one served), for un-jittering a frustum decoded from
+// what the guest rendered with. 0 when none.
+int kl_vpktaa_jitter_served(int eye, float *dx, float *dy) {
+    if (dx) *dx = 0;
+    if (dy) *dy = 0;
+    if ((unsigned)eye > 1 || !klovrp_jit_want()) return 0;
+    pthread_mutex_lock(&g_frames.mu);
+    float x = g_frames.pending.jitter[eye][0], y = g_frames.pending.jitter[eye][1];
+    pthread_mutex_unlock(&g_frames.mu);
+    if (dx) *dx = x;
+    if (dy) *dy = y;
+    return x != 0 || y != 0;
+}
+
+// The near/far of the guest's projection this frame, for VPKTAA's depth linearisation (render pose
+// depth_near/depth_far). From an OpenVR guest's submitted depth projection (klvr_plat_eye_depth_map).
+void kl_ovrp_set_depth_range(float znear, float zfar) {
+    pthread_mutex_lock(&g_frames.mu);
+    g_frames.pending.depth_near = znear;
+    g_frames.pending.depth_far = zfar;
     pthread_mutex_unlock(&g_frames.mu);
 }
 

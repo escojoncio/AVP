@@ -193,6 +193,9 @@ static const char kl_msl_reproject[] =
 "    uint     fadeOn;     // ovrp_SetColorScaleAndOffset — kl_reproject.h\n"
 "    float    fadeScale[4];\n"
 "    float    fadeOffset[4];\n"
+"    float    depthM22;   // KL_CP_DEPTH: the game's depth mapping (kl_reproject.h)\n"
+"    float    depthM23;\n"
+"    uint     depthOn;\n"
 "};\n"
 "\n"
 // The sRGB EOTF, piecewise as the spec has it rather than a 2.2 power. The
@@ -239,7 +242,12 @@ static const char kl_msl_reproject[] =
 // members, so a float3 here costs nothing and hides nothing.
 "              uint chromaOn [[flat]]; float3 chromaKey [[flat]];\n"
 "              float2 chromaRange [[flat]];\n"
-"              uint fadeOn [[flat]]; float3 fadeS [[flat]]; float3 fadeO [[flat]]; };\n"
+"              uint fadeOn [[flat]]; float3 fadeS [[flat]]; float3 fadeO [[flat]];\n"
+// KL_CP_DEPTH (kl_reproject_depth_f): this pixel's point on the quad in the render pose's eye space, the quad's
+// distance, rows z and w of projection * modelView (all the fragment stage needs to project a point it moved
+// along its ray), and the game's depth mapping. Flat for the reason `slice` is.
+"              float3 qpos; float qdepth [[flat]]; float4 zrow [[flat]];\n"
+"              float4 wrow [[flat]]; float2 dmap [[flat]]; uint depthOn [[flat]]; };\n"
 "\n"
 // One place, so a rung of the probe ladder cannot disagree with the real pass
 // about which eye it is looking at — which is the failure this whole file keeps
@@ -380,6 +388,13 @@ static const char kl_msl_reproject[] =
 "    o.src = uint(amp);\n"
 "    o.pos = u.visible == 0u ? kl_offscreen\n"
 "                            : u.projection * u.modelView * float4(x, y, -d, 1.0);\n"
+"    float4x4 pm = u.projection * u.modelView;\n"
+"    o.qpos = float3(x, y, -d);\n"
+"    o.qdepth = d;\n"
+"    o.zrow = float4(pm[0][2], pm[1][2], pm[2][2], pm[3][2]);\n"
+"    o.wrow = float4(pm[0][3], pm[1][3], pm[2][3], pm[3][3]);\n"
+"    o.dmap = float2(u.depthM22, u.depthM23);\n"
+"    o.depthOn = u.depthOn;\n"
 "    // Same mapping as the plain blit below, and for the same reason. Derived\n"
 "    // in the viewer against a frame known to be the right way up — do not\n"
 "    // re-derive it from first principles about GL's origin, because ANGLE's\n"
@@ -408,12 +423,43 @@ static const char kl_msl_reproject[] =
 "    return o;\n"
 "}\n"
 "\n"
+// KL_CP_DEPTH — the same picture, plus the game's own depth for visionOS's reprojection. The quad pass writes one
+// depth for the whole eye (a flat picture 500 m away), so the system can only ever correct it for rotation; this
+// moves each pixel's point along its ray to the distance the game rendered there and writes THAT point's depth in
+// this drawable's projection. Empty background (a stored depth at or past the game's infinity) keeps the quad's.
+"struct KLDepthOut { float4 color [[color(0)]]; float depth [[depth(any)]]; };\n"
+"\n"
+"fragment KLDepthOut kl_reproject_depth_f(VOut in [[stage_in]],\n"
+"                                         texture2d_array<float> tex [[texture(0)]],\n"
+"                                         texture2d_array<float> tex1 [[texture(1)]],\n"
+"                                         texture2d<float> dep0 [[texture(2)]],\n"
+"                                         texture2d<float> dep1 [[texture(3)]],\n"
+"                                         sampler samp [[sampler(0)]])\n"
+"{\n"
+"    KLDepthOut o;\n"
+"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
+"    if (in.fadeOn != 0u) c.rgb = c.rgb * in.fadeS + in.fadeO;\n"
+"    o.color = kl_chroma_apply(c, in.chromaOn, in.chromaKey, in.chromaRange);\n"
+"    float3 p = in.qpos;\n"
+"    if (in.depthOn != 0u) {\n"
+"        constexpr sampler ns(filter::nearest, address::clamp_to_edge);\n"
+"        float D = in.src == 0u ? dep0.sample(ns, in.uv).r : dep1.sample(ns, in.uv).r;\n"
+"        float den = D + in.dmap.x;\n"
+"        float L = in.dmap.y / den;\n"
+"        if (den < 0.0 && L > 0.02 && L < in.qdepth) p = in.qpos * (L / in.qdepth);\n"
+"    }\n"
+"    float4 hp = float4(p, 1.0);\n"
+"    o.depth = clamp(dot(in.zrow, hp) / dot(in.wrow, hp), 0.0, 1.0);\n"
+"    return o;\n"
+"}\n"
+"\n"
 "fragment float4 kl_reproject_f(VOut in [[stage_in]],\n"
 "                               texture2d_array<float> tex [[texture(0)]],\n"
 "                               texture2d_array<float> tex1 [[texture(1)]],\n"
 "                               sampler samp [[sampler(0)]])\n"
 "{\n"
-"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n""    if (in.fadeOn != 0u) c.rgb = c.rgb * in.fadeS + in.fadeO;\n"
+"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
+"    if (in.fadeOn != 0u) c.rgb = c.rgb * in.fadeS + in.fadeO;\n"
 // The matte is applied HERE and in no probe below. A rung of the probe ladder
 // exists to answer "is the picture arriving", and one that could also be
 // keyed out would answer that question with the matte's opinion — which is the
@@ -460,6 +506,9 @@ static const char kl_msl_reproject[] =
 "    o.pos = ua[amp].visible == 0u ? kl_offscreen\n"
 "                                  : float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
 "    o.uv  = float2(p.x, ua[amp].flipY != 0u ? 1.0 - p.y : p.y);\n"
+"    o.qpos = float3(0.0); o.qdepth = 1.0; o.zrow = float4(0.0); o.wrow = float4(0.0, 0.0, 0.0, 1.0);\n"
+"    o.dmap = float2(0.0); o.depthOn = 0u;\n"
+"    o.fadeOn = 0u; o.fadeS = float3(1.0); o.fadeO = float3(0.0);\n"
 "    return o;\n"
 "}\n"
 "\n"
@@ -828,6 +877,8 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     kl_reproject_uniforms u;
     u.projection = projection;
     u.slice = slice;
+    u.depth_on = 0;                       // KL_CP_DEPTH: the caller turns it on per view, with the mapping
+    u.depth_m22 = u.depth_m23 = 0.0f;
     // Which grid block this eye reads. `eye` and `slice` are not the same
     // number and neither could stand in for this one: an Array-layout guest has
     // slice == eye, a Stereo-layout one has two textures and slice 0 for both,

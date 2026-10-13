@@ -1,0 +1,460 @@
+From fb3aeb69801cfb88ce34588eff852949e3c8978a Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 04:56:00 +0000
+Subject: [PATCH 08/10] Shaders + VPVulkan: multisampled texture reads,
+ OpImageQuerySamples, vkCmdResolveImage
+
+VPIR: Resource::multisampled (2d / 2d_array sampled textures), image operand "sample" (u32 sample
+index, required on image_fetch of a multisampled texture), op image_samples (u32; 1 for other
+textures). Verifier, text form and optimizer know them. MSL: texture2d_ms / texture2d_ms_array /
+depth2d_ms(_array), .read(coord, [layer,] sample), get_num_samples().
+SPIR-V lowering: images with MS=1 become multisampled resources; OpImageFetch's Sample operand
+(texelFetch of sampler2DMS, subpassLoad of MS inputs) is honoured, sample 0 when absent;
+OpImageQuerySamples returns the real count (was always 1).
+vkCmdResolveImage: an empty pass over the source (load) whose StoreAndResolve resolves into the
+destination, colour or depth (was dropped). Metal resolves whole attachments: partial regions are
+resolved whole (logged).
+
+Tests: vpmsl.golden.ms_textures (new golden), gpu_vulkan.depth_resolve (vkCmdResolveImage).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
+---
+ gpu/shader/ir/include/vpir/ir.h        |  4 +++
+ gpu/shader/ir/src/optimize.cpp         |  1 +
+ gpu/shader/ir/src/parse.cpp            |  1 +
+ gpu/shader/ir/src/print.cpp            |  1 +
+ gpu/shader/ir/src/text_common.h        |  2 +-
+ gpu/shader/ir/src/verify.cpp           | 23 ++++++++++++++---
+ gpu/shader/msl/src/msl.cpp             |  8 ++++--
+ gpu/shader/msl/tests/ms_textures.metal | 31 +++++++++++++++++++++++
+ gpu/shader/msl/tests/ms_textures.vpir  | 30 +++++++++++++++++++++++
+ gpu/shader/spirv/src/lower.cpp         | 23 +++++++++++++++--
+ gpu/vulkan/src/commands.cpp            |  4 +++
+ gpu/vulkan/src/commands.h              |  7 +++++-
+ gpu/vulkan/src/pipelines.cpp           | 34 ++++++++++++++++++++++++--
+ gpu/vulkan/tests/vk_tests.cpp          | 16 ++++++++++++
+ 14 files changed, 174 insertions(+), 11 deletions(-)
+ create mode 100644 gpu/shader/msl/tests/ms_textures.metal
+ create mode 100644 gpu/shader/msl/tests/ms_textures.vpir
+
+diff --git a/gpu/shader/ir/include/vpir/ir.h b/gpu/shader/ir/include/vpir/ir.h
+index bd3c4ab..d38836b 100644
+--- a/gpu/shader/ir/include/vpir/ir.h
++++ b/gpu/shader/ir/include/vpir/ir.h
+@@ -101,6 +101,7 @@ struct Resource {
+     TexDim dim = TexDim::D2;          // textures
+     Scalar elem = Scalar::F32;        // textures: component type
+     bool depth = false;               // sampled textures: depth texture (compare sampling)
++    bool multisampled = false;        // 2d / 2d-array textures with samples: fetch only (`sample` operand)
+     Access access = Access::ReadWrite;  // buffers, storage textures
+ };
+ 
+@@ -130,6 +131,7 @@ enum class Topology : uint8_t { Point, Line, Triangle };
+ //   image_atomic_*  storage texture (read_write, i32/u32 texels, not cube), integer coord (with the
+ //                  layer for arrays), value[, value] -> previous texel; as atomic_* otherwise
+ //   image_gather   texture, sampler, component, coord
++//   image_samples  sample count of a multisampled texture (u32); 1 for any other texture
+ //   image_query_lod  texture, sampler, coord (with the layer for arrays) -> vec2<f32>(lod a sample
+ //                  would use, clamped to the view and sampler; lod computed from derivatives,
+ //                  unclamped). Fragment-only.
+@@ -239,6 +241,7 @@ enum class Topology : uint8_t { Point, Line, Triangle };
+     X(ImageStore, "image_store", "rvv")                                                            \
+     X(ImageSize, "image_size", "rI")                                                               \
+     X(ImageLevels, "image_levels", "r")                                                            \
++    X(ImageSamples, "image_samples", "r")                                                          \
+     X(ImageQueryLod, "image_query_lod", "rsv")                                                     \
+     X(InterpCentroid, "interp_centroid", "i")                                                      \
+     X(InterpSample, "interp_sample", "iv")                                                         \
+@@ -283,6 +286,7 @@ enum ImageOperand : uint8_t {
+     kImageGrad = 1 << 2,    // 2 values: d/dx, d/dy
+     kImageOffset = 1 << 3,  // 1 value: integer texel offset
+     kImageCompare = 1 << 4, // 1 value: f32 depth reference
++    kImageSample = 1 << 5,  // 1 value: u32 sample index (image_fetch of a multisampled texture, required)
+ };
+ 
+ // ---- Functions -----------------------------------------------------------------------------------
+diff --git a/gpu/shader/ir/src/optimize.cpp b/gpu/shader/ir/src/optimize.cpp
+index 5eddcd8..c3320e6 100644
+--- a/gpu/shader/ir/src/optimize.cpp
++++ b/gpu/shader/ir/src/optimize.cpp
+@@ -30,6 +30,7 @@ bool pure(const Module& m, const Inst& in) {
+         case Op::Load: return in.sym < m.resources.size() && m.resources[in.sym].kind == ResourceKind::ConstantBuffer;
+         case Op::ImageFetch:
+         case Op::ImageSize:
++        case Op::ImageSamples:
+         case Op::ImageLevels: return in.sym < m.resources.size() && m.resources[in.sym].kind == ResourceKind::Texture;
+         case Op::QuadShuffle:
+         case Op::QuadAny: return false;  // (depend on the active lanes, like subgroup ops)
+diff --git a/gpu/shader/ir/src/parse.cpp b/gpu/shader/ir/src/parse.cpp
+index 7eed73f..34baa2f 100644
+--- a/gpu/shader/ir/src/parse.cpp
++++ b/gpu/shader/ir/src/parse.cpp
+@@ -275,6 +275,7 @@ private:
+             if (t.width != 1) fail("texture element must be scalar");
+             r.elem = t.scalar;
+             r.depth = acceptWord("depth");
++            r.multisampled = acceptWord("multisampled");
+         }
+         expectWord("index");
+         r.index = parseParenU32();
+diff --git a/gpu/shader/ir/src/print.cpp b/gpu/shader/ir/src/print.cpp
+index 2b25fbf..57a5e98 100644
+--- a/gpu/shader/ir/src/print.cpp
++++ b/gpu/shader/ir/src/print.cpp
+@@ -65,6 +65,7 @@ private:
+         if (r.kind == ResourceKind::Texture || r.kind == ResourceKind::StorageTexture) {
+             s += std::string(" ") + toString(r.dim) + " " + toString(Type(r.elem));
+             if (r.depth) s += " depth";
++            if (r.multisampled) s += " multisampled";
+         }
+         s += " index(" + std::to_string(r.index) + ")";
+         if (r.kind == ResourceKind::Buffer || r.kind == ResourceKind::StorageTexture)
+diff --git a/gpu/shader/ir/src/text_common.h b/gpu/shader/ir/src/text_common.h
+index 892062c..7fe2e67 100644
+--- a/gpu/shader/ir/src/text_common.h
++++ b/gpu/shader/ir/src/text_common.h
+@@ -17,7 +17,7 @@ struct ImageOperandSpec {
+ // Canonical order: matches the bit order, which is also the order of the values in Inst::args.
+ inline constexpr ImageOperandSpec kImageOperands[] = {
+     {kImageLod, "lod", 1},       {kImageBias, "bias", 1},       {kImageGrad, "grad", 2},
+-    {kImageOffset, "offset", 1}, {kImageCompare, "compare", 1},
++    {kImageOffset, "offset", 1}, {kImageCompare, "compare", 1},  {kImageSample, "sample", 1},
+ };
+ 
+ // Shortest text that parses back to exactly `bits`; non-finite floats print as hex bits.
+diff --git a/gpu/shader/ir/src/verify.cpp b/gpu/shader/ir/src/verify.cpp
+index a45ec4d..34bd830 100644
+--- a/gpu/shader/ir/src/verify.cpp
++++ b/gpu/shader/ir/src/verify.cpp
+@@ -101,6 +101,8 @@ private:
+             if ((r.kind == ResourceKind::Texture || r.kind == ResourceKind::StorageTexture) &&
+                 (r.elem == Scalar::Bool))
+                 error("resource ", r.name, ": bool texel type");
++            if (r.multisampled && (r.kind != ResourceKind::Texture || (r.dim != TexDim::D2 && r.dim != TexDim::D2Array)))
++                error("resource ", r.name, ": multisampled textures are sampled 2d or 2d_array");
+         }
+ 
+         bool grid = stageIs(kGridStages);
+@@ -505,6 +507,7 @@ private:
+                 expectResult(in, true);
+                 const Resource* r = image(in.sym, false);
+                 if (!r) break;
++                require(!r->multisampled, "multisampled textures are only fetched");
+                 if (!require(in.sampler < m_.resources.size() && m_.resources[in.sampler].kind == ResourceKind::Sampler,
+                              "expected a sampler"))
+                     break;
+@@ -527,10 +530,15 @@ private:
+                 const Resource* r = image(in.sym, storage);
+                 if (!r) break;
+                 require(!storage || r->access != Access::Write, "storage texture is write-only");
+-                require(in.image == 0 || in.image == kImageLod, "fetch only takes lod");
++                if (r->multisampled) {
++                    require(in.image == kImageSample, "multisampled fetch takes exactly a sample index");
++                    if (in.image == kImageSample) require(a.size() == 2 && a[1] == kU32, "sample must be u32");
++                } else {
++                    require(in.image == 0 || in.image == kImageLod, "fetch only takes lod");
++                    if (in.image) require(a[1] == kU32, "lod must be u32");
++                }
+                 require(!storage || in.image == 0, "storage reads take no lod");
+                 require(a[0] == coordType(*r, Scalar::U32), "coordinate must be u32 vector");
+-                if (in.image) require(a[1] == kU32, "lod must be u32");
+                 require(t == texel(*r), "result must be a vec4 of the texel type");
+                 break;
+             }
+@@ -568,7 +576,8 @@ private:
+                 bool storage = in.sym < m_.resources.size() && m_.resources[in.sym].kind == ResourceKind::StorageTexture;
+                 const Resource* r = image(in.sym, storage);
+                 if (!r) break;
+-                require(in.image == 0 || (in.image == kImageLod && !storage), "image_size only takes lod on textures");
++                require(in.image == 0 || (in.image == kImageLod && !storage && !r->multisampled),
++                        "image_size only takes lod on single-sample textures");
+                 if (in.image) require(a[0] == kU32, "lod must be u32");
+                 require(t == Type(Scalar::U32, uint8_t(sizeWidth(r->dim))), "result must be a u32 vector of the size width");
+                 break;
+@@ -586,6 +595,14 @@ private:
+                 break;
+             }
+             case Op::ImageLevels: {
++                expectResult(in, true);
++                if (const Resource* r = image(in.sym, false)) {
++                    require(t == kU32, "result must be u32");
++                    require(!r->multisampled, "multisampled textures have one level");
++                }
++                break;
++            }
++            case Op::ImageSamples: {
+                 expectResult(in, true);
+                 if (image(in.sym, false)) require(t == kU32, "result must be u32");
+                 break;
+diff --git a/gpu/shader/msl/src/msl.cpp b/gpu/shader/msl/src/msl.cpp
+index 320592a..e52565e 100644
+--- a/gpu/shader/msl/src/msl.cpp
++++ b/gpu/shader/msl/src/msl.cpp
+@@ -128,6 +128,7 @@ std::string textureType(const Resource& r) {
+                                   "texturecube_array"};
+     static const char* depth[] = {"", "depth2d", "depth2d_array", "", "depthcube", "depthcube_array"};
+     std::string t = r.depth ? depth[unsigned(r.dim)] : color[unsigned(r.dim)];
++    if (r.multisampled) t = std::string(r.depth ? "depth2d_ms" : "texture2d_ms") + (r.dim == TexDim::D2Array ? "_array" : "");
+     t += "<" + scalarName(r.elem);
+     if (r.kind == ResourceKind::StorageTexture) {
+         static const char* access[] = {"read", "write", "read_write"};
+@@ -911,13 +912,16 @@ private:
+             case Op::ImageFetch: {
+                 const Resource& r = m_.resources[in.sym];
+                 std::string s = texture(in.sym) + ".read(" + coords(r, in.args[0], true);
+-                if (in.image) s += ", " + a(1);
++                if (in.image) s += ", " + a(1);  // lod, or the sample index of a multisampled texture
+                 return define(in, s + ")");
+             }
++            case Op::ImageSamples:
++                return define(in, m_.resources[in.sym].multisampled ? texture(in.sym) + ".get_num_samples()" : "1u");
+             case Op::ImageStore:
+                 return line(texture(in.sym), ".write(", a(1), ", ", coords(m_.resources[in.sym], in.args[0], true), ");");
+             case Op::ImageSize: return define(in, imageSize(in));
+-            case Op::ImageLevels: return define(in, texture(in.sym) + ".get_num_mip_levels()");
++            case Op::ImageLevels:
++                return define(in, m_.resources[in.sym].multisampled ? "1u" : texture(in.sym) + ".get_num_mip_levels()");
+             case Op::ImageAtomicAdd: return imageAtomic("atomic_fetch_add", in);
+             case Op::ImageAtomicSub: return imageAtomic("atomic_fetch_sub", in);
+             case Op::ImageAtomicMin: return imageAtomic("atomic_fetch_min", in);
+diff --git a/gpu/shader/msl/tests/ms_textures.metal b/gpu/shader/msl/tests/ms_textures.metal
+new file mode 100644
+index 0000000..da4f204
+--- /dev/null
++++ b/gpu/shader/msl/tests/ms_textures.metal
+@@ -0,0 +1,31 @@
++#include <metal_stdlib>
++using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
++
++struct VpArgs {
++    texture2d_ms<float> msaa;
++    depth2d_ms_array<float> mdepth;
++};
++
++struct VpOut {
++    float4 color [[color(0)]];
++};
++
++fragment VpOut vp_main(constant VpArgs& vp_args [[buffer(0)]],
++        float4 in_pos [[position]],
++        uint in_sid [[sample_id]]) {
++    VpOut vp_out;
++    const float2 v4 = float2(in_pos.x, in_pos.y);
++    const uint2 v5 = uint2(v4);
++    const float4 v6 = vp_args.msaa.read(v5, in_sid);
++    const uint3 v10 = uint3(v5.x, v5.y, 1u);
++    const float v12 = vp_args.mdepth.read(v10.xy, v10.z, 0u);
++    const uint v13 = vp_args.msaa.get_num_samples();
++    const float v14 = float(v13);
++    const float v16 = v6.x + v12;
++    const float4 v17 = float4(v16, v14, v12, v6.x);
++    vp_out.color = v17;
++    return vp_out;
++}
+diff --git a/gpu/shader/msl/tests/ms_textures.vpir b/gpu/shader/msl/tests/ms_textures.vpir
+new file mode 100644
+index 0000000..0d00129
+--- /dev/null
++++ b/gpu/shader/msl/tests/ms_textures.vpir
+@@ -0,0 +1,30 @@
++module fragment
++
++input pos : vec4<f32> builtin(position)
++input sid : u32 builtin(sample_id)
++output color : vec4<f32> location(0)
++texture msaa : 2d f32 multisampled index(0)
++texture mdepth : 2d_array f32 depth multisampled index(1)
++
++; Multisampled reads (texelFetch of sampler2DMS / subpass MS inputs) and the sample count query.
++func main() {
++  %0 = load_input pos : vec4<f32>
++  %1 = load_input sid : u32
++  %2 = extract %0, 0 : f32
++  %3 = extract %0, 1 : f32
++  %4 = construct %2, %3 : vec2<f32>
++  %5 = convert %4 : vec2<u32>
++  %6 = image_fetch msaa, %5, sample(%1) : vec4<f32>
++  %7 = extract %5, 0 : u32
++  %8 = extract %5, 1 : u32
++  %9 = const 1 : u32
++  %10 = construct %7, %8, %9 : vec3<u32>
++  %11 = const 0 : u32
++  %12 = image_fetch mdepth, %10, sample(%11) : f32
++  %13 = image_samples msaa : u32
++  %14 = convert %13 : f32
++  %15 = extract %6, 0 : f32
++  %16 = add %15, %12 : f32
++  %17 = construct %16, %14, %12, %15 : vec4<f32>
++  store_output color, %17
++}
+diff --git a/gpu/shader/spirv/src/lower.cpp b/gpu/shader/spirv/src/lower.cpp
+index 3438b2e..720ffd3 100644
+--- a/gpu/shader/spirv/src/lower.cpp
++++ b/gpu/shader/spirv/src/lower.cpp
+@@ -589,6 +589,7 @@ private:
+                                  r.dim = texDim(img);
+                                  r.elem = imageElem(img);
+                                  r.depth = depth && !storage;
++                                 r.multisampled = img.ms != 0 && !storage;
+                                  if (storage) {
+                                      auto d = m_.deco(global);
+                                      bool nr = d && d->has(Deco::NonReadable), nw = d && d->has(Deco::NonWritable);
+@@ -2185,7 +2186,13 @@ private:
+                 q.args = {sampleCoord(h, get1(w(in, 4)), false)};
+                 return one(b_->emit(q));
+             }
+-            case OpImageQuerySamples: return one(castBits(u32(1), vt(rtId)));
++            case OpImageQuerySamples: {
++                Handle h = handle(w(in, 3));
++                if (h.texture < 0) return one(castBits(u32(1), vt(rtId)));
++                Inst q;
++                q.op = Op::ImageSamples, q.sym = uint32_t(h.texture), q.type = vpir::kU32;
++                return one(castBits(b_->emit(q), vt(rtId)));
++            }
+             // ---- atomics
+             case OpAtomicLoad: {
+                 RPtr p = resolve(w(in, 3), false);
+@@ -2457,11 +2464,23 @@ private:
+         if (!storage && in.count > 5) {
+             uint32_t mask = w(in, 5);
+             uint32_t i = 6;
+-            if (mask & ImgOp::Lod) {
++            if (mask & ImgOp::Bias) ++i;
++            if ((mask & ImgOp::Lod) && !r.multisampled) {
+                 ValueId l = castBits(get1(w(in, i)), vpir::kU32);
+                 f.args.push_back(l);
+                 f.image = vpir::kImageLod;
+             }
++            if (mask & ImgOp::Lod) ++i;
++            if (mask & ImgOp::Grad) i += 2;
++            if (mask & (ImgOp::ConstOffset | ImgOp::Offset)) ++i;
++            if ((mask & ImgOp::Sample) && r.multisampled) {
++                f.args.push_back(castBits(get1(w(in, i)), vpir::kU32));
++                f.image = vpir::kImageSample;
++            }
++        }
++        if (r.multisampled && f.image != vpir::kImageSample) {  // texelFetch(sampler2DMS) always names a sample
++            f.args.push_back(u32(0));
++            f.image = vpir::kImageSample;
+         }
+         return texelResult(h, b_->emit(f), w(in, 1));
+     }
+diff --git a/gpu/vulkan/src/commands.cpp b/gpu/vulkan/src/commands.cpp
+index ebe3eee..125d446 100644
+--- a/gpu/vulkan/src/commands.cpp
++++ b/gpu/vulkan/src/commands.cpp
+@@ -371,6 +371,10 @@ struct Translator {
+         c.label = "vk.blit";
+         frame.copy(std::move(c));
+         ++st.copies;
++      } else if (const auto* rs = std::get_if<OpResolve>(&op)) {
++        frame.beginRenderPass(rs->desc);
++        frame.endRenderPass();
++        ++st.copies;
+       } else if (const auto* d = std::get_if<OpDraw>(&op)) {
+         draw(*d);
+       } else if (const auto* x = std::get_if<OpDispatch>(&op)) {
+diff --git a/gpu/vulkan/src/commands.h b/gpu/vulkan/src/commands.h
+index d6d209d..008a594 100644
+--- a/gpu/vulkan/src/commands.h
++++ b/gpu/vulkan/src/commands.h
+@@ -91,6 +91,11 @@ struct OpBlitImage {
+   VkImageBlit region{};
+   VkFilter filter = VK_FILTER_LINEAR;
+ };
++// vkCmdResolveImage: an empty pass over the multisampled image (loaded) whose store resolves into
++// the destination (Metal resolves the whole attachment at the end of the encoder).
++struct OpResolve {
++  vpgpu::RenderPassDesc desc;
++};
+ struct OpDraw {
+   vpgpu::Draw draw;
+   // Indirect draws: arguments read from the buffer at submit (unified memory).
+@@ -118,7 +123,7 @@ struct OpExecute {
+ 
+ using Op = std::variant<OpBeginPass, OpBeginRendering, OpNextSubpass, OpLocalRead, OpEndPass, OpCopyBuffer, OpUpload,
+                         OpFillBuffer, OpClearColor, OpClearDepth, OpClearAttachments, OpCopyBufferToImage,
+-                        OpCopyImageToBuffer, OpCopyImage, OpBlitImage, OpDraw, OpDispatch, OpExecute>;
++                        OpCopyImageToBuffer, OpCopyImage, OpBlitImage, OpResolve, OpDraw, OpDispatch, OpExecute>;
+ 
+ // Host memory owned by a command buffer for the data it carries (push constants, vkCmdUpdateBuffer):
+ // 64 KiB chunks aliased by core buffers, reused after a reset.
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index ebf7485..14d4433 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -1610,8 +1610,38 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer cb, VkI
+     }
+     return;
+   }
+-  static std::atomic<unsigned> k{0};
+-  if (k.fetch_add(1) < 8) log("vk.unimpl resolve_image (render-pass resolves are supported)");
++  const Image* s = from<Image>(src);
++  const Image* d = from<Image>(dst);
++  if (!s || !d || !s->id || !d->id) return;
++  Recorder& r = rec(cb);
++  const bool depth = vpgpu::formatInfo(s->desc.format).depth() || vpgpu::formatInfo(s->desc.format).stencil();
++  for (uint32_t i = 0; i < n; ++i) {
++    const VkImageResolve& x = regions[i];
++    // Metal resolves whole attachments: a region smaller than the image resolves the rest too
++    // (logged); engines resolve whole images in practice.
++    const uint32_t w = std::max(1u, s->desc.width >> x.srcSubresource.mipLevel);
++    const uint32_t h = std::max(1u, s->desc.height >> x.srcSubresource.mipLevel);
++    if (x.srcOffset.x || x.srcOffset.y || x.extent.width < w || x.extent.height < h || x.dstOffset.x || x.dstOffset.y) {
++      static std::atomic<unsigned> k{0};
++      if (k.fetch_add(1) < 8)
++        logf("vk.note resolve_image partial region %ux%u+%d,%d of %ux%u resolved whole", x.extent.width, x.extent.height,
++             x.srcOffset.x, x.srcOffset.y, w, h);
++    }
++    const uint32_t layers = x.srcSubresource.layerCount == VK_REMAINING_ARRAY_LAYERS
++                                ? s->desc.layers - x.srcSubresource.baseArrayLayer
++                                : x.srcSubresource.layerCount;
++    OpResolve op;
++    vpgpu::Attachment& a = depth ? op.desc.depth : op.desc.colors[0];
++    a.texture = s->id;
++    a.mip = uint16_t(x.srcSubresource.mipLevel), a.layer = uint16_t(x.srcSubresource.baseArrayLayer);
++    a.load = vpgpu::LoadAction::Load;
++    a.store = vpgpu::StoreAction::StoreAndResolve;
++    a.resolve = d->id;
++    a.resolveMip = uint16_t(x.dstSubresource.mipLevel), a.resolveLayer = uint16_t(x.dstSubresource.baseArrayLayer);
++    op.desc.layerCount = uint16_t(std::max(1u, layers));
++    op.desc.label = "vk.resolve_image";
++    r.ops.emplace_back(std::move(op));
++  }
+ }
+ 
+ // =================================================================================================
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index b97ae2a..80a285b 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -1077,6 +1077,22 @@ void testDepthResolve() {
+     CHECK(b.resolve == from<Image>(ss)->id && b.store == vpgpu::StoreAction::Resolve &&
+           b.depthResolve == vpgpu::Attachment::DepthResolve::Min);
+   }
++  // vkCmdResolveImage: an empty pass whose store resolves into the destination.
++  vkBeginCommandBuffer(cb, &bi);
++  VkImageResolve res{};
++  res.srcSubresource = res.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
++  res.extent = {128, 128, 1};
++  vkCmdResolveImage(cb, ms, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ss, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &res);
++  vkEndCommandBuffer(cb);
++  vpgpu::Frame f2;
++  TranslateStats s2;
++  translate(*from<CommandBuffer>(cb)->rec, f2, s2);
++  CHECK(f2.commands().size() == 1);
++  if (f2.commands().size() == 1) {
++    const auto& p = std::get<vpgpu::RenderPass>(f2.commands()[0]);
++    CHECK(p.draws.empty() && p.desc.depth.texture == from<Image>(ms)->id && p.desc.depth.load == vpgpu::LoadAction::Load &&
++          p.desc.depth.store == vpgpu::StoreAction::StoreAndResolve && p.desc.depth.resolve == from<Image>(ss)->id);
++  }
+   vkDestroyCommandPool(c.dev, pool, nullptr);
+   vkDestroyFramebuffer(c.dev, fb, nullptr);
+   vkDestroyRenderPass(c.dev, rp, nullptr);
+-- 
+2.43.0
+

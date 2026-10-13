@@ -44,6 +44,15 @@ int kl_app_configure(const char *resources, const char *container);
 int kl_app_configure_game(const char *name, const char *tree, const char *apk,
                           const char *dylibs, const char *files,
                           const char *obb_rel, const char *container);
+// AVP, Half-Life: Alyx only (KL_APP_ALYX): configure from the four folders of a launch (AlyxBoot.swift's
+// AVPLaunchPaths) instead of a bundled target. `resources` is the app bundle (Frameworks/: the Vulkan driver, SDL);
+//   game    the depot's game/ folder (bin/, hlvr/, core/), with the real ELF files (never mapped)
+//   dylibs  the flat folder of signed <stem>.dylib translations: the ONLY library search path
+//   config  alyx-env.txt, alyx-convars.lua, video2.txt, vr_fidelity_levels_override.csv, device-info.json
+//   data    writable: klfz/ (pipelines, device info), logs/ (klepton-boot.log, klepton-crash.log), files/
+// Once per process, as kl_app_configure. Returns 0, or non-zero with kl_app_status() saying which path is missing.
+int kl_app_configure_alyx(const char *resources, const char *game, const char *dylibs,
+                          const char *config, const char *data);
 
 // Run the boot sequence. Returns 0 if initJni completed with no unimplemented
 // JNI call. Everything printed goes to the log file below as well as stdout,
@@ -123,6 +132,10 @@ void kl_app_guest_stop(void);
 // last case kl_app_status() says why.
 int  kl_app_guest_state(void);
 
+// The thermal state (ProcessInfo.ThermalState's raw value: 0 nominal .. 3 critical), from the compositor at start and
+// on each change, for the once-a-minute line in Documents/klfz/perf.txt.
+void kl_app_note_thermal(int state);
+
 // Which guest this app was built for, and whether it is the Steam Link one.
 //
 // Valid after kl_app_configure; before that the name is "(unconfigured)" and the
@@ -143,6 +156,7 @@ int         kl_app_target_is_steamlink(void);
 // (GTA Vice City), which is an in-world game meant to fill the view — .mixed
 // leaves it a window in passthrough. KL_FULL in the environment overrides.
 int         kl_app_target_wants_full(void);
+int         kl_app_target_is_linux(void);
 
 // ...and the question the COMPOSITOR is really asking, which is not the same
 // one. Three of the four doors here hand the frame loop to the guest: Steam
@@ -186,5 +200,27 @@ const char *kl_app_log_path(void);
 
 // Human-readable status of the last call, for the UI. Never NULL.
 const char *kl_app_status(void);
+
+// The Vulkan pipeline replay's progress (runtime/linux/kl_fossilize.cpp), for a loading screen: 0 no replay this run,
+// 1 replaying, 2 done; done/total pipelines so far (the total grows as each database opens), elapsed seconds.
+// Targets without the Alyx add-on get a stub that says 0.
+int kl_foz_progress(unsigned *done, unsigned *total, double *elapsed);
+
+// The launcher's "Preparing graphics" before Play, in the shared space: configures (kl_app_configure_alyx, once per
+// process, as boot would) and warms the Metal cache with no game, on a device made from the game's recorded settings
+// (kl_foz_prewarm: <data>/klfz/device-info.json, else <config>/device-info.json). Blocks; progress is
+// kl_foz_progress's. 0 done, negative when it could not (the game's own replay at Play is the fallback).
+int kl_app_prewarm_alyx(const char *resources, const char *game, const char *dylibs,
+                        const char *config, const char *data);
+
+// The compositor's count of pictures reused in a row (0 when a new one arrives): after KL_STALL_DUMP_S seconds of
+// it, every thread's frames go to the log once (and again 10 s later), to show where a stuck guest waits.
+void kl_guest_stall_check(unsigned stale);
+
+// What this process was given, written at launch to <container>/klepton-memprobe.txt (and stdout): the memory it may
+// use (os_proc_available_memory), whether the signature carries the two memory entitlements (embedded.mobileprovision),
+// the largest single address-space reservation it can make and the total it can reserve. For the free-team build,
+// which has the memory limit but not Extended Virtual Addressing. Reservations are PROT_NONE and released at once.
+void kl_app_memprobe(const char *resources, const char *container);
 
 #endif
