@@ -22,7 +22,7 @@ void *kl_vrr_map_for(int w, int h);
 void kl_vrr_reload(void);
 // Live foveation shape without touching the environment: soft (1) or centre (0) map, inner/outer/edge
 // (< 0: that preset's default). Rebuilds the maps.
-void kl_vrr_set(int soft, float inner, float outer, float edge);
+void kl_vrr_set(int mode, float inner, float outer, float edge);   // mode: 0 centre, 1 soft, 2 wide (KL_VRR_MAP)
 void kl_vrr_s2p(void *ctx, float sx, float sy, float *px, float *py);
 // The frame the guest is recording now (counts from 1; 0 before GPU timing is on).
 unsigned kl_gpu_time_frame(void);

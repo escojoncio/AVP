@@ -673,10 +673,27 @@ static void vrr_rates(float centre, float in, float outr, float edge, float *out
 // foveation region), converted to image fractions from the eye's tangents, then falls to 0.25 over the next 12%
 // of the image; "soft" is the first map (full rate within 18% of the width, 0.35 from 50% out). KL_VRR_EDGE,
 // KL_VRR_INNER, KL_VRR_OUTER override either.
-static int vrr_soft(void) {
+// KL_VRR_MAP=wide (AVP's M2/M5 presets): PTVisionPro's tested foveation, the user's reference: a sharp zone 60 degrees
+// across around each eye's FORWARD axis (tangent 0, not the image centre), its centre 10 degrees BELOW that axis (the
+// headset shows more below than above), the rest at KL_VRR_EDGE (10 % default, up to 65 % on an M5). A rate map is
+// separable, so the circle becomes the
+// rectangle that holds it; the ramp to the periphery is one zone wide, and a zone is given the rate of its point
+// nearest the centre so the sharp zone is never cut by the 16-zone quantisation.
+// Live mode (kl_vrr_set): 0 centre, 1 soft, 2 wide; -1 = from the environment.
+static int vrr_mode(void) {
     if (g_vrr_live_soft >= 0) return g_vrr_live_soft;
     const char *m = getenv("KL_VRR_MAP");
-    return m && !strcmp(m, "soft");
+    return m && !strcmp(m, "soft") ? 1 : m && !strcmp(m, "wide") ? 2 : 0;
+}
+static int vrr_soft(void) { return vrr_mode() == 1; }
+// Rate per zone: 1 for any zone reaching within `in` of `centre`, falling linearly to `edge` at `out` (by the
+// zone's nearest point), `edge` beyond.
+static void vrr_rates_near(float centre, float in, float outr, float edge, float *out) {
+    for (int i = 0; i < kVrrZones; i++) {
+        float a = (float)i / kVrrZones, b = (float)(i + 1) / kVrrZones;
+        float t = centre < a ? a - centre : centre > b ? centre - b : 0.0f;
+        out[i] = t <= in ? 1.0f : t >= outr ? edge : 1.0f - (1.0f - edge) * (t - in) / (outr - in);
+    }
 }
 static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, NSUInteger h, NSUInteger layers) {
     for (int i = 0; i < 8; i++)
@@ -690,18 +707,31 @@ static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, 
         if (t[0] > 0 && t[1] > 0) { cx[e] = t[0] / (t[0] + t[1]); span_x = t[0] + t[1]; }
         if (e == 0 && t[2] > 0 && t[3] > 0) { cy = t[2] / (t[2] + t[3]); span_y = t[2] + t[3]; }
     }
-    int soft = vrr_soft();
+    int soft = vrr_soft(), wide = vrr_mode() == 2;
     float tan20 = 0.364f;
-    float in_x = vrr_env("KL_VRR_INNER", soft ? 0.18f : tan20 / span_x);
-    float in_y = vrr_env("KL_VRR_INNER", soft ? 0.18f : tan20 / span_y);
-    float out_x = vrr_env("KL_VRR_OUTER", soft ? 0.50f : in_x + 0.12f);
-    float out_y = vrr_env("KL_VRR_OUTER", soft ? 0.50f : in_y + 0.12f);
-    float edge = vrr_env("KL_VRR_EDGE", soft ? 0.35f : 0.25f);
-    float ry[kVrrZones];
-    vrr_rates(cy, in_y, out_y, edge, ry);
+    float in_x, in_y, out_x, out_y, edge, ry[kVrrZones];
+    if (wide) {
+        // Forward axis = tangent 0: x at left/(left+right) across (cx), y at up/(up+down) from the top (cy). The
+        // centre sits 10 degrees below it, tan(10) = 0.1763 further down; half width tan(30) = 0.5774.
+        cy += 0.1763f / span_y;
+        in_x = vrr_env("KL_VRR_INNER", 0.5774f / span_x);
+        in_y = vrr_env("KL_VRR_INNER", 0.5774f / span_y);
+        out_x = vrr_env("KL_VRR_OUTER", in_x + 1.0f / kVrrZones);
+        out_y = vrr_env("KL_VRR_OUTER", in_y + 1.0f / kVrrZones);
+        edge = vrr_env("KL_VRR_EDGE", 0.10f);
+        vrr_rates_near(cy, in_y, out_y, edge, ry);
+    } else {
+        in_x = vrr_env("KL_VRR_INNER", soft ? 0.18f : tan20 / span_x);
+        in_y = vrr_env("KL_VRR_INNER", soft ? 0.18f : tan20 / span_y);
+        out_x = vrr_env("KL_VRR_OUTER", soft ? 0.50f : in_x + 0.12f);
+        out_y = vrr_env("KL_VRR_OUTER", soft ? 0.50f : in_y + 0.12f);
+        edge = vrr_env("KL_VRR_EDGE", soft ? 0.35f : 0.25f);
+        vrr_rates(cy, in_y, out_y, edge, ry);
+    }
     for (NSUInteger l = 0; l < layers && l < 2; l++) {
         float rx[kVrrZones];
-        vrr_rates(cx[layers > 1 ? l : 0], in_x, out_x, edge, rx);
+        if (wide) vrr_rates_near(cx[layers > 1 ? l : 0], in_x, out_x, edge, rx);
+        else vrr_rates(cx[layers > 1 ? l : 0], in_x, out_x, edge, rx);
         ls[l] = [[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(kVrrZones, kVrrZones, 0)
                                                                      horizontal:rx vertical:ry];
     }
@@ -717,7 +747,7 @@ static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, 
         }
     MTLSize p0 = [map physicalSizeForLayer:0];
     fprintf(stderr, "[vrr] foveated map (%s) %lu layer(s) %lux%lu: axis at %.0f%% / %.0f%% across, %.0f%% down; full rate within %.0f%%/%.0f%%, "
-            "edge %.2f; physical %lux%lu (%.0f%% of the pixels)\n", soft ? "soft" : "centre", (unsigned long)(layers > 1 ? 2 : 1),
+            "edge %.2f; physical %lux%lu (%.0f%% of the pixels)\n", soft ? "soft" : wide ? "wide" : "centre", (unsigned long)(layers > 1 ? 2 : 1),
             (unsigned long)w, (unsigned long)h, 100 * cx[0], 100 * cx[1], 100 * cy, 100 * in_x, 100 * in_y, edge, (unsigned long)p0.width,
             (unsigned long)p0.height, 100.0 * p0.width * p0.height / ((double)w * h));
     const char *dump = getenv("KL_VRR_DUMP");
@@ -758,12 +788,12 @@ void kl_vrr_s2p(void *ctx, float sx, float sy, float *px, float *py) {
 // Live foveation settings (pause menu): forget the cached maps so the next scene pass builds one from the
 // current KL_VRR_* environment. The old maps are not released: the compositor and the guest's published
 // eye-map pointer may still be using them for a frame in flight (8 small objects at most per change).
-void kl_vrr_set(int soft, float inner, float outer, float edge) {
+void kl_vrr_set(int mode, float inner, float outer, float edge) {   // mode: 0 centre, 1 soft, 2 wide
     g_vrr_live_inner = inner, g_vrr_live_outer = outer, g_vrr_live_edge = edge;   // < 0: preset default
     if (inner < 0) g_vrr_live_inner = NAN;
     if (outer < 0) g_vrr_live_outer = NAN;
     if (edge < 0) g_vrr_live_edge = NAN;
-    g_vrr_live_soft = soft ? 1 : 0;
+    g_vrr_live_soft = mode >= 0 && mode <= 2 ? mode : 0;
     kl_vrr_reload();
 }
 void kl_vrr_reload(void) {

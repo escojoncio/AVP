@@ -98,8 +98,11 @@ struct AVPSettingsView: View {
         } header: {
             Text(AVPL("Antialiasing", "Antialiasing"))
         } footer: {
-            Text(s.vpktaa ? AVPL("El MSAA del juego queda apagado: VPKTAA hace el antialiasing.", "The game's MSAA stays off: VPKTAA does the antialiasing.")
-                          : AVPL("Sin VPKTAA el juego usa MSAA 4x.", "Without VPKTAA the game uses 4x MSAA."))
+            Text(s.foveation == .off
+                 ? AVPL("El juego usa MSAA 4x. VPKTAA solo actúa en la periferia foveada: con el foveado apagado no hace nada.",
+                        "The game uses 4x MSAA. VPKTAA only works on the foveated periphery: with foveation off it does nothing.")
+                 : AVPL("El juego usa MSAA 4x. VPKTAA suaviza solo la periferia foveada (los bloques del foveado); el centro queda intacto. Se aplica en vivo.",
+                        "The game uses 4x MSAA. VPKTAA smooths only the foveated periphery (the foveation blocks); the centre is untouched. Applied live."))
         }
     }
 
@@ -112,6 +115,14 @@ struct AVPSettingsView: View {
                 Text(AVPL("Personalizado", "Custom")).tag(AVPSettings.Foveation.custom)
             }
             .pickerStyle(.segmented)
+            if s.foveation == .m2 || s.foveation == .m5 {
+                Stepper(AVPL("Calidad de la periferia: \(pct(s.presetPeriphery))", "Periphery quality: \(pct(s.presetPeriphery))"),
+                        value: Binding(get: { s.presetPeriphery }, set: { s.periphery = $0 }),
+                        in: AVPSettings.presetPeripheryRange, step: 0.05)
+                Text(AVPL("Zona nítida de 60° al 100 %, 10° por debajo del eje de mirada (los valores probados en P.T.). La periferia va del 10 % (máximo rendimiento) al 65 % (para un M5). VPKTAA suaviza la periferia. Se aplica en vivo.",
+                          "60° sharp zone at 100 %, 10° below the straight-ahead axis (the values tested in P.T.). The periphery goes from 10 % (most performance) to 65 % (for an M5). VPKTAA smooths the periphery. Applied live."))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if s.foveation == .custom {
                 Stepper(AVPL("Zona nítida: \(pct(s.sharpZone))", "Sharp zone: \(pct(s.sharpZone))"), value: $s.sharpZone, in: 0.05...0.6, step: 0.01)
                 Stepper(AVPL("Periferia: \(pct(s.periphery))", "Periphery: \(pct(s.periphery))"), value: $s.periphery, in: 0.1...1, step: 0.05)

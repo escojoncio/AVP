@@ -196,6 +196,10 @@ static const char kl_msl_reproject[] =
 "    float    depthM22;   // KL_CP_DEPTH: the game's depth mapping (kl_reproject.h)\n"
 "    float    depthM23;\n"
 "    uint     depthOn;\n"
+"    uint     reconOn;    // KL_CP_RECON: periphery reconstruction (kl_eye_recon)\n"
+"    float    reconStrength;\n"
+"    float    reconSharp;\n"
+"    float    reconRef;   // the centre's texels per pixel; thresholds are relative to it\n"
 "};\n"
 "\n"
 // The sRGB EOTF, piecewise as the spec has it rather than a 2.2 power. The
@@ -247,7 +251,8 @@ static const char kl_msl_reproject[] =
 // distance, rows z and w of projection * modelView (all the fragment stage needs to project a point it moved
 // along its ray), and the game's depth mapping. Flat for the reason `slice` is.
 "              float3 qpos; float qdepth [[flat]]; float4 zrow [[flat]];\n"
-"              float4 wrow [[flat]]; float2 dmap [[flat]]; uint depthOn [[flat]]; };\n"
+"              float4 wrow [[flat]]; float2 dmap [[flat]]; uint depthOn [[flat]];\n"
+"              uint reconOn [[flat]]; float3 reconK [[flat]]; };\n"
 "\n"
 // One place, so a rung of the probe ladder cannot disagree with the real pass
 // about which eye it is looking at — which is the failure this whole file keeps
@@ -260,6 +265,82 @@ static const char kl_msl_reproject[] =
 "{\n"
 "    return src == 0u ? kl_eye_sample(t0, samp, uv, slice, srgbDecode)\n"
 "                     : kl_eye_sample(t1, samp, uv, slice, srgbDecode);\n"
+"}\n"
+"\n"
+// ---- VPKTAA periphery reconstruction (KL_CP_RECON) ---------------------------
+//
+// The foveated periphery reaches this pass as a few physical texels stretched over many drawable pixels; the
+// bilinear tent turns each into a soft square and every edge into a staircase of them. This is the spatial half
+// of VPKTAA (no motion vectors, no history, so nothing here can smear or ghost): a 9-tap Catmull-Rom (the bilinear
+// formulation: 9 hardware samples for the 16 texel footprint), clamped to the 2x2 texels around the point so it
+// cannot ring, then a short blur ALONG the local edge (direction from the 2x2 luma gradient) that rounds the
+// staircase off without softening across the edge. `mag` is source texels per drawable pixel, `k.z` the centre's
+// (render size over native): nothing happens at 0.75 of the centre's and up (so the sharp centre is never touched,
+// whatever the render resolution), full effect from 0.45 of it down.
+// A texture argument cannot be chosen into a variable, so the caller passes the eye's own texture.
+"static float3 kl_luma_w() { return float3(0.299, 0.587, 0.114); }\n"
+"static float4 kl_eye_recon(texture2d_array<float> t, sampler samp, float2 uv, uint slice,\n"
+"                           float mag, float3 k)\n"
+"{\n"
+"    float4 base = t.sample(samp, uv, slice, level(0.0));\n"
+"    float w = k.x * saturate((0.75 * k.z - mag) / (0.30 * k.z));\n"
+"    if (w <= 0.0) return base;\n"
+"    float2 sz = float2(float(t.get_width()), float(t.get_height()));\n"
+"    float2 rcp = 1.0 / sz;\n"
+"    float2 p = uv * sz - 0.5;\n"
+"    float2 f = fract(p);\n"
+"    float2 tc = floor(p) + 0.5;\n"
+"    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));\n"
+"    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);\n"
+"    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));\n"
+"    float2 w3 = f * f * (-0.5 + 0.5 * f);\n"
+"    float2 w12 = w1 + w2;\n"
+"    float2 c0 = (tc - 1.0) * rcp, c3 = (tc + 2.0) * rcp, c12 = (tc + w2 / w12) * rcp;\n"
+"    float4 cr = float4(0.0);\n"
+"    cr += t.sample(samp, float2(c0.x,  c0.y),  slice, level(0.0)) * (w0.x  * w0.y);\n"
+"    cr += t.sample(samp, float2(c12.x, c0.y),  slice, level(0.0)) * (w12.x * w0.y);\n"
+"    cr += t.sample(samp, float2(c3.x,  c0.y),  slice, level(0.0)) * (w3.x  * w0.y);\n"
+"    cr += t.sample(samp, float2(c0.x,  c12.y), slice, level(0.0)) * (w0.x  * w12.y);\n"
+"    cr += t.sample(samp, float2(c12.x, c12.y), slice, level(0.0)) * (w12.x * w12.y);\n"
+"    cr += t.sample(samp, float2(c3.x,  c12.y), slice, level(0.0)) * (w3.x  * w12.y);\n"
+"    cr += t.sample(samp, float2(c0.x,  c3.y),  slice, level(0.0)) * (w0.x  * w3.y);\n"
+"    cr += t.sample(samp, float2(c12.x, c3.y),  slice, level(0.0)) * (w12.x * w3.y);\n"
+"    cr += t.sample(samp, float2(c3.x,  c3.y),  slice, level(0.0)) * (w3.x  * w3.y);\n"
+// The 2x2 texels around the point: the anti-ringing bounds and the edge direction.
+"    int2 mx = int2(sz) - 1;\n"
+"    int2 i0 = clamp(int2(floor(p)), int2(0), mx), i1 = clamp(int2(floor(p)) + 1, int2(0), mx);\n"
+"    float4 a = t.read(uint2(i0.x, i0.y), slice), b = t.read(uint2(i1.x, i0.y), slice);\n"
+"    float4 c = t.read(uint2(i0.x, i1.y), slice), d = t.read(uint2(i1.x, i1.y), slice);\n"
+"    float4 lo = min(min(a, b), min(c, d)), hi = max(max(a, b), max(c, d));\n"
+"    float4 core = mix(base, clamp(cr, lo, hi), saturate(k.y));\n"
+"    float la = dot(a.rgb, kl_luma_w()), lb = dot(b.rgb, kl_luma_w());\n"
+"    float lc = dot(c.rgb, kl_luma_w()), ld = dot(d.rgb, kl_luma_w());\n"
+"    float2 g = float2((lb + ld) - (la + lc), (lc + ld) - (la + lb));\n"
+"    float gl = length(g);\n"
+"    float lmax = max(max(la, lb), max(lc, ld));\n"
+// Edge strength: local contrast against brightness, so a dim edge counts like a bright one.
+"    float e = saturate(gl / (lmax * 0.5 + 0.04) - 0.1);\n"
+"    if (e > 0.0) {\n"
+"        float2 tdir = float2(-g.y, g.x) / max(gl, 1e-5);\n"
+"        float2 o = tdir * 0.85 * rcp;\n"
+"        float4 s1 = t.sample(samp, uv + o, slice, level(0.0));\n"
+"        float4 s2 = t.sample(samp, uv - o, slice, level(0.0));\n"
+"        core = mix(core, core * 0.5 + (s1 + s2) * 0.25, e);\n"
+"    }\n"
+"    return mix(base, core, w);\n"
+"}\n"
+"\n"
+// The eye sample the composite takes: the plain one, or the reconstruction where it applies. `mag` is measured
+// HERE, outside the per-texture branch, so the derivatives are taken in uniform control flow.
+"static float4 kl_eye_sample_main(texture2d_array<float> t0, texture2d_array<float> t1, sampler samp,\n"
+"                                 float2 uv, uint slice, uint srgbDecode, uint src, uint reconOn, float3 k)\n"
+"{\n"
+"    float2 dt = fwidth(uv) * (src == 0u ? float2(float(t0.get_width()), float(t0.get_height()))\n"
+"                                        : float2(float(t1.get_width()), float(t1.get_height())));\n"
+"    float mag = max(dt.x, dt.y);\n"
+"    if (reconOn == 0u || mag >= 0.75 * k.z) return kl_eye_sample2(t0, t1, samp, uv, slice, srgbDecode, src);\n"
+"    float4 r = src == 0u ? kl_eye_recon(t0, samp, uv, slice, mag, k) : kl_eye_recon(t1, samp, uv, slice, mag, k);\n"
+"    return float4(srgbDecode != 0u ? kl_srgb_to_linear(max(r.rgb, 0.0)) : r.rgb, r.a);\n"
 "}\n"
 "\n"
 // ---- the chroma key -------------------------------------------------------
@@ -395,6 +476,8 @@ static const char kl_msl_reproject[] =
 "    o.wrow = float4(pm[0][3], pm[1][3], pm[2][3], pm[3][3]);\n"
 "    o.dmap = float2(u.depthM22, u.depthM23);\n"
 "    o.depthOn = u.depthOn;\n"
+"    o.reconOn = u.reconOn;\n"
+"    o.reconK = float3(u.reconStrength, u.reconSharp, max(u.reconRef, 0.25));\n"
 "    // Same mapping as the plain blit below, and for the same reason. Derived\n"
 "    // in the viewer against a frame known to be the right way up — do not\n"
 "    // re-derive it from first principles about GL's origin, because ANGLE's\n"
@@ -437,7 +520,7 @@ static const char kl_msl_reproject[] =
 "                                         sampler samp [[sampler(0)]])\n"
 "{\n"
 "    KLDepthOut o;\n"
-"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
+"    float4 c = kl_eye_sample_main(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src, in.reconOn, in.reconK);\n"
 "    if (in.fadeOn != 0u) c.rgb = c.rgb * in.fadeS + in.fadeO;\n"
 "    o.color = kl_chroma_apply(c, in.chromaOn, in.chromaKey, in.chromaRange);\n"
 "    float3 p = in.qpos;\n"
@@ -458,7 +541,7 @@ static const char kl_msl_reproject[] =
 "                               texture2d_array<float> tex1 [[texture(1)]],\n"
 "                               sampler samp [[sampler(0)]])\n"
 "{\n"
-"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\n"
+"    float4 c = kl_eye_sample_main(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src, in.reconOn, in.reconK);\n"
 "    if (in.fadeOn != 0u) c.rgb = c.rgb * in.fadeS + in.fadeO;\n"
 // The matte is applied HERE and in no probe below. A rung of the probe ladder
 // exists to answer "is the picture arriving", and one that could also be
@@ -879,6 +962,9 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     u.slice = slice;
     u.depth_on = 0;                       // KL_CP_DEPTH: the caller turns it on per view, with the mapping
     u.depth_m22 = u.depth_m23 = 0.0f;
+    u.recon_on = 0;                       // KL_CP_RECON: the compositor turns it on per view
+    u.recon_strength = u.recon_sharp = 0.0f;
+    u.recon_ref = 1.0f;
     // Which grid block this eye reads. `eye` and `slice` are not the same
     // number and neither could stand in for this one: an Array-layout guest has
     // slice == eye, a Stereo-layout one has two textures and slice 0 for both,
