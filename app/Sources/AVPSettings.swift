@@ -276,7 +276,7 @@ final class AVPSettings: ObservableObject {
             ("VPVK_FORCE_1X", taaActive ? "1" : "0"),
             ("VPVK_TEXTURE_CAP", String(textureCap)),
             ("KL_FPS_HUD", showFps ? "1" : "0"),
-            ("KL_CAPTURE", diagCaptures ? "1" : "0"),
+            ("KL_CAPTURE", (diagCaptures || engine == .vpkengine) ? "1" : "0"),
         ]
         // VPKTAA inputs not usable yet (build 17 log): VPKEngine's motion vectors are all zero (its "eye frame"
         // restarts at every depth-clearing multiview pass, 4-7 per game frame, so no draw ever finds last frame's
@@ -288,7 +288,13 @@ final class AVPSettings: ObservableObject {
             env += [("VPVK_MOTION", "0"), ("KL_VPKTAA_DEPTH", "0")]
         }
         // Foveation: Klepton's rasterization-rate map (kl_gpu_time.m) and VPKEngine's own.
-        switch foveation {
+        // Klepton's hook decides per Metal render pass which ones get the map: with MSAA (MoltenVK) every scene pass
+        // has an MSAA target and they all do; at 1x (VPKEngine + VPKTAA) only layered passes with a depth attachment
+        // do, so Source 2's colour-only eye passes (particles, effects) and compute work land in screen layout on a
+        // foveated (physical-layout) picture that the compositor then unwarps: geometry and effects torn apart
+        // (build 19). Off with VPKEngine until VPKEngine applies the rate map itself, to every eye pass.
+        let foveationUsable = engine != .vpkengine
+        switch foveationUsable ? foveation : .off {
         case .off:
             env.append(("KL_VRR", "0"))
         case .m2:
@@ -301,8 +307,11 @@ final class AVPSettings: ObservableObject {
                     ("KL_VRR_OUTER", String(format: "%.3f", min(0.95, sharpZone + transition))),
                     ("KL_VRR_EDGE", String(format: "%.3f", periphery))]
         }
-        if diagCaptures, let logs = AVPFolder.shared.logs {
-            env += [("KL_CAPTURE_DIR", logs.path), ("VP_DUMP_FRAME", "600"), ("VP_DUMP_DIR", logs.path)]
+        // Captures (eye pictures as PNG at guest frames 120/600/1200) and a per-pass dump of one in-game frame: always on
+        // while VPKEngine's picture is being validated. Core frame 6000 is ~35 s after the first picture (frame 540 in
+        // build 19, ~150 core frames per second); 600 fell inside the loading screen.
+        if (diagCaptures || engine == .vpkengine), let logs = AVPFolder.shared.logs {
+            env += [("KL_CAPTURE_DIR", logs.path), ("VP_DUMP_FRAME", "6000"), ("VP_DUMP_DIR", logs.path)]
         }
         if let driver = AVPLaunch.driverPath { env.append(("KL_MVK_DYLIB", driver)) }
         // VPKEngine's persistent pipeline caches (recipes + Metal binary archive) and whether a full prewarm already

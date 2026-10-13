@@ -88,7 +88,7 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   renderArea); parche de arenas de movimiento (agents/perf/03) para cuando vuelvan los vectores.
 - Linux: ctest 152/152, vpvk_tests OK, shim 311/311. Metal/Swift revisados (Sonnet).
 
-## Build 19 (sin validar): caché de shaders fría tras cambiar el traductor
+## Build 19 (validada: juego visible ~25 fps; geometría y efectos destrozados): caché de shaders fría
 - Logs_Alyx_13 (build 18): traductor v3 → todo el MSL nuevo; el prewarm se saltaba la espera al driver con archives
   off, así que el juego compilaba en frío y `gpu.hold` retenía cada frame 1,5 s (`timeouts`), draws sin pipeline
   (`missing_pipelines=49`) → 0,7 fps y negro. GPU del juego 28 ms/frame (`[gputime]` ya mide), foveado aplicado
@@ -96,6 +96,20 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
 - `kl_fossilize.cpp`: el prewarm SIEMPRE espera `vpvk_device_wait_compiles` (llena la caché del SO antes de jugar).
   `AVPPrepare.prewarm`: texto "Compilando shaders en la GPU… N s — no cierres la app" cuando el replay llega al total.
 - VPKEngine `0025`: tras un hold que agota el tiempo, los holds bajan a 15 ms durante 3 s (`Device::submit`).
+
+## Build 20 (sin validar): foveado de Klepton fuera con VPKEngine + capturas
+- Logs_Alyx_14 (build 19, usuario al 100 %: ojo 3072x2496): 0 cuelgues, ~25 fps, GPU juego 39-45 ms, "explosiones de
+  vértices" y efectos rotos. Desde la build 18 el hook KL_VRR (kl_gpu_time.m) actúa sobre VPKEngine: a 1x solo
+  foveaba pases con capas + depth; los pases de ojo solo-color (partículas/efectos, census `viewMask 0x3: c0[...]`
+  sin depth) y el compute caían en layout de pantalla sobre una imagen en layout físico que el compositor desdobla.
+- `AVPSettings`: con VPKEngine el foveado de Klepton va siempre off (KL_VRR=0) hasta foveado nativo en VPKEngine;
+  capturas siempre activas con VPKEngine (KL_CAPTURE, PNG de los ojos en frames 120/600/1200) y volcado por pase
+  `VP_DUMP_FRAME=6000` (~35 s tras la 1.ª imagen) en la carpeta de logs.
+- VPKEngine `0026`: `RenderPassDesc::renderWidth/Height` (renderArea) → `renderTargetWidth/Height` (máximo de los
+  pases fusionados, nunca mayor que el adjunto); volcado por pase limitado a 512 MB.
+- Pendiente: si con esto sigue habiendo picos de vértices → mirar las capturas/volcado (pase culpable) — candidatos:
+  instancing de multiview/base instance, offsets de vertex buffers dinámicos, `0023` (invariant/clip). Rendimiento:
+  foveado nativo en VPKEngine (rate map en todos los pases de ojo + compute), alias de la copia del depth.
 
 ## Siguiente
 - Log build 18: imagen correcta? (`[cp] eye probe` no negro), fps (`[openvr] frames`), `[gputime] game avg` > 0,
