@@ -158,7 +158,7 @@ final class VPKTAACore {
     /// The rate map's decoder data for the kernel (copied once per map).
     private func vrrParams(_ map: MTLRasterizationRateMap) -> MTLBuffer? {
         if let b = vrrBuf, vrrBufMap === map { return b }
-        let sa = map.parameterBufferSizeAndAlign
+        let sa = map.parameterDataSizeAndAlign
         guard let b = device.makeBuffer(length: max(sa.size, 16), options: .storageModeShared) else { return nil }
         map.copyParameterData(buffer: b, offset: 0)
         vrrBuf = b; vrrBufMap = map
