@@ -124,5 +124,12 @@ Logs B7: (1) MoltenVK: `[guest] pacing`, `pace governor`, `[vrr] foveated map`, 
 `klepton-boot-vpkengine.log` + crash; `vk.feature`, `vk.err`, `vk.unimpl`, `[taa]`, `[vrr] foveating 1x`.
 
 ## Pendiente
+- **Pausa → launcher** (pedido): no cerrar la app al terminar la inmersiva (`KleptonApp.swift` Lifecycle: hoy
+  "no window to return to — exiting"); congelar guest (pacer/stop de frames), abrir launcher con "Volver al juego" y
+  reabrir la inmersiva. Ajustes en vivo al volver: aniso (vpvk_config gen), foveado (invalidar `g_vrr_maps`),
+  VPKTAA pct/sharp (hoy `let` en `KleptonTAA`), FPS HUD; resolución/texturas vía convars del juego (SendToConsole);
+  motor y tamaño máx. marcados "al reiniciar".
+- **Botón PS**: log B6 "Button Menu=free" y el PS no aparece en `physicalInputProfile` (no capturable igual que en
+  VQP, mismo código). Garantizar que PS/corona → fondo = pausa (no salida) + log de elementos/eventos al pulsar PS.
 - VPKEngine arrancando Alyx (necesita log B7). MetalFX (VPKEngine `vpvk_config_set_metalfx`) y luego reactivar el ajuste.
 - QR de Steam. Píldoras de batería: verificar mano.
