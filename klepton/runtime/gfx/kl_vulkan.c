@@ -6266,13 +6266,22 @@ static void fs_report(void);
 static void klvk_gpu_watch(VkQueue q) {
     static VkQueue seen[8];
     static _Atomic int nseen;
+    static _Atomic long long next_ns;   // a known queue is re-exported at most every 2 s
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
-    int n = nseen;
-    for (int i = 0; i < n; i++) if (seen[i] == q) return;
+    // Known queues are exported again now and then: VPKEngine replaces its MTLCommandQueue after a GPU
+    // error (gpu.recover), and kl_gpu_time (GPU time, KL_VRR foveation) only sees watched queues.
+    // kl_gpu_time_watch ignores a queue it already has.
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const long long now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    int n = nseen, known = 0;
+    for (int i = 0; i < n; i++) if (seen[i] == q) known = 1;
+    if (known && now < next_ns) return;
     pthread_mutex_lock(&mu);
+    next_ns = now + 2000000000LL;
     int have = 0;
     for (int i = 0; i < nseen; i++) if (seen[i] == q) have = 1;
-    if (!have && nseen < 8) {
+    if (have || nseen < 8) {
         klvk_device *d = dev_of_queue(q);
         PFN_vkExportMetalObjectsEXT export_ext = d && real_gdpa
             ? (PFN_vkExportMetalObjectsEXT)real_gdpa(d->dev, "vkExportMetalObjectsEXT") : NULL;
@@ -6286,9 +6295,11 @@ static void klvk_gpu_watch(VkQueue q) {
         };
         if (export_ext) export_ext(d->dev, &info);
         if (cq.mtlCommandQueue) kl_gpu_time_watch((void *)cq.mtlCommandQueue);
-        else VKI("no MTLCommandQueue behind guest queue %p; its GPU time is not measured\n", (void *)q);
-        seen[nseen] = q;
-        nseen = nseen + 1;
+        else if (!have) VKI("no MTLCommandQueue behind guest queue %p; its GPU time is not measured\n", (void *)q);
+        if (!have) {
+            seen[nseen] = q;
+            nseen = nseen + 1;
+        }
     }
     pthread_mutex_unlock(&mu);
 }

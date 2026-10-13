@@ -90,6 +90,12 @@ void klvr_plat_end_stage(int stage, const klvr_pose *head, const float tan[2][4]
     if (head) klvr_null.last_render_head = *head;
 }
 
+void klvr_plat_close_stage(int stage, const float jit[2][2], const int have[2]) {
+    (void)stage;
+    memcpy(klvr_null.last_jit, jit, sizeof klvr_null.last_jit);
+    memcpy(klvr_null.last_have_jit, have, sizeof klvr_null.last_have_jit);
+}
+
 void *klvr_plat_vk_proc(const char *name) { return klvr_null.vk_proc ? klvr_null.vk_proc(name) : NULL; }
 
 void klvr_plat_log(const char *line) {

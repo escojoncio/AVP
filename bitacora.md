@@ -44,7 +44,7 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
 - B15: archivos binarios Metal desactivados para siempre (`VP_PIPELINE_ARCHIVE=0`), sin prewarm de recetas.
 - B16 (`0020`): vectores de movimiento off tras el 1.er cuelgue (`motion.off`) — refutado en B17.
 
-## Build 17 (sin validar): causa de los cuelgues de GPU + crash
+## Build 17 (validada: 0 cuelgues, primera imagen; 16-19 fps, casi todo negro): causa de los cuelgues + crash
 - Logs_Alyx_11 (build 16): los cuelgues siguen tras `vk.motion disabled` (y el 1.º, f=462, fue con 0 draws de movimiento):
   los vectores de movimiento son inocentes. Todo encoder "stuck" es un pase de ojo 2784x2208x2 con depth
   Depth32Float_Stencil8; el censo da `depth[... resolve 0x1] stencil[... resolve 0x1]` con imágenes 1x (vr_msaa 0, ninguna
@@ -65,10 +65,33 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   `gpu.hunt`/`resolve_refused` de la sesión anterior.
 - Linux: ctest 149/149, vpvk_tests OK (incl. `resolve_1x`). Metal/Swift revisados (Sonnet).
 
+## Build 18 (sin validar): imagen negra, rendimiento, shaders (3 agentes sobre Logs_Alyx_13)
+- Negro: Source 2 parte el pase de ojo en chunks suspend/resume (flags 0x2/0x6/0x4) repitiendo loadOp CLEAR; VPVulkan
+  limpiaba en cada chunk → solo sobrevivía el último. `0022`: chunk RESUMING → Load, SUSPENDING → Store sin resolve,
+  copia del depth 1x solo al final (`vk.rendering suspend_resume`). Test `suspend_resume`.
+- `0023` (traductor v3, recetas se retraducen): OpKill fuera de bucles = demote (derivadas tras clip()), ClipDistance →
+  `[[clip_distance]]`, Invariant → `[[position, invariant]]` + preserveInvariance (`VPVK_INVARIANT_ALL=1` todo),
+  offsets en texel fetch, A2C a 1x como alpha test (`VP_A2C1`; A2C hardware solo con >1 muestra), acceso de storage
+  textures según uso. Test `gpu_spirv.correctness` (.spvasm).
+- `0024`: 12 command buffers en vuelo (`VP_FRAMES_IN_FLIGHT`; antes 3 por submit y Source 2 hace ~11/frame → CPU y GPU
+  en serie, 17 fps); `vkExportMetalObjectsEXT` exporta la MTLCommandQueue (Klepton mide GPU del juego y aplica el
+  foveado KL_VRR a los pases de ojo de VPKEngine; colas retiradas vivas); adjuntos de color con formato de vista
+  distinto (imagen sRGB 43 dibujada con vista UNORM 37) se renderizan por una vista Metal (`Attachment::viewFormat`,
+  `formatView`, también en resolve y clears; `vk.attachment view_format`, `gpu.attachment view`).
+- AVP: re-export de la cola cada 2 s (`kl_vulkan.c` `klvk_gpu_watch`), `kMaxQueues` 96; governor: sin fallback hasta
+  medir GPU del juego y panel = máximo medido de la sesión; VPKTAA: jitter/record emparejados al Submit
+  (`kl_ovrp_frame_close_external`), tag de depth en `klvr_plat_end_stage`; con VPKTAA `VPVK_MOTION=0` y
+  `KL_VPKTAA_DEPTH=0` (vectores de VPKEngine a cero/basura, depth sin linealización Source 2: TAA solo rotación);
+  `KL_VK_MERGE=0` con VPKEngine; logs copiados a la carpeta AVP cada 20 s y al abrir la app.
+- Pendiente de estas investigaciones: modo polígono LINE ignorado; vistas de aspecto stencil devuelven depth;
+  `vkCopyMemoryToImageEXT` espera la GPU por región; copia del depth (aliasar); mapa VRR usa tamaño de textura (no
+  renderArea); parche de arenas de movimiento (agents/perf/03) para cuando vuelvan los vectores.
+- Linux: ctest 152/152, vpvk_tests OK, shim 311/311. Metal/Swift revisados (Sonnet).
+
 ## Siguiente
-- Log build 17: ¿0 `Caused_GPU_Hang`? Buscar `vk.resolve as_copy`, `resolve_refused` (=0), `gpu.hunt` (si hubo
-  cuelgues: veredicto/culpable + `gpu.hunt.msl`), `[cp] queue replaced`. Con imagen: rendimiento (34 fps en B15).
-- Optimización posible: la copia del depth 1x (≈60 MB/frame) podría evitarse aliasando el destino con la fuente.
+- Log build 18: imagen correcta? (`[cp] eye probe` no negro), fps (`[openvr] frames`), `[gputime] game avg` > 0,
+  `[vrr] foveating 1x`, `gpu.cfg frames_in_flight=12`, `vk.rendering suspend_resume`, `gpu.attachment view`, cero
+  `Caused_GPU_Hang` (si hay: `gpu.hunt`). Activar capturas (Ajustes › Diagnóstico) si la imagen sigue mal.
 
 ## Pendiente
 - Ajustes en vivo que faltan: resolución/texturas (convars del juego), anisotrópico (solo afecta a samplers nuevos);

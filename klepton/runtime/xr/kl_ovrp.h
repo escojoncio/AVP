@@ -466,6 +466,13 @@ unsigned kl_loadingvideo_request_name(char *buf, int cap);
 // knob.
 void kl_ovrp_frame_begin_external(void);
 void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8);
+// A guest whose end of frame is filed LATER than it is submitted (the OpenVR shim's frame worker,
+// KLVR_ASYNC_FRAMES: frame N is filed after its copies finish, by which time the guest has begun N+1 and
+// `pending` is N+1's) closes the frame here, on its own thread, at submit: the record as it stands now is
+// kept for `stage` and kl_ovrp_frame_end_external files THAT one (serial, jitter, depth range of frame N,
+// never N+1's). `jit` (nullable): per eye, the offset this frame was really rendered with, decoded from
+// its projection (have[e] != 0), replacing the last served one.
+void kl_ovrp_frame_close_external(int stage, const float jit[2][2], const int have[2]);
 
 // ...and the same for the OTHER layers, which for an OpenXR guest is the whole
 // of `xrEndFrame`'s list that is not a projection layer.

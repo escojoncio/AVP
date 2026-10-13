@@ -1,0 +1,307 @@
+From dce7052b1532d7b5a41cdd4d56a06931a5d08634 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 20:04:01 +0000
+Subject: [PATCH] VPVulkan: 12 command buffers in flight (CPU and GPU overlap
+ again), MTLCommandQueue exported (VK_EXT_metal_objects: GPU time and
+ foveation hook), colour attachments rendered through their view's pixel
+ format (sRGB image drawn via a UNORM view)
+
+---
+ gpu/core/include/vpgpu/core/commands.h        |  7 ++-
+ .../include/vpgpu/metal2/metal_backend.h      |  2 +
+ gpu/metal2/src/metal_backend.mm               | 59 +++++++++++++++++--
+ gpu/vulkan/include/vpvk/platform.h            |  2 +
+ gpu/vulkan/src/commands.cpp                   | 13 ++++
+ gpu/vulkan/src/commands.h                     |  3 +
+ gpu/vulkan/src/entry.cpp                      |  6 ++
+ gpu/vulkan/src/pipelines.cpp                  |  1 +
+ gpu/vulkan/src/platform_metal.mm              | 13 ++++
+ 9 files changed, 101 insertions(+), 5 deletions(-)
+
+diff --git a/gpu/core/include/vpgpu/core/commands.h b/gpu/core/include/vpgpu/core/commands.h
+index 636aac5..0b9ae25 100644
+--- a/gpu/core/include/vpgpu/core/commands.h
++++ b/gpu/core/include/vpgpu/core/commands.h
+@@ -99,8 +99,13 @@ struct Attachment {
+   uint16_t resolveMip = 0, resolveLayer = 0;
+   // Depth attachments: how samples combine when resolved (stencil always takes sample 0).
+   enum class DepthResolve : uint8_t { Sample0, Min, Max } depthResolve = DepthResolve::Sample0;
++  // (Last: the tests build Attachments positionally.)
++  // The pass renders through a view of another pixel format (Vulkan MUTABLE_FORMAT: Source 2 draws its
++  // sRGB eye image through a UNORM view and encodes in the shader). Undefined = the texture's own. The
++  // backend binds a view of `texture` in this format; hazards still key on `texture`.
++  Format viewFormat = Format::Undefined;
+   bool sameTarget(const Attachment& o) const {
+-    return texture == o.texture && mip == o.mip && layer == o.layer;
++    return texture == o.texture && mip == o.mip && layer == o.layer && viewFormat == o.viewFormat;
+   }
+ };
+ 
+diff --git a/gpu/metal2/include/vpgpu/metal2/metal_backend.h b/gpu/metal2/include/vpgpu/metal2/metal_backend.h
+index aab695a..6ff14a8 100644
+--- a/gpu/metal2/include/vpgpu/metal2/metal_backend.h
++++ b/gpu/metal2/include/vpgpu/metal2/metal_backend.h
+@@ -153,6 +153,8 @@ class MetalBackend final : public Backend {
+   TextureId createView(TextureId base, const ViewDesc&);
+   void destroyView(TextureId);
+   void* nativeDevice() const;
++  // The id<MTLCommandQueue> frames are committed to now (a new one after gpu.recover), unretained.
++  void* nativeQueue() const;
+   void* nativeTexture(TextureId);
+   // Writes the pipeline binary archive under cacheRoot; false (and a gpu.err line) on failure.
+   bool saveArchive();
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 3447ce0..b8bc582 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -386,6 +386,7 @@ struct MetalBackend::Impl {
+ 
+   id<MTLDevice> device;
+   id<MTLCommandQueue> queue;
++  std::vector<id<MTLCommandQueue>> retiredQueues;  // kept alive: nativeQueue() hands out unretained pointers
+   id<MTLResidencySet> residency;  // M4: attached to the MTL4CommandQueue the same way
+   bool residencyDirty = false;
+   dispatch_semaphore_t inFlight;
+@@ -623,6 +624,14 @@ struct MetalBackend::Impl {
+   void retire(id object);
+   id<MTLTexture> texture(TextureId);
+   id<MTLTexture> memorylessTexture(const TextureDesc&, std::unordered_map<uint64_t, size_t>& taken);
++  // Attachments rendered through another pixel format (Attachment::viewFormat): one cached view per
++  // (texture, format), rebuilt if the texture object behind the id changed. Submit thread only.
++  struct FormatView {
++    __unsafe_unretained id<MTLTexture> of = nil;
++    id<MTLTexture> view;
++  };
++  std::unordered_map<uint64_t, FormatView> formatViews;
++  id<MTLTexture> formatView(id<MTLTexture> base, TextureId id, MTLPixelFormat pf);
+   id<MTLFunction> function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader, std::string& error,
+                            bool noPointSize = false, bool noFragDepth = false, bool coverageTest = false);
+   bool buildRender(const PipelineState&, Pipeline&, std::string& error);
+@@ -795,6 +804,26 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
+   return tex.texture;
+ }
+ 
++id<MTLTexture> MetalBackend::Impl::formatView(id<MTLTexture> base, TextureId id, MTLPixelFormat pf) {
++  const uint64_t key = (uint64_t(id.index) << 32) ^ (uint64_t(id.generation) << 12) ^ uint64_t(pf);
++  FormatView& fv = formatViews[key];
++  if (fv.view && fv.of == base) return fv.view;
++  fv.of = base;
++  fv.view = [base newTextureViewWithPixelFormat:pf];
++  if (!fv.view) {
++    static std::atomic<unsigned> failed{0};
++    if (failed.fetch_add(1) < 4)
++      err("what=attachment_view from=%lu to=%lu (the attachment keeps its own format)", (unsigned long)base.pixelFormat,
++          (unsigned long)pf);
++    return base;
++  }
++  static std::atomic<unsigned> made{0};
++  if (made.fetch_add(1) < 4)
++    info("gpu.attachment view from=" + std::to_string(base.pixelFormat) + " to=" + std::to_string(pf) + " " +
++         std::to_string(base.width) + "x" + std::to_string(base.height) + "x" + std::to_string(base.arrayLength));
++  return fv.view;
++}
++
+ id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::unordered_map<uint64_t, size_t>& taken) {
+   const uint64_t key = uint64_t(d.format) | uint64_t(d.samples) << 8 | uint64_t(d.layers) << 16 |
+                        uint64_t(d.width) << 32 | uint64_t(d.height) << 48;
+@@ -1161,7 +1190,8 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
+     return false;
+   }
+   d.rasterSampleCount = s.samples;
+-  d.alphaToCoverageEnabled = s.alphaToCoverage;
++  // At 1x the shader does it (VP_A2C1: alpha < 0.5 discards); hardware A2C with one sample would dither on top.
++  d.alphaToCoverageEnabled = s.alphaToCoverage && s.samples > 1;
+   d.inputPrimitiveTopology = topologyClass(s.primitive);
+ 
+   NSError* e = nil;
+@@ -1789,6 +1819,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       ++queueRebuilds;
+       q.label = [NSString stringWithFormat:@"vpgpu.r%u", queueRebuilds];
+       if (residency) [q addResidencySet:residency];
++      if (queue) retiredQueues.push_back(queue);
+       queue = q;
+       frontier.clear();
+       info("gpu.recover what=new_queue n=" + std::to_string(queueRebuilds) + " f=" + std::to_string(frameIndex));
+@@ -2343,10 +2374,18 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       auto target = [&](const Attachment& src, int slot) -> id<MTLTexture> {
+         if (tileMemory && enc.tileLocal(slot)) {
+           auto it = textures.find(src.texture.index);
+-          if (it != textures.end() && it->second.generation == src.texture.generation && !it->second.texture)
+-            return memorylessTexture(it->second.desc, taken);
++          if (it != textures.end() && it->second.generation == src.texture.generation && !it->second.texture) {
++            TextureDesc md = it->second.desc;
++            if (src.viewFormat != Format::Undefined) md.format = src.viewFormat;  // a stand-in in the view's format
++            return memorylessTexture(md, taken);
++          }
++        }
++        id<MTLTexture> t = texture(src.texture);
++        if (t && src.viewFormat != Format::Undefined) {
++          const MTLPixelFormat vf = pixelFormat(src.viewFormat);
++          if (vf != MTLPixelFormatInvalid && vf != t.pixelFormat) t = formatView(t, src.texture, vf);
+         }
+-        return texture(src.texture);
++        return t;
+       };
+       auto attach = [&](MTLRenderPassAttachmentDescriptor* a, const Attachment& src, id<MTLTexture> t) {
+         a.texture = t;
+@@ -2357,6 +2396,9 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         a.storeAction = storeAction(src.store);
+         if (src.store == StoreAction::Resolve || src.store == StoreAction::StoreAndResolve) {
+           a.resolveTexture = src.resolve ? texture(src.resolve) : nil;
++          // Same pixel format as the attachment (a view when it renders through Attachment::viewFormat).
++          if (a.resolveTexture && a.resolveTexture.pixelFormat != t.pixelFormat && src.viewFormat != Format::Undefined)
++            a.resolveTexture = formatView(a.resolveTexture, src.resolve, t.pixelFormat);
+           a.resolveLevel = src.resolveMip;
+           a.resolveSlice = src.resolveLayer;
+           // No resolve target: a resolve store would fail validation. Keep the samples instead
+@@ -3134,6 +3176,14 @@ void MetalBackend::destroyTexture(TextureId handle) {
+   auto it = impl_->textures.find(handle.index);
+   if (it == impl_->textures.end() || it->second.generation != handle.generation) return;
+   impl_->retire(it->second.texture);
++  // Format views of it (Attachment::viewFormat) retain it: they go with it.
++  for (auto f = impl_->formatViews.begin(); f != impl_->formatViews.end();)
++    if (uint32_t(f->first >> 32) == handle.index) {
++      impl_->retire(f->second.view);
++      f = impl_->formatViews.erase(f);
++    } else {
++      ++f;
++    }
+   impl_->textures.erase(it);
+ }
+ 
+@@ -3233,6 +3283,7 @@ TextureId MetalBackend::createView(TextureId base, const ViewDesc& d) {
+ void MetalBackend::destroyView(TextureId t) { impl_->views.erase(t.index); }
+ 
+ void* MetalBackend::nativeDevice() const { return (__bridge void*)impl_->device; }
++void* MetalBackend::nativeQueue() const { return (__bridge void*)impl_->queue; }
+ 
+ void* MetalBackend::nativeTexture(TextureId handle) { return (__bridge void*)impl_->texture(handle); }
+ 
+diff --git a/gpu/vulkan/include/vpvk/platform.h b/gpu/vulkan/include/vpvk/platform.h
+index ae2fbe5..999e12a 100644
+--- a/gpu/vulkan/include/vpvk/platform.h
++++ b/gpu/vulkan/include/vpvk/platform.h
+@@ -41,6 +41,8 @@ class Platform {
+   virtual void* nativeDevice() { return nullptr; }
+   virtual void* nativeTexture(vpgpu::TextureId) { return nullptr; }
+   virtual void* nativeBuffer(vpgpu::BufferId) { return nullptr; }
++  // id<MTLCommandQueue> the frames go to now (replaced after a GPU error: ask again), unretained.
++  virtual void* nativeQueue() { return nullptr; }
+   // Texture views (VkImageView with another type, format or subresource range). Null: unsupported,
+   // the image itself is bound.
+   struct ViewInfo {
+diff --git a/gpu/vulkan/src/commands.cpp b/gpu/vulkan/src/commands.cpp
+index 559e154..5d32758 100644
+--- a/gpu/vulkan/src/commands.cpp
++++ b/gpu/vulkan/src/commands.cpp
+@@ -44,6 +44,17 @@ vpgpu::Copy forcedResolveCopy(const ImageView* src, const ImageView* dst, uint16
+   return c;
+ }
+ 
++vpgpu::Format attachmentViewFormat(const ImageView* v) {
++  if (!v || !v->image || v->format == VK_FORMAT_UNDEFINED || v->format == v->image->info.format) return vpgpu::Format::Undefined;
++  const vpgpu::Format f = toCoreFormat(v->format);
++  if (f == vpgpu::Format::Undefined || f == v->image->desc.format) return vpgpu::Format::Undefined;
++  static std::atomic<unsigned> said{0};
++  if (said.fetch_add(1) < 4)
++    logf("vk.attachment view_format image_format=%d view_format=%d %ux%u: rendered through a view of the view's format",
++         int(v->image->info.format), int(v->format), v->image->desc.width, v->image->desc.height);
++  return f;
++}
++
+ bool resolveAsCopy(const ImageView* src) {
+   return src && src->image && (src->image->forcedFrom > 1 || src->image->desc.samples <= 1);
+ }
+@@ -115,6 +126,7 @@ bool attach(const OpBeginPass& b, uint32_t sub, uint32_t index, uint32_t resolve
+                         vpgpu::formatInfo(v->image->desc.format).stencil();
+   const UseRange u = uses(*b.pass, index);
+   out.texture = v->image->id;
++  if (!depthFmt) out.viewFormat = attachmentViewFormat(v);
+   out.mip = static_cast<uint16_t>(v->range.baseMipLevel);
+   out.layer = static_cast<uint16_t>(v->range.baseArrayLayer);
+   out.load = int(sub) == u.first ? toLoad(depthFmt && !vpgpu::formatInfo(v->image->desc.format).depth() ? d.stencilLoadOp : d.loadOp)
+@@ -319,6 +331,7 @@ struct Translator {
+     t.texture = a.texture;
+     t.mip = a.mip;
+     t.layer = a.layer;
++    t.viewFormat = a.viewFormat;  // cleared through the same view the pass renders through
+     t.load = vpgpu::LoadAction::Clear;
+     t.store = vpgpu::StoreAction::Store;
+     t.clear = v;
+diff --git a/gpu/vulkan/src/commands.h b/gpu/vulkan/src/commands.h
+index 9eecd40..6227db6 100644
+--- a/gpu/vulkan/src/commands.h
++++ b/gpu/vulkan/src/commands.h
+@@ -32,6 +32,9 @@ vpgpu::Copy forcedResolveCopy(const ImageView* src, const ImageView* dst, uint16
+ // into a second image). Metal has no 1x resolve: StoreAndMultisampleResolve on a 1x texture is
+ // undefined behaviour (build 16: every eye pass with that depth hung the GPU).
+ bool resolveAsCopy(const ImageView* src);
++// Colour attachment drawn through a view whose format differs from the image's (sRGB image, UNORM view):
++// the format the backend must render in (Undefined = the image's own).
++vpgpu::Format attachmentViewFormat(const ImageView* v);
+ // Whether the stand-in copy can be made: different image, same format and sample count. Logged
+ // (once per reason) when not; the resolve is then dropped (the source is still stored).
+ bool resolveCopyUsable(const ImageView* src, const ImageView* dst);
+diff --git a/gpu/vulkan/src/entry.cpp b/gpu/vulkan/src/entry.cpp
+index 06f0ab0..3778b90 100644
+--- a/gpu/vulkan/src/entry.cpp
++++ b/gpu/vulkan/src/entry.cpp
+@@ -995,6 +995,12 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkExportMetalObjectsEXT(VkDevice dv, VkEx
+         reinterpret_cast<VkExportMetalDeviceInfoEXT*>(s)->mtlDevice =
+             static_cast<MTLDevice_id>(d->platform->nativeDevice());
+         break;
++      case VK_STRUCTURE_TYPE_EXPORT_METAL_COMMAND_QUEUE_INFO_EXT:
++        // Klepton (kl_gpu_time.m) watches this queue: the game's GPU time for the OpenVR frame timing
++        // and the pace governor, and its foveated-pass hook (KL_VRR) applies only to watched queues.
++        reinterpret_cast<VkExportMetalCommandQueueInfoEXT*>(s)->mtlCommandQueue =
++            static_cast<MTLCommandQueue_id>(d->platform->nativeQueue());
++        break;
+       case VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT: {
+         auto* t = reinterpret_cast<VkExportMetalTextureInfoEXT*>(s);
+         const Image* img = t->image ? from<Image>(t->image)
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index 453b61f..53785ee 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -1652,6 +1652,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer cb, c
+     if (!v || !v->image || !v->image->id) return;
+     t.texture = v->image->id;
+     t.mip = uint16_t(v->range.baseMipLevel), t.layer = uint16_t(v->range.baseArrayLayer);
++    if (!depth) t.viewFormat = attachmentViewFormat(v);
+     t.load = resuming ? vpgpu::LoadAction::Load : toLoad(a.loadOp);
+     bool resolve = false;
+     if (a.resolveMode != VK_RESOLVE_MODE_NONE && a.resolveImageView) {
+diff --git a/gpu/vulkan/src/platform_metal.mm b/gpu/vulkan/src/platform_metal.mm
+index 154ee78..d5f6041 100644
+--- a/gpu/vulkan/src/platform_metal.mm
++++ b/gpu/vulkan/src/platform_metal.mm
+@@ -63,6 +63,7 @@ class MetalPlatform final : public Platform {
+   }
+   // Unretained pointers (VK_EXT_metal_objects): the image's texture is allocated here if it was lazy.
+   void* nativeDevice() override { return backend_.nativeDevice(); }
++  void* nativeQueue() override { return backend_.nativeQueue(); }
+   vpgpu::TextureId createTextureView(vpgpu::TextureId base, const ViewInfo& i) override {
+     vpgpu::metal2::MetalBackend::ViewDesc d;
+     d.type = i.type, d.array = i.array, d.format = i.format;
+@@ -97,6 +98,18 @@ class MetalPlatform final : public Platform {
+     };
+     mb("VP_PIPELINE_ARCHIVE_BUDGET_MB", o.archiveBudgetBytes);
+     mb("VP_PIPELINE_ARCHIVE_FLOOR_MB", o.archiveFloorBytes);
++    // Command buffers in flight. metal2 takes one slot per vkQueueSubmit that has GPU work, not per
++    // game frame: Source 2 makes ~11 submits per frame (~9 with encoders), so the old 3 slots let the
++    // CPU run only 2 command buffers past the frame's main one (~40 ms on the GPU) and the game
++    // thread blocked in vkQueueSubmit until it finished: CPU + GPU per frame instead of the larger of
++    // the two (Logs_Alyx_13: 17 fps, "after" 45 ms, GPU finishing 7.5 ms after handover). Each slot
++    // costs 9 MB of shared memory (1 MB argument ring + 8 MB indirect scratch): 12 slots, ~108 MB.
++    o.framesInFlight = 12;
++    if (const char* v = std::getenv("VP_FRAMES_IN_FLIGHT"); v && *v) {
++      const unsigned long n = std::strtoul(v, nullptr, 10);
++      if (n >= 2 && n <= 64) o.framesInFlight = unsigned(n);
++    }
++    log("gpu.cfg frames_in_flight=" + std::to_string(o.framesInFlight));
+     return o;
+   }
+   vpgpu::metal2::ShaderTable shaders_;
+-- 
+2.43.0
+

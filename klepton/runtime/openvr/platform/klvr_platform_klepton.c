@@ -170,8 +170,15 @@ static void pace_plan(float *base, float *fallback) {
         const char *hp = getenv("KLVR_HOST_PANEL_HZ");
         panel = hp && atof(hp) > 0 ? (float)atof(hp) : 2.0f * (float)atof(hf);
     } else {
+        // The publish rate only ever reads LOW (a refresh the compositor misses is a pose not published):
+        // plan from the highest rate seen this session (the panel never runs faster than it is). Planning
+        // from each 1 s window made a 100 Hz panel read 93-95 Hz whenever the GPU was overloaded, which
+        // drops the fallback (panel / 3 < 32) and flips the pacer 1/3 <-> 1/2 every few seconds
+        // (Logs_Alyx_13: 10 flips in 80 s).
         float measured = kl_guest_display_rate();
-        panel = measured > 20 ? roundf(measured) : kl_ovrp_display_frequency();
+        static float peak;
+        if (measured > 20 && measured > peak) peak = measured;
+        panel = peak > 20 ? roundf(peak) : kl_ovrp_display_frequency();
     }
     if (!(panel > 20)) panel = 90;
     unsigned div = (unsigned)ceil(panel / 60.0 - 0.05);
@@ -218,13 +225,19 @@ static void pace_governor(void) {
         started = 0;
         return;
     }
+    float comp = 0, game = klvr_plat_gpu_ms(0, &comp);
+    // Without the game's GPU time (a driver whose queue kl_gpu_time cannot watch: VPKEngine until it
+    // exports its MTLCommandQueue) the governor can never see headroom, so starting at the fallback
+    // pinned the game to 1/3 of the panel for good while logging "the GPU cannot hold the target".
+    static int measured;
+    if (game > 0) measured = 1;
+    if (!measured) return;
     if (!started) {
         started = 1; g_pace_extra = 1; kl_guest_pace_extra(1);
         fprintf(stderr, "  [openvr] pace governor: starting at the fallback, %.1f fps\n", fb);
     }
     static double t0, sum;
     static int n, late, over, good;
-    float comp = 0, game = klvr_plat_gpu_ms(0, &comp);
     if (game > 0) {
         // The compositor draws once per panel refresh; at the fallback pace a frame
         // holds more refreshes than at the base, so scale its share to the base frame.
@@ -725,6 +738,11 @@ int klvr_plat_jitter(int eye, float *dx, float *dy) {
 void klvr_plat_render_size(uint32_t w, uint32_t h) { kl_vpktaa_set_render_size((int)w, (int)h); }
 void klvr_plat_depth_range(float znear, float zfar) { kl_ovrp_set_depth_range(znear, zfar); }
 
+void klvr_plat_close_stage(int stage, const float jit[2][2], const int have[2]) {
+    if (host()) return;
+    kl_ovrp_frame_close_external(stage, jit, have);
+}
+
 void klvr_plat_end_stage(int stage, const klvr_pose *head, const float tan[2][4]) {
     // Order is load-bearing (see kl_openxr.c's xrEndFrame): completion first,
     // then the record that describes it.
@@ -761,6 +779,12 @@ void klvr_plat_end_stage(int stage, const klvr_pose *head, const float tan[2][4]
         if (after < before) memcpy(t, u, sizeof u);
     }
     kl_ovrp_frame_end_external(stage, head ? pose7 : NULL, tan8);
+    // VPKTAA: the eye depth kl_vulkan_frame_done just filed belongs to the record filed above. The OVRPlugin
+    // path tags it in ovrp_EndFrame4; without this the OpenVR path never did, and VPKTAA (which asks for the
+    // depth of exactly the record it resolves) got "depth=none" on every frame.
+    kl_ovrp_render_pose rec;
+    if (kl_ovrp_stage_render_pose(stage, &rec) && rec.complete && rec.stage == stage)
+        kl_vulkan_eye_depth_tag(stage, rec.serial);
 }
 
 void *klvr_plat_vk_proc(const char *name) { return kl_vulkan_lookup(name); }

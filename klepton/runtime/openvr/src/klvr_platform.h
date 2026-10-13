@@ -143,6 +143,11 @@ void     klvr_plat_eye_depth_map(int stage, int eye, float m22, float m23, uint3
 // is the head pose the frame was rendered from, and `tan` the eye tangents it
 // used, so the compositor reprojects against the truth.
 void     klvr_plat_end_stage(int stage, const klvr_pose *render_head, const float tan[2][4]);
+// Called on the game's thread when `stage` is closed (both eyes submitted), before klvr_plat_end_stage
+// (which the frame worker may call much later, after the game has begun its next frame): the frame's
+// own record is fixed here. `jit[e]` (when have[e]): the sub-pixel offset eye e was really rendered
+// with, read off its submitted projection (tangent units, dx right, dy up).
+void     klvr_plat_close_stage(int stage, const float jit[2][2], const int have[2]);
 // Called once, before the first klvr_plat_end_stage made from the shim's
 // frame worker (KLVR_ASYNC_FRAMES): from then on end_stage is called only
 // after the shim has waited for that stage's copies itself, from a thread

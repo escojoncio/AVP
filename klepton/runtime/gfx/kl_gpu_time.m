@@ -38,7 +38,7 @@
 #include "kl_glfb.h"
 #include <math.h>
 
-enum { kRing = 16, kMaxQueues = 8 };
+enum { kRing = 16, kMaxQueues = 96 };   // VPKEngine replaces its queue after a GPU error (up to 64): each is watched
 // Role 0 is the guest's queue(s), role 1 our compositor's (on the device it
 // draws every panel refresh, so twice per game frame at 120 Hz; SteamVR's
 // "total render" time includes the compositor's GPU work too).

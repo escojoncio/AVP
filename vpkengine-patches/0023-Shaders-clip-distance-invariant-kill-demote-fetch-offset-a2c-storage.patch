@@ -1,0 +1,986 @@
+From 2f25b45f1533366bf0b5988c0b1783a50bb20f8c Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 19:57:34 +0000
+Subject: [PATCH 2/3] Shaders: ClipDistance -> [[clip_distance]], Invariant ->
+ [[position, invariant]] + preserveInvariance, OpKill demotes outside loops
+ (quad derivatives after clip()), texel-fetch offsets applied,
+ alpha-to-coverage at 1x as an alpha test (VP_A2C1), storage-texture access
+ from use; translator v3
+
+---
+ gpu/metal2/src/metal_backend.mm               |  14 +++-
+ gpu/shader/ir/include/vpir/ir.h               |   4 ++
+ gpu/shader/ir/src/ir.cpp                      |   4 +-
+ gpu/shader/ir/src/parse.cpp                   |   2 +-
+ gpu/shader/ir/src/verify.cpp                  |   3 +-
+ gpu/shader/msl/src/msl.cpp                    |  51 +++++++++++++-
+ gpu/shader/msl/tests/heavy_lighting_fs.metal  |   3 +
+ gpu/shader/msl/tests/ms_textures.metal        |   3 +
+ gpu/shader/msl/tests/precise_fma.metal        |   3 +
+ gpu/shader/msl/tests/private_memory.metal     |   3 +
+ gpu/shader/msl/tests/private_slots.metal      |   3 +
+ gpu/shader/msl/tests/quad_ops.metal           |   3 +
+ gpu/shader/msl/tests/query_lod.metal          |   3 +
+ gpu/shader/msl/tests/syntax_tour.metal        |   6 ++
+ gpu/shader/msl/tests/textured_fs.metal        |   3 +
+ gpu/shader/spirv/CMakeLists.txt               |   1 +
+ gpu/shader/spirv/src/lower.cpp                |  65 +++++++++++++++++-
+ .../tests/asm/clip_invariant.vert.spvasm      |  33 +++++++++
+ .../tests/asm/fetch_offset_kill.frag.spvasm   |  61 ++++++++++++++++
+ .../spirv/tests/asm/loop_kill.frag.spvasm     |  48 +++++++++++++
+ gpu/shader/spirv/tests/asm/spvasm.py          |  56 +++++++++++++++
+ .../spirv/tests/asm/storage_write.comp.spvasm |  31 +++++++++
+ .../spirv/tests/clip_invariant.vert.spv       | Bin 0 -> 496 bytes
+ .../spirv/tests/fetch_offset_kill.frag.spv    | Bin 0 -> 964 bytes
+ gpu/shader/spirv/tests/loop_kill.frag.spv     | Bin 0 -> 680 bytes
+ gpu/shader/spirv/tests/spirv_tests.cpp        |  44 ++++++++++++
+ gpu/shader/spirv/tests/storage_write.comp.spv | Bin 0 -> 520 bytes
+ gpu/vulkan/src/pipelines.cpp                  |   3 +
+ gpu/vulkan/src/recipes.h                      |   2 +-
+ 29 files changed, 439 insertions(+), 13 deletions(-)
+ create mode 100644 gpu/shader/spirv/tests/asm/clip_invariant.vert.spvasm
+ create mode 100644 gpu/shader/spirv/tests/asm/fetch_offset_kill.frag.spvasm
+ create mode 100644 gpu/shader/spirv/tests/asm/loop_kill.frag.spvasm
+ create mode 100644 gpu/shader/spirv/tests/asm/spvasm.py
+ create mode 100644 gpu/shader/spirv/tests/asm/storage_write.comp.spvasm
+ create mode 100644 gpu/shader/spirv/tests/clip_invariant.vert.spv
+ create mode 100644 gpu/shader/spirv/tests/fetch_offset_kill.frag.spv
+ create mode 100644 gpu/shader/spirv/tests/loop_kill.frag.spv
+ create mode 100644 gpu/shader/spirv/tests/storage_write.comp.spv
+
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 08fb18a..3447ce0 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -624,7 +624,7 @@ struct MetalBackend::Impl {
+   id<MTLTexture> texture(TextureId);
+   id<MTLTexture> memorylessTexture(const TextureDesc&, std::unordered_map<uint64_t, size_t>& taken);
+   id<MTLFunction> function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader, std::string& error,
+-                           bool noPointSize = false, bool noFragDepth = false);
++                           bool noPointSize = false, bool noFragDepth = false, bool coverageTest = false);
+   bool buildRender(const PipelineState&, Pipeline&, std::string& error);
+   bool buildCompute(const PipelineState&, Pipeline&, std::string& error);
+   void submit(uint64_t frameIndex, const Frame&, const CompiledFrame&);
+@@ -822,7 +822,8 @@ id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::
+ }
+ 
+ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInputs& fetch, MslShader& shader,
+-                                             std::string& error, bool noPointSize, bool noFragDepth) {
++                                             std::string& error, bool noPointSize, bool noFragDepth,
++                                             bool coverageTest) {
+   if (!(fetch.mask ? shaders.findFetch(shaderId, fetch, shader) : shaders.find(shaderId, shader))) {
+     error = "shader " + std::to_string(shaderId) + " not found";
+     return nil;
+@@ -835,6 +836,9 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
+   // Same for a fragment FragDepth write in a pass without a depth attachment.
+   noFragDepth = noFragDepth && shader.source.find("VP_NO_FDEPTH") != std::string::npos;
+   if (noFragDepth) key = (key ^ 0x4644E9ull) * 1099511628211ull;
++  // Alpha-to-coverage at one sample: the fragment shader's own alpha test (VP_A2C1, see msl.cpp).
++  coverageTest = coverageTest && shader.source.find("VP_A2C1") != std::string::npos;
++  if (coverageTest) key = (key ^ 0xA2C1ull) * 1099511628211ull;
+   {
+     std::unique_lock lock(pipelineMutex);
+     for (;;) {
+@@ -862,9 +866,12 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
+   MTLCompileOptions* o = [MTLCompileOptions new];
+   o.mathMode = MTLMathModeFast;  // the emitter marks precise math with precise:: explicitly
+   o.languageVersion = MTLLanguageVersion3_2;
++  // [[invariant]] positions (SPIR-V Invariant) only stay invariant with this set; no effect on the rest.
++  o.preserveInvariance = YES;
+   NSMutableDictionary<NSString*, NSObject*>* macros = [NSMutableDictionary dictionary];
+   if (noPointSize) macros[@"VP_PSZ"] = @"user(vp_psz)";
+   if (noFragDepth) macros[@"VP_NO_FDEPTH"] = @"1";
++  if (coverageTest) macros[@"VP_A2C1"] = @"1";
+   if (macros.count) o.preprocessorMacros = macros;
+   NSError* e = nil;
+   id<MTLLibrary> lib = [device newLibraryWithSource:@(shader.source.c_str()) options:o error:&e];
+@@ -1107,7 +1114,8 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
+   if (!d.vertexFunction) return false;
+   if (s.fragmentShader) {  // none = depth-only
+     // Vulkan ignores FragDepth writes without a depth attachment; Metal rejects the pipeline.
+-    d.fragmentFunction = function(s.fragmentShader, s.fetch, fs, error, false, !formatInfo(s.depthFormat).depth());
++    d.fragmentFunction = function(s.fragmentShader, s.fetch, fs, error, false, !formatInfo(s.depthFormat).depth(),
++                                  s.alphaToCoverage && s.samples <= 1);
+     if (!d.fragmentFunction) return false;
+   }
+   // Attachments the fragment shader does not write (fetch-only G-buffer, depth-only pipelines)
+diff --git a/gpu/shader/ir/include/vpir/ir.h b/gpu/shader/ir/include/vpir/ir.h
+index bb6a635..016747e 100644
+--- a/gpu/shader/ir/include/vpir/ir.h
++++ b/gpu/shader/ir/include/vpir/ir.h
+@@ -71,6 +71,7 @@ enum class Builtin : uint8_t {
+     LocalInvocationIndex, // compute/object/mesh in: u32
+     SubgroupInvocation,   // fragment/compute/object/mesh in: u32
+     SubgroupSize,         // fragment/compute/object/mesh in: u32
++    ClipDistance,         // vertex/mesh out: f32 x N (N = 1..4; one [[clip_distance]] array of N)
+ };
+ 
+ enum class Interp : uint8_t { Perspective, Linear, Flat };
+@@ -367,6 +368,9 @@ struct Module {
+     // 64; Apple SIMD groups are 32, so emitters may require the frontend to lower wave-64 subgroup
+     // code (the MSL emitter does).
+     uint32_t waveSize = 32;
++    // Vertex/mesh: the Position output is [[invariant]] (SPIR-V Invariant decoration): identical
++    // position math in two pipelines must give bit-identical depth (depth prepass + LEQUAL pass).
++    bool invariantPosition = false;
+     // Helpers first; a function may only call functions declared before it. The entry point is
+     // the function named "main" (no parameters, void).
+     std::vector<Function> functions;
+diff --git a/gpu/shader/ir/src/ir.cpp b/gpu/shader/ir/src/ir.cpp
+index aa5c5c2..9549790 100644
+--- a/gpu/shader/ir/src/ir.cpp
++++ b/gpu/shader/ir/src/ir.cpp
+@@ -45,7 +45,8 @@ const char* toString(Builtin b) {
+                               "sample_id",     "sample_mask",       "frag_depth",
+                               "primitive_id",  "layer",             "global_invocation_id",
+                               "local_invocation_id", "workgroup_id", "num_workgroups",
+-                              "local_invocation_index", "subgroup_invocation", "subgroup_size"};
++                              "local_invocation_index", "subgroup_invocation", "subgroup_size",
++                              "clip_distance"};
+     return n[unsigned(b)];
+ }
+ const char* toString(Interp i) {
+@@ -109,6 +110,7 @@ BuiltinInfo builtinInfo(Builtin b, bool asInput) {
+         case Builtin::LocalInvocationIndex: return {kU32, true, kGrid};
+         case Builtin::SubgroupInvocation:
+         case Builtin::SubgroupSize: return {kU32, true, kGrid | kFrag};
++        case Builtin::ClipDistance: return {Type{Scalar::F32, 4}, false, kVtx | bit(Stage::Mesh)};  // width 1..4
+     }
+     return {kVoid, asInput, 0};
+ }
+diff --git a/gpu/shader/ir/src/parse.cpp b/gpu/shader/ir/src/parse.cpp
+index 34baa2f..7fe24e5 100644
+--- a/gpu/shader/ir/src/parse.cpp
++++ b/gpu/shader/ir/src/parse.cpp
+@@ -239,7 +239,7 @@ private:
+         v.type = parseType();
+         if (acceptWord("builtin")) {
+             expectPunct('(');
+-            v.builtin = parseEnum<Builtin>(toString, Builtin::SubgroupSize, "builtin");
++            v.builtin = parseEnum<Builtin>(toString, Builtin::ClipDistance, "builtin");
+             if (v.builtin == Builtin::None) fail("expected builtin");
+             expectPunct(')');
+         } else {
+diff --git a/gpu/shader/ir/src/verify.cpp b/gpu/shader/ir/src/verify.cpp
+index 85cd36b..4e694e1 100644
+--- a/gpu/shader/ir/src/verify.cpp
++++ b/gpu/shader/ir/src/verify.cpp
+@@ -65,7 +65,8 @@ private:
+             BuiltinInfo b = builtinInfo(v.builtin, input);
+             if (b.input != input || !stageIs(b.stages))
+                 error(dir, v.name, ": builtin ", toString(v.builtin), " not valid here");
+-            else if (b.type != v.type)
++            else if (v.builtin == Builtin::ClipDistance ? !(v.type.scalar == Scalar::F32 && v.type.width >= 1 && v.type.width <= 4)
++                                                        : b.type != v.type)
+                 error(dir, v.name, ": builtin ", toString(v.builtin), " must be ", toString(b.type));
+             return;
+         }
+diff --git a/gpu/shader/msl/src/msl.cpp b/gpu/shader/msl/src/msl.cpp
+index 79e154f..46f4c03 100644
+--- a/gpu/shader/msl/src/msl.cpp
++++ b/gpu/shader/msl/src/msl.cpp
+@@ -109,6 +109,7 @@ const char* builtinAttr(Builtin b) {
+         case Builtin::LocalInvocationIndex: return "thread_index_in_threadgroup";
+         case Builtin::SubgroupInvocation: return "thread_index_in_simdgroup";
+         case Builtin::SubgroupSize: return "threads_per_simdgroup";
++        case Builtin::ClipDistance: return "clip_distance";
+         case Builtin::None: break;
+     }
+     return "";
+@@ -269,7 +270,14 @@ private:
+         for (const IoVar& v : m_.outputs) {
+             if (v.perPrimitive != perPrimitive) continue;
+             std::string attr;
++            if (v.builtin == Builtin::ClipDistance) {
++                // One array of N distances; the VPIR output is its f32xN value (see StoreOutput).
++                out_ += "    float " + ident(v.name) + " [[clip_distance]] [" + std::to_string(v.type.width) + "];\n";
++                continue;
++            }
+             if (v.builtin == Builtin::PointSize && m_.stage == Stage::Vertex) attr = "VP_PSZ";
++            else if (v.builtin == Builtin::Position && m_.invariantPosition && m_.stage != Stage::Fragment)
++                attr = "position, invariant";  // needs MTLCompileOptions.preserveInvariance (metal2)
+             else if (v.builtin != Builtin::None) attr = builtinAttr(v.builtin);
+             else if (m_.stage == Stage::Fragment)
+                 attr = "color(" + std::to_string(v.location) + ")" + (v.blendIndex ? ", index(1)" : "");
+@@ -283,6 +291,24 @@ private:
+ 
+     const char* returnOut() const { return depthOnlyOutput() ? "VP_FRET;" : "return vp_out;"; }
+ 
++    // Fragment colour 0 as a float4 output (the alpha-to-coverage source), or null.
++    const IoVar* coverageColor() const {
++        if (m_.stage != Stage::Fragment) return nullptr;
++        for (const IoVar& v : m_.outputs)
++            if (v.builtin == Builtin::None && v.location == 0 && !v.blendIndex && v.type == Type(Scalar::F32, 4)) return &v;
++        return nullptr;
++    }
++    // VP_A2C1 (set by the backend for pipelines with alpha-to-coverage at one sample): Vulkan keeps
++    // the fragment iff its coverage bit is set, i.e. alpha >= 0.5; done here so it does not depend on
++    // what the GPU makes of a one-sample coverage mask.
++    void coverageTest() {
++        const IoVar* c = coverageColor();
++        if (!c || !entry_) return;
++        out_ += "#ifdef VP_A2C1\n";
++        line("if (vp_out.", ident(c->name), ".w < 0.5f) discard_fragment();");
++        out_ += "#endif\n";
++    }
++
+     // ---- functions ----
+     void helper(const Function& f) {
+         std::string sig = "static " + typeName(f.returnType) + " " + helperName(uint32_t(&f - m_.functions.data())) + "(";
+@@ -410,7 +436,10 @@ private:
+         for (size_t i = 0; i < f.vars.size(); ++i) line(typeName(f.vars[i].type), " l", std::to_string(i), "{};");
+         if (opt_.loopBudget && hasLoop(f.body)) line("uint vp_budget = 0u;");
+         block(f.body);
+-        if (vsfsOut && (f.body.empty() || f.body.back().kind != NodeKind::Return)) line(returnOut());
++        if (vsfsOut && (f.body.empty() || f.body.back().kind != NodeKind::Return)) {
++            coverageTest();
++            line(returnOut());
++        }
+     }
+ 
+     // ---- private slot scalarization ----
+@@ -512,9 +541,12 @@ private:
+         ++depth_;
+         block(b);
+         --depth_;
++        lastDiscard_ = false;
+     }
+ 
+     void node(const Node& n) {
++        const bool afterDiscard = lastDiscard_;  // a return right after discard_fragment() needs no coverage test
++        lastDiscard_ = false;
+         switch (n.kind) {
+             case NodeKind::Inst: inst(n.inst); break;
+             case NodeKind::If:
+@@ -553,11 +585,16 @@ private:
+             }
+             case NodeKind::Break: line("break;"); break;
+             case NodeKind::Continue: line("continue;"); break;
+-            case NodeKind::Discard: line("discard_fragment();"); break;
++            case NodeKind::Discard:
++                line("discard_fragment();");
++                lastDiscard_ = true;
++                break;
+             case NodeKind::Return:
+                 if (n.value != kNoValue) line("return ", ex(n.value), ";");
+-                else if (entry_ && (m_.stage == Stage::Vertex || m_.stage == Stage::Fragment) && !m_.outputs.empty())
++                else if (entry_ && (m_.stage == Stage::Vertex || m_.stage == Stage::Fragment) && !m_.outputs.empty()) {
++                    if (!afterDiscard) coverageTest();
+                     line(returnOut());
++                }
+                 else line("return;");
+                 break;
+         }
+@@ -787,6 +824,13 @@ private:
+                     out_ += "#endif\n";
+                     return;
+                 }
++                if (m_.outputs[in.sym].builtin == Builtin::ClipDistance) {
++                    const IoVar& o = m_.outputs[in.sym];
++                    if (o.type.width == 1) return line("vp_out.", ident(o.name), "[0] = ", a(0), ";");
++                    for (unsigned k = 0; k < o.type.width; ++k)
++                        line("vp_out.", ident(o.name), "[", std::to_string(k), "] = ", a(0), ".", std::string(1, kSwizzle[k]), ";");
++                    return;
++                }
+                 return line("vp_out.", ident(m_.outputs[in.sym].name), " = ", a(0), ";");
+             case Op::Call: {
+                 std::string c = helperName(in.sym) + "(" + args(in) + ")";
+@@ -1014,6 +1058,7 @@ private:
+     std::string out_;
+     unsigned depth_ = 0;
+     unsigned loops_ = 0;  // loop guard counters emitted so far (names vp_guardN)
++    bool lastDiscard_ = false;  // the previous node of this block was a Discard
+     // EmitOptions::loopCap: iterations a loop may run per entry before the hang guard breaks it, far
+     // above real game loops (lights, kernel taps, bones; a dispatch loop counts one per block run)
+     // and low enough that a runaway loop over a full-screen pass finishes before the GPU watchdog.
+diff --git a/gpu/shader/msl/tests/heavy_lighting_fs.metal b/gpu/shader/msl/tests/heavy_lighting_fs.metal
+index 372a03b..11eb2a2 100644
+--- a/gpu/shader/msl/tests/heavy_lighting_fs.metal
++++ b/gpu/shader/msl/tests/heavy_lighting_fs.metal
+@@ -390,5 +390,8 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
+     const float3 v353 = v351 / v352;
+     const float4 v355 = float4(v353, v5.w);
+     vp_out.color = v355;
++#ifdef VP_A2C1
++    if (vp_out.color.w < 0.5f) discard_fragment();
++#endif
+     return vp_out;
+ }
+diff --git a/gpu/shader/msl/tests/ms_textures.metal b/gpu/shader/msl/tests/ms_textures.metal
+index da4f204..acf05fd 100644
+--- a/gpu/shader/msl/tests/ms_textures.metal
++++ b/gpu/shader/msl/tests/ms_textures.metal
+@@ -27,5 +27,8 @@ fragment VpOut vp_main(constant VpArgs& vp_args [[buffer(0)]],
+     const float v16 = v6.x + v12;
+     const float4 v17 = float4(v16, v14, v12, v6.x);
+     vp_out.color = v17;
++#ifdef VP_A2C1
++    if (vp_out.color.w < 0.5f) discard_fragment();
++#endif
+     return vp_out;
+ }
+diff --git a/gpu/shader/msl/tests/precise_fma.metal b/gpu/shader/msl/tests/precise_fma.metal
+index 2964cdb..b557bf6 100644
+--- a/gpu/shader/msl/tests/precise_fma.metal
++++ b/gpu/shader/msl/tests/precise_fma.metal
+@@ -24,5 +24,8 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]]) {
+     const float4 v6 = rsqrt(v5);
+     const float4 v7 = 1.0f / v6;
+     vp_out.fast = v7;
++#ifdef VP_A2C1
++    if (vp_out.exact.w < 0.5f) discard_fragment();
++#endif
+     return vp_out;
+ }
+diff --git a/gpu/shader/msl/tests/private_memory.metal b/gpu/shader/msl/tests/private_memory.metal
+index 48d7860..cbc9d25 100644
+--- a/gpu/shader/msl/tests/private_memory.metal
++++ b/gpu/shader/msl/tests/private_memory.metal
+@@ -26,5 +26,8 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]]) {
+     float4 v11 = v8;
+     v11.w = v10;
+     vp_out.color = v11;
++#ifdef VP_A2C1
++    if (vp_out.color.w < 0.5f) discard_fragment();
++#endif
+     return vp_out;
+ }
+diff --git a/gpu/shader/msl/tests/private_slots.metal b/gpu/shader/msl/tests/private_slots.metal
+index 31169d1..136d4ae 100644
+--- a/gpu/shader/msl/tests/private_slots.metal
++++ b/gpu/shader/msl/tests/private_slots.metal
+@@ -36,5 +36,8 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]]) {
+     float4 v16 = v14;
+     v16.x = v15;
+     vp_out.color = v16;
++#ifdef VP_A2C1
++    if (vp_out.color.w < 0.5f) discard_fragment();
++#endif
+     return vp_out;
+ }
+diff --git a/gpu/shader/msl/tests/quad_ops.metal b/gpu/shader/msl/tests/quad_ops.metal
+index dad8b20..28becaa 100644
+--- a/gpu/shader/msl/tests/quad_ops.metal
++++ b/gpu/shader/msl/tests/quad_ops.metal
+@@ -23,5 +23,8 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]]) {
+     const float v13 = v10 ? 1.0f : 0.0f;
+     const float4 v14 = float4(v6, v7, v13, 1.0f);
+     vp_out.color = v14;
++#ifdef VP_A2C1
++    if (vp_out.color.w < 0.5f) discard_fragment();
++#endif
+     return vp_out;
+ }
+diff --git a/gpu/shader/msl/tests/query_lod.metal b/gpu/shader/msl/tests/query_lod.metal
+index 68f6eb0..9043ba3 100644
+--- a/gpu/shader/msl/tests/query_lod.metal
++++ b/gpu/shader/msl/tests/query_lod.metal
+@@ -27,5 +27,8 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
+     const float2 v4 = v2 + v3;
+     const float4 v8 = float4(v4.x, v4.y, 1.0f, 1.0f);
+     vp_out.color = v8;
++#ifdef VP_A2C1
++    if (vp_out.color.w < 0.5f) discard_fragment();
++#endif
+     return vp_out;
+ }
+diff --git a/gpu/shader/msl/tests/syntax_tour.metal b/gpu/shader/msl/tests/syntax_tour.metal
+index 93c50e9..fdf3238 100644
+--- a/gpu/shader/msl/tests/syntax_tour.metal
++++ b/gpu/shader/msl/tests/syntax_tour.metal
+@@ -75,7 +75,13 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
+     if (v42) {
+         discard_fragment();
+     } else {
++#ifdef VP_A2C1
++        if (vp_out.color.w < 0.5f) discard_fragment();
++#endif
+         return vp_out;
+     }
++#ifdef VP_A2C1
++    if (vp_out.color.w < 0.5f) discard_fragment();
++#endif
+     return vp_out;
+ }
+diff --git a/gpu/shader/msl/tests/textured_fs.metal b/gpu/shader/msl/tests/textured_fs.metal
+index 6ce85be..36cf087 100644
+--- a/gpu/shader/msl/tests/textured_fs.metal
++++ b/gpu/shader/msl/tests/textured_fs.metal
+@@ -29,5 +29,8 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
+     }
+     const float4 v7 = v1 * vp_in.tint;
+     vp_out.color = v7;
++#ifdef VP_A2C1
++    if (vp_out.color.w < 0.5f) discard_fragment();
++#endif
+     return vp_out;
+ }
+diff --git a/gpu/shader/spirv/CMakeLists.txt b/gpu/shader/spirv/CMakeLists.txt
+index 86f9c27..dedb07f 100644
+--- a/gpu/shader/spirv/CMakeLists.txt
++++ b/gpu/shader/spirv/CMakeLists.txt
+@@ -16,5 +16,6 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
+         add_test(NAME gpu_spirv.${t}.${v} COMMAND vpspirv_tests ${t} ${v} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+       endforeach()
+     endforeach()
++    add_test(NAME gpu_spirv.correctness COMMAND vpspirv_tests correctness plain ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+   endif()
+ endif()
+diff --git a/gpu/shader/spirv/src/lower.cpp b/gpu/shader/spirv/src/lower.cpp
+index 2625905..ea1b388 100644
+--- a/gpu/shader/spirv/src/lower.cpp
++++ b/gpu/shader/spirv/src/lower.cpp
+@@ -91,6 +91,7 @@ struct IoLeaf {
+     enum Kind : uint8_t { Io, Dropped, VertexAttr, ViewIndex, Helper, InstanceIndex, VertexIndex,
+                           SampleMaskIn, FrontFacing } kind = Io;
+     int index = -1;       // vpir input/output index (Io)
++    int component = -1;   // >= 0: this leaf is that component of the output (ClipDistance[i])
+     uint32_t location = 0;
+     uint32_t type = 0;    // SPIR-V leaf type
+ };
+@@ -162,6 +163,7 @@ private:
+     std::unordered_map<uint32_t, uint32_t> privateGlobal_;// Private global -> private slot target
+     std::map<std::pair<int, uint32_t>, int> resIndex_;    // (kind, slot) -> resource index
+     std::set<int> written_;                               // buffer/texture resources stored to
++    std::set<int> readTex_;                               // storage textures read (OpImageRead, atomics)
+     std::map<int, std::pair<uint32_t, uint32_t>> resBinding_;  // resource index -> (set, binding)
+     std::vector<Ctx> ctx_;
+     std::vector<std::unique_ptr<Scope>> scopes_;
+@@ -1039,7 +1041,9 @@ private:
+     ValueId outputValue(const IoLeaf& leaf) {
+         if (leaf.kind != IoLeaf::Io) return zeroOf(vt(leaf.type));
+         uint32_t var = shadowOf(leaf);
+-        return var == UINT32_MAX ? zeroOf(vt(leaf.type)) : loadVar(var);
++        if (var == UINT32_MAX) return zeroOf(vt(leaf.type));
++        if (leaf.component >= 0) return ext(loadVar(var), uint32_t(leaf.component));
++        return loadVar(var);
+     }
+     void storeIo(const RPtr& p, const Val& v) {
+         if (p.kind != RPtr::Output) fail("store to an input");
+@@ -1063,6 +1067,18 @@ private:
+             if (leaf.kind != IoLeaf::Io) continue;
+             uint32_t var = shadowOf(leaf);
+             if (var == UINT32_MAX) continue;
++            if (leaf.component >= 0) {
++                Type vt0 = b_fn().vars[var].type;
++                ValueId x = cast(v.v[i], vt0.element());
++                if (vt0.width == 1) {
++                    b_->storeVar(var, x);
++                    continue;
++                }
++                Inst ins;
++                ins.op = Op::Insert, ins.type = vt0, ins.args = {loadVar(var), x}, ins.lits = {uint32_t(leaf.component)};
++                b_->storeVar(var, b_->emit(ins));
++                continue;
++            }
+             b_->storeVar(var, cast(v.v[i], b_fn().vars[var].type));
+         }
+     }
+@@ -1164,6 +1180,21 @@ private:
+                         uint32_t n = t.kind == TypeKind::Array ? arrayLength(t) : t.count;
+                         if (builtin) {  // ClipDistance[] / SampleMask[] / TessLevel…
+                             BuiltIn bi = BuiltIn(d->get(Deco::BuiltIn));
++                            // Vertex ClipDistance[n <= 4]: one [[clip_distance]] array (the driver
++                            // advertises shaderClipDistance; dropping the writes drew clipped geometry).
++                            if (bi == BuiltIn::ClipDistance && !input && stage_ == vpir::Stage::Vertex && n >= 1 && n <= 4 &&
++                                T(t.elem).kind == TypeKind::Float) {
++                                vpir::IoVar v;
++                                v.builtin = vpir::Builtin::ClipDistance, v.name = "clip_distance";
++                                v.type = vpir::kF32.withWidth(uint8_t(n));
++                                int idx = addOutput(v);
++                                for (uint32_t i = 0; i < n; ++i) {
++                                    IoLeaf leaf;
++                                    leaf.type = t.elem, leaf.kind = IoLeaf::Io, leaf.index = idx, leaf.component = int(i);
++                                    info.leaves.push_back(leaf);
++                                }
++                                return;
++                            }
+                             for (uint32_t i = 0; i < n; ++i) {
+                                 IoLeaf leaf;
+                                 leaf.type = t.elem;
+@@ -1203,6 +1234,9 @@ private:
+                             } else {
+                                 leaf.index = addOutput(v);
+                                 if (vb == vpir::Builtin::Layer) writesLayer_ = true, layerOutput_ = leaf.index;
++                                if (vb == vpir::Builtin::Position &&
++                                    ((d && d->has(Deco::Invariant)) || (vd && vd->has(Deco::Invariant))))
++                                    out_.invariantPosition = true;
+                             }
+                             if (special == IoLeaf::Io || special == IoLeaf::FrontFacing || special == IoLeaf::SampleMaskIn) {
+                                 if (special != IoLeaf::Io) {}  // index set above
+@@ -1690,8 +1724,11 @@ private:
+                 // (MSL 2.3+ on Apple GPUs: execution goes on), so the code after the kill site would
+                 // run: in a loop whose exit sits on the other path that spins until the loop guard.
+                 // Every callee is inlined into "main", so a return here leaves the shader.
++                // Outside every loop nothing can spin: keep the lane running as a helper (Metal's
++                // demote, D3D/SPIRV-Cross semantics) so quad derivatives of the code after the kill
++                // site (the material's texture reads after clip()) stay defined for its neighbours.
+                 b_->discard();
+-                b_->ret();
++                if (std::any_of(ctx_.begin(), ctx_.end(), [](const Ctx& c) { return c.kind == Ctx::Loop; })) b_->ret();
+                 return 0;
+             case OpUnreachable: return 0;
+             default: fail("block without a known terminator");
+@@ -2554,6 +2591,7 @@ private:
+         }
+         coord = intCoord(h, get1(w(in, 4)));
+         const vpir::Resource& r = out_.resources.at(size_t(h.texture));
++        if (storage) readTex_.insert(h.texture);
+         Inst f;
+         f.op = Op::ImageFetch;
+         f.sym = uint32_t(h.texture);
+@@ -2570,7 +2608,20 @@ private:
+             }
+             if (mask & ImgOp::Lod) ++i;
+             if (mask & ImgOp::Grad) i += 2;
+-            if (mask & (ImgOp::ConstOffset | ImgOp::Offset)) ++i;
++            if (mask & (ImgOp::ConstOffset | ImgOp::Offset)) {
++                // texelFetchOffset / Texture.Load(.., offset): the offset moves the texel read.
++                const unsigned cw = vpir::coordWidth(r.dim);
++                if (r.dim != vpir::TexDim::Cube && r.dim != vpir::TexDim::CubeArray) {
++                    Type ct = typeOfValue(coord);
++                    ValueId off = castBits(get1(w(in, i)), Type(Scalar::U32, uint8_t(cw)));
++                    std::vector<ValueId> parts;
++                    for (unsigned k = 0; k < ct.width; ++k)
++                        parts.push_back(k < cw ? bin(Op::Add, ext(coord, k), cw == 1 ? off : ext(off, k), vpir::kU32) : ext(coord, k));
++                    coord = vecOf(parts, ct);
++                    f.args[0] = coord;
++                }
++                ++i;
++            }
+             if ((mask & ImgOp::Sample) && r.multisampled) {
+                 f.args.push_back(castBits(get1(w(in, i)), vpir::kU32));
+                 f.image = vpir::kImageSample;
+@@ -2712,6 +2763,7 @@ private:
+             a.args = {coord};
+             a.args.insert(a.args.end(), vals.begin(), vals.end());
+             written_.insert(h.texture);
++            readTex_.insert(h.texture);
+             return castBits(b_->emit(a), rt);
+         }
+         RPtr p = resolve(ptrId, true);
+@@ -3203,6 +3255,13 @@ void Lowering::run() {
+     for (size_t i = 0; i < out_.resources.size(); ++i) {
+         auto& r = out_.resources[i];
+         if (r.kind == vpir::ResourceKind::Buffer && !written_.count(int(i))) r.access = vpir::Access::Read;
++        // DXC never decorates RWTexture NonReadable/NonWritable: read_write needs Metal's tier-2 read-write
++        // formats (no RG11B10Float, RG16Float, RGBA16Unorm, RG32Float…). Use what the code does.
++        if (r.kind == vpir::ResourceKind::StorageTexture && r.access == vpir::Access::ReadWrite) {
++            const bool rd = readTex_.count(int(i)) != 0, wr = written_.count(int(i)) != 0;
++            if (wr && !rd) r.access = vpir::Access::Write;
++            else if (rd && !wr) r.access = vpir::Access::Read;
++        }
+     }
+     // Stores through any path (storage images, texel buffers, image atomics, pointer parameters)
+     // mark their binding written, so the frame compiler orders later reads after them.
+diff --git a/gpu/shader/spirv/tests/asm/clip_invariant.vert.spvasm b/gpu/shader/spirv/tests/asm/clip_invariant.vert.spvasm
+new file mode 100644
+index 0000000..50c6b6d
+--- /dev/null
++++ b/gpu/shader/spirv/tests/asm/clip_invariant.vert.spvasm
+@@ -0,0 +1,33 @@
++OpCapability Shader
++OpCapability 32
++OpMemoryModel Logical GLSL450
++OpEntryPoint Vertex %main "main" %inpos %outpos %clip
++OpDecorate %inpos Location 0
++OpDecorate %outpos BuiltIn Position
++OpDecorate %outpos Invariant
++OpDecorate %clip BuiltIn ClipDistance
++%void = OpTypeVoid
++%fn = OpTypeFunction %void
++%float = OpTypeFloat 32
++%v4 = OpTypeVector %float 4
++%uint = OpTypeInt 32 0
++%u1 = OpConstant %uint 1
++%arr = OpTypeArray %float %u1
++%pin = OpTypePointer Input %v4
++%pout = OpTypePointer Output %v4
++%parr = OpTypePointer Output %arr
++%pf = OpTypePointer Output %float
++%inpos = OpVariable %pin Input
++%outpos = OpVariable %pout Output
++%clip = OpVariable %parr Output
++%int = OpTypeInt 32 1
++%i0 = OpConstant %int 0
++%main = OpFunction %void 0 %fn
++%l = OpLabel
++%p = OpLoad %v4 %inpos
++OpStore %outpos %p
++%c = OpAccessChain %pf %clip %i0
++%x = OpCompositeExtract %float %p 0
++OpStore %c %x
++OpReturn
++OpFunctionEnd
+diff --git a/gpu/shader/spirv/tests/asm/fetch_offset_kill.frag.spvasm b/gpu/shader/spirv/tests/asm/fetch_offset_kill.frag.spvasm
+new file mode 100644
+index 0000000..2189b98
+--- /dev/null
++++ b/gpu/shader/spirv/tests/asm/fetch_offset_kill.frag.spvasm
+@@ -0,0 +1,61 @@
++OpCapability Shader
++OpMemoryModel Logical GLSL450
++OpEntryPoint Fragment %main "main" %fc %uv %out
++OpExecutionMode %main OriginUpperLeft
++OpDecorate %fc BuiltIn FragCoord
++OpDecorate %uv Location 0
++OpDecorate %out Location 0
++OpDecorate %tex DescriptorSet 0
++OpDecorate %tex Binding 1
++OpDecorate %smp DescriptorSet 0
++OpDecorate %smp Binding 2
++%void = OpTypeVoid
++%fn = OpTypeFunction %void
++%float = OpTypeFloat 32
++%v2 = OpTypeVector %float 2
++%v4 = OpTypeVector %float 4
++%int = OpTypeInt 32 1
++%v2i = OpTypeVector %int 2
++%img = OpTypeImage %float 2D 0 0 0 1 0
++%simg = OpTypeSampledImage %img
++%sampler = OpTypeSampler
++%pimg = OpTypePointer UniformConstant %img
++%psmp = OpTypePointer UniformConstant %sampler
++%tex = OpVariable %pimg UniformConstant
++%smp = OpVariable %psmp UniformConstant
++%pin4 = OpTypePointer Input %v4
++%pin2 = OpTypePointer Input %v2
++%pout4 = OpTypePointer Output %v4
++%fc = OpVariable %pin4 Input
++%uv = OpVariable %pin2 Input
++%out = OpVariable %pout4 Output
++%i0 = OpConstant %int 0
++%im1 = OpConstant %int -1
++%i1 = OpConstant %int 1
++%off = OpConstantComposite %v2i %im1 %i1
++%f05 = OpConstant %float 0.5
++%bool = OpTypeBool
++%main = OpFunction %void 0 %fn
++%l = OpLabel
++%frag = OpLoad %v4 %fc
++%xy = OpCompositeExtract %float %frag 0
++%yy = OpCompositeExtract %float %frag 1
++%xi = OpConvertFToS %int %xy
++%yi = OpConvertFToS %int %yy
++%ci = OpCompositeConstruct %v2i %xi %yi
++%t = OpLoad %img %tex
++%f = OpImageFetch %v4 %t %ci 10 %i0 %off
++%a = OpCompositeExtract %float %f 3
++%cond = OpFOrdLessThan %bool %a %f05
++OpSelectionMerge %m None
++OpBranchConditional %cond %k %m
++%k = OpLabel
++OpKill
++%m = OpLabel
++%s = OpLoad %sampler %smp
++%si = OpSampledImage %simg %t %s
++%u = OpLoad %v2 %uv
++%c = OpImageSampleImplicitLod %v4 %si %u
++OpStore %out %c
++OpReturn
++OpFunctionEnd
+diff --git a/gpu/shader/spirv/tests/asm/loop_kill.frag.spvasm b/gpu/shader/spirv/tests/asm/loop_kill.frag.spvasm
+new file mode 100644
+index 0000000..473d645
+--- /dev/null
++++ b/gpu/shader/spirv/tests/asm/loop_kill.frag.spvasm
+@@ -0,0 +1,48 @@
++OpCapability Shader
++OpMemoryModel Logical GLSL450
++OpEntryPoint Fragment %main "main" %uv %out
++OpExecutionMode %main OriginUpperLeft
++OpDecorate %uv Location 0
++OpDecorate %out Location 0
++%void = OpTypeVoid
++%fn = OpTypeFunction %void
++%float = OpTypeFloat 32
++%v2 = OpTypeVector %float 2
++%v4 = OpTypeVector %float 4
++%int = OpTypeInt 32 1
++%bool = OpTypeBool
++%pin2 = OpTypePointer Input %v2
++%pout4 = OpTypePointer Output %v4
++%uv = OpVariable %pin2 Input
++%out = OpVariable %pout4 Output
++%i0 = OpConstant %int 0
++%i1 = OpConstant %int 1
++%i4 = OpConstant %int 4
++%f05 = OpConstant %float 0.5
++%f1 = OpConstant %float 1.0
++%c1 = OpConstantComposite %v4 %f1 %f1 %f1 %f1
++%main = OpFunction %void 0 %fn
++%entry = OpLabel
++%u = OpLoad %v2 %uv
++%ux = OpCompositeExtract %float %u 0
++OpBranch %hdr
++%hdr = OpLabel
++%i = OpPhi %int %i0 %entry %inext %cont
++%lt = OpSLessThan %bool %i %i4
++OpLoopMerge %merge %cont None
++OpBranchConditional %lt %body %merge
++%body = OpLabel
++%k = OpFOrdLessThan %bool %ux %f05
++OpSelectionMerge %after None
++OpBranchConditional %k %kill %after
++%kill = OpLabel
++OpKill
++%after = OpLabel
++OpBranch %cont
++%cont = OpLabel
++%inext = OpIAdd %int %i %i1
++OpBranch %hdr
++%merge = OpLabel
++OpStore %out %c1
++OpReturn
++OpFunctionEnd
+diff --git a/gpu/shader/spirv/tests/asm/spvasm.py b/gpu/shader/spirv/tests/asm/spvasm.py
+new file mode 100644
+index 0000000..6a3787e
+--- /dev/null
++++ b/gpu/shader/spirv/tests/asm/spvasm.py
+@@ -0,0 +1,56 @@
++# Minimal SPIR-V assembler for probes (subset). Usage: python3 -I spvasm.py in.spvasm out.spv
++import struct, sys, re
++OPS = {'OpCapability':17,'OpExtInstImport':11,'OpMemoryModel':14,'OpEntryPoint':15,'OpExecutionMode':16,
++'OpDecorate':71,'OpMemberDecorate':72,'OpTypeVoid':19,'OpTypeBool':20,'OpTypeInt':21,'OpTypeFloat':22,
++'OpTypeVector':23,'OpTypeMatrix':24,'OpTypeImage':25,'OpTypeSampler':26,'OpTypeSampledImage':27,'OpTypeArray':28,
++'OpTypeStruct':30,'OpTypePointer':32,'OpTypeFunction':33,'OpConstant':43,'OpConstantComposite':44,
++'OpVariable':59,'OpLoad':61,'OpStore':62,'OpAccessChain':65,'OpFunction':54,'OpFunctionEnd':56,'OpLabel':248,
++'OpReturn':253,'OpSampledImage':86,'OpImageSampleImplicitLod':87,'OpImageSampleExplicitLod':88,
++'OpImageSampleDrefExplicitLod':90,'OpImageFetch':95,'OpImage':100,'OpCompositeConstruct':80,'OpCompositeExtract':81,
++'OpFAdd':129,'OpFMul':133,'OpVectorTimesScalar':142,'OpMatrixTimesVector':145,'OpKill':252,'OpBranch':249,
++'OpBranchConditional':250,'OpSelectionMerge':247,'OpFOrdLessThan':184,'OpExtInst':12,'OpDPdx':207,'OpName':5,
++'OpConvertFToS':110,'OpImageWrite':99,'OpExecutionModeId':331,'OpBitcast':124,'OpIAdd':128,'OpLoopMerge':246,'OpSLessThan':177,'OpPhi':245}
++NAMES = {'Shader':1,'Logical':0,'GLSL450':1,'Vertex':0,'Fragment':4,'GLCompute':5,'OriginUpperLeft':7,
++'Input':1,'Output':3,'Uniform':2,'UniformConstant':0,'Function':7,'PushConstant':9,
++'Location':30,'BuiltIn':11,'Block':2,'Offset':35,'DescriptorSet':34,'Binding':33,'Invariant':18,'Flat':14,
++'Position':0,'ClipDistance':3,'FragCoord':15,'None':0,'2D':1,'ClipDistanceCap':32,'ArrayStride':6,'RowMajor':4,'ColMajor':5,'MatrixStride':7}
++def asm(text):
++    ids = {}; nxt = [1]
++    def idof(n):
++        if n not in ids: ids[n] = nxt[0]; nxt[0] += 1
++        return ids[n]
++    insts = []
++    for line in text.splitlines():
++        line = line.split(';')[0].strip()
++        if not line: continue
++        toks = re.findall(r'"[^"]*"|\S+', line)
++        res = None
++        if len(toks) > 2 and toks[1] == '=': res = toks[0]; toks = toks[2:]
++        op = toks[0]; args = toks[1:]
++        words = []
++        # result type comes first for value-producing ops in SPIR-V; we keep source order: [type] result args
++        operands = []
++        if res is not None:
++            if op.startswith('OpType') or op == 'OpExtInstImport' or op == 'OpLabel':
++                operands.append(('id', res))
++            else:
++                operands.append(('id', args[0])); operands.append(('id', res)); args = args[1:]
++        for a in args:
++            if a.startswith('%'): operands.append(('id', a))
++            elif a.startswith('"'): operands.append(('str', a[1:-1]))
++            elif re.fullmatch(r'-?\d+\.\d*(e-?\d+)?', a): operands.append(('f', float(a)))
++            elif re.fullmatch(r'-?(0x[0-9a-fA-F]+|\d+)', a): operands.append(('i', int(a, 0)))
++            else: operands.append(('i', NAMES[a]))
++        for k, v in operands:
++            if k == 'id': words.append(idof(v))
++            elif k == 'i': words.append(v & 0xFFFFFFFF)
++            elif k == 'f': words.append(struct.unpack('<I', struct.pack('<f', v))[0])
++            else:
++                b = v.encode() + b'\0'
++                b += b'\0' * ((4 - len(b) % 4) % 4)
++                words += list(struct.unpack('<%dI' % (len(b)//4), b))
++        insts.append([((len(words)+1) << 16) | OPS[op]] + words)
++    out = [0x07230203, 0x00010000, 0, nxt[0], 0]
++    for i in insts: out += i
++    return struct.pack('<%dI' % len(out), *out)
++open(sys.argv[2], 'wb').write(asm(open(sys.argv[1]).read()))
+diff --git a/gpu/shader/spirv/tests/asm/storage_write.comp.spvasm b/gpu/shader/spirv/tests/asm/storage_write.comp.spvasm
+new file mode 100644
+index 0000000..256c186
+--- /dev/null
++++ b/gpu/shader/spirv/tests/asm/storage_write.comp.spvasm
+@@ -0,0 +1,31 @@
++OpCapability Shader
++OpMemoryModel Logical GLSL450
++OpEntryPoint GLCompute %main "main" %gid
++OpExecutionMode %main 17 8 8 1
++OpDecorate %gid BuiltIn 28
++OpDecorate %img DescriptorSet 0
++OpDecorate %img Binding 5
++%void = OpTypeVoid
++%fn = OpTypeFunction %void
++%float = OpTypeFloat 32
++%v4 = OpTypeVector %float 4
++%uint = OpTypeInt 32 0
++%v3u = OpTypeVector %uint 3
++%v2u = OpTypeVector %uint 2
++%itype = OpTypeImage %float 2D 0 0 0 2 2
++%pimg = OpTypePointer UniformConstant %itype
++%img = OpVariable %pimg UniformConstant
++%pin3 = OpTypePointer Input %v3u
++%gid = OpVariable %pin3 Input
++%f1 = OpConstant %float 1.0
++%c1 = OpConstantComposite %v4 %f1 %f1 %f1 %f1
++%main = OpFunction %void 0 %fn
++%l = OpLabel
++%g = OpLoad %v3u %gid
++%gx = OpCompositeExtract %uint %g 0
++%gy = OpCompositeExtract %uint %g 1
++%c = OpCompositeConstruct %v2u %gx %gy
++%t = OpLoad %itype %img
++OpImageWrite %t %c %c1
++OpReturn
++OpFunctionEnd
+diff --git a/gpu/shader/spirv/tests/clip_invariant.vert.spv b/gpu/shader/spirv/tests/clip_invariant.vert.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..6e496bc55d39b8b2b9d17312b36e674c7895d3bc
+GIT binary patch
+literal 496
+zcmX|-xsC!s3`ETg%emZFg3usBa)h*6BqCxyfsg>cp9G2bng&bN?y_CByUSwJjHrb+
+zPiMp^iWJdT#QIUDj8%hZeebu+^)4xZ6?Jgpl&^p$H`h%}UM4=yIW^|2nV|f^uVD?m
+z_c?bKOnWTo<#f5a8D~4^aIww2!`)q%aC=*Ctb+gI&DlrZ!#n%K`<bgVKgir3e_8MQ
+z>>>Z??IBn1ZgTe<;wxai`^iT@+wnr*XioFZ5B|Wv`KQ*MCct?II==rX;)u$<rodVD
+TI}>xq8Bn9CvBubwDSPk&6@v_l
+
+literal 0
+HcmV?d00001
+
+diff --git a/gpu/shader/spirv/tests/fetch_offset_kill.frag.spv b/gpu/shader/spirv/tests/fetch_offset_kill.frag.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..e117846bfd5a4a4dbbc34e1d6f7210f10056f0d4
+GIT binary patch
+literal 964
+zcmYk4$xZ_?5Jb&{C2U#9MiL-1346j7AtB(%6)tc@966Bh<Ig|{1n-S(DJ}JMS6A8H
+zwx^O!)<Rec+C}*dp&7EWQVW%`B3lpDuuL?6e|?)vWVj0J4Kg`43-?syHt~AI>JD&C
+z-ZhJO1w59-<i!Q<p5j&FA}^M=Pm8a83udSi&Aa65#2oLjeuF4hFLpMub9DG_5p&#r
+z^4mmf>iZ~bMD_BEmhg~%o>kp|RSja!KFuh$F5Zb){yOrWRTIm5HcfqtXb<NVw<GpE
+z;ttWfm3O^*XLgNPy?nyzJ+rkbnP=?cTEac@KP=&0u<K{MiucmT)mT^Ky$o>du1)tL
+z$t7Cf!F8JN@&&g?ykU*=?&Hq-h}J#)AFOGqHX^s?KJz$lPOdiLf?VB0oNr8?<JRrv
+z-A{1u`GraBeHd$My-V-FbEUpV<Z8U94_11nW8AuD{e(FoYTxvbJH@SePV*n8Hn-*+
+pzWEvM`#!O!|I0b<Y}VB{%M`coGa6@|;p(j4!uWpHe%b#D{|CBhBf9_q
+
+literal 0
+HcmV?d00001
+
+diff --git a/gpu/shader/spirv/tests/loop_kill.frag.spv b/gpu/shader/spirv/tests/loop_kill.frag.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..5667e811cf7a75689e134b53837263fd7f0b602d
+GIT binary patch
+literal 680
+zcmYk3IZgvX5Jiiz!K~gFb_NmR*s_Fdhr}F#kO0o$E0J+AR)NHOt!~LB{i*u3cTJ<Z
+zX+>;>Qm1c3FRJ8eM<aQRcA^zcwD$Ak(~E%$n9=2{pGI*{mi|ki$jvEyK-50hc(>8o
+zW9%Jt4JLT(Be#!yH*<4G@I7=5oH-<GKk;T9WS{jld536cTYm>PZcppvC2r1b?t6r-
+z6yC-*zwi#Wd&u3f3y@Xey+qfmDX(yDAL!e}jF;QPzKVDFVzU8yLB#!sz+E4RI%kx9
+zsQ4x_Mq8tPr^1^|fcx9$7@UAt>b=h?Fz)^z%s4|ESAO8e&w+mXYQN>$3vB26)=w^4
+t{-t%su7E!4w10V-wmx@tj$FN_r@OkJ`*`2Y_c(va4F8F@`=i$!`~$n3AP@im
+
+literal 0
+HcmV?d00001
+
+diff --git a/gpu/shader/spirv/tests/spirv_tests.cpp b/gpu/shader/spirv/tests/spirv_tests.cpp
+index 8c6315f..8a35e65 100644
+--- a/gpu/shader/spirv/tests/spirv_tests.cpp
++++ b/gpu/shader/spirv/tests/spirv_tests.cpp
+@@ -230,6 +230,49 @@ void subpass(const std::string& dir, const std::string& v) {
+ 
+ }  // namespace
+ 
++// Translation correctness probes (tests/asm/*.spvasm, assembled with tests/asm/spvasm.py):
++// ClipDistance reaches [[clip_distance]], an Invariant position is [[invariant]], a texel-fetch offset
++// moves the read, and OpKill keeps the lane as a helper outside loops but leaves inside one.
++void correctness(const std::string& dir, const std::string&) {
++    std::printf("[correctness]\n");
++    {
++        spirv::SpirvLowerOptions o;
++        o.entry = "main", o.stage = vpir::Stage::Vertex;
++        Result r = run(dir + "/clip_invariant.vert.spv", o);
++        CHECK(r.ok);
++        CHECK(r.msl.source.find("[[clip_distance]] [1]") != std::string::npos);
++        CHECK(r.msl.source.find("[[position, invariant]]") != std::string::npos);
++        CHECK(r.msl.source.find("vp_out.clip_distance[0] = ") != std::string::npos);
++    }
++    spirv::SpirvLowerOptions f;
++    f.entry = "main", f.stage = vpir::Stage::Fragment;
++    f.layout = {bind(0, 1, vpgpu::BindKind::Texture, 0), bind(0, 2, vpgpu::BindKind::Sampler, 0)};
++    {
++        Result r = run(dir + "/fetch_offset_kill.frag.spv", f);
++        CHECK(r.ok);
++        const std::string& s = r.msl.source;
++        CHECK(s.find("+ 4294967295u") != std::string::npos);  // ConstOffset (-1, +1) applied
++        CHECK(s.find("+ 1u") != std::string::npos);
++        size_t d = s.find("discard_fragment();");
++        CHECK(d != std::string::npos && s.find("return", d) > s.find(".sample(", d));  // no return before the sample
++    }
++    {
++        Result r = run(dir + "/loop_kill.frag.spv", f);
++        CHECK(r.ok);
++        const std::string& s = r.msl.source;
++        size_t d = s.find("discard_fragment();");
++        CHECK(d != std::string::npos && s.find("return vp_out;", d) < s.find("continue;", d));  // inside the loop: leaves
++    }
++    {  // RWTexture2D only written (DXC: no NonReadable decoration): access::write, not read_write
++        spirv::SpirvLowerOptions c;
++        c.entry = "main", c.stage = vpir::Stage::Compute;
++        c.layout = {bind(0, 5, vpgpu::BindKind::StorageTexture, 0)};
++        Result r = run(dir + "/storage_write.comp.spv", c);
++        CHECK(r.ok);
++        CHECK(r.msl.source.find("access::write>") != std::string::npos);
++    }
++}
++
+ int main(int argc, char** argv) {
+     if (argc < 4) {
+         std::fprintf(stderr, "usage: vpspirv_tests <case> <plain|opt> <tests dir>\n");
+@@ -241,6 +284,7 @@ int main(int argc, char** argv) {
+     else if (c == "cull") cull(dir, v);
+     else if (c == "subpass") subpass(dir, v);
+     else if (c == "motion") motion(dir, v);
++    else if (c == "correctness") correctness(dir, v);
+     else {
+         std::fprintf(stderr, "unknown case %s\n", c.c_str());
+         return 2;
+diff --git a/gpu/shader/spirv/tests/storage_write.comp.spv b/gpu/shader/spirv/tests/storage_write.comp.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..2043e3cfd3bacfc4507041f86a839579f122abb2
+GIT binary patch
+literal 520
+zcmYk2!A=4}5JcNu1OZ_|1VZ9rfg_xWi6I=h>L(CR9`GCdY%V6eH;jZyYG<mdr?z{_
+zV%ds#2-hTiBZg5Vr5|NdbgO8_BfIC*;rmCU00VTjA$ZD=@1v3YF6Xz*O<Mq$zI+bM
+z9Z}s#yiDBlgo-A64W_s>nz-H=?*D4w(r>e?nJe#PZl5z;doj=c?w7u(x$~S2Yd<o-
+zzQWb-p?lwd>C3&Vwt}1A2NA!!H67b?1=Q}bVM^!t@5MJblQdx8;+XH7n*BwsbG>AZ
+h?WT>gX3i&d&io3j)icXk#=tp_aL?A**B>3cg9`vf4PXEO
+
+literal 0
+HcmV?d00001
+
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index 4a30f70..453b61f 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -567,6 +567,9 @@ TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerO
+     errors.push_back(std::move(error));
+     return TranslateFail::Lower;
+   }
++  // A/B test: every vertex position [[invariant]] (depth prepass vs. LEQUAL colour pass speckles).
++  static const bool invariantAll = [] { const char* e = std::getenv("VPVK_INVARIANT_ALL"); return e && *e == '1'; }();
++  if (invariantAll && opt.stage == vpir::Stage::Vertex) mod.invariantPosition = true;
+   vpmsl::EmitResult e = vpmsl::emitMsl(mod);
+   if (!e.errors.empty()) {
+     if (const char* dd = std::getenv("VPVK_DUMP_DIR")) {  // harness: IR + SPIR-V of the first failures per message
+diff --git a/gpu/vulkan/src/recipes.h b/gpu/vulkan/src/recipes.h
+index 271be6f..4007d88 100644
+--- a/gpu/vulkan/src/recipes.h
++++ b/gpu/vulkan/src/recipes.h
+@@ -37,7 +37,7 @@ namespace vpvk {
+ // Bump whenever SPIR-V -> VPIR -> MSL output changes for the same input (stored recipes are then
+ // retranslated at the next prewarm instead of being discarded).
+ // 1: per-variable private slots (was recipe file version 2).
+-inline constexpr uint32_t kTranslatorVersion = 2;  // 2: OpKill returns, loop budget (0018)
++inline constexpr uint32_t kTranslatorVersion = 3;  // 2: OpKill returns, loop budget (0018); 3: clip distance, invariant, OpKill demotes outside loops, fetch offsets, VP_A2C1
+ 
+ // Content hash of a SPIR-V module (never 0).
+ uint64_t spirvHash(const uint32_t* words, size_t count);
+-- 
+2.43.0
+

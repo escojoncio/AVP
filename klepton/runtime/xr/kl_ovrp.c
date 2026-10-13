@@ -3234,6 +3234,21 @@ void kl_ovrp_frame_begin_external(void) {
     pthread_mutex_unlock(&g_frames.mu);
 }
 
+// kl_ovrp_frame_close_external's snapshots, per stage (a stage is not refilled before it is filed).
+static kl_ovrp_render_pose g_ext_closed[KLOVRP_MAX_STAGES];
+static int g_ext_closed_ok[KLOVRP_MAX_STAGES];
+void kl_ovrp_frame_close_external(int stage, const float jit[2][2], const int have[2]) {
+    if ((unsigned)stage >= KLOVRP_MAX_STAGES) return;
+    pthread_mutex_lock(&g_frames.mu);
+    if (g_frames.serial) {
+        g_ext_closed[stage] = g_frames.pending;
+        for (int e = 0; e < 2; e++)
+            if (jit && have && have[e]) memcpy(g_ext_closed[stage].jitter[e], jit[e], sizeof jit[e]);
+        g_ext_closed_ok[stage] = 1;
+    }
+    pthread_mutex_unlock(&g_frames.mu);
+}
+
 void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8) {
     if ((unsigned)stage >= KLOVRP_MAX_STAGES) {
     // Not clamped. A stage outside the ring means the swapchain has more
@@ -3264,6 +3279,9 @@ void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8
         }
     }
     pthread_mutex_lock(&g_frames.mu);
+    // The record closed at submit for this stage (kl_ovrp_frame_close_external), else the open one.
+    kl_ovrp_render_pose *rec = g_ext_closed_ok[stage] ? &g_ext_closed[stage] : &g_frames.pending;
+    g_ext_closed_ok[stage] = 0;
     if (g_frames.serial) {
     // The guest's own statement of what it drew, where it has one. See the
         // header: this is what keeps a compositor from correcting a delta the
@@ -3277,14 +3295,14 @@ void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8
         // first frame and then rarely, because the number only has to settle
         // which of the two guests this is.
         if (pose7) {
-            klovrp_pose a = { .qx = g_frames.pending.qx, .qy = g_frames.pending.qy,
-                              .qz = g_frames.pending.qz, .qw = g_frames.pending.qw };
+            klovrp_pose a = { .qx = rec->qx, .qy = rec->qy,
+                              .qz = rec->qz, .qw = rec->qw };
             klovrp_pose b = { .qx = pose7[3], .qy = pose7[4],
                               .qz = pose7[5], .qw = pose7[6] };
             float deg = klovrp_quat_degrees(&a, &b);
-            float dx = pose7[0] - g_frames.pending.px;
-            float dy = pose7[1] - g_frames.pending.py;
-            float dz = pose7[2] - g_frames.pending.pz;
+            float dx = pose7[0] - rec->px;
+            float dy = pose7[1] - rec->py;
+            float dz = pose7[2] - rec->pz;
             static unsigned n;
             static float worst_deg, worst_m;
             float m = sqrtf(dx * dx + dy * dy + dz * dz);
@@ -3299,18 +3317,18 @@ void kl_ovrp_frame_end_external(int stage, const float *pose7, const float *tan8
                             ? "REPROJECTS ITS OWN FRAMES, so ours must not repeat it"
                             : "renders at the pose it is given");
             if (n == 0) n = 1;
-            g_frames.pending.px = pose7[0];
-            g_frames.pending.py = pose7[1];
-            g_frames.pending.pz = pose7[2];
-            g_frames.pending.qx = pose7[3];
-            g_frames.pending.qy = pose7[4];
-            g_frames.pending.qz = pose7[5];
-            g_frames.pending.qw = pose7[6];
+            rec->px = pose7[0];
+            rec->py = pose7[1];
+            rec->pz = pose7[2];
+            rec->qx = pose7[3];
+            rec->qy = pose7[4];
+            rec->qz = pose7[5];
+            rec->qw = pose7[6];
         }
-        if (tan8) memcpy(g_frames.pending.tangents, tan8, sizeof g_frames.pending.tangents);
-        g_frames.pending.stage = stage;
-        g_frames.pending.complete = 1;
-        g_frames.r[stage] = g_frames.pending;
+        if (tan8) memcpy(rec->tangents, tan8, sizeof rec->tangents);
+        rec->stage = stage;
+        rec->complete = 1;
+        g_frames.r[stage] = *rec;
         g_frames.last_complete = stage;
         g_frames.filed[stage]++;
     }

@@ -249,8 +249,11 @@ final class AVPSettings: ObservableObject {
             ("KLVR_EYE_SIZE", "\(eye.width),\(eye.height)"),
             ("KL_DISPLAY_HZ", String(refreshHz)),
             ("KL_GUEST_PACE_HZ", halfRate ? String(refreshHz / 2) : "0"),
-            ("KL_VK_MERGE", "1"),
-            ("KL_VK_MERGE_VIS", "1"),
+            // Klepton's encoder merging is MoltenVK's (MSAA scene chunks). VPKEngine merges same-target passes in its
+            // own frame compiler, and now that its queue is watched those hooks would hold its encoders open across
+            // its fences: off for VPKEngine.
+            ("KL_VK_MERGE", engine == .vpkengine ? "0" : "1"),
+            ("KL_VK_MERGE_VIS", engine == .vpkengine ? "0" : "1"),
             ("KLVR_PACE_FALLBACK", halfRate ? "1" : "0"),   // 50 fps on 100 Hz when the GPU fits, else 33.3
             ("KL_LOG_TAG", engine.rawValue),
             ("KL_CP_QUALITY", "0.40"),
@@ -275,6 +278,15 @@ final class AVPSettings: ObservableObject {
             ("KL_FPS_HUD", showFps ? "1" : "0"),
             ("KL_CAPTURE", diagCaptures ? "1" : "0"),
         ]
+        // VPKTAA inputs not usable yet (build 17 log): VPKEngine's motion vectors are all zero (its "eye frame"
+        // restarts at every depth-clearing multiview pass, 4-7 per game frame, so no draw ever finds last frame's
+        // data) yet are flagged as full screen motion, which turns the reprojection OFF; and the eye depth needs a
+        // Source 2 linearisation (viewport depth 0.05..0.95, z = 0.95 - 0.0375/d) that VPKTAA does not have. Until
+        // both are fixed VPKTAA runs rotation-only, and the motion targets, motion pipeline variants and the
+        // per-frame depth snapshot (a 61 MB copy with a CPU wait on the frame worker) are not paid for.
+        if taaActive {
+            env += [("VPVK_MOTION", "0"), ("KL_VPKTAA_DEPTH", "0")]
+        }
         // Foveation: Klepton's rasterization-rate map (kl_gpu_time.m) and VPKEngine's own.
         switch foveation {
         case .off:
