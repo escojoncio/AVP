@@ -156,14 +156,37 @@ __attribute__((weak)) void kl_foz_prewarm_log(double seconds, unsigned pipelines
 }
 
 int kl_app_configure(const char *resources, const char *container);  // below
+__attribute__((weak)) void kl_foz_set_threads(unsigned n) { (void)n; }
+void kl_app_prewarm_threads(unsigned n) { kl_foz_set_threads(n); }
+static void heartbeat_start(void);              // below
 
 #ifdef KL_APP_ALYX
+static char g_logdir[1024], g_envline[2048];    // tentative: defined with the rest of the Alyx state below
 static char g_alyx_config[1024], g_alyx_data[1024];
 int kl_app_configure_alyx(const char *resources, const char *game, const char *dylibs,
                           const char *config, const char *data);
 int kl_app_prewarm_alyx(const char *resources, const char *game, const char *dylibs,
                         const char *config, const char *data) {
     if (kl_app_configure_alyx(resources, game, dylibs, config, data) != 0) return -1;
+    // The prewarm runs before the boot log exists and compiles thousands of pipelines on several threads: it
+    // gets a log of its own (stdout + stderr, line-buffered: VPKEngine's and the replayer's lines), the fault
+    // handler (its report also goes to klepton-crash-<engine>.log, set by configure) and the heartbeat (memory),
+    // so a crash here leaves a stack instead of nothing. Boot's open_log() later points both streams at the boot log.
+    if (kl_env_on("KL_LOG_FILE", 1)) {
+        const char *tag = getenv("KL_LOG_TAG");
+        int tagged = tag && *tag && strlen(tag) < 32;
+        char pl[1200];
+        snprintf(pl, sizeof pl, "%s/klepton-prewarm%s%s.log", g_logdir, tagged ? "-" : "", tagged ? tag : "");
+        if (freopen(pl, "w", stdout)) {
+            setvbuf(stdout, NULL, _IOLBF, 0);
+            dup2(fileno(stdout), STDERR_FILENO);
+            setvbuf(stderr, NULL, _IOLBF, 0);
+        }
+    }
+    app_phase("prewarm");
+    heartbeat_start();
+    kl_fault_install();
+    fprintf(stderr, "=== Klepton prewarm (launcher, before the game) ===\n  %s\n", g_envline);
     // The headset's own record of how the game makes its device (written at each game launch), else the app's
     // (the config folder's device-info.json).
     char own[1300], shipped[1300];
@@ -172,6 +195,8 @@ int kl_app_prewarm_alyx(const char *resources, const char *game, const char *dyl
     int rc = kl_foz_prewarm(own);
     if (rc == -2) rc = kl_foz_prewarm(shipped);
     if (rc == -2) kl_foz_prewarm_log(0, 0, 0, -2);  // neither copy was usable
+    fprintf(stderr, "=== prewarm finished (rc %d) ===\n", rc);
+    app_phase("prewarm done");
     return rc;
 }
 #endif

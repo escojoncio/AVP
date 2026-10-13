@@ -79,6 +79,30 @@ enum AVPPrepare {
 
     /// AlyxBoot.prewarm with progress (VPKEngine compiles every pipeline of the list). Blocking.
     static func prewarm(_ paths: AVPLaunchPaths, progress: @escaping Progress) {
+        // Crash guard: a marker lives while the prewarm runs. Found at the next start (same install), the last
+        // prewarm never finished: once -> this one runs on 1 thread; twice or more -> skipped (the game's own
+        // replay warms the cache, also on 1 thread). A new install (another bundle path) starts over.
+        let marker = paths.dataDir.appendingPathComponent("prewarm.inflight")
+        let install = Bundle.main.bundlePath
+        var unfinished = 0
+        if let text = try? String(contentsOf: marker, encoding: .utf8) {
+            let parts = text.split(separator: " ", maxSplits: 1).map(String.init)
+            if parts.count == 2, parts[1] == install { unfinished = Int(parts[0]) ?? 0 }
+        }
+        if unfinished > 0 {
+            AVPLog.log("Preparar: la precompilación anterior no terminó (\(unfinished) vez/veces, cierre inesperado); "
+                       + "detalles en Logs Alyx/klepton-prewarm-*.log y klepton-crash-*.log")
+            kl_app_prewarm_threads(1)
+        }
+        if unfinished >= 2 {
+            AVPLog.log("Preparar: precompilado saltado; el juego compila los shaders al arrancar (1 hilo)")
+            progress(4, 1, AVPL("Shaders: se compilan al arrancar", "Shaders: compiled at start"))
+            // Next start tries again on 1 thread (never stuck skipping for good).
+            try? "1 \(install)".write(to: marker, atomically: true, encoding: .utf8)
+            return
+        }
+        try? "\(unfinished + 1) \(install)".write(to: marker, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: marker) }
         let t0 = Date()
         let done = DispatchSemaphore(value: 0)
         nonisolated(unsafe) var rc: Int32 = 0
@@ -93,7 +117,8 @@ enum AVPPrepare {
         }
         let p = AlyxBoot.pipelineProgress()
         progress(4, 1, AVPL("Shaders listos", "Shaders ready"))
-        AVPLog.log("Preparar: precompilados \(p.done)/\(p.total) pipelines en \(Int(Date().timeIntervalSince(t0))) s (rc \(rc): \(String(cString: kl_app_status())))")
+        AVPLog.log("Preparar: precompilados \(p.done)/\(p.total) pipelines en \(Int(Date().timeIntervalSince(t0))) s"
+                   + "\(unfinished > 0 ? " (1 hilo)" : "") (rc \(rc): \(String(cString: kl_app_status())))")
     }
 
     // MARK: 1. Runtime libraries

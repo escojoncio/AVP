@@ -29,6 +29,11 @@
 #include "kl_vk_diag_gen.h"
 #undef KLD_GEN_TABLE
 
+// Suspended (a count) while the pipeline replayer resolves its entry points and while the launcher's
+// prewarm runs: those calls are Klepton's own, not the guest's, and the thunks exist for the guest.
+static _Atomic int g_kld_suspend;
+void klvk_diag_suspend(int on) { atomic_fetch_add_explicit(&g_kld_suspend, on ? 1 : -1, memory_order_acq_rel); }
+
 static int kld_on(void) {
     static _Atomic int on = -1;
     int v = atomic_load_explicit(&on, memory_order_relaxed);
@@ -158,7 +163,8 @@ static int kld_cmp(const void *k, const void *e) { return strcmp((const char *)k
 // The pointer to hand the guest for `name`: a thunk around `fn`, or `fn` itself when
 // there is nothing to wrap (unknown name, vkCmd*, the missing-function stub, diag off).
 static PFN_vkVoidFunction kld_wrap(const char *name, PFN_vkVoidFunction fn) {
-    if (!fn || !name || fn == (PFN_vkVoidFunction)klvk_missing_trap || !kld_on()) return fn;
+    if (!fn || !name || fn == (PFN_vkVoidFunction)klvk_missing_trap || !kld_on() || t_pipe_replay ||
+        atomic_load_explicit(&g_kld_suspend, memory_order_acquire) > 0) return fn;
     const char *const *p = bsearch(name, kld_names, KLD_N, sizeof *kld_names, kld_cmp);
     if (!p) return fn;
     int id = (int)(p - kld_names);

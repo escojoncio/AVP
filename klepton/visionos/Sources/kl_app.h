@@ -206,6 +206,9 @@ const char *kl_app_status(void);
 // Targets without the Alyx add-on get a stub that says 0.
 int kl_foz_progress(unsigned *done, unsigned *total, double *elapsed);
 
+// Crash guard: the pipeline replays (prewarm and the game's own) on this many threads (0 = KL_VK_FOZ_THREADS).
+void kl_app_prewarm_threads(unsigned n);
+
 // The launcher's "Preparing graphics" before Play, in the shared space: configures (kl_app_configure_alyx, once per
 // process, as boot would) and warms the Metal cache with no game, on a device made from the game's recorded settings
 // (kl_foz_prewarm: <data>/klfz/device-info.json, else <config>/device-info.json). Blocks; progress is

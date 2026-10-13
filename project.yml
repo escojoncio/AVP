@@ -31,6 +31,7 @@ targets:
           - "**/*.txt"
       - path: app/Resources
         buildPhase: resources
+      - path: app/Assets.xcassets
       - path: klepton/visionos/Sources
         excludes:
           - "*.h"
@@ -64,6 +65,7 @@ targets:
         INFOPLIST_FILE: klepton/visionos/Info.plist
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: AVP
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_KEY_GCSupportsControllerUserInteraction: YES
         CODE_SIGN_ENTITLEMENTS: app/AVP.entitlements
         CODE_SIGN_STYLE: Automatic
