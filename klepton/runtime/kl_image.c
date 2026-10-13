@@ -19,6 +19,7 @@
 #include <mach/vm_map.h>
 #include <dlfcn.h>
 #include <limits.h>
+#include <time.h>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <mach-o/loader.h>
@@ -731,11 +732,24 @@ static int bind_dynamic(kl_image *img, const Elf64_Phdr *ph, int phnum, uint64_t
 // The mach_header is located by matching the dylib against dyld's loaded-image
 // list. dlsym would be the obvious route and is precisely what we cannot use —
 // the translated dylib deliberately exports nothing.
+// Load-time accounting for the boot log (where the seconds between the pipeline replay and the first picture
+// go): the last translated dylib's dlopen (dyld + the system's signature check of a freshly signed file) and the
+// running totals, printed by kl_load_auto.
+static double g_dylib_dlopen_ms, g_dylib_total_ms, g_dylib_last_dlopen_ms;
+static unsigned g_dylib_count;
+static double mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
 kl_image *kl_load_dylib(const char *path) {
     char real[PATH_MAX];
     if (!realpath(path, real)) snprintf(real, sizeof real, "%s", path);
 
+    const double t_open = mono_ms();
     void *h = dlopen(real, RTLD_NOW | RTLD_LOCAL);
+    g_dylib_last_dlopen_ms = mono_ms() - t_open;
     if (!h) { err("dlopen %s: %s", real, dlerror()); return NULL; }
 
     const struct mach_header_64 *mh = NULL;
@@ -892,13 +906,21 @@ static int dylib_candidate(const char *path, char *out, size_t cap, char *name_o
 kl_image *kl_load_auto(const char *path) {
     char cand[1024], name[256];
     if (dylib_candidate(path, cand, sizeof cand, name, sizeof name)) {
+        const double t_load = mono_ms();
+        g_dylib_last_dlopen_ms = 0;
         kl_image *img = kl_load_dylib(cand);
         if (!img) {
             fprintf(stderr, "  [klepton] %s: translated dylib present but failed "
                             "to load: %s\n", cand, kl_error());
             return NULL;
         }
-        fprintf(stderr, "  [klepton] %s: loaded as a translated dylib\n", name);
+        const double load_ms = mono_ms() - t_load;
+        g_dylib_count++;
+        g_dylib_total_ms += load_ms;
+        g_dylib_dlopen_ms += g_dylib_last_dlopen_ms;
+        fprintf(stderr, "  [klepton] %s: loaded as a translated dylib (%.0f ms, dlopen %.0f; %u so far: %.1f s, "
+                        "dlopen %.1f s)\n", name, load_ms, g_dylib_last_dlopen_ms, g_dylib_count,
+                g_dylib_total_ms / 1e3, g_dylib_dlopen_ms / 1e3);
         // The guest sees the library under the path it asked for, not where
         // its translation lives: Source 2 finds its game directory from its
         // own module path (dladdr), and a dylib directory there made it look

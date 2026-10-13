@@ -33,6 +33,7 @@
 #include <fstream>
 #include <sstream>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <stdio.h>
@@ -370,10 +371,26 @@ std::atomic<unsigned> g_threads_override{0};
 // Set while kl_foz_prewarm makes its own device: that device's replay is the prewarm's to run, not the hook's.
 std::atomic<bool> g_prewarming{false};
 
+// Set when this process's prewarm replayed every database AND the driver confirmed it compiled everything into
+// its persistent caches (VPKEngine with VP_PIPELINE_CACHE_DIR: recipes + binary archive, which its own
+// vkCreateDevice prewarm loads for the game's device). The game's replay would then redo the same work.
+std::atomic<bool> g_prewarm_complete{false};
+
 void start_replay(VkDevice dev, PFN_vkGetDeviceProcAddr gdpa, bool block);
 
 void h_device_created(VkDevice dev, PFN_vkGetDeviceProcAddr gdpa) {
     if (g_prewarming.load()) return;
+    if (g_prewarm_complete.load()) {
+        fprintf(stderr, "  [foz] game replay skipped: the launcher's prewarm in this process compiled every pipeline "
+                        "into VPKEngine's caches (its vkCreateDevice prewarm loads them: gpu.prewarm)\n");
+        return;
+    }
+    // The app's verdict for a launch whose prewarm it skipped: VPKEngine's caches are warm for this install and
+    // this pipeline list (AVP: <data>/vpcache/warm.stamp).
+    if (const char *g = getenv("KL_VK_FOZ_GAME_REPLAY"); g && !strcmp(g, "0")) {
+        fprintf(stderr, "  [foz] game replay skipped: VPKEngine's caches are warm (KL_VK_FOZ_GAME_REPLAY=0)\n");
+        return;
+    }
     // KL_VK_FOZ_REPLAY_BLOCK=1 holds vkCreateDevice until the replay is done: a cold cache then
     // costs load time before the first frame instead of racing the guest into its first views.
     const char *b = getenv("KL_VK_FOZ_REPLAY_BLOCK");
@@ -457,8 +474,8 @@ extern "C" void *kl_vulkan_sym(const char *name);
 extern "C" void kl_foz_set_threads(unsigned n) { g_threads_override.store(n); }
 
 // One line per "Preparing graphics" before Play in prewarm.log beside the recording, which a stutter report carries
-// (diagnostics/): "<unix time it began> <seconds> <pipelines> <over 100 ms> <result>" (result 0, or why it could not:
-// -1 the device, -2 no usable device info). The launcher's own log line comes before the game's log file exists.
+// (diagnostics/): "<unix time it began> <seconds> <pipelines> <over 100 ms> <result>" (result 0; 1 replayed but not kept by
+// the driver's persistent caches; or why it could not: -1 the device, -2 no usable device info). The launcher's own log line comes before the game's log file exists.
 extern "C" void kl_foz_prewarm_log(double seconds, unsigned pipelines, unsigned slow, int rc) {
     std::string path = default_dir() + "/prewarm.log";
     if (FILE *f = fopen(path.c_str(), "a")) {
@@ -471,10 +488,12 @@ extern "C" void kl_foz_prewarm_log(double seconds, unsigned pipelines, unsigned 
 // made its own (device-info.json, which the layer writes at the game's vkCreateDevice: KL_VK_DEVICE_INFO), through the
 // layer's own entry points, and replay the databases on it (KL_VK_FOZ_REPLAY), blocking. Pipelines made on that
 // device go through the same fix-ups and MoltenVK state as the game's, so the game's own replay then finds each one
-// in the cache. Progress is kl_foz_progress's. Returns 0 when it replayed; -2 when the device info is missing or not
+// in the cache. Progress is kl_foz_progress's. Returns 0 when it replayed and the driver's persistent caches hold the
+// result (g_prewarm_complete: the game skips its replay); 1 when it replayed without that; -2 when the device info is missing or not
 // usable (a feature struct this build cannot rebuild: try another copy), -1 when it could not otherwise (no databases,
 // a create that failed). The game's own replay is the fallback. The device and instance are retired after the replay
 // (klvk_retire_device), so the game's own device is the layer's first.
+extern "C" const char *kl_vulkan_driver_path(void);   // gfx/kl_vulkan.c: the driver dylib Klepton loaded
 static int foz_prewarm(const char *info_path);
 // The whole prewarm is Klepton's own Vulkan use: the diag thunks (meant for the guest's calls) stay out of it.
 extern "C" int kl_foz_prewarm(const char *info_path) {
@@ -583,9 +602,36 @@ static int foz_prewarm(const char *info_path) {
             iext.size(), dext.size(), chain.size());
     g_sum_compiled.store(0); g_sum_slow.store(0);
     start_replay(dev, (PFN_vkGetDeviceProcAddr)gipa(inst, "vkGetDeviceProcAddr"), true);
+    // vkCreate*Pipelines only queues the compiles: without this wait, retiring the device drops whatever is
+    // still queued (build 12: 1268 of ~2900 libraries compiled when the prewarm device went away).
+    bool drained = false;
+    {
+        typedef uint32_t (*wait_fn)(VkDevice);
+        void *h = nullptr;
+        if (const char *drv = kl_vulkan_driver_path()) h = dlopen(drv, RTLD_NOW | RTLD_NOLOAD);
+        wait_fn w = (wait_fn)dlsym(h ? h : RTLD_DEFAULT, "vpvk_device_wait_compiles");
+        if (w) {
+            double tw = now_s();
+            w(dev);
+            drained = true;
+            fprintf(stderr, "  [foz] prewarm: waited %.1f s for the driver's queued compiles\n", now_s() - tw);
+        }
+        if (h) dlclose(h);
+    }
+    if (!drained) fprintf(stderr, "  [foz] prewarm: the driver cannot wait for its queued compiles (not VPKEngine 0017+)\n");
+    // Complete = every compile waited for AND kept on disk: the recipes (VP_PIPELINE_CACHE_DIR) and the binary
+    // archive (off with VP_PIPELINE_ARCHIVE=0: the game would then compile every pipeline again, so it replays).
+    const char *cache = getenv("VP_PIPELINE_CACHE_DIR"), *archive = getenv("VP_PIPELINE_ARCHIVE");
+    const bool have_cache = cache && *cache, archive_off = archive && *archive == '0';
+    if (drained && have_cache && !archive_off) g_prewarm_complete.store(true);
+    else fprintf(stderr, "  [foz] prewarm: not complete (driver wait %s, VP_PIPELINE_CACHE_DIR %s, binary archive %s): "
+                         "the game replays again\n",
+                 drained ? "done" : "unavailable", have_cache ? "set" : "unset", archive_off ? "off" : "on");
     klvk_retire_device(inst, dev);
     fprintf(stderr, "  [foz] prewarm done in %.1f s\n", now_s() - t0);
-    kl_foz_prewarm_log(now_s() - t0, g_sum_compiled.load(), g_sum_slow.load(), 0);
-    return 0;
+    // 1: replayed, but nothing persistent says so (the app must not mark its cache warm; the game replays).
+    const int rc = g_prewarm_complete.load() ? 0 : 1;
+    kl_foz_prewarm_log(now_s() - t0, g_sum_compiled.load(), g_sum_slow.load(), rc);
+    return rc;
 }
 

@@ -58,13 +58,25 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   si hay dual-source con >1 render target. `pipelines.cpp` compila en Linux; `vpvk_tests` ya fallaba antes de 0014
   (`std::bad_variant_access`, Release, sin investigar).
 
+## Build 13 (sin validar): GPU colgada (sin imagen) + carga lenta
+- Logs_Alyx_7 (build 12): precompilado OK (3312 en 13 s). Juego: primer frame con escena → `Caused_GPU_Hang_Error`
+  (f=247, f=256 `render23`) y después 6737 `SubmissionsIgnored`: audio sí, imagen no. ~67 s de Jugar a la 1.ª imagen.
+- VPKEngine `0015`: args indirectos escritos por la GPU (registro por BufferId/VkDeviceMemory) se leen en la GPU
+  (metal2 kernel `vp_indirect_fix`: count, multiview ×viewCount, clamp; scratch 8 MiB/slot); límites en la ruta CPU
+  (`vk.indirect …`); `gpu.err what=encoder_fault` por encoder; cola Metal nueva tras SubmissionsIgnored
+  (`gpu.recover`, `queueGen`); shadps4 `Indirect` por campos. `0016`: tests depth_resolve (vpvk_tests pasa con
+  `LD_LIBRARY_PATH=.` desde `<build>/vulkan`). `0017`: `vpvk_device_wait_compiles`, colas de librerías núcleos−2,
+  `VP_PIPELINE_ARCHIVE=0`, `archive.inflight`, `gpu.pso.recipe game hits/misses`, recetas de variantes .mv.
+- AVP: `VP_PIPELINE_CACHE_DIR=<Data>/vpcache`; `AVPPipelineCache` (AVPPrepare.swift): `warm.stamp` = sha VPVulkan +
+  lista + versión SO + archive on; con caché completa se salta el prewarm y el juego (`KL_VK_FOZ_GAME_REPLAY=0`);
+  2 sesiones con `archive.inflight` → `archive.off`; misses >25 % → se descarta el stamp (`last.key`).
+  `pipelines.foz` stamp por SHA-256 de `alyx.recipe`. `kl_fossilize.cpp`: espera del driver, rc 1 = no persistido.
+  `kl_image.c`/`kl_dl.c`: ms por librería. Compositor: errores de cmdbuf en `alive`, `[cp] eye probe` (RGBA de los ojos).
+- Todo VPKEngine no-Metal compila y pasa tests en Linux; Metal/Swift solo revisados (Sonnet ×3).
+
 ## Siguiente
-- ¿Pasa el precompilado y arranca el juego? Si cae: `klepton-crash-vpkengine.log` + `klepton-prewarm-vpkengine.log`.
-- Si arranca: comprobar imagen en ambos ojos, VPKTAA (`[taa] … foveated`), FPS/GPU (`[gputime]`), pausa (PS izq. 1 s),
-  Home/PS accidental + "Volver al juego" (segundo CompositorLayer sobre el mismo guest: sin validar).
-- Si sigue "RenderDeviceMgr001": leer `[vk] diag` (ring + errores), la consola del juego tras el message box y
-  `vk.format unsupported`. Siguiente hipótesis: identidad GPU (VPVulkan dice Adreno 740 / driver 0.1.0, MoltenVK
-  Apple) → interruptor A/B `VPVK_GPU_IDENTITY=moltenvk`.
+- Log build 13: `vk.indirect … gpu=`, `gpu.indirect fix_kernel=ready`, ¿`Caused_GPU_Hang`/`encoder_fault`?, `gpu.recover`,
+  `[cp] eye probe`, `[foz] prewarm: waited`, `[foz] game replay skipped` (2.º arranque), tiempos `(X ms, dlopen Y)`.
 
 ## Pendiente
 - Ajustes en vivo que faltan: resolución/texturas (convars del juego), anisotrópico (solo afecta a samplers nuevos);

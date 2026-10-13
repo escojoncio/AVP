@@ -1,0 +1,398 @@
+From c0841c70f4a24cd18ffa973b9831d6ce7050d893 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 16:39:02 +0000
+Subject: [PATCH 3/3] VPVulkan: persistent pipeline cache for the prewarm
+ (vpvk_device_wait_compiles, parallel library queues, archive switch and
+ inflight marker, recipe hit/miss counters, motion-variant recipes at
+ creation)
+
+---
+ .../include/vpgpu/metal2/metal_backend.h      |  3 +
+ gpu/metal2/src/metal_backend.mm               | 70 +++++++++++++++++--
+ gpu/vulkan/include/vpvk/platform.h            |  4 ++
+ gpu/vulkan/src/entry.cpp                      | 21 +++++-
+ gpu/vulkan/src/pipelines.cpp                  | 18 +++++
+ gpu/vulkan/src/platform_metal.mm              | 11 ++-
+ gpu/vulkan/src/vpvk.h                         |  5 ++
+ gpu/vulkan/tests/vk_tests.cpp                 | 35 +++++++++-
+ 8 files changed, 156 insertions(+), 11 deletions(-)
+
+diff --git a/gpu/metal2/include/vpgpu/metal2/metal_backend.h b/gpu/metal2/include/vpgpu/metal2/metal_backend.h
+index 084be1b..4eef641 100644
+--- a/gpu/metal2/include/vpgpu/metal2/metal_backend.h
++++ b/gpu/metal2/include/vpgpu/metal2/metal_backend.h
+@@ -150,6 +150,9 @@ class MetalBackend final : public Backend {
+   // Compiles the MTLLibrary/MTLFunction of a shader already in the ShaderProvider on a background
+   // queue, so pipeline creation later finds it compiled. Deduplicated by shader id (= MSL hash).
+   void prewarmShader(uint64_t shaderId);
++  // Blocks until every prewarmShader compile queued so far has run (not dropped: the launcher's
++  // prewarm calls it before retiring its device, so the whole list reaches the Metal caches).
++  void drainShaderPrewarm();
+   // Compiles shader `shaderId`'s library synchronously (same variant as prewarmShader).
+   bool compileShader(uint64_t shaderId, std::string& error);
+ 
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index f1dab5b..bbe9dd5 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -424,9 +424,13 @@ struct MetalBackend::Impl {
+   // waits on functionReady instead of compiling the same MSL again.
+   std::unordered_set<uint64_t> compiling;
+   std::condition_variable functionReady;
+-  // Speculative library compiles (prewarmShader): two serial queues, low QoS. A pipeline worker that
+-  // needs a key not yet started compiles it itself at once, so a draw never waits behind them.
+-  dispatch_queue_t prewarmQueues[2] = {nil, nil};
++  // Speculative library compiles (prewarmShader): serial queues, low QoS, one per core minus two
++  // (2..kMaxPrewarmQueues; was 2, which left thousands of compiles queued for minutes on a first
++  // run). A pipeline worker that needs a key not yet started compiles it itself at once, so a draw
++  // never waits behind them.
++  static constexpr unsigned kMaxPrewarmQueues = 8;
++  dispatch_queue_t prewarmQueues[kMaxPrewarmQueues] = {};
++  unsigned prewarmQueueCount = 0;  // set once, under pipelineMutex, with the queues
+   std::atomic<uint32_t> prewarmNext{0};
+   std::atomic<bool> closing{false};
+   std::mutex libStatsMutex;
+@@ -478,6 +482,20 @@ struct MetalBackend::Impl {
+   void writeArchiveCountLocked();
+   bool saveArchiveLocked();
+   void maybeSaveArchive();
++  // <cacheRoot>/archive.inflight exists while archive code runs (open, add, save, lookups), so a
++  // crash inside it -- also in Apple's <redacted> frames -- leaves the file for the host to find
++  // (AVP turns the archive off, VP_PIPELINE_ARCHIVE=0). Nested/concurrent sections share one file.
++  std::mutex inflightMutex;
++  int inflightDepth = 0;
++  void inflightEnter(const char* what);
++  void inflightLeave();
++  struct Inflight {
++    Impl* m;
++    Inflight(Impl* impl, const char* what) : m(impl) { m->inflightEnter(what); }
++    ~Inflight() { m->inflightLeave(); }
++    Inflight(const Inflight&) = delete;
++    Inflight& operator=(const Inflight&) = delete;
++  };
+ 
+   // Depth-stencil states of draws with dynamic depth/stencil state (submit thread only).
+   std::unordered_map<uint64_t, id<MTLDepthStencilState>> dynamicDepth;
+@@ -822,6 +840,19 @@ id<MTLFunction> MetalBackend::Impl::function(uint64_t shaderId, const FetchInput
+   return fn;
+ }
+ 
++void MetalBackend::drainShaderPrewarm() {
++  Impl* m = impl_.get();
++  dispatch_queue_t qs[Impl::kMaxPrewarmQueues] = {};
++  unsigned n = 0;
++  {
++    std::lock_guard lock(m->pipelineMutex);
++    n = m->prewarmQueueCount;
++    for (unsigned i = 0; i < n; ++i) qs[i] = m->prewarmQueues[i];
++  }
++  for (unsigned i = 0; i < n; ++i)
++    if (qs[i]) dispatch_sync(qs[i], ^{});  // serial: returns once everything queued before it ran
++}
++
+ bool MetalBackend::compileShader(uint64_t shaderId, std::string& error) {
+   Impl* m = impl_.get();
+   if (!ok() || !shaderId) {
+@@ -839,13 +870,17 @@ void MetalBackend::prewarmShader(uint64_t shaderId) {
+   {
+     std::lock_guard lock(m->pipelineMutex);
+     if (m->functions.count(shaderId) || m->compiling.count(shaderId)) return;
+-    if (!m->prewarmQueues[0]) {
++    if (!m->prewarmQueueCount) {
++      const NSUInteger cores = [NSProcessInfo processInfo].activeProcessorCount;
++      const unsigned n = unsigned(std::clamp<NSUInteger>(cores > 2 ? cores - 2 : 2, 2, Impl::kMaxPrewarmQueues));
+       dispatch_queue_attr_t a = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
+-      m->prewarmQueues[0] = dispatch_queue_create("vpgpu.shader.prewarm0", a);
+-      m->prewarmQueues[1] = dispatch_queue_create("vpgpu.shader.prewarm1", a);
++      for (unsigned i = 0; i < n; ++i)
++        m->prewarmQueues[i] = dispatch_queue_create(("vpgpu.shader.prewarm" + std::to_string(i)).c_str(), a);
++      m->prewarmQueueCount = n;
++      m->info("gpu.shader.lib prewarm_queues=" + std::to_string(n));
+     }
+   }
+-  dispatch_queue_t q = m->prewarmQueues[m->prewarmNext++ & 1];
++  dispatch_queue_t q = m->prewarmQueues[m->prewarmNext++ % m->prewarmQueueCount];
+   dispatch_async(q, ^{
+     if (m->closing) return;
+     {
+@@ -1066,6 +1101,7 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
+   NSArray<id<MTLBinaryArchive>>* ars = lookupArchives;
+   bool hit = false;
+   if (ars.count) {  // archive lookup only: a miss fails fast instead of compiling
++    Inflight guard(this, "lookup");
+     d.binaryArchives = ars;
+     p.render = [device newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                                  reflection:nil error:&e];
+@@ -1104,6 +1140,7 @@ bool MetalBackend::Impl::buildCompute(const PipelineState& s, Pipeline& p, std::
+   NSArray<id<MTLBinaryArchive>>* ars = lookupArchives;  // immutable: no lock
+   bool hit = false;
+   if (ars.count) {
++    Inflight guard(this, "lookup");
+     d.binaryArchives = ars;
+     p.compute = [device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionFailOnBinaryArchiveMiss
+                                                    reflection:nil error:&e];
+@@ -2731,10 +2768,27 @@ id<MTLBinaryArchive> MetalBackend::Impl::newArchive() {
+   return ar;
+ }
+ 
++void MetalBackend::Impl::inflightEnter(const char* what) {
++  if (options.cacheRoot.empty()) return;
++  std::lock_guard lock(inflightMutex);
++  if (inflightDepth++) return;
++  std::ofstream f(options.cacheRoot / "archive.inflight", std::ios::trunc);
++  f << what << '\n';
++}
++
++void MetalBackend::Impl::inflightLeave() {
++  if (options.cacheRoot.empty()) return;
++  std::lock_guard lock(inflightMutex);
++  if (--inflightDepth) return;
++  std::error_code ec;
++  std::filesystem::remove(options.cacheRoot / "archive.inflight", ec);
++}
++
+ void MetalBackend::Impl::openArchives() {
+   namespace fs = std::filesystem;
+   std::error_code ec;
+   fs::create_directories(options.cacheRoot, ec);
++  Inflight guard(this, "open");
+   // pipelines.count: "v2 <next file number>" then "<n> <pipelines>" per file. The legacy form is
+   // a single number: the pipelines in pipelines.metalar.
+   uint64_t next = 1;
+@@ -2828,6 +2882,7 @@ void MetalBackend::Impl::drainArchiveLocked() {
+       batch.swap(archiveQueue);
+     }
+     if (batch.empty()) return;
++    Inflight guard(this, "add");
+     for (ArchiveEntry& q : batch) {
+       // A pipeline without its main function cannot be packed ("missing 'vertex' stage").
+       const bool complete = q.compute ? [(MTLComputePipelineDescriptor*)q.desc computeFunction] != nil
+@@ -2983,6 +3038,7 @@ void MetalBackend::Impl::writeArchiveCountLocked() {
+ 
+ bool MetalBackend::Impl::saveArchiveLocked() {
+   if (!archiveOn) return false;
++  Inflight guard(this, "save");
+   drainArchiveLocked();
+   if (!archiveUnsaved) return true;
+   const auto file = archivePath(archiveSession);
+diff --git a/gpu/vulkan/include/vpvk/platform.h b/gpu/vulkan/include/vpvk/platform.h
+index 9e74cc2..f2b1785 100644
+--- a/gpu/vulkan/include/vpvk/platform.h
++++ b/gpu/vulkan/include/vpvk/platform.h
+@@ -55,6 +55,10 @@ class Platform {
+   virtual void destroyTextureView(vpgpu::TextureId) {}
+   // Blocks until all submitted GPU work finished (vkQueueWaitIdle / vkDeviceWaitIdle / fences).
+   virtual void waitIdle() {}
++  // Blocks until the speculative shader-library compiles queued so far have run.
++  virtual void drainCompiles() {}
++  // Writes pending on-disk caches (pipeline binary archive).
++  virtual void flushCaches() {}
+   // Bytes the process may still allocate before the OS kills it (visionOS: os_proc_available_memory),
+   // 0 = unknown. VK_EXT_memory_budget reports usage + this as the heap budget.
+   virtual uint64_t availableMemory() { return 0; }
+diff --git a/gpu/vulkan/src/entry.cpp b/gpu/vulkan/src/entry.cpp
+index edd8498..c528c30 100644
+--- a/gpu/vulkan/src/entry.cpp
++++ b/gpu/vulkan/src/entry.cpp
+@@ -4,6 +4,7 @@
+ // Every function is exported under its Vulkan name so dlsym() on the dylib finds it, as a client
+ // that loads a driver directly (Klepton's kl_vulkan.c) does for a few vkCmd* entry points.
+ #include <atomic>
++#include <chrono>
+ #include <algorithm>
+ #include <cstdarg>
+ #include <cstddef>
+@@ -515,7 +516,8 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
+   // vkCreate*Pipelines calls are cache hits. With vpvk_prewarm() run by the app beforehand this is
+   // mostly binary-archive lookups.
+   d->recipes = std::make_unique<RecipeStore>(RecipeStore::defaultDir());
+-  if (d->recipes->enabled() && prewarmEnabled()) prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 20.0);
++  if (d->recipes->enabled() && prewarmEnabled())
++    d->prewarmedRecipes = prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 20.0).recipes;
+   logf("vk.device exts=%u multiview=%d fdm=%d metal_objects=%d", ci->enabledExtensionCount,
+        d->multiview, d->densityMap, d->metalObjects);
+   logConfig();
+@@ -1393,6 +1395,23 @@ VPVK_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkIns
+   return lookup(name, false);
+ }
+ 
++// For a host's prewarm device (no game running): blocks until every shader library and pipeline
++// its vkCreate*Pipelines calls queued has compiled, then writes the binary archive, so retiring
++// the device drops nothing. Returns the milliseconds waited. Found with dlsym.
++VPVK_EXPORT uint32_t vpvk_device_wait_compiles(VkDevice dv) {
++  Device* d = dv ? from<Device>(dv) : nullptr;
++  if (!d || !d->gpu || !d->platform) return 0;
++  const auto t0 = std::chrono::steady_clock::now();
++  d->platform->drainCompiles();
++  d->gpu->pipelines().waitIdle();
++  d->platform->drainCompiles();  // libraries the last pipelines asked for
++  d->platform->flushCaches();
++  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++  const vpgpu::PipelineStats t = d->gpu->pipelines().totals();
++  logf("vk.prewarm drained ms=%.0f pipelines compiled=%u failed=%u hits=%u", ms, t.compiled, t.failed, t.hits);
++  return uint32_t(ms);
++}
++
+ // Loader-facing ICD interface (only used if a Vulkan loader is ever put in front of the driver).
+ VPVK_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance i, const char* name) {
+   return vkGetInstanceProcAddr(i, name);
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index b9c6a74..5ced71f 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -798,6 +798,22 @@ void buildMotionVariants(Device* d, const VkGraphicsPipelineCreateInfo& ci, Pipe
+   p.mv = std::move(mv);
+   d->gpu->pipelines().request(p.mv->formatOnly, p.mv->formatOnly.key(), vpgpu::Priority::Prefetch);
+   if (p.mv->hasMotion) d->gpu->pipelines().request(p.mv->motion, p.mv->motion.key(), vpgpu::Priority::Prefetch);
++  // Recipes too (were only recorded once drawn): a prewarm then compiles them before the game's first frame.
++  if (d->recipes) {
++    d->recipes->addPipeline(p.mv->formatOnly, p.recipeInputs);
++    if (p.mv->hasMotion) d->recipes->addPipeline(p.mv->motion, p.mv->motionInputs);
++  }
++}
++
++// Did this device's recipe prewarm already produce this key? Checked before the game's request.
++// The boot log's last "gpu.pso.recipe game" line is what AVP reads to trust (or drop) warm.stamp.
++void noteRecipeKey(Device* d, vpgpu::PipelineKey key, const std::string& label) {
++  if (!d->prewarmedRecipes) return;
++  const bool hit = d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing;
++  const uint32_t h = hit ? ++d->recipeHits : d->recipeHits.load(), m = hit ? d->recipeMisses.load() : ++d->recipeMisses;
++  if (!hit && m <= 8) logf("gpu.pso.recipe game miss key=%016llx pipeline=%s", (unsigned long long)key.value, label.c_str());
++  if (h + m <= 4 || (h + m) % 64 == 0)
++    logf("gpu.pso.recipe game hits=%u misses=%u prewarmed=%u", h, m, d->prewarmedRecipes);
+ }
+ 
+ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
+@@ -921,6 +937,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
+   p->recipeInputs = inputs;
+   if (ok && d->motion && p->viewCount > 1) buildMotionVariants(d, ci, *p, attrs);
+   if (ok) {
++    noteRecipeKey(d, p->key, st.label);
+     d->gpu->pipelines().request(st, p->key, vpgpu::Priority::Blocking);
+     if (d->recipes) d->recipes->addPipeline(st, inputs);
+   }
+@@ -940,6 +957,7 @@ PipelineObj* createCompute(Device* d, const VkComputePipelineCreateInfo& ci) {
+     collectUsed(*p, o, vpgpu::stage::compute);
+     p->ok = true;
+     p->key = p->state.key();
++    noteRecipeKey(d, p->key, p->state.label);
+     d->gpu->pipelines().request(p->state, p->key, vpgpu::Priority::Blocking);
+     if (d->recipes) d->recipes->addPipeline(p->state, {0, 0, o.input});
+   }
+diff --git a/gpu/vulkan/src/platform_metal.mm b/gpu/vulkan/src/platform_metal.mm
+index f09cd5c..74bb9e4 100644
+--- a/gpu/vulkan/src/platform_metal.mm
++++ b/gpu/vulkan/src/platform_metal.mm
+@@ -26,7 +26,8 @@ class MetalPlatform final : public Platform {
+     { std::lock_guard<std::mutex> l(livePlatformsMutex()); livePlatforms().erase(this); }
+     backend_.saveArchive();
+   }
+-  void flushCaches() { backend_.saveArchive(); }  // pipeline binary archive, if any is pending
++  void flushCaches() override { backend_.saveArchive(); }  // pipeline binary archive, if any is pending
++  void drainCompiles() override { backend_.drainShaderPrewarm(); }
+   vpgpu::Backend& backend() override { return backend_; }
+   void waitIdle() override { backend_.waitIdle(); }
+   uint64_t availableMemory() override { return os_proc_available_memory(); }
+@@ -66,9 +67,15 @@ class MetalPlatform final : public Platform {
+ 
+  private:
+   // VP_PIPELINE_CACHE_DIR (set by the app per game): persistent MTLBinaryArchive across runs.
++  // VP_PIPELINE_ARCHIVE=0 keeps the recipes (same dir) but turns the binary archive off: the host's
++  // fallback after a crash inside the archive code.
+   static vpgpu::metal2::MetalOptions options() {
+     vpgpu::metal2::MetalOptions o;
+-    if (const char* dir = std::getenv("VP_PIPELINE_CACHE_DIR"); dir && *dir) o.cacheRoot = dir;
++    const char* dir = std::getenv("VP_PIPELINE_CACHE_DIR");
++    const char* ar = std::getenv("VP_PIPELINE_ARCHIVE");
++    const bool archiveOff = ar && *ar == '0';
++    if (dir && *dir && !archiveOff) o.cacheRoot = dir;
++    if (dir && *dir && archiveOff) log("gpu.pso.cache archive=off (VP_PIPELINE_ARCHIVE=0)");
+     return o;
+   }
+   vpgpu::metal2::ShaderTable shaders_;
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index ada4ff8..dacd675 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -316,6 +316,11 @@ struct Device : Dispatchable {
+   std::unique_ptr<Platform> platform;
+   std::unique_ptr<vpgpu::Device> gpu;
+   std::unique_ptr<RecipeStore> recipes;  // pipeline recipes for prewarming the next run
++  // Recipes compiled by this device's vkCreateDevice prewarm, and how the game's own pipeline
++  // creates fared against them (pipelines.cpp: gpu.pso.recipe game hits/misses). A miss is a key
++  // the prewarm did not produce: a new pipeline, or recipes that do not match the game's keys.
++  uint32_t prewarmedRecipes = 0;
++  std::atomic<uint32_t> recipeHits{0}, recipeMisses{0};
+   Queue queue;
+   bool multiview = false, densityMap = false, metalObjects = false;
+   std::mutex submitMutex;
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index 0cc2c50..1f85afd 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -17,6 +17,8 @@
+ #include "commands.h"
+ #include "vpvk.h"
+ 
++extern "C" uint32_t vpvk_device_wait_compiles(VkDevice);  // entry.cpp (VPKEngine 0017)
++
+ using namespace vpvk;
+ 
+ namespace {
+@@ -503,6 +505,8 @@ VkShaderModule module(Ctx& c, const std::string& name) {
+ // A multiview draw through the whole driver: our own vertex + fragment shaders (gpu/shader/spirv
+ // tests), descriptors of every kind they use, push constants, two vertex buffers, a dynamic
+ // uniform offset. Checks the pipeline compiled and the core draw carries what the shaders read.
++bool gRecipeKeyCheck = false;  // testRecipeKeys
++
+ void testPipeline() {
+   Ctx c({VK_KHR_MULTIVIEW_EXTENSION_NAME});
+   VkDeviceMemory m = alloc(c, 64 << 20, 0);
+@@ -747,6 +751,35 @@ void testPipeline() {
+   vkDestroyPipelineLayout(c.dev, pl, nullptr);
+   vkDestroyDescriptorSetLayout(c.dev, sl[0], nullptr);
+   vkDestroyDescriptorSetLayout(c.dev, sl[1], nullptr);
++  // The prewarm host's wait: nothing left queued afterwards, and a null device is a no-op.
++  CHECK(vpvk_device_wait_compiles(c.dev) < 60000);
++  CHECK(vpvk_device_wait_compiles(VK_NULL_HANDLE) == 0);
++  if (gRecipeKeyCheck) {  // recipe_keys, second run: every pipeline above was already in the cache
++    const Device* d = from<Device>(c.dev);
++    std::printf("  recipe keys: prewarmed=%u hits=%u misses=%u\n", d->prewarmedRecipes, d->recipeHits.load(),
++                d->recipeMisses.load());
++    CHECK(d->prewarmedRecipes > 0 && d->recipeHits.load() > 0 && d->recipeMisses.load() == 0);
++  }
++}
++
++// The recipes a device records give, at the next device's vkCreateDevice prewarm, exactly the keys
++// the same vkCreateGraphicsPipelines computes: what lets the app skip the game's replay (AVP).
++void testRecipeKeys() {
++  char tmpl[] = "/tmp/vpvk_recipe_keys_XXXXXX";
++  const char* dir = mkdtemp(tmpl);
++  CHECK(dir != nullptr);
++  if (!dir) return;
++  const char* old = std::getenv("VP_PIPELINE_CACHE_DIR");
++  const std::string keep = old ? old : "";
++  setenv("VP_PIPELINE_CACHE_DIR", dir, 1);
++  testPipeline();  // records
++  gRecipeKeyCheck = true;
++  testPipeline();  // prewarmed from the recipes, then the same creates
++  gRecipeKeyCheck = false;
++  if (old) setenv("VP_PIPELINE_CACHE_DIR", keep.c_str(), 1);
++  else unsetenv("VP_PIPELINE_CACHE_DIR");
++  std::error_code ec;
++  std::filesystem::remove_all(dir, ec);
+ }
+ 
+ // Pipeline recipes survive translator changes: a compute pipeline recorded through the driver is
+@@ -1602,7 +1635,7 @@ int main(int argc, char** argv) {
+       {"passes", testPasses},   {"submit", testSubmit}, {"pipeline", testPipeline},
+       {"recipes", testRecipes}, {"alyx", testAlyxSurface}, {"depth_resolve", testDepthResolve},
+       {"local_read", testLocalRead}, {"sync", testSync},
+-      {"host_image_copy", testHostImageCopy}, {"motion", testMotion}};
++      {"host_image_copy", testHostImageCopy}, {"motion", testMotion}, {"recipe_keys", testRecipeKeys}};
+   bool ran = false;
+   for (const auto& [name, fn] : groups) {
+     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
+-- 
+2.43.0
+

@@ -94,7 +94,7 @@ public enum AlyxBoot {
         let t0 = Date()
         let rc = kl_app_prewarm_alyx(Bundle.main.bundlePath, p.gameDir.path, p.dylibDir.path,
                                      p.configDir.path, p.dataDir.path)
-        NSLog("[alyx] prewarm: %@ in %.1f s", rc == 0 ? "done" : "not possible (\(rc)); the game's own replay is the fallback",
+        NSLog("[alyx] prewarm: %@ in %.1f s", rc == 0 ? "done" : rc == 1 ? "replayed but not persisted (rc 1); the game replays again" : "not possible (\(rc)); the game's own replay is the fallback",
               Date().timeIntervalSince(t0))
         return rc
     }

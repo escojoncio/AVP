@@ -79,6 +79,15 @@ enum AVPPrepare {
 
     /// AlyxBoot.prewarm with progress (VPKEngine compiles every pipeline of the list). Blocking.
     static func prewarm(_ paths: AVPLaunchPaths, progress: @escaping Progress) {
+        // VPKEngine's caches already hold every pipeline for this VPVulkan build and this list (a full prewarm
+        // filled them, AVPPipelineCache): the game's device loads them itself (gpu.prewarm in the boot log).
+        let cache = AVPPipelineCache.current
+        if let cache, cache.warm {
+            AVPLog.log("Preparar: caché de pipelines de VPKEngine ya completa (\(cache.summary)); precompilado saltado")
+            progress(4, 1, AVPL("Shaders listos (caché)", "Shaders ready (cache)"))
+            return
+        }
+        if let cache { AVPPipelineCache.clearWarm(cache) }
         // Crash guard: a marker lives while the prewarm runs. Found at the next start (same install), the last
         // prewarm never finished: once -> this one runs on 1 thread; twice or more -> skipped (the game's own
         // replay warms the cache, also on 1 thread). A new install (another bundle path) starts over.
@@ -117,6 +126,9 @@ enum AVPPrepare {
         }
         let p = AlyxBoot.pipelineProgress()
         progress(4, 1, AVPL("Shaders listos", "Shaders ready"))
+        // Warm only when the prewarm ran to the end on every thread it was given (rc 0) and the runtime waited for
+        // the driver's queued compiles ("[foz] prewarm: waited" in klepton-prewarm-*.log).
+        if let cache, rc == 0, unfinished == 0, p.total > 0 { AVPPipelineCache.markWarm(cache) }
         AVPLog.log("Preparar: precompilados \(p.done)/\(p.total) pipelines en \(Int(Date().timeIntervalSince(t0))) s"
                    + "\(unfinished > 0 ? " (1 hilo)" : "") (rc \(rc): \(String(cString: kl_app_status())))")
     }
@@ -396,7 +408,13 @@ enum AVPPrepare {
             let a = (try? fm.attributesOfItem(atPath: u.path)) ?? [:]
             return "\((a[.size] as? NSNumber)?.int64Value ?? 0)/\(Int64((a[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0))"
         }
-        let want = [pipelinesVersion, fileID(recipe), fileID(game.appendingPathComponent("core/shaders_vulkan_dir.vpk")),
+        // The recipe ships in the app bundle, whose files get a new date at every install: by content, so a
+        // reinstall of the same build does not rebuild the list (13 s). The game's packs keep size/date (GBs).
+        func contentID(_ u: URL) -> String {
+            guard let d = try? Data(contentsOf: u, options: .mappedIfSafe) else { return fileID(u) }
+            return "sha256:" + SHA256.hash(data: d).prefix(12).map { String(format: "%02x", $0) }.joined()
+        }
+        let want = [pipelinesVersion, contentID(recipe), fileID(game.appendingPathComponent("core/shaders_vulkan_dir.vpk")),
                     fileID(game.appendingPathComponent("hlvr/shaders_vulkan_dir.vpk"))].joined(separator: "|")
         if (try? String(contentsOf: stampURL, encoding: .utf8)) == want, fm.fileExists(atPath: out.path) {
             progress(1, AVPL("Ya lista", "Already done"))
@@ -427,5 +445,134 @@ enum AVPPrepare {
     private final class ProgressBox {
         let report: (Double, String) -> Void
         init(_ r: @escaping (Double, String) -> Void) { report = r }
+    }
+}
+
+// MARK: VPKEngine's persistent pipeline caches
+
+/// <data>/vpcache is VP_PIPELINE_CACHE_DIR: VPKEngine's recipes (recipes.bin: each pipeline's SPIR-V inputs and
+/// translated MSL) and Metal binary archives (pipelines-<n>.metalar + pipelines.count). warm.stamp records that a
+/// full prewarm (every database replayed and the driver's queued compiles waited for) filled them for this
+/// VPVulkan build and this pipeline list. archive.inflight is VPKEngine's own (0017): it exists while its binary
+/// archive code runs, so finding it at start means the last run died inside it; two runs in a row -> archive.off
+/// (VP_PIPELINE_ARCHIVE=0 for good, the recipes stay).
+enum AVPPipelineCache {
+    struct State {
+        let dir: URL
+        let key: String
+        let warm: Bool
+        let archiveOff: Bool
+        let summary: String
+    }
+    /// Decided at writeConfig (before the prewarm), read by AVPPrepare.prewarm.
+    nonisolated(unsafe) static var current: State?
+
+    static func configure(data: URL, pipelines: URL, engine: String) -> State {
+        let fm = FileManager.default
+        let dir = data.appendingPathComponent("vpcache", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stamp = dir.appendingPathComponent("warm.stamp")
+        checkArchiveInflight(dir: dir)
+        let archiveOff = fm.fileExists(atPath: dir.appendingPathComponent("archive.off").path)
+        let driver = AVPLaunch.driverPath.flatMap { digest($0) } ?? "?"
+        let list = (try? String(contentsOf: pipelines.deletingLastPathComponent().appendingPathComponent("pipelines.stamp"),
+                                encoding: .utf8)) ?? "?"
+        // The OS version too: Metal binary archives and the system's shader cache are only valid for the OS (and GPU
+        // driver) that wrote them.
+        let os = ProcessInfo.processInfo.operatingSystemVersionString
+        let key = "avp-vpcache-2|vpvulkan \(driver)|list \(list)|os \(os)|archive \(archiveOff ? "off" : "on")"
+        // The previous boot log is judged only if that session ran with this same key (last.key, written below for
+        // the session about to start): after a new driver, list or OS its misses say nothing about this cache.
+        let lastKeyURL = dir.appendingPathComponent("last.key")
+        if (try? String(contentsOf: lastKeyURL, encoding: .utf8)) == key {
+            checkGameMisses(dir: dir, key: key, bootLog: AVPLog.directory.appendingPathComponent("klepton-boot-\(engine).log"))
+        }
+        try? key.write(to: lastKeyURL, atomically: true, encoding: .utf8)
+        let recipes = (try? fm.attributesOfItem(atPath: dir.appendingPathComponent("recipes.bin").path))?[.size] as? NSNumber
+        let archives = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).filter { $0.hasSuffix(".metalar") }.count
+        // Without the binary archive the game would compile every pipeline again: never warm then (it replays).
+        let warm = driver != "?" && list != "?" && (recipes?.int64Value ?? 0) > 0 && !archiveOff && archives > 0
+            && (try? String(contentsOf: stamp, encoding: .utf8)) == key
+        let summary = "recetas \((recipes?.int64Value ?? 0) / 1_048_576) MB, \(archives) archivo(s) binario(s)"
+            + (archiveOff ? " (desactivados)" : "") + ", VPVulkan \(driver), \(os)"
+        let verdict = warm ? "completa"
+            : archiveOff ? "sin archivo binario: precompilado y replay del juego en cada arranque"
+            : "por llenar (precompilado completo antes de jugar)"
+        AVPLog.log("Gráficos: caché de pipelines \(dir.lastPathComponent): \(summary); \(verdict)")
+        let s = State(dir: dir, key: key, warm: warm, archiveOff: archiveOff, summary: summary)
+        current = s
+        return s
+    }
+
+    static func markWarm(_ s: State) {
+        guard !s.archiveOff else { return }   // the C side reports such a prewarm as incomplete (rc 1) anyway
+        try? s.key.write(to: s.dir.appendingPathComponent("warm.stamp"), atomically: true, encoding: .utf8)
+        AVPLog.log("Preparar: caché de pipelines de VPKEngine completa; el juego no repite el replay")
+    }
+
+    static func clearWarm(_ s: State) {
+        try? FileManager.default.removeItem(at: s.dir.appendingPathComponent("warm.stamp"))
+    }
+
+    /// SHA-256 (first 12 bytes, hex) of the VPVulkan binary: a new driver build invalidates the stamp.
+    private static func digest(_ path: String) -> String? {
+        guard let d = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe) else { return nil }
+        return SHA256.hash(data: d).prefix(12).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// archive.inflight left by the last run (it died inside VPKEngine's binary archive code: open, add, save or a
+    /// lookup, Apple's <redacted> frames included). One strike can be the system closing the app at that moment;
+    /// two in a row turn the archive off. A run that leaves no marker clears the strikes.
+    private static func checkArchiveInflight(dir: URL) {
+        let fm = FileManager.default
+        let inflight = dir.appendingPathComponent("archive.inflight")
+        let strikesURL = dir.appendingPathComponent("archive.strikes")
+        guard fm.fileExists(atPath: inflight.path) else {
+            try? fm.removeItem(at: strikesURL)
+            return
+        }
+        let what = ((try? String(contentsOf: inflight, encoding: .utf8)) ?? "?").trimmingCharacters(in: .whitespacesAndNewlines)
+        try? fm.removeItem(at: inflight)
+        let strikes = (Int((try? String(contentsOf: strikesURL, encoding: .utf8)) ?? "") ?? 0) + 1
+        try? String(strikes).write(to: strikesURL, atomically: true, encoding: .utf8)
+        if strikes >= 2 {
+            try? "inflight \(what), \(strikes) runs".write(to: dir.appendingPathComponent("archive.off"), atomically: true, encoding: .utf8)
+            try? fm.removeItem(at: dir.appendingPathComponent("warm.stamp"))
+            AVPLog.log("Gráficos: el archivo binario de pipelines de VPKEngine quedó a medias (\(what)) \(strikes) veces seguidas; "
+                       + "queda desactivado (VP_PIPELINE_ARCHIVE=0), las recetas siguen")
+        } else {
+            AVPLog.log("Gráficos: la última sesión terminó dentro del archivo binario de pipelines (\(what)); "
+                       + "si se repite, se desactiva")
+        }
+    }
+
+    /// The last boot log, from a run that skipped the game's replay: if the game's own pipeline creates mostly missed
+    /// what VPKEngine's prewarm compiled ("gpu.pso.recipe game hits=H misses=M"), the cache was not as complete as
+    /// warm.stamp said: the stamp goes, so the next start replays everything again. Once per key (miss.reject): misses
+    /// that a full replay does not fix are pipelines absent from the lists, which replaying again would not help.
+    private static func checkGameMisses(dir: URL, key: String, bootLog: URL) {
+        guard let h = try? FileHandle(forReadingFrom: bootLog) else { return }
+        defer { try? h.close() }
+        let size = (try? h.seekToEnd()) ?? 0
+        try? h.seek(toOffset: size > 8_388_608 ? size - 8_388_608 : 0)
+        guard let data = try? h.readToEnd(), let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else { return }
+        guard text.contains("[foz] game replay skipped") else { return }
+        guard let line = text.components(separatedBy: "\n").last(where: { $0.contains("gpu.pso.recipe game hits=") }) else { return }
+        func value(_ name: String) -> Int {
+            guard let r = line.range(of: name + "=") else { return 0 }
+            return Int(line[r.upperBound...].prefix { $0.isNumber }) ?? 0
+        }
+        let hits = value("hits"), misses = value("misses")
+        guard hits + misses >= 64, misses * 4 > hits + misses else { return }
+        let reject = dir.appendingPathComponent("miss.reject")
+        if (try? String(contentsOf: reject, encoding: .utf8)) == key {
+            AVPLog.log("Gráficos: el juego creó \(misses) de \(hits + misses) pipelines fuera de la caché, también tras un "
+                       + "precompilado completo: son pipelines que no están en las listas (se graban para la próxima vez)")
+            return
+        }
+        try? key.write(to: reject, atomically: true, encoding: .utf8)
+        try? FileManager.default.removeItem(at: dir.appendingPathComponent("warm.stamp"))
+        AVPLog.log("Gráficos: el juego creó \(misses) de \(hits + misses) pipelines fuera de la caché de VPKEngine; "
+                   + "se descarta warm.stamp y el próximo arranque precompila todo otra vez")
     }
 }
