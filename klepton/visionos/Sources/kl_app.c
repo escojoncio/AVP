@@ -756,6 +756,7 @@ static int open_log(void) {
 // one that ends with avail still comfortable was killed for time.
 static const char *volatile g_phase = "start";
 static void app_phase(const char *p) { g_phase = p; }
+const char *kl_app_phase(void) { const char *p = g_phase; return p ? p : "?"; }
 
 // Bytes of headroom before this app is jetsammed, or -1 where the OS will not
 // say. os_proc_available_memory() is the app-process-only API and returns 0 in

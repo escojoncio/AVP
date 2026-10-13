@@ -17,8 +17,6 @@ resolved whole (logged).
 
 Tests: vpmsl.golden.ms_textures (new golden), gpu_vulkan.depth_resolve (vkCmdResolveImage).
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
 ---
  gpu/shader/ir/include/vpir/ir.h        |  4 +++
  gpu/shader/ir/src/optimize.cpp         |  1 +

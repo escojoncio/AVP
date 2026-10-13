@@ -11,8 +11,6 @@ sizes its texture streaming pool from this.
 
 Test: gpu_vulkan.alyx (usage follows an allocation, budget covers it).
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
 ---
  gpu/vulkan/include/vpvk/platform.h |  3 +++
  gpu/vulkan/src/entry.cpp           | 23 +++++++++++++++++++++++

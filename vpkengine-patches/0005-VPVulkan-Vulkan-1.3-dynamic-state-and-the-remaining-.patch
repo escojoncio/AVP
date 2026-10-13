@@ -22,8 +22,6 @@ advertised. Every 1.1-1.3 command resolves except YCbCr conversion and buffer de
 Tests: gpu_vulkan.pipeline (Alyx dynamic set, write-mask variant, cull FRONT_AND_BACK),
 gpu_vulkan.sync (1.3 entry points resolve).
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
 ---
  gpu/core/include/vpgpu/core/commands.h |  16 ++
  gpu/metal2/src/metal_backend.mm        |  37 +++-

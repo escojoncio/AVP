@@ -74,9 +74,25 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   `kl_image.c`/`kl_dl.c`: ms por librería. Compositor: errores de cmdbuf en `alive`, `[cp] eye probe` (RGBA de los ojos).
 - Todo VPKEngine no-Metal compila y pasa tests en Linux; Metal/Swift solo revisados (Sonnet ×3).
 
+## Build 14 (sin validar): OOM de la 13 + cuelgue GPU sin resolver + pantalla de carga
+- Logs_Alyx_8 (build 13): jetsam (footprint 8,1 GB) al abrir 9 `.metalar` + prewarm de 4505 pipelines en el
+  vkCreateDevice del juego (0017). Cuelgue GPU sigue (f=465, encoder índice 5 de 24, igual que build 12 f=247).
+  Alyx NO hace draws indirectos (sin `vk.indirect`): la hipótesis de 0015 era falsa (0015 se queda, inocuo).
+- VPKEngine `0018`: informe de cuelgue por encoder (`gpu.hang.enc`: tiempos, waits/updaters, pipelines; `gpu.hang.stuck`,
+  MSL en `vpcache/hang/<id>.metal`); culpa solo Faulted/Affected o "started_no_end"/>500 ms/1.º sin muestras con draws;
+  cuarentena: sesión inmediata, a `quarantine.txt` al 2.º cuelgue de la misma clave (1.º → `suspects.txt`);
+  stubs sin compilar; cola nueva tras Hang (gen actual, no InnocentVictim); guarda de fences huérfanas;
+  traductor v2: OpKill = discard + return, presupuesto de bucles por función (`vp_budget` 65536).
+- VPKEngine `0019`: apertura de archives con presupuesto medido (768 MB, suelo 5 GB libres), juego lazy con archives
+  (sin prewarm en vkCreateDevice ni en vkCreatePipelineCache), prewarm acotado sin ellos, RecipeStore ligero, `gpu.mem`.
+- AVP: pantalla de carga en el espacio inmersivo (arte de Steam en caché + "Cargando… N s · fase", fundido al 1.er
+  frame), Ajustes › Diagnóstico › restablecer cuarentena (borra quarantine.txt + suspects.txt), resumen en app.txt de
+  cuelgues/cuarentena de la sesión anterior. Parches 0001-0010: quitados trailers con noreply.
+- Linux: ctest 149/149, vpvk_tests y vpgpu_core_tests OK. Metal/Swift revisados (Sonnet).
+
 ## Siguiente
-- Log build 13: `vk.indirect … gpu=`, `gpu.indirect fix_kernel=ready`, ¿`Caused_GPU_Hang`/`encoder_fault`?, `gpu.recover`,
-  `[cp] eye probe`, `[foz] prewarm: waited`, `[foz] game replay skipped` (2.º arranque), tiempos `(X ms, dlopen Y)`.
+- Log build 14: `gpu.mem`, `gpu.pso.cache open … mem_delta_mb`, `gpu.prewarm skipped=lazy`, `gpu.hang.enc` (qué es el
+  encoder 5: kind, label, target, pipelines, waits), `gpu.quarantine`, `gpu.recover`, `[cp] eye probe`, panel de carga.
 
 ## Pendiente
 - Ajustes en vivo que faltan: resolución/texturas (convars del juego), anisotrópico (solo afecta a samplers nuevos);

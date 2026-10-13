@@ -13,6 +13,8 @@ struct AVPSettingsView: View {
     @State private var password = ""
     @State private var result: String?
     @State private var pickingFolder = false
+    @State private var confirmQuarantine = false
+    @State private var quarantined = AVPPipelineCache.quarantineCount()
 
     private func pct(_ v: Double) -> String { "\(Int((v * 100).rounded())) %" }
 
@@ -156,6 +158,23 @@ struct AVPSettingsView: View {
                 Text(AVPL("MoltenVK (diagnóstico)", "MoltenVK (diagnostic)")).tag(AVPSettings.Engine.moltenvk)
             }
             Toggle(AVPL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $s.diagCaptures)
+            Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
+                   role: .destructive) { confirmQuarantine = true }
+                .disabled(quarantined == 0)
+                .confirmationDialog(AVPL("¿Restablecer los \(quarantined) pipelines en cuarentena?",
+                                         "Reset the \(quarantined) quarantined pipelines?"),
+                                    isPresented: $confirmQuarantine, titleVisibility: .visible) {
+                    Button(AVPL("Restablecer", "Reset"), role: .destructive) {
+                        AVPPipelineCache.resetQuarantine()
+                        quarantined = AVPPipelineCache.quarantineCount()
+                    }
+                    Button(AVPL("Cancelar", "Cancel"), role: .cancel) {}
+                } message: {
+                    Text(AVPL("VPKEngine volverá a dibujarlos en el próximo arranque. Si alguno vuelve a colgar la GPU, "
+                              + "entrará otra vez en cuarentena.",
+                              "VPKEngine draws them again at the next launch. One that hangs the GPU again goes back into quarantine."))
+                }
+                .onAppear { quarantined = AVPPipelineCache.quarantineCount() }
             Button(AVPL("Restablecer ajustes", "Reset settings"), role: .destructive) { s.resetToDefaults() }
         } header: {
             Text(AVPL("Diagnóstico", "Diagnostics"))

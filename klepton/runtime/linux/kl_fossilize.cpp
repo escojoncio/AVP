@@ -382,7 +382,8 @@ void h_device_created(VkDevice dev, PFN_vkGetDeviceProcAddr gdpa) {
     if (g_prewarming.load()) return;
     if (g_prewarm_complete.load()) {
         fprintf(stderr, "  [foz] game replay skipped: the launcher's prewarm in this process compiled every pipeline "
-                        "into VPKEngine's caches (its vkCreateDevice prewarm loads them: gpu.prewarm)\n");
+                        "into VPKEngine's caches (the game's device takes them on first use: gpu.prewarm skipped=lazy, "
+                        "gpu.pso.recipe game hits/misses)\n");
         return;
     }
     // The app's verdict for a launch whose prewarm it skipped: VPKEngine's caches are warm for this install and

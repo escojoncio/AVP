@@ -19,8 +19,6 @@ maxPerStageDescriptorSamplers 64 (argument tables; Alyx sets hold 17).
 
 Tests: gpu_vulkan.alyx (Alyx's captured device), gpu_vulkan.depth_resolve.
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
 ---
  gpu/core/include/vpgpu/core/commands.h  |   2 +
  gpu/core/include/vpgpu/core/resources.h |   2 +

@@ -74,6 +74,12 @@ enum AVPLaunch {
             return 1
         }
         AVPLog.log("Arranque: game=\(paths.gameDir.path) dylibs=\(paths.dylibDir.path) config=\(paths.configDir.path) data=\(paths.dataDir.path)")
+        // The loading panel in the immersive space (until the game's first picture): the cached Steam art. With
+        // none cached the panel still shows, with the title as text over a plain background.
+        let art = AVPArtCache.loadingPanelFiles()
+        KleptonCompositor.loadingArt = art
+        KleptonCompositor.loadingEnabled = true
+        AVPLog.log("Arranque: pantalla de carga con \(art.filter { !$0.isEmpty }.count) de 2 imágenes de Steam en caché")
         AVPLog.mirrorToFolder()
         try? FileManager.default.createDirectory(at: AVPLog.directory, withIntermediateDirectories: true)
         setenv("KL_ALYX_LOG_DIR", AVPLog.directory.path, 1)
