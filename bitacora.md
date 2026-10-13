@@ -132,7 +132,7 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   la 1.ª partida (holds, `0025` los limita) y quedan grabados para la siguiente.
 - Revisión adversarial (Sonnet): sin bugs; aplicado su aviso (umbral relativo a la resolución del centro).
 
-## Build 22 (sin validar): ojo izquierdo deformado por el foveado
+## Build 22 (Logs_Alyx_16: explosiones de vértices al mover la cabeza también con foveado y VPKTAA off)
 - Logs_Alyx_15 (build 21): capturas `capture-600-*`: las dos texturas de ojo comprimidas igual (rasterizadas con la misma
   capa del rate map), salida izquierda deformada, derecha bien. Causa: Metal elige la capa del rate map por
   `[[viewport_array_index]]`; VPKEngine solo escribía `[[render_target_array_index]]` (regla fija en la bitácora de
@@ -141,6 +141,16 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
   espera) y metal2 fija un viewport/scissor por vista (`passViews`, `setViewports`/`setScissorRects`); volcado por pase
   = primer frame >= `VP_DUMP_FRAME` con >= 8 encoders y un pase con capas (el 6000 de la build 21 salió vacío).
 - Capturas también en frames de juego 2400/3600 (`KleptonCompositor` `frames`; 1200 cayó en un fundido a negro).
+
+## Build 23 (sin validar): A/B de la cola de GPU + captura a demanda
+- Usuario: con foveado off y VPKTAA off siguen las "explosiones de vértices", solo al mover la cabeza (no son el foveado).
+  Hipótesis principal: carrera de datos por 12 command buffers en vuelo (`0024`): con la cabeza quieta dos frames
+  llevan los mismos constantes y no se nota. Alternativa: `0023` (clip distance / invariant).
+- `AVPSettings.gpuQueueDepth` (clave `avp.gpuQueueDepth`, 12 por defecto | 3) → `VP_FRAMES_IN_FLIGHT`; Ajustes ›
+  Diagnóstico "Trabajo en cola para la GPU"; en app.txt "cola GPU N".
+- Captura a demanda: L3 + R3 a la vez (`KleptonControllers.stickClick`, solo con KL_CAPTURE) → `FrameCapture.requestManual`
+  (PNG de ojos y salida del siguiente frame) + `vpgpu_metal2_request_dump` (VPKEngine `0028`: volcado por pase del
+  siguiente frame real, `gpu.dump requested f=N`), encontrado con `dlopen(KL_MVK_DYLIB, RTLD_NOLOAD)`.
 
 ## Siguiente
 - Log build 21: `[vrr] foveated map (wide)` (% de píxeles), `[vrr] foveated scene passes on`, `[cp] periphery

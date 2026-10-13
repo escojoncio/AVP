@@ -2610,7 +2610,7 @@ final class KleptonCompositor {
         let guestLive = completeStage >= 0 && kl_ovrp_eye_layer_live() != 0
         if guestLive { capGuestFrames += 1 }
         let capNow = guestLive && FrameCapture.enabled
-            && (FrameCapture.frames.contains(capGuestFrames) || capGuestFrames == overlayCapFrame)
+            && (FrameCapture.frames.contains(capGuestFrames) || capGuestFrames == overlayCapFrame || FrameCapture.takeManual())
         hudCount(rendered: rendered, haveRendered: haveRendered)
         loadingTick(originFromHead: originFromHead)
         for (di, drawable) in drawables.enumerated() {
@@ -5758,6 +5758,16 @@ enum FrameCapture {
     static let frames: Set<Int> = [2, 30, 120, 600, 1200, 2400, 3600]   // 2400/3600: in game (1200 fell on a fade)
     static let maxWidth = 1024
     private static let queue = DispatchQueue(label: "klepton.capture", qos: .utility)
+    // L3 + R3 (KleptonControllers.stickClick): one capture of the next composited guest frame.
+    private static let manualLock = NSLock()
+    nonisolated(unsafe) private static var manual = false
+    static func requestManual() { manualLock.lock(); manual = true; manualLock.unlock() }
+    static func takeManual() -> Bool {
+        manualLock.lock(); defer { manualLock.unlock() }
+        let m = manual
+        manual = false
+        return m
+    }
 
     // KL_CAPTURE_DIR (QUEST/Registros, set by the launcher) is the folder the user can open in
     // Files; without it, the app's own Documents/Registros.
