@@ -246,7 +246,7 @@ final class AVPSettings: ObservableObject {
         let lang = gameLanguage(gameDir: p.gameDir)
         let eye = eyeSize
         var args = forcedConvars().map { "+\($0.0) \($0.1)" }.joined(separator: " ")
-        args += " +log_verbosity VR max -language \(lang.name)"
+        args += " +log_verbosity VR max -condebug -language \(lang.name)"
 
         var env: [(String, String)] = [
             ("KL_ALYX_PROFILE_ARGS", args),

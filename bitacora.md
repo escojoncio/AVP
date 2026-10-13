@@ -60,6 +60,15 @@ Base: VisionQuestPro `04f7e6a` (app, Klepton propio, CI). Glovebox (MIT) fusiona
   capturas del CDN de Steam en tiempo de ejecución, caché `Library/Caches/AVP/art`, Ken Burns), derecha 40 % columna
   de control. Batería de los Sense (`AVPModel.senseControllers`, sondeo 20 s, log al cambiar).
 
+## Build 5 (2026-10-13) — prueba 3: Alyx JUGABLE con MoltenVK (config Glovebox)
+- Entra en partida. Overrides confirmados en el boot log: env, args (`vr_msaa 4`, fidelity 0, texturas 2048/2560),
+  `video2.txt` + CSV instalados (gpu ids 4203/452984840), `alyx-convars.lua` inyectado como `gameinit.lua` (vacío en
+  retail). Re-aplicador Lua (AVPFORCE) sin confirmar: escribe en la consola del juego, no recogida.
+- Rendimiento: GPU juego ~28–31 ms/frame → ~33 fps (objetivo 45); compositor 100 Hz estable, ~9 ms.
+- Censo incompleto: el prewarm del launcher crea device y pipelines antes de abrir el boot log → líneas de
+  instancia/device/shaders deduplicadas perdidas. Ahora `kl_vk_census.inc` escribe también `<Logs Alyx>/census.txt`.
+- `-condebug` → `game/hlvr/console.log`, copiado a Logs Alyx junto a census.txt (`AVPLog.all`).
+
 ## Pendiente
 - VPEngine: int64/16-bit en shaders, teselación, depth bounds, foveado (MTLRasterizationRateMap), MetalFX, bindless.
 - QR de Steam; `vpvk_config_set_metalfx`/`_texture_cap` no existen aún (solo se registran).
