@@ -54,6 +54,22 @@ static void klc_emit(const char *fmt, ...) {
     if (!klc_first(line)) return;
     g_klc_lines++;
     fprintf(stderr, "[census] %s\n", line);
+    // Also its own file in the app's log folder: the launcher's pipeline prewarm creates the device and every
+    // pipeline before the boot log exists, so on stderr those first (deduplicated) lines were lost.
+    static FILE *cf;
+    static int tried;
+    pthread_mutex_lock(&g_klc_mu);
+    if (!tried) {
+        tried = 1;
+        const char *d = getenv("KL_ALYX_LOG_DIR");
+        if (d && *d) {
+            char path[1200];
+            snprintf(path, sizeof path, "%s/census.txt", d);
+            cf = fopen(path, "w");
+        }
+    }
+    if (cf) { fprintf(cf, "%s\n", line); fflush(cf); }
+    pthread_mutex_unlock(&g_klc_mu);
 }
 
 // ---- running counters for the summary line -------------------------------------------------------

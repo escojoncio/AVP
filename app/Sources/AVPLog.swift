@@ -20,6 +20,11 @@ enum AVPLog {
     static var crashLog: URL { directory.appendingPathComponent("klepton-crash.log") }
     static var errorLog: URL { directory.appendingPathComponent("alyx-error.txt") }
     static var prewarmLog: URL { AVPFolder.data.appendingPathComponent("klfz/prewarm.log") }
+    /// Every distinct Vulkan feature the game uses (kl_vk_census.inc), for VPEngine.
+    static var censusLog: URL { directory.appendingPathComponent("census.txt") }
+    /// The game's own console (Msg output, our AVPFORCE lines from alyx-convars.lua).
+    static var consoleLog: URL? { AVPFolder.shared.game?.appendingPathComponent("hlvr/console.log") }
+    private static var all: [URL] { [appLog, previousLog, bootLog, crashLog, errorLog, prewarmLog, censusLog] + (consoleLog.map { [$0] } ?? []) }
 
     /// Starts a new log for this session (the previous one is kept as app-previous.txt).
     static func start() {
@@ -49,7 +54,7 @@ enum AVPLog {
     /// Copies this session's logs into AVP/Logs (survives a reinstall; visible in Files).
     static func mirrorToFolder() {
         guard let dir = AVPFolder.shared.logs else { return }
-        for url in [appLog, previousLog, bootLog, crashLog, errorLog, prewarmLog] where FileManager.default.fileExists(atPath: url.path) {
+        for url in all where FileManager.default.fileExists(atPath: url.path) {
             let dest = dir.appendingPathComponent(url.lastPathComponent)
             try? FileManager.default.removeItem(at: dest)
             try? FileManager.default.copyItem(at: url, to: dest)
@@ -58,7 +63,7 @@ enum AVPLog {
 
     /// The logs that exist, for the share button.
     static var shareable: [URL] {
-        [appLog, previousLog, bootLog, crashLog, errorLog, prewarmLog]
+        all
             .filter { FileManager.default.fileExists(atPath: $0.path) }
             + captures
     }
