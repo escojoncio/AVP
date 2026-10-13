@@ -69,6 +69,9 @@ Base: VisionQuestPro `04f7e6a` (app, Klepton propio, CI). Glovebox (MIT) fusiona
   instancia/device/shaders deduplicadas perdidas. Ahora `kl_vk_census.inc` escribe también `<Logs Alyx>/census.txt`.
 - `-condebug` → `game/hlvr/console.log`, copiado a Logs Alyx junto a census.txt (`AVPLog.all`).
 
+- Idioma: la comprobación por ficheros sueltos (`hlvr/resource/*_<lang>.*`) fallaba (la localización va en los VPK) →
+  lista fija de idiomas de texto de Alyx en `AVPSettings.gameLanguage`; `-language <steam name>` (ISteamApps es NULL en el shim).
+
 ## Pendiente
 - VPEngine: int64/16-bit en shaders, teselación, depth bounds, foveado (MTLRasterizationRateMap), MetalFX, bindless.
 - QR de Steam; `vpvk_config_set_metalfx`/`_texture_cap` no existen aún (solo se registran).
