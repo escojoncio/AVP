@@ -1,0 +1,786 @@
+From 8d5fbf3b66d478a909924a70f5dfd96d65e581db Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 17:37:28 +0000
+Subject: [PATCH 2/2] VPVulkan: bounded pipeline memory (archive open budget
+ measured per file, lazy game device with archives, memory-capped prewarm
+ otherwise, lean recipe store, gpu.mem lines, retirement footprint check)
+
+---
+ gpu/core/include/vpgpu/core/pipeline_cache.h  |  2 +
+ gpu/core/src/pipeline_cache.cpp               |  7 ++
+ .../include/vpgpu/metal2/metal_backend.h      | 16 ++++
+ gpu/metal2/src/metal_backend.mm               | 90 +++++++++++++++++-
+ gpu/vulkan/include/vpvk/platform.h            | 10 ++
+ gpu/vulkan/src/entry.cpp                      | 68 +++++++++++++-
+ gpu/vulkan/src/pipelines.cpp                  | 14 ++-
+ gpu/vulkan/src/platform_metal.mm              | 21 +++++
+ gpu/vulkan/src/platform_null.cpp              |  8 ++
+ gpu/vulkan/src/recipes.cpp                    | 93 ++++++++++++++++---
+ gpu/vulkan/src/recipes.h                      | 18 +++-
+ gpu/vulkan/src/sync.cpp                       |  1 +
+ gpu/vulkan/src/vpvk.h                         | 10 ++
+ gpu/vulkan/tests/vk_tests.cpp                 | 50 ++++++++++
+ 14 files changed, 382 insertions(+), 26 deletions(-)
+
+diff --git a/gpu/core/include/vpgpu/core/pipeline_cache.h b/gpu/core/include/vpgpu/core/pipeline_cache.h
+index 491a9d2..c2aeb91 100644
+--- a/gpu/core/include/vpgpu/core/pipeline_cache.h
++++ b/gpu/core/include/vpgpu/core/pipeline_cache.h
+@@ -115,6 +115,8 @@ class PipelineCache {
+   // Pipeline stats since the last call (per-frame counters for the diagnostics report).
+   PipelineStats takeFrameStats();
+   PipelineStats totals() const;
++  // Pipelines compiled and held (Ready) right now (gpu.mem).
++  size_t readyCount() const;
+ 
+   // Persist / restore the states seen, so a next run can prefetch them before they are needed.
+   bool save(const DiskCachePath&) const;
+diff --git a/gpu/core/src/pipeline_cache.cpp b/gpu/core/src/pipeline_cache.cpp
+index 1c572f4..579f19d 100644
+--- a/gpu/core/src/pipeline_cache.cpp
++++ b/gpu/core/src/pipeline_cache.cpp
+@@ -182,6 +182,13 @@ PipelineStats PipelineCache::totals() const {
+   return total_;
+ }
+ 
++size_t PipelineCache::readyCount() const {
++  std::lock_guard lock(mutex_);
++  size_t n = 0;
++  for (const auto& [k, e] : entries_) n += e.status == Status::Ready;
++  return n;
++}
++
+ bool PipelineCache::save(const DiskCachePath& path) const {
+   std::error_code ec;
+   std::filesystem::create_directories(path.root, ec);
+diff --git a/gpu/metal2/include/vpgpu/metal2/metal_backend.h b/gpu/metal2/include/vpgpu/metal2/metal_backend.h
+index 4eef641..aab695a 100644
+--- a/gpu/metal2/include/vpgpu/metal2/metal_backend.h
++++ b/gpu/metal2/include/vpgpu/metal2/metal_backend.h
+@@ -94,6 +94,15 @@ struct MetalCaps {
+ struct MetalOptions {
+   std::filesystem::path cacheRoot;  // binary archive lives here; empty = no disk cache
+   unsigned framesInFlight = 3;
++  // Opening a binary archive costs process footprint roughly in proportion to its contents
++  // (build 13: 9 files, 4109 pipelines, +6.7 GB inside vkCreateDevice -> jetsam). Files are opened
++  // smallest first while the measured footprint growth stays under archiveBudgetBytes and the
++  // available memory stays above archiveFloorBytes; the rest stay on disk unopened (their
++  // pipelines compile from the OS shader cache). 0 = no limit.
++  uint64_t archiveBudgetBytes = 768ull << 20;
++  uint64_t archiveFloorBytes = 5ull << 30;
++  // Reserved (not implemented yet): consolidate every archive into one session file.
++  bool archiveConsolidate = false;
+ };
+ 
+ class MetalBackend final : public Backend {
+@@ -147,6 +156,13 @@ class MetalBackend final : public Backend {
+   void* nativeTexture(TextureId);
+   // Writes the pipeline binary archive under cacheRoot; false (and a gpu.err line) on failure.
+   bool saveArchive();
++  struct ArchiveStats {
++    uint32_t loaded = 0, skipped = 0, pipelines = 0;
++    uint64_t bytesLoaded = 0, bytesSkipped = 0;
++    int64_t memDelta = 0;  // footprint after opening them minus before (bytes)
++  };
++  ArchiveStats archiveStats() const;  // set once at construction
++  static uint64_t footprint();        // phys_footprint of this process, 0 = unknown
+   // Compiles the MTLLibrary/MTLFunction of a shader already in the ShaderProvider on a background
+   // queue, so pipeline creation later finds it compiled. Deduplicated by shader id (= MSL hash).
+   void prewarmShader(uint64_t shaderId);
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 639cb74..6e5a6df 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -13,7 +13,11 @@
+ #include "vpgpu/metal2/metal_backend.h"
+ 
+ #include <TargetConditionals.h>
++#include <mach/mach.h>
+ #include <unistd.h>
++#if TARGET_OS_IPHONE
++#include <os/proc.h>
++#endif
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -489,6 +493,7 @@ struct MetalBackend::Impl {
+   std::unordered_set<uint64_t> archiveSeen;
+   std::chrono::steady_clock::time_point archiveSavedAt = std::chrono::steady_clock::now();
+   void openArchives();
++  MetalBackend::ArchiveStats archiveStats;  // what openArchives opened (set once, in init)
+   std::filesystem::path archivePath(uint64_t n) const;
+   id<MTLBinaryArchive> newArchive();
+   bool addToArchive(id<MTLBinaryArchive> ar, const ArchiveEntry& e, std::string& error);
+@@ -3159,23 +3164,89 @@ void MetalBackend::Impl::openArchives() {
+   }
+   NSMutableArray<id<MTLBinaryArchive>>* loaded = [NSMutableArray array];
+   uint32_t pipelinesLoaded = 0;
++  // Memory budget (MetalOptions::archiveBudgetBytes / archiveFloorBytes): opening an archive costs
++  // footprint roughly in proportion to its size (build 13: 9 files -> +6.7 GB, jetsam inside
++  // vkCreateDevice). Smallest files first; each one's cost is predicted from the ratio measured on
++  // the ones already opened (1x file size before any), and a file that would not fit stays on disk
++  // unopened -- its pipelines miss once and compile (OS shader cache), nothing is lost.
++  struct Cand {
++    uint64_t n, bytes;
++  };
++  std::vector<Cand> cands;
+   for (uint64_t n : found) {
+-    const fs::path p = archivePath(n);
++    const uint64_t b = fs::file_size(archivePath(n), ec);
++    cands.push_back({n, ec ? 0 : b});
++  }
++  std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.bytes != b.bytes ? a.bytes < b.bytes : a.n < b.n; });
++  const uint64_t budget = options.archiveBudgetBytes, floorBytes = options.archiveFloorBytes;
++  const uint64_t foot0 = MetalBackend::footprint();
++  auto avail = []() -> uint64_t {
++#if TARGET_OS_IPHONE
++    return uint64_t(os_proc_available_memory());
++#else
++    return 0;
++#endif
++  };
++  double ratio = 1.0;  // footprint growth per archive byte, measured as files open
++  uint64_t openedBytes = 0;
++  for (const Cand& cd : cands) {
++    const fs::path p = archivePath(cd.n);
++    const auto c = counts.find(cd.n);
++    const uint32_t pc = c == counts.end() ? 0 : c->second;
++    const uint64_t footNow = MetalBackend::footprint();
++    const uint64_t used = footNow > foot0 ? footNow - foot0 : 0;
++    const uint64_t predicted = uint64_t(double(cd.bytes) * ratio);
++    const uint64_t av = avail();
++    const char* why = nullptr;
++    if (budget && used + predicted > budget) why = "budget";
++    else if (floorBytes && av && (av < floorBytes || av - floorBytes < predicted)) why = "floor";
++    if (why) {
++      ++archiveStats.skipped;
++      archiveStats.bytesSkipped += cd.bytes;
++      archiveFileCounts[cd.n] = pc;  // still on disk: counted, kept for the next session / eviction
++      info("gpu.pso.cache skipped file=" + token(p.filename().string()) + " bytes=" + std::to_string(cd.bytes) +
++           " entries=" + std::to_string(pc) + " reason=" + why + " predicted_mb=" + std::to_string(predicted >> 20) +
++           " used_mb=" + std::to_string(used >> 20) + " avail_mb=" + std::to_string(av >> 20));
++      continue;
++    }
+     MTLBinaryArchiveDescriptor* ad = [MTLBinaryArchiveDescriptor new];
+     ad.url = [NSURL fileURLWithPath:@(p.c_str())];
+     NSError* ae = nil;
++    const auto t0 = std::chrono::steady_clock::now();
+     id<MTLBinaryArchive> ar = [device newBinaryArchiveWithDescriptor:ad error:&ae];
++    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+     if (!ar) {  // stale or from another OS version: remove it, its pipelines are rebuilt
+       err("what=archive_load file=%s error=%s", token(p.filename().string()).c_str(), token(str(ae)).c_str());
+       fs::remove(p, ec);
+       continue;
+     }
+     [loaded addObject:ar];
+-    const auto c = counts.find(n);
+-    const uint32_t pc = c == counts.end() ? 0 : c->second;
+-    archiveFileCounts[n] = pc;
++    archiveFileCounts[cd.n] = pc;
+     pipelinesLoaded += pc;
+-  }
++    const uint64_t footAfter = MetalBackend::footprint();
++    const int64_t delta = int64_t(footAfter) - int64_t(footNow);
++    openedBytes += cd.bytes;
++    ++archiveStats.loaded;
++    archiveStats.bytesLoaded += cd.bytes;
++    if (openedBytes && footAfter > foot0) ratio = std::max(1.0, double(footAfter - foot0) / double(openedBytes));
++    info("gpu.pso.cache open file=" + token(p.filename().string()) + " bytes=" + std::to_string(cd.bytes) +
++         " entries=" + std::to_string(pc) + " mem_delta_mb=" + std::to_string(delta / (1 << 20)) +
++         " ratio=" + std::to_string(ratio).substr(0, 4) + " ms=" + std::to_string(int(ms)));
++  }
++  const uint64_t foot1 = MetalBackend::footprint();
++  archiveStats.pipelines = pipelinesLoaded;
++  archiveStats.memDelta = int64_t(foot1) - int64_t(foot0);
++  if (!cands.empty())
++    info("gpu.pso.cache open_total files=" + std::to_string(archiveStats.loaded) + " skipped=" +
++         std::to_string(archiveStats.skipped) + " bytes=" + std::to_string(archiveStats.bytesLoaded) +
++         " skipped_bytes=" + std::to_string(archiveStats.bytesSkipped) + " mem_delta_mb=" +
++         std::to_string(archiveStats.memDelta / (1 << 20)) + " budget_mb=" + std::to_string(budget >> 20) +
++         " floor_mb=" + std::to_string(floorBytes >> 20));
++  // Opening them cost a lot more than their size: the budget prediction is what keeps this bounded.
++  if (archiveStats.memDelta > int64_t(256ull << 20))
++    info("gpu.pso.cache warn=archive_memory mem_delta_mb=" + std::to_string(archiveStats.memDelta / (1 << 20)) +
++         " bytes_mb=" + std::to_string(archiveStats.bytesLoaded >> 20) +
++         " (opening binary archives costs footprint; lower VP_PIPELINE_ARCHIVE_BUDGET_MB or turn the archive off)");
+   lookupArchives = [loaded copy];
+   archiveSession = next;
+   archive = newArchive();
+@@ -3486,6 +3557,15 @@ void MetalBackend::Impl::maybeSaveArchive() {
+   saveArchiveLocked();
+ }
+ 
++MetalBackend::ArchiveStats MetalBackend::archiveStats() const { return impl_->archiveStats; }
++
++uint64_t MetalBackend::footprint() {
++  task_vm_info_data_t vm = {};
++  mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
++  if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &n) != KERN_SUCCESS) return 0;
++  return uint64_t(vm.phys_footprint);
++}
++
+ bool MetalBackend::saveArchive() {
+   @autoreleasepool {
+     std::lock_guard lock(impl_->archiveMutex);
+diff --git a/gpu/vulkan/include/vpvk/platform.h b/gpu/vulkan/include/vpvk/platform.h
+index f2b1785..ae2fbe5 100644
+--- a/gpu/vulkan/include/vpvk/platform.h
++++ b/gpu/vulkan/include/vpvk/platform.h
+@@ -62,6 +62,16 @@ class Platform {
+   // Bytes the process may still allocate before the OS kills it (visionOS: os_proc_available_memory),
+   // 0 = unknown. VK_EXT_memory_budget reports usage + this as the heap budget.
+   virtual uint64_t availableMemory() { return 0; }
++  // Pipeline binary archives this device opened (gpu.mem, vkCreateDevice prewarm mode). All zero
++  // without a disk cache. memDelta: footprint growth measured across opening them (bytes, may be < 0).
++  struct ArchiveStats {
++    uint32_t loaded = 0, skipped = 0, pipelines = 0;
++    uint64_t bytesLoaded = 0, bytesSkipped = 0;
++    int64_t memDelta = 0;
++  };
++  virtual ArchiveStats archiveStats() { return {}; }
++  // Process footprint in bytes (visionOS: phys_footprint, what jetsam counts), 0 = unknown.
++  virtual uint64_t footprint() { return 0; }
+ };
+ 
+ // Defined by exactly one platform source linked into the dylib.
+diff --git a/gpu/vulkan/src/entry.cpp b/gpu/vulkan/src/entry.cpp
+index c528c30..06f0ab0 100644
+--- a/gpu/vulkan/src/entry.cpp
++++ b/gpu/vulkan/src/entry.cpp
+@@ -512,12 +512,33 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
+   const unsigned workers = std::clamp(std::thread::hardware_concurrency(), 4u, 8u) - 2u;
+   d->gpu = std::make_unique<vpgpu::Device>(d->platform->backend(), workers, [](const std::string& s) { log(s); });
+   d->queue.device = d;
+-  // Pipeline recipes of earlier runs: compiled now, before the game's first frame, so its
+-  // vkCreate*Pipelines calls are cache hits. With vpvk_prewarm() run by the app beforehand this is
+-  // mostly binary-archive lookups.
++  // Pipeline recipes of earlier runs. Compiling every one here held all of them (build 13: 4505
++  // pipelines plus their libraries, on top of the archives -> jetsam), so:
++  //  - binary archives on disk (the launcher's prewarm filled them, or earlier runs): lazy. Nothing
++  //    is compiled now; each vkCreate*Pipelines finds its pipeline in the archive (fast lookup) or
++  //    the OS shader cache on first use, and only what the game creates is held. The store goes
++  //    lean (its MSL text is never read again by this device).
++  //  - no archive: a prewarm bounded by memory (kPrewarmBudget of footprint growth, kPrewarmFloor
++  //    available) and time, so it can never take the process down.
++  // Either way prewarmedRecipes = the recipes on disk, which noteRecipeKey counts the game's
++  // pipelines against (gpu.pso.recipe game hits/misses, read by the host).
+   d->recipes = std::make_unique<RecipeStore>(RecipeStore::defaultDir());
+-  if (d->recipes->enabled() && prewarmEnabled())
+-    d->prewarmedRecipes = prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 20.0).recipes;
++  if (d->recipes->enabled() && prewarmEnabled()) {
++    constexpr uint64_t kPrewarmBudget = 512ull << 20, kPrewarmFloor = 3ull << 30;
++    const Platform::ArchiveStats as = d->platform->archiveStats();
++    d->prewarmedRecipes = uint32_t(d->recipes->pipelineCount());
++    if (as.loaded + as.skipped > 0) {
++      d->recipeMode = "lazy";
++      if (d->recipes->needsRefresh()) d->recipes->refresh(std::max(2u, std::thread::hardware_concurrency()));
++      const size_t released = d->recipes->releaseSources();
++      logf("gpu.prewarm skipped=lazy recipes=%u archives=%u skipped_archives=%u released_mb=%zu",
++           d->prewarmedRecipes, as.loaded, as.skipped, released >> 20);
++    } else {
++      d->recipeMode = "bounded";
++      prewarm(*d->platform, d->gpu->pipelines(), *d->recipes, nullptr, 20.0, kPrewarmBudget, kPrewarmFloor);
++    }
++  }
++  logDeviceMemory(*d, "create", 0);
+   logf("vk.device exts=%u multiview=%d fdm=%d metal_objects=%d", ci->enabledExtensionCount,
+        d->multiview, d->densityMap, d->metalObjects);
+   logConfig();
+@@ -533,7 +554,15 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyDevice(VkDevice dv, const VkAllo
+   if (d->gpu) d->platform->waitIdle();
+   if (d->gpu) motionDeviceDestroyed(*d);
+   d->platform->waitIdle();
++  // Retirement check (the launcher's prewarm device must give everything back): footprint before
++  // and after the pipeline cache (every compiled pipeline) goes; the platform (libraries, archives)
++  // goes with `d` right after.
++  const uint64_t f0 = d->platform->footprint();
++  const size_t held = d->gpu ? d->gpu->pipelines().readyCount() : 0;
+   d->gpu.reset();
++  const uint64_t f1 = d->platform->footprint();
++  if (f0) logf("gpu.mem when=destroy pipelines_released=%zu footprint_mb=%llu after_pipelines_mb=%llu", held,
++               (unsigned long long)(f0 >> 20), (unsigned long long)(f1 >> 20));
+   delete d;
+ }
+ 
+@@ -1395,6 +1424,34 @@ VPVK_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkIns
+   return lookup(name, false);
+ }
+ 
++namespace vpvk {
++constexpr uint64_t kMemLogFrames = 600;
++
++void logDeviceMemory(Device& d, const char* when, uint64_t frame) {
++  if (!d.gpu || !d.platform) return;
++  const Platform::ArchiveStats as = d.platform->archiveStats();
++  const size_t held = d.gpu->pipelines().readyCount();
++  const uint64_t foot = d.platform->footprint(), avail = d.platform->availableMemory();
++  const uint64_t recipeFile = d.recipes ? d.recipes->fileBytes() : 0;
++  const size_t recipeSrc = d.recipes ? d.recipes->sourceBytes() : 0;
++  logf("gpu.mem when=%s f=%llu pipelines_held=%zu archives=%u archives_skipped=%u archive_pipelines=%u "
++       "archive_mb=%llu archive_open_delta_mb=%lld recipes=%u recipe_mode=%s recipe_file_mb=%llu recipe_msl_mb=%zu "
++       "footprint_mb=%llu avail_mb=%llu",
++       when, (unsigned long long)frame, held, as.loaded, as.skipped, as.pipelines,
++       (unsigned long long)(as.bytesLoaded >> 20), (long long)(as.memDelta / (1 << 20)), d.prewarmedRecipes,
++       d.recipeMode, (unsigned long long)(recipeFile >> 20), recipeSrc >> 20, (unsigned long long)(foot >> 20),
++       (unsigned long long)(avail >> 20));
++}
++
++// After each submitted frame (sync.cpp): gpu.mem every kMemLogFrames frames. Cheap when not due.
++void memFrameSubmitted(Device& d, uint64_t frame) {
++  uint64_t due = d.memNextFrame.load(std::memory_order_relaxed);
++  if (frame < due) return;
++  if (!d.memNextFrame.compare_exchange_strong(due, frame + kMemLogFrames)) return;
++  logDeviceMemory(d, "frame", frame);
++}
++}  // namespace vpvk
++
+ // For a host's prewarm device (no game running): blocks until every shader library and pipeline
+ // its vkCreate*Pipelines calls queued has compiled, then writes the binary archive, so retiring
+ // the device drops nothing. Returns the milliseconds waited. Found with dlsym.
+@@ -1409,6 +1466,7 @@ VPVK_EXPORT uint32_t vpvk_device_wait_compiles(VkDevice dv) {
+   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+   const vpgpu::PipelineStats t = d->gpu->pipelines().totals();
+   logf("vk.prewarm drained ms=%.0f pipelines compiled=%u failed=%u hits=%u", ms, t.compiled, t.failed, t.hits);
++  logDeviceMemory(*d, "drained", d->lastFrame == kNoFrame ? 0 : d->lastFrame);
+   return uint32_t(ms);
+ }
+ 
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index 5ced71f..d90e0e0 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -805,11 +805,15 @@ void buildMotionVariants(Device* d, const VkGraphicsPipelineCreateInfo& ci, Pipe
+   }
+ }
+ 
+-// Did this device's recipe prewarm already produce this key? Checked before the game's request.
+-// The boot log's last "gpu.pso.recipe game" line is what AVP reads to trust (or drop) warm.stamp.
++// Was this key among the recipes a prewarm compiled into the caches (stored before this run, or
++// already requested on this device)? Checked before the game's request records it. With the lazy
++// vkCreateDevice nothing is requested up front, so a stored recipe is the hit: the launcher's prewarm
++// compiled it into the binary archive / OS shader cache. The boot log's last "gpu.pso.recipe game"
++// line is what AVP reads to trust (or drop) warm.stamp.
+ void noteRecipeKey(Device* d, vpgpu::PipelineKey key, const std::string& label) {
+   if (!d->prewarmedRecipes) return;
+-  const bool hit = d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing;
++  const bool hit = d->gpu->pipelines().status(key) != vpgpu::PipelineCache::Status::Missing ||
++                   (d->recipes && d->recipes->has(key.value));
+   const uint32_t h = hit ? ++d->recipeHits : d->recipeHits.load(), m = hit ? d->recipeMisses.load() : ++d->recipeMisses;
+   if (!hit && m <= 8) logf("gpu.pso.recipe game miss key=%016llx pipeline=%s", (unsigned long long)key.value, label.c_str());
+   if (h + m <= 4 || (h + m) % 64 == 0)
+@@ -1042,6 +1046,10 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreatePipelineCache(VkDevice dv, co
+     logf("vk.pipelinecache initial size=%zu foreign=1 (ignored)", n);
+     return VK_SUCCESS;
+   }
++  if (std::strcmp(d->recipeMode, "lazy") == 0) {  // pipelines come from the archives on first use
++    logf("vk.pipelinecache initial size=%zu keys=%u lazy=1 (nothing queued)", n, count);
++    return VK_SUCCESS;
++  }
+   uint32_t queued = 0, known = 0;
+   for (uint32_t i = 0; i < count; ++i) {
+     uint64_t k;
+diff --git a/gpu/vulkan/src/platform_metal.mm b/gpu/vulkan/src/platform_metal.mm
+index 74bb9e4..154ee78 100644
+--- a/gpu/vulkan/src/platform_metal.mm
++++ b/gpu/vulkan/src/platform_metal.mm
+@@ -31,6 +31,14 @@ class MetalPlatform final : public Platform {
+   vpgpu::Backend& backend() override { return backend_; }
+   void waitIdle() override { backend_.waitIdle(); }
+   uint64_t availableMemory() override { return os_proc_available_memory(); }
++  uint64_t footprint() override { return vpgpu::metal2::MetalBackend::footprint(); }
++  ArchiveStats archiveStats() override {
++    const auto a = backend_.archiveStats();
++    ArchiveStats r;
++    r.loaded = a.loaded, r.skipped = a.skipped, r.pipelines = a.pipelines;
++    r.bytesLoaded = a.bytesLoaded, r.bytesSkipped = a.bytesSkipped, r.memDelta = a.memDelta;
++    return r;
++  }
+   void addShader(uint64_t id, ShaderBlob b) override {
+     vpgpu::metal2::MslShader m;
+     m.source = std::move(b.source);
+@@ -76,6 +84,19 @@ class MetalPlatform final : public Platform {
+     const bool archiveOff = ar && *ar == '0';
+     if (dir && *dir && !archiveOff) o.cacheRoot = dir;
+     if (dir && *dir && archiveOff) log("gpu.pso.cache archive=off (VP_PIPELINE_ARCHIVE=0)");
++    // Overrides of the archive memory budget (MetalOptions defaults are the safe ones): MB of
++    // footprint growth allowed for opening archives, and MB that must stay available (0 = no limit).
++    auto mb = [](const char* name, uint64_t& out) {
++      const char* v = std::getenv(name);
++      if (!v || !*v) return;
++      char* end = nullptr;
++      const unsigned long long n = std::strtoull(v, &end, 10);
++      if (end == v) return;
++      out = uint64_t(n) << 20;
++      log(std::string("gpu.pso.cache ") + name + "=" + std::to_string(n));
++    };
++    mb("VP_PIPELINE_ARCHIVE_BUDGET_MB", o.archiveBudgetBytes);
++    mb("VP_PIPELINE_ARCHIVE_FLOOR_MB", o.archiveFloorBytes);
+     return o;
+   }
+   vpgpu::metal2::ShaderTable shaders_;
+diff --git a/gpu/vulkan/src/platform_null.cpp b/gpu/vulkan/src/platform_null.cpp
+index c74124f..dacf5b8 100644
+--- a/gpu/vulkan/src/platform_null.cpp
++++ b/gpu/vulkan/src/platform_null.cpp
+@@ -1,6 +1,8 @@
+ // Linux/test platform: gpu/core's null backend (records calls, executes nothing).
+ #include "vpvk/platform.h"
+ 
++#include <cstdlib>
++
+ namespace vpvk {
+ namespace {
+ class NullPlatform final : public Platform {
+@@ -8,6 +10,12 @@ class NullPlatform final : public Platform {
+   // Nothing executes, so every frame is finished at once (tests move completedBelow to hold one).
+   NullPlatform() { backend_.completedBelow = ~uint64_t(0); }
+   vpgpu::Backend& backend() override { return backend_; }
++  // Tests: VPVK_TEST_ARCHIVES=<n> pretends n binary archives were opened (lazy vkCreateDevice).
++  ArchiveStats archiveStats() override {
++    ArchiveStats a;
++    if (const char* e = std::getenv("VPVK_TEST_ARCHIVES")) a.loaded = uint32_t(std::strtoul(e, nullptr, 10));
++    return a;
++  }
+ 
+  private:
+   vpgpu::NullBackend backend_;
+diff --git a/gpu/vulkan/src/recipes.cpp b/gpu/vulkan/src/recipes.cpp
+index 46e8de5..6500136 100644
+--- a/gpu/vulkan/src/recipes.cpp
++++ b/gpu/vulkan/src/recipes.cpp
+@@ -402,7 +402,8 @@ void RecipeStore::addStage(const StageInput& in, uint64_t h, const std::vector<u
+     Writer w;
+     encodeShader(w, msl, blob);
+     write(kTagShader, w.b);
+-    shaders_[msl] = blob;
++    ShaderBlob& kept = shaders_[msl] = blob;
++    if (lean_) std::string().swap(kept.source), std::vector<ShaderBlob::Arg>().swap(kept.arguments);
+   }
+   if (known && it->second.translator == translator_ && it->second.msl != msl) {
+     // Same input, same translator version, other MSL: the translator changed without a version
+@@ -438,6 +439,7 @@ void RecipeStore::addPipeline(const vpgpu::PipelineState& s, const std::array<ui
+ 
+ bool RecipeStore::needsRefresh() const {
+   std::lock_guard lock(mutex_);
++  if (lean_) return false;
+   if (drift_ || compactionDueLocked()) return true;
+   for (const auto& [h, rec] : inputs_)
+     if (rec.translator != translator_) return true;
+@@ -462,7 +464,7 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
+   std::vector<uint64_t> unbuildable;
+   {
+     std::lock_guard lock(mutex_);
+-    if (!file_) return r;
++    if (!file_ || lean_) return r;  // lean: the MSL a rewrite would write back is gone
+     std::unordered_map<uint64_t, size_t> jobOf;
+     for (const auto& [h, rec] : inputs_) {
+       if (!drift_ && rec.translator == translator_) continue;
+@@ -570,6 +572,7 @@ RecipeStore::RefreshResult RecipeStore::refresh(unsigned threads) {
+ // Writes every live record to recipes.bin.tmp and renames it over the file (a crash mid-way leaves
+ // the old file intact). SPIR-V words are copied from the old file.
+ bool RecipeStore::rewriteLocked() {
++  if (lean_) return false;  // would write the shaders without their MSL
+   const std::string tmp = path_ + ".tmp";
+   FILE* out = std::fopen(tmp.c_str(), "wb");
+   if (!out) {
+@@ -649,6 +652,7 @@ bool RecipeStore::rewriteLocked() {
+ RecipeStore::Snapshot RecipeStore::snapshot() const {
+   std::lock_guard lock(mutex_);
+   Snapshot out;
++  if (lean_) return out;  // sources released: nothing to compile from
+   for (const auto& [id, b] : shaders_) out.shaders.emplace_back(id, b);
+   auto has = [&](uint64_t id) { return !id || shaders_.count(id); };
+   for (const auto& [k, p] : pipelines_)
+@@ -672,6 +676,40 @@ bool RecipeStore::stateFor(uint64_t key, vpgpu::PipelineState& out) const {
+   return true;
+ }
+ 
++bool RecipeStore::has(uint64_t key) const {
++  std::lock_guard lock(mutex_);
++  return pipelines_.count(key) != 0;
++}
++
++size_t RecipeStore::releaseSources() {
++  std::lock_guard lock(mutex_);
++  size_t bytes = 0;
++  for (auto& [id, b] : shaders_) {
++    bytes += b.source.capacity() + b.arguments.capacity() * sizeof(ShaderBlob::Arg);
++    std::string().swap(b.source);
++    std::vector<ShaderBlob::Arg>().swap(b.arguments);
++  }
++  lean_ = true;
++  return bytes;
++}
++
++bool RecipeStore::lean() const {
++  std::lock_guard lock(mutex_);
++  return lean_;
++}
++
++size_t RecipeStore::sourceBytes() const {
++  std::lock_guard lock(mutex_);
++  size_t bytes = 0;
++  for (const auto& [id, b] : shaders_) bytes += b.source.size();
++  return bytes;
++}
++
++uint64_t RecipeStore::fileBytes() const {
++  std::lock_guard lock(mutex_);
++  return size_;
++}
++
+ size_t RecipeStore::pipelineCount() const {
+   std::lock_guard lock(mutex_);
+   return pipelines_.size();
+@@ -690,7 +728,8 @@ std::vector<StageInput> RecipeStore::stageInputs() const {
+ }
+ 
+ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeStore& store,
+-                      const std::function<void(uint32_t, uint32_t)>& progress, double maxSeconds) {
++                      const std::function<void(uint32_t, uint32_t)>& progress, double maxSeconds, uint64_t memBudget,
++                      uint64_t memFloor) {
+   using Clock = std::chrono::steady_clock;
+   const auto start = Clock::now();
+   PrewarmResult r;
+@@ -702,13 +741,45 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
+        snap.pipelines.size(), rf.retranslated, rf.failed, rf.ms);
+   r.recipes = uint32_t(snap.pipelines.size());
+   if (snap.pipelines.empty()) return r;
+-  for (auto& [id, b] : snap.shaders) platform.addShader(id, std::move(b));
++  // Shaders are registered as the pipelines that use them are requested (registering one also
++  // queues its library compile), so a bounded prewarm compiles no library it does not use.
++  std::unordered_map<uint64_t, ShaderBlob*> pendingShaders;
++  for (auto& [id, b] : snap.shaders) pendingShaders.emplace(id, &b);
++  auto addShader = [&](uint64_t id) {
++    if (!id) return;
++    auto it = pendingShaders.find(id);
++    if (it == pendingShaders.end()) return;
++    platform.addShader(id, std::move(*it->second));
++    pendingShaders.erase(it);
++  };
++  const uint64_t foot0 = platform.footprint(), avail0 = platform.availableMemory();
++  auto grown = [&]() -> uint64_t {  // footprint growth since the start (available memory if unknown)
++    if (foot0) {
++      const uint64_t f = platform.footprint();
++      return f > foot0 ? f - foot0 : 0;
++    }
++    const uint64_t a = platform.availableMemory();
++    return avail0 > a ? avail0 - a : 0;
++  };
++  constexpr size_t kBatch = 64;
+   std::vector<uint64_t> keys;
+-  for (const auto& s : snap.pipelines) {
++  const char* stopped = nullptr;
++  for (size_t i = 0; i < snap.pipelines.size(); ++i) {
++    if ((memBudget || memFloor) && i % kBatch == 0) {
++      if (memBudget && grown() > memBudget) stopped = "budget";
++      else if (const uint64_t a = memFloor ? platform.availableMemory() : 0; a && a < memFloor) stopped = "floor";
++      if (stopped) break;
++    }
++    const auto& s = snap.pipelines[i];
++    addShader(s.vertexShader), addShader(s.fragmentShader), addShader(s.computeShader);
+     const vpgpu::PipelineKey k = s.key();
+     keys.push_back(k.value);
+     if (cache.request(s, k, vpgpu::Priority::Prefetch) == vpgpu::PipelineCache::Status::Ready) ++r.hits;
+   }
++  r.issued = uint32_t(keys.size());
++  if (stopped)
++    logf("gpu.prewarm bounded issued=%u of %u reason=%s grown_mb=%llu budget_mb=%llu", r.issued, r.recipes, stopped,
++         (unsigned long long)(grown() >> 20), (unsigned long long)(memBudget >> 20));
+   for (;;) {
+     uint32_t done = 0, failed = 0;
+     for (uint64_t k : keys) {
+@@ -716,23 +787,23 @@ PrewarmResult prewarm(Platform& platform, vpgpu::PipelineCache& cache, RecipeSto
+       if (st == vpgpu::PipelineCache::Status::Ready) ++done;
+       else if (st == vpgpu::PipelineCache::Status::Failed) ++done, ++failed;
+     }
+-    if (progress) progress(done, r.recipes);
+-    if (done == r.recipes) {
++    if (progress) progress(done, r.issued);
++    if (done == r.issued) {
+       r.failed = failed;
+       break;
+     }
+     // Bounded wait (game boot / watchdog): the rest keeps compiling on the workers.
+     if (maxSeconds > 0 && std::chrono::duration<double>(Clock::now() - start).count() > maxSeconds) {
+-      logf("gpu.prewarm timeout done=%u of %u after %.0f s (rest continues in background)", done, r.recipes, maxSeconds);
++      logf("gpu.prewarm timeout done=%u of %u after %.0f s (rest continues in background)", done, r.issued, maxSeconds);
+       r.failed = failed;
+       break;
+     }
+     std::this_thread::sleep_for(std::chrono::milliseconds(15));
+   }
+-  r.compiled = r.recipes - r.failed - r.hits;
++  r.compiled = r.issued - r.failed - r.hits;
+   r.ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+-  logf("gpu.prewarm recipes=%u compiled=%u hits=%u failed=%u retranslated=%u ms=%.0f", r.recipes, r.compiled, r.hits,
+-       r.failed, r.retranslated, r.ms);
++  logf("gpu.prewarm recipes=%u issued=%u compiled=%u hits=%u failed=%u retranslated=%u ms=%.0f", r.recipes, r.issued,
++       r.compiled, r.hits, r.failed, r.retranslated, r.ms);
+   return r;
+ }
+ 
+diff --git a/gpu/vulkan/src/recipes.h b/gpu/vulkan/src/recipes.h
+index 2588f92..271be6f 100644
+--- a/gpu/vulkan/src/recipes.h
++++ b/gpu/vulkan/src/recipes.h
+@@ -87,6 +87,15 @@ class RecipeStore {
+   Snapshot snapshot() const;
+   std::vector<uint64_t> keys() const;
+   bool stateFor(uint64_t key, vpgpu::PipelineState& out) const;
++  bool has(uint64_t key) const;  // a recipe with this pipeline key is stored
++  // Lean mode (the game's device when pipelines come lazily from the caches): drops the MSL text
++  // of every stored shader (ids, colour outputs kept), which the device never reads again. Recording
++  // goes on as before; refresh(), compaction and snapshot() shaders are off for this store's life.
++  // Returns the bytes released.
++  size_t releaseSources();
++  bool lean() const;
++  size_t sourceBytes() const;  // MSL text held in memory (gpu.mem)
++  uint64_t fileBytes() const;  // recipes.bin size
+   size_t pipelineCount() const;
+   size_t shaderCount() const;
+   std::vector<StageInput> stageInputs() const;  // diagnostics / tests
+@@ -128,6 +137,7 @@ class RecipeStore {
+   std::unordered_map<uint64_t, SpirvRec> spirv_;
+   std::unordered_map<uint64_t, PipeRec> pipelines_;
+   size_t storedThisRun_ = 0, records_ = 0, deadRecords_ = 0;
++  bool lean_ = false;         // releaseSources() ran
+   bool drift_ = false;        // a run saw the same input give another MSL under the same version
+   bool driftWritten_ = false; // drift record appended this run
+ };
+@@ -135,11 +145,15 @@ class RecipeStore {
+ // Compiles every stored recipe on `device`'s pipeline workers and waits for them. Retranslates
+ // stale stage inputs first (RecipeStore::refresh, on all cores).
+ // progress(done, total) is called from the calling thread (may be null). Logs gpu.prewarm.
++// memBudget (bytes, 0 = none): recipes are requested in batches and the requests stop once the
++// process footprint grew by more than this (or availableMemory fell under memFloor): a bounded
++// prewarm for a device that keeps every pipeline it compiles (the game's).
+ struct PrewarmResult {
+-  uint32_t recipes = 0, compiled = 0, hits = 0, failed = 0, retranslated = 0;
++  uint32_t recipes = 0, issued = 0, compiled = 0, hits = 0, failed = 0, retranslated = 0;
+   double ms = 0;
+ };
+ PrewarmResult prewarm(Platform&, vpgpu::PipelineCache&, RecipeStore&,
+-                      const std::function<void(uint32_t, uint32_t)>& progress, double maxSeconds = 0);
++                      const std::function<void(uint32_t, uint32_t)>& progress, double maxSeconds = 0,
++                      uint64_t memBudget = 0, uint64_t memFloor = 0);
+ 
+ }  // namespace vpvk
+diff --git a/gpu/vulkan/src/sync.cpp b/gpu/vulkan/src/sync.cpp
+index 34e7210..e0da776 100644
+--- a/gpu/vulkan/src/sync.cpp
++++ b/gpu/vulkan/src/sync.cpp
+@@ -166,6 +166,7 @@ VkResult submit(Device& d, std::vector<Batch>& batches, Fence* fence) {
+   if (!frame.commands().empty() || queries) {
+     d.lastFrame = d.gpu->submit(frame).frame;
+     motionFrameSubmitted(&d, d.lastFrame);
++    memFrameSubmitted(d, d.lastFrame);
+   }
+   ++d.submits;
+   stampQueries(batches, d.lastFrame);
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index dacd675..3a31c07 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -32,6 +32,11 @@ void logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+ bool prewarmEnabled();  // config.cpp: vpvk_config_set_prewarm
+ bool forceSingleSample();  // config.cpp: vpvk_config_set_force_single_sample
+ bool vpktaaEnabled();      // config.cpp: vpvk_config_set_vpktaa
++struct Device;
++// entry.cpp: "gpu.mem ..." (pipelines held, archives, recipes, footprint) at device creation and
++// every kMemLogFrames submitted frames.
++void logDeviceMemory(Device& d, const char* when, uint64_t frame);
++void memFrameSubmitted(Device& d, uint64_t frame);
+ 
+ // Dispatchable handles start with the loader word (vk_icd.h): harmless without a loader and
+ // required if one is ever put in front of the driver.
+@@ -321,6 +326,11 @@ struct Device : Dispatchable {
+   // the prewarm did not produce: a new pipeline, or recipes that do not match the game's keys.
+   uint32_t prewarmedRecipes = 0;
+   std::atomic<uint32_t> recipeHits{0}, recipeMisses{0};
++  // How vkCreateDevice treated the recipes (gpu.mem): "lazy" (binary archives on disk: every
++  // pipeline comes from them / the OS shader cache on first use), "bounded" (memory-capped prewarm),
++  // "off" (no recipes or prewarm disabled).
++  const char* recipeMode = "off";
++  std::atomic<uint64_t> memNextFrame{0};  // next frame index that logs gpu.mem
+   Queue queue;
+   bool multiview = false, densityMap = false, metalObjects = false;
+   std::mutex submitMutex;
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index 1f85afd..e0d367b 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -506,6 +506,7 @@ VkShaderModule module(Ctx& c, const std::string& name) {
+ // tests), descriptors of every kind they use, push constants, two vertex buffers, a dynamic
+ // uniform offset. Checks the pipeline compiled and the core draw carries what the shaders read.
+ bool gRecipeKeyCheck = false;  // testRecipeKeys
++bool gRecipeLazyCheck = false;  // testRecipeKeys, third run: archives "on disk" (VPVK_TEST_ARCHIVES)
+ 
+ void testPipeline() {
+   Ctx c({VK_KHR_MULTIVIEW_EXTENSION_NAME});
+@@ -760,6 +761,49 @@ void testPipeline() {
+                 d->recipeMisses.load());
+     CHECK(d->prewarmedRecipes > 0 && d->recipeHits.load() > 0 && d->recipeMisses.load() == 0);
+   }
++  if (gRecipeLazyCheck) {  // lazy vkCreateDevice: nothing compiled up front, the hits still count
++    const Device* d = from<Device>(c.dev);
++    std::printf("  lazy: mode=%s held=%zu prewarmed=%u hits=%u misses=%u lean=%d\n", d->recipeMode,
++                d->gpu->pipelines().readyCount(), d->prewarmedRecipes, d->recipeHits.load(), d->recipeMisses.load(),
++                d->recipes->lean() ? 1 : 0);
++    CHECK(std::strcmp(d->recipeMode, "lazy") == 0);
++    CHECK(d->recipes->lean() && d->recipes->sourceBytes() == 0);
++    CHECK(d->prewarmedRecipes > 0 && d->recipeHits.load() > 0 && d->recipeMisses.load() == 0);
++    CHECK(d->gpu->pipelines().readyCount() < d->prewarmedRecipes + 8);  // only what the test created
++  }
++}
++
++// prewarm() with a memory budget stops requesting once the footprint grew past it.
++class GrowingPlatform final : public Platform {
++ public:
++  GrowingPlatform() { backend_.completedBelow = ~uint64_t(0); }
++  vpgpu::Backend& backend() override { return backend_; }
++  uint64_t footprint() override { return (1ull << 30) + (calls_++) * (64ull << 20); }  // +64 MB per look
++
++ private:
++  vpgpu::NullBackend backend_;
++  uint64_t calls_ = 0;
++};
++
++void testBoundedPrewarm(const char* dir) {
++  RecipeStore store(dir);
++  const size_t n = store.pipelineCount();
++  CHECK(n > 0);
++  GrowingPlatform plat;
++  vpgpu::PipelineCache cache(plat.backend(), 0);
++  const PrewarmResult unbounded = prewarm(plat, cache, store, nullptr, 5.0);
++  CHECK(unbounded.issued == unbounded.recipes);
++  GrowingPlatform plat2;
++  vpgpu::PipelineCache cache2(plat2.backend(), 0);
++  const PrewarmResult bounded = prewarm(plat2, cache2, store, nullptr, 5.0, 1);  // 1 byte: stop at the first check
++  std::printf("  bounded: recipes=%u issued=%u (unbounded issued=%u)\n", bounded.recipes, bounded.issued, unbounded.issued);
++  CHECK(bounded.recipes == unbounded.recipes && bounded.issued == 0);  // checked before the first batch
++  // Lean store: sources gone, no refresh, no snapshot shaders.
++  RecipeStore lean(dir);
++  CHECK(lean.sourceBytes() > 0);
++  CHECK(lean.releaseSources() > 0);
++  CHECK(lean.lean() && lean.sourceBytes() == 0 && !lean.needsRefresh() && lean.snapshot().shaders.empty());
++  CHECK(lean.has(store.keys()[0]) && !lean.has(12345));
+ }
+ 
+ // The recipes a device records give, at the next device's vkCreateDevice prewarm, exactly the keys
+@@ -776,6 +820,12 @@ void testRecipeKeys() {
+   gRecipeKeyCheck = true;
+   testPipeline();  // prewarmed from the recipes, then the same creates
+   gRecipeKeyCheck = false;
++  setenv("VPVK_TEST_ARCHIVES", "1", 1);
++  gRecipeLazyCheck = true;
++  testPipeline();  // lazy: no prewarm, the recipes still count the game's creates as hits
++  gRecipeLazyCheck = false;
++  unsetenv("VPVK_TEST_ARCHIVES");
++  testBoundedPrewarm(dir);
+   if (old) setenv("VP_PIPELINE_CACHE_DIR", keep.c_str(), 1);
+   else unsetenv("VP_PIPELINE_CACHE_DIR");
+   std::error_code ec;
+-- 
+2.43.0
+

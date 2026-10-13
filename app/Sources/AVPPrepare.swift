@@ -488,12 +488,23 @@ enum AVPPipelineCache {
             checkGameMisses(dir: dir, key: key, bootLog: AVPLog.directory.appendingPathComponent("klepton-boot-\(engine).log"))
         }
         try? key.write(to: lastKeyURL, atomically: true, encoding: .utf8)
+        summarizeGpuTrouble(dir: dir, bootLog: AVPLog.directory.appendingPathComponent("klepton-boot-\(engine).log"))
+        let quarantined = quarantineCount(dir: dir)
+        if quarantined > 0 {
+            AVPLog.log("Gráficos: \(quarantined) pipelines en cuarentena (VPKEngine no los dibuja; Ajustes › Diagnóstico › "
+                       + "Restablecer shaders en cuarentena)")
+        }
         let recipes = (try? fm.attributesOfItem(atPath: dir.appendingPathComponent("recipes.bin").path))?[.size] as? NSNumber
-        let archives = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).filter { $0.hasSuffix(".metalar") }.count
+        let archiveFiles = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).filter { $0.hasSuffix(".metalar") }
+        let archives = archiveFiles.count
+        // Their size on disk: VPKEngine opens them only within a memory budget (0019: gpu.pso.cache open/skipped).
+        let archiveMB = archiveFiles.reduce(Int64(0)) { sum, name in
+            sum + (((try? fm.attributesOfItem(atPath: dir.appendingPathComponent(name).path))?[.size] as? NSNumber)?.int64Value ?? 0)
+        } / 1_048_576
         // Without the binary archive the game would compile every pipeline again: never warm then (it replays).
         let warm = driver != "?" && list != "?" && (recipes?.int64Value ?? 0) > 0 && !archiveOff && archives > 0
             && (try? String(contentsOf: stamp, encoding: .utf8)) == key
-        let summary = "recetas \((recipes?.int64Value ?? 0) / 1_048_576) MB, \(archives) archivo(s) binario(s)"
+        let summary = "recetas \((recipes?.int64Value ?? 0) / 1_048_576) MB, \(archives) archivo(s) binario(s) (\(archiveMB) MB)"
             + (archiveOff ? " (desactivados)" : "") + ", VPVulkan \(driver), \(os)"
         let verdict = warm ? "completa"
             : archiveOff ? "sin archivo binario: precompilado y replay del juego en cada arranque"
@@ -502,6 +513,71 @@ enum AVPPipelineCache {
         let s = State(dir: dir, key: key, warm: warm, archiveOff: archiveOff, summary: summary)
         current = s
         return s
+    }
+
+    // MARK: Quarantine (VPKEngine 0018: <VP_PIPELINE_CACHE_DIR>/quarantine.txt, pipelines that hung the GPU)
+
+    static var cacheDir: URL { AVPFolder.data.appendingPathComponent("vpcache", isDirectory: true) }
+    static func quarantineURL(dir: URL = cacheDir) -> URL { dir.appendingPathComponent("quarantine.txt") }
+
+    /// Entries in quarantine.txt: one per non-empty line that is not a comment.
+    static func quarantineCount(dir: URL = cacheDir) -> Int {
+        guard let text = try? String(contentsOf: quarantineURL(dir: dir), encoding: .utf8) else { return 0 }
+        return text.split(whereSeparator: \.isNewline).filter {
+            let t = $0.trimmingCharacters(in: .whitespaces)
+            return !t.isEmpty && !t.hasPrefix("#")
+        }.count
+    }
+
+    /// Settings › Diagnóstico: forget the quarantine (VPKEngine draws those pipelines again next launch).
+    static func resetQuarantine() {
+        let n = quarantineCount()
+        let url = quarantineURL()
+        // Single-hang suspects go too: a reset is a clean slate, not "persist on the next hang".
+        try? FileManager.default.removeItem(at: url.deletingLastPathComponent().appendingPathComponent("suspects.txt"))
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            AVPLog.log("Gráficos: no hay shaders en cuarentena que restablecer")
+            return
+        }
+        do {
+            try FileManager.default.removeItem(at: url)
+            AVPLog.log("Gráficos: cuarentena restablecida (\(n) pipelines); VPKEngine los vuelve a dibujar en el próximo arranque")
+        } catch {
+            AVPLog.log("Gráficos: no se pudo borrar \(url.lastPathComponent): \(error.localizedDescription)")
+        }
+    }
+
+    /// The previous session's GPU hangs and quarantines (VPKEngine 0018 logs gpu.hang.stuck / gpu.quarantine in the
+    /// boot log), summarised in app.txt once per boot log (gpu-trouble.seen holds the date of the one reported).
+    private static func summarizeGpuTrouble(dir: URL, bootLog: URL) {
+        let fm = FileManager.default
+        guard let date = (try? fm.attributesOfItem(atPath: bootLog.path))?[.modificationDate] as? Date else { return }
+        let stamp = String(Int64(date.timeIntervalSince1970))
+        let seenURL = dir.appendingPathComponent("gpu-trouble.seen")
+        if (try? String(contentsOf: seenURL, encoding: .utf8)) == stamp { return }
+        try? stamp.write(to: seenURL, atomically: true, encoding: .utf8)
+        guard let h = try? FileHandle(forReadingFrom: bootLog) else { return }
+        defer { try? h.close() }
+        let size = (try? h.seekToEnd()) ?? 0
+        try? h.seek(toOffset: size > 8_388_608 ? size - 8_388_608 : 0)
+        guard let data = try? h.readToEnd(),
+              let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else { return }
+        var hangs: [String] = [], quarantines: [String] = []
+        for line in text.split(whereSeparator: \.isNewline) where line.contains("gpu.hang.stuck") || line.contains("gpu.quarantine") {
+            // From the tag on (the boot log prefixes some lines with a timestamp and process).
+            let tag = line.contains("gpu.hang.stuck") ? "gpu.hang.stuck" : "gpu.quarantine"
+            guard let r = line.range(of: tag) else { continue }
+            let entry = String(line[r.lowerBound...].prefix(200))
+            if tag == "gpu.hang.stuck" { hangs.append(entry) } else { quarantines.append(entry) }
+        }
+        guard !hangs.isEmpty || !quarantines.isEmpty else { return }
+        AVPLog.log("Gráficos: la sesión anterior tuvo \(hangs.count) bloqueo(s) de GPU (gpu.hang.stuck) y "
+                   + "\(quarantines.count) aviso(s) de cuarentena (gpu.quarantine)")
+        func firstDistinct(_ lines: [String]) -> [String] {
+            var seen = Set<String>()
+            return Array(lines.filter { seen.insert($0).inserted }.prefix(3))
+        }
+        for e in firstDistinct(hangs) + firstDistinct(quarantines) { AVPLog.log("  \(e)") }
     }
 
     static func markWarm(_ s: State) {

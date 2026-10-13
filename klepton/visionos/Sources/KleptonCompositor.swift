@@ -2592,6 +2592,7 @@ final class KleptonCompositor {
         let capNow = guestLive && FrameCapture.enabled
             && (FrameCapture.frames.contains(capGuestFrames) || capGuestFrames == overlayCapFrame)
         hudCount(rendered: rendered, haveRendered: haveRendered)
+        loadingTick(originFromHead: originFromHead)
         for (di, drawable) in drawables.enumerated() {
             // Per drawable, not once: each one is presented separately and each
             // is reprojected by the system against its own anchor.
@@ -2804,6 +2805,205 @@ final class KleptonCompositor {
             hudDepth = device.makeDepthStencilState(descriptor: d)
         }
         if let hudDepth { enc.setDepthStencilState(hudDepth) }
+        enc.setRenderPipelineState(pipe)
+        enc.setFragmentTexture(tex, index: 0)
+        enc.setFragmentSamplerState(sampler, index: 0)
+        uniforms.withUnsafeBytes { buf in
+            enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+            enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
+        }
+        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+    }
+
+    // MARK: - Loading panel (AVP)
+    //
+    // Until this render loop composites the game's first picture, a world-locked panel 2 m ahead
+    // (placed once, level, where the head looked when it appeared) shows the game's art with a
+    // progress line, instead of an empty space; it fades out over `loadingFadeSeconds` once the
+    // first picture is composited. Per compositor instance, so a reopened space (pause/resume)
+    // shows it again until its own first picture — after `loadingDelayFrames` black frames, so a
+    // guest that already has a picture does not flash it. The art is loaded from disk and every
+    // texture is drawn on `loadingQueue`: the render thread only swaps a finished texture in.
+    /// Off unless the host turns it on. Set before the immersive space opens (AVPLaunch.configure).
+    nonisolated(unsafe) static var loadingEnabled = false
+    /// Image files for the panel (AVP: the Steam art the launcher cached): [background, logo], "" = none.
+    nonisolated(unsafe) static var loadingArt: [String] = []
+    nonisolated(unsafe) static var loadingTitle = "Half-Life: Alyx"
+    private static let loadingDelayFrames = 20
+    private static let loadingFadeSeconds = 0.6
+    private let loadingQueue = DispatchQueue(label: "klepton.loading-panel", qos: .utility)
+    private let loadingLock = NSLock()
+    private var loadingShared: MTLTexture?   // under loadingLock: the newest finished texture
+    private var loadingBuilding = false      // under loadingLock: a build is queued or running
+    private var loadingImages: [CGImage?]?   // loadingQueue only: decoded once, parallel to loadingArt
+    private var loadingTex: MTLTexture?      // render thread
+    private var loadingStart: Date?
+    private var loadingLastBuild = Date.distantPast
+    private var loadingFadeStart: Date?
+    private var loadingAlpha: Float = 0
+    private var loadingDone = false
+    private var loadingFinished = false   // under loadingLock: the panel is gone, late builds are dropped
+    private var loadingPose: (Float, Float, Float, Float, Float, Float, Float)?
+    private var loadingDepth: MTLDepthStencilState?
+
+    /// Once per frame on the render thread: placement, fade and a texture rebuild twice a second (queued, never
+    /// waited for).
+    private func loadingTick(originFromHead: simd_float4x4) {
+        guard !loadingDone, Self.loadingEnabled else { return }
+        if loggedFirstPicture {
+            guard loadingTex != nil else { loadingDone = true; return }   // never shown: nothing to fade
+            if loadingFadeStart == nil { loadingFadeStart = Date(); NSLog("[cp] loading panel: fading out (first picture)") }
+            let t = Date().timeIntervalSince(loadingFadeStart!) / Self.loadingFadeSeconds
+            loadingAlpha = Float(max(0, 1 - t))
+            if t >= 1 {
+                loadingDone = true
+                loadingTex = nil
+                loadingLock.lock(); loadingShared = nil; loadingFinished = true; loadingLock.unlock()
+                NSLog("[cp] loading panel: gone")
+            }
+            return
+        }
+        guard blackFrames >= Self.loadingDelayFrames else { return }
+        if loadingStart == nil {
+            loadingStart = Date()
+            NSLog("[cp] loading panel: shown (no guest picture after \(blackFrames) frames)")
+        }
+        if loadingPose == nil {
+            // Level, 2 m along where the head looks, facing it; never moved afterwards (world-locked).
+            let p = originFromHead.columns.3
+            var f = -SIMD3<Float>(originFromHead.columns.2.x, 0, originFromHead.columns.2.z)
+            if simd_length(f) < 1e-3 { f = SIMD3<Float>(0, 0, -1) }
+            f = simd_normalize(f)
+            let c = SIMD3<Float>(p.x, p.y, p.z) + 2.0 * f
+            // The quad faces +Z: turn +Z onto -f (back towards the viewer) about Y.
+            let yaw = atan2(-f.x, -f.z)
+            loadingPose = (0, sin(yaw / 2), 0, cos(yaw / 2), c.x, c.y, c.z)
+        }
+        loadingLock.lock()
+        if let t = loadingShared { loadingTex = t }
+        let busy = loadingBuilding
+        loadingLock.unlock()
+        loadingAlpha = 1
+        guard !busy, Date().timeIntervalSince(loadingLastBuild) >= 0.5 else { return }
+        loadingLastBuild = Date()
+        let line = loadingLine(seconds: Int(Date().timeIntervalSince(loadingStart!)))
+        loadingLock.lock(); loadingBuilding = true; loadingLock.unlock()
+        loadingQueue.async { [weak self] in
+            guard let self else { return }
+            if self.loadingImages == nil {
+                let images = Self.loadingArt.map { path -> CGImage? in
+                    guard !path.isEmpty,
+                          let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
+                    return CGImageSourceCreateImageAtIndex(src, 0, nil)
+                }
+                self.loadingImages = images
+                NSLog("[cp] loading panel: \(images.compactMap { $0 }.count) of \(Self.loadingArt.filter { !$0.isEmpty }.count) image(s) decoded")
+            }
+            let tex = self.makeLoadingTexture(images: self.loadingImages ?? [], line: line)
+            self.loadingLock.lock()
+            if let tex, !self.loadingFinished { self.loadingShared = tex }   // a build that ends after the fade is dropped
+            self.loadingBuilding = false
+            self.loadingLock.unlock()
+        }
+    }
+
+    /// "Cargando… 23 s · Compilando shaders 812/3354" — the game's own pipeline replay when it runs, else the boot
+    /// phase the heartbeat logs.
+    private func loadingLine(seconds: Int) -> String {
+        var done: UInt32 = 0, total: UInt32 = 0, elapsed: Double = 0
+        let what: String
+        if kl_foz_progress(&done, &total, &elapsed) == 1 && total > 0 {
+            what = "Compilando shaders \(done)/\(total)"
+        } else {
+            let phase = String(cString: kl_app_phase())
+            switch phase {
+            case "boot", "boot report", "boot done", "proc": what = "Iniciando el juego"
+            case "looper pump": what = "Cargando el juego"
+            default: what = phase
+            }
+        }
+        return "Cargando…  \(seconds) s  ·  \(what)"
+    }
+
+    /// Background art aspect-filled and darkened, the logo (or the title) over it, the progress line at the bottom.
+    /// On loadingQueue.
+    private func makeLoadingTexture(images: [CGImage?], line: String) -> MTLTexture? {
+        let w = 1024, h = 576
+        guard let cs = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        let full = CGRect(x: 0, y: 0, width: w, height: h)
+        ctx.setFillColor(CGColor(red: 0.09, green: 0.10, blue: 0.13, alpha: 1))
+        ctx.fill(full)
+        if let bg = images.first ?? nil, bg.width > 0, bg.height > 0 {
+            let scale = max(CGFloat(w) / CGFloat(bg.width), CGFloat(h) / CGFloat(bg.height))
+            let dw = CGFloat(bg.width) * scale, dh = CGFloat(bg.height) * scale
+            ctx.interpolationQuality = .high
+            ctx.draw(bg, in: CGRect(x: (CGFloat(w) - dw) / 2, y: (CGFloat(h) - dh) / 2, width: dw, height: dh))
+        }
+        ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 0.45))
+        ctx.fill(full)
+        ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 0.55))
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: 84))
+        if images.count > 1, let logo = images[1], logo.width > 0, logo.height > 0 {
+            let scale = min(560 / CGFloat(logo.width), 220 / CGFloat(logo.height))
+            let lw = CGFloat(logo.width) * scale, lh = CGFloat(logo.height) * scale
+            ctx.draw(logo, in: CGRect(x: (CGFloat(w) - lw) / 2, y: 250 - lh / 2 + 60, width: lw, height: lh))
+        } else {
+            drawLoadingText(ctx, Self.loadingTitle, size: 64, y: 300, width: w)
+        }
+        drawLoadingText(ctx, line, size: 30, y: 28, width: w)
+        guard let data = ctx.data else { return nil }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm_srgb, width: w, height: h, mipmapped: false)
+        d.usage = [.shaderRead]
+        d.storageMode = .shared
+        guard let t = device.makeTexture(descriptor: d) else { return nil }
+        t.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: data, bytesPerRow: w * 4)
+        return t
+    }
+
+    private func drawLoadingText(_ ctx: CGContext, _ text: String, size: CGFloat, y: CGFloat, width: Int) {
+        let font = CTFontCreateWithName("Helvetica-Bold" as CFString, size, nil)
+        let attrs: [NSAttributedString.Key: Any] = [
+            NSAttributedString.Key(kCTFontAttributeName as String): font,
+            NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(red: 1, green: 1, blue: 1, alpha: 1)]
+        let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attrs))
+        let tw = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
+        ctx.textPosition = CGPoint(x: max(16, (CGFloat(width) - tw) / 2), y: y)
+        CTLineDraw(line, ctx)
+    }
+
+    private func drawLoadingPanel(_ enc: MTLRenderCommandEncoder, viewIndices: [Int],
+                                  drawable: LayerRenderer.Drawable, originFromHead: simd_float4x4) {
+        guard !loadingDone, loadingAlpha > 0, let tex = loadingTex, let pose = loadingPose,
+              let pipe = overlayPipeline, let sampler else { return }
+        var ov = kl_ovrp_overlay()
+        ov.layer_id = -98
+        ov.shape = 0
+        ov.tex_w = Int32(tex.width); ov.tex_h = Int32(tex.height)
+        ov.pose = pose                       // tracking (origin) space: world-locked
+        ov.size = (1.6, 0.9)                 // metres, the texture's 16:9
+        ov.head_locked = 0
+        ov.origin_top_left = 1
+        ov.color_on = 1                      // the fade: alpha scaled (straight-alpha blend)
+        ov.color_scale = (1, 1, 1, loadingAlpha)
+        ov.color_offset = (0, 0, 0, 0)
+        var uniforms: [kl_overlay_uniforms] = []
+        for vi in viewIndices {
+            var u = kl_overlay_build(&ov, Int32(vi), originFromHead,
+                                     Self.headFromView(drawable.views[vi].transform,
+                                                       midpoint: eyeMidpointInDevice),
+                                     drawable.computeProjection(viewIndex: vi))
+            u.srgb_decode = 0
+            uniforms.append(u)
+        }
+        if loadingDepth == nil {
+            let d = MTLDepthStencilDescriptor()
+            d.depthCompareFunction = .always   // nothing of the game's is on screen yet: always on top
+            d.isDepthWriteEnabled = true
+            loadingDepth = device.makeDepthStencilState(descriptor: d)
+        }
+        if let loadingDepth { enc.setDepthStencilState(loadingDepth) }
         enc.setRenderPipelineState(pipe)
         enc.setFragmentTexture(tex, index: 0)
         enc.setFragmentSamplerState(sampler, index: 0)
@@ -3362,6 +3562,7 @@ final class KleptonCompositor {
         let panels = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,
                                     originFromHead: originFromHead,
                                     writeDepth: visible == 0)
+        drawLoadingPanel(enc, viewIndices: viewIndices, drawable: drawable, originFromHead: originFromHead)
         drawFpsHud(enc, viewIndices: viewIndices, drawable: drawable, originFromHead: originFromHead)
         enc.endEncoding()
         // "How many eyes got a picture", which is what the caller counts black

@@ -16,8 +16,6 @@ InputAttachmentIndicesKHR accept the identity mapping (a remap is logged).
 
 Test: gpu_vulkan.local_read.
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
 ---
  gpu/vulkan/CMakeLists.txt          |  2 +-
  gpu/vulkan/src/commands.cpp        | 96 +++++++++++++++++++++++++++++-

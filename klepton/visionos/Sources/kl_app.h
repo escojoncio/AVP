@@ -201,6 +201,10 @@ const char *kl_app_log_path(void);
 // Human-readable status of the last call, for the UI. Never NULL.
 const char *kl_app_status(void);
 
+// The boot/run phase the heartbeat logs ("boot", "looper pump", ...): a static string, never NULL. For the
+// compositor's loading panel; read from any thread.
+const char *kl_app_phase(void);
+
 // The Vulkan pipeline replay's progress (runtime/linux/kl_fossilize.cpp), for a loading screen: 0 no replay this run,
 // 1 replaying, 2 done; done/total pipelines so far (the total grows as each database opens), elapsed seconds.
 // Targets without the Alyx add-on get a stub that says 0.

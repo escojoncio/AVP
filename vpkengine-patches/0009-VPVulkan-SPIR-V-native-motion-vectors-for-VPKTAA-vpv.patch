@@ -31,8 +31,6 @@ Motion includes camera motion (the game's own matrices).
 Tests: gpu_spirv.motion (variant lowering), gpu_vulkan.motion (pass gets the target, variants,
 previous bytes bound, vpvk_motion_get).
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
 ---
  gpu/shader/spirv/CMakeLists.txt          |   2 +-
  gpu/shader/spirv/src/lower.cpp           | 136 +++++++++--

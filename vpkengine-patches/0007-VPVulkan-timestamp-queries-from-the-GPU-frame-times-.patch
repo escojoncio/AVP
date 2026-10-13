@@ -16,8 +16,6 @@ available when recorded.
 
 Test: gpu_vulkan.sync (timestamps not ready before the frame completes, then start/end).
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
 ---
  gpu/core/include/vpgpu/core/backend.h |   2 +
  gpu/core/include/vpgpu/core/device.h  |   9 ++

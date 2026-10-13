@@ -32,10 +32,17 @@ enum AVPArtCache {
 
     @MainActor private static var memory: [URL: UIImage] = [:]
 
-    private static func file(for url: URL) -> URL {
+    static func file(for url: URL) -> URL {
         // ".../546560/ss_<hash>.1920x1080.jpg" -> "ss_<hash>.1920x1080.jpg"; keep the app id in front.
         let name = url.pathComponents.suffix(2).joined(separator: "_")
         return dir.appendingPathComponent(name)
+    }
+
+    /// The immersive space's loading panel (KleptonCompositor.loadingArt): [hero, logo] as files already in the
+    /// cache, "" for one not cached (nothing is downloaded for it). Any thread.
+    static func loadingPanelFiles() -> [String] {
+        let g = GameProfile.halfLifeAlyx
+        return [g.heroImageURL, g.logoURL].map { file(for: $0).path }.map { FileManager.default.fileExists(atPath: $0) ? $0 : "" }
     }
 
     @MainActor static func cached(_ url: URL) -> UIImage? {

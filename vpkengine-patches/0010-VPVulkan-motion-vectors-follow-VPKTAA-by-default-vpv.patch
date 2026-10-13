@@ -9,8 +9,6 @@ VPKTAA (vpvk_config_set_vpktaa) before vkCreateDevice. vpvk_motion_recording_ser
 eye frame being recorded, so the host can tag its frame record and later ask vpvk_motion_get for
 exactly that frame.
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01P8F98JbsaD2Vbgvi6v4LyY
 ---
  gpu/vulkan/include/vpvk/motion.h |  7 +++++--
  gpu/vulkan/src/config.cpp        |  4 ++++

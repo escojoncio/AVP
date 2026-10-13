@@ -1,0 +1,897 @@
+From 1859dc19f83c09619a9b1f3aceccaf747b744a9a Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 17:28:19 +0000
+Subject: [PATCH 1/2] VPVulkan + translator: GPU hang report per encoder
+ (timestamps, fence waits and their updaters), pipeline quarantine persisted
+ in VP_PIPELINE_CACHE_DIR, queue replaced after a hang, fence wait guard,
+ OpKill returns, function-wide loop budget (translator v2)
+
+---
+ gpu/metal2/src/metal_backend.mm              | 430 ++++++++++++++++---
+ gpu/shader/msl/include/vpmsl/msl.h           |  12 +-
+ gpu/shader/msl/src/msl.cpp                   |  40 +-
+ gpu/shader/msl/tests/compute_loop.metal      |   3 +-
+ gpu/shader/msl/tests/heavy_lighting_fs.metal |  11 +-
+ gpu/shader/spirv/src/lower.cpp               |   5 +
+ gpu/vulkan/src/recipes.h                     |   2 +-
+ 7 files changed, 431 insertions(+), 72 deletions(-)
+
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index bbe9dd5..639cb74 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -352,6 +352,13 @@ struct MetalBackend::Impl {
+     id<MTLComputePipelineState> compute;
+     MTLSize threads{1, 1, 1};
+     Table stage[2];  // render: vertex, fragment; compute: [0]
++    // Identity for the hang report and the quarantine: the stable PipelineKey, the shader ids
++    // (content hash of their MSL, as VPVulkan names them) and the client's label.
++    uint64_t key = 0, vs = 0, fs = 0, cs = 0;
++    std::string label;
++    // In the hang quarantine when it was requested: never built (no library, no archive entry, no
++    // memory); its draws are skipped like a quarantined pipeline's.
++    bool quarantined = false;
+   };
+   // Per frame in flight: things the GPU may still read until that frame completes.
+   struct Slot {
+@@ -412,6 +419,22 @@ struct MetalBackend::Impl {
+   std::atomic<uint32_t> queueGen{0};
+   uint32_t queueRebuilds = 0;
+   std::atomic<uint32_t> hangReports{0};
++  // Pipelines whose encoder hung the GPU: their draws/dispatches are skipped from then on (a lost
++  // pass instead of a lost device). Persisted in <VP_PIPELINE_CACHE_DIR>/quarantine.txt so the next
++  // launch starts with them; VP_QUARANTINE=0 turns it off. The submit thread copies the set only
++  // when `quarantineSerial` moved (one atomic load per frame otherwise).
++  std::mutex quarantineMutex;
++  std::unordered_map<uint64_t, std::string> quarantine;  // PipelineKey -> description (file line)
++  std::unordered_set<uint64_t> suspects;                 // blamed once (suspects.txt); a 2nd blame persists
++  std::atomic<uint32_t> quarantineSerial{0};
++  std::unordered_set<uint64_t> quarantineSnapshot;  // submit thread only
++  uint32_t quarantineSeen = 0;                       // submit thread only
++  uint64_t quarantinedDraws = 0;                     // submit thread only
++  bool quarantineOn = true;
++  std::string quarantineDir;  // "" = not persisted
++  void loadQuarantine();
++  void quarantineAdd(uint64_t key, const std::string& desc, uint64_t frameIndex);
++  void dumpShaderSource(uint64_t shaderId);
+ 
+   // pipelineMutex guards only the maps (the submit thread takes it every frame, so it is never
+   // held across a Metal compile). archiveMutex guards the session's binary archive: adding to it
+@@ -597,6 +620,7 @@ void MetalBackend::Impl::init() {
+   if (residency) [queue addResidencySet:residency];
+   else  // a capability, not a failure (the simulator has none): bound resources use useResource
+     info("gpu.metal.info what=no_residency_set fallback=use_resource error=" + token(str(e)));
++  loadQuarantine();
+ 
+   // Timestamps at encoder boundaries, if this GPU samples there (Apple GPUs do).
+   id<MTLCounterSet> timestamps = nil;
+@@ -1171,12 +1195,27 @@ namespace {
+ struct EncDiag {
+   char kind = 'c';  // 'r' render, 'c' compute/copy
+   uint32_t draws = 0, indirect = 0, layers = 1, width = 0, height = 0;
++  uint32_t skipped = 0;  // draws/dispatches not encoded (missing pipeline, unbound, quarantine...)
+   uint64_t maxWork = 0;  // render: count x instances; compute: groups
+   NSUInteger color0 = 0, depth = 0;
++  int load = -1, store = -1;  // render: colour 0 (or depth) load/store action
+   std::string label;
+-  std::vector<id> states;  // distinct pipeline states, first kMaxDiagStates
++  std::vector<id> states;       // distinct pipeline states, first kMaxDiagStates
++  std::vector<uint64_t> keys;   // distinct PipelineKeys, first kMaxDiagKeys (the quarantine's input)
++  std::vector<int> waits;       // who updated each fence it waited on (FenceOwner codes), first 16
+ };
+ constexpr size_t kMaxDiagStates = 6;
++constexpr size_t kMaxDiagKeys = 64;
++// Fence updaters in a hang report: >= 0 the core encoder of this command buffer; or one of these.
++constexpr int kOwnerPrevious = -1;  // an earlier command buffer (the frontier carried in)
++constexpr int kOwnerDump = -3;      // VP_DUMP_FRAME copy encoder
++constexpr int kOwnerFixBase = 100000;  // + e: the indirect fix-up kernel of core encoder e
++std::string ownerName(int o) {
++  if (o == kOwnerPrevious) return "prev_cb";
++  if (o == kOwnerDump) return "dump";
++  if (o >= kOwnerFixBase) return "fix" + std::to_string(o - kOwnerFixBase);
++  return "e" + std::to_string(o);
++}
+ 
+ // The Metal encoder currently open. A core compute encoder becomes compute and blit encoders as
+ // its items alternate between dispatches and copies (M4: one MTL4ComputeCommandEncoder does both).
+@@ -1420,6 +1459,96 @@ std::string dumpWrite(const DumpItem& it, uint64_t frame, const std::string& dir
+ 
+ }  // namespace
+ 
++// ---- Hang quarantine ---------------------------------------------------------------------------
++
++void MetalBackend::Impl::loadQuarantine() {
++  const char* off = std::getenv("VP_QUARANTINE");
++  quarantineOn = !(off && *off == '0');
++  const char* dir = std::getenv("VP_PIPELINE_CACHE_DIR");
++  if (dir && *dir) quarantineDir = dir;
++  if (!quarantineOn) {
++    info("gpu.quarantine off (VP_QUARANTINE=0)");
++    return;
++  }
++  if (quarantineDir.empty()) return;
++  std::ifstream in(std::filesystem::path(quarantineDir) / "quarantine.txt");
++  std::string line;
++  uint32_t n = 0;
++  std::lock_guard lock(quarantineMutex);
++  {  // keys blamed once in an earlier session (suspects.txt): a second hang on one persists it
++    std::ifstream sin(std::filesystem::path(quarantineDir) / "suspects.txt");
++    std::string sl;
++    while (std::getline(sin, sl)) {
++      const unsigned long long k = std::strtoull(sl.c_str(), nullptr, 16);
++      if (k) suspects.insert(k);
++    }
++  }
++  while (std::getline(in, line)) {
++    if (line.empty() || line[0] == '#') continue;
++    char* end = nullptr;
++    const unsigned long long key = std::strtoull(line.c_str(), &end, 16);
++    if (!key || end == line.c_str()) continue;
++    if (quarantine.emplace(key, line).second) {
++      ++n;
++      info("gpu.quarantine loaded " + line);
++    }
++  }
++  if (n) {
++    ++quarantineSerial;
++    info("gpu.quarantine loaded_total=" + std::to_string(n) + " file=" + token(quarantineDir + "/quarantine.txt") +
++         " (delete it to retry them)");
++  }
++}
++
++// Any thread (the completion handler). Logs, adds and appends the line to the file once per key.
++void MetalBackend::Impl::quarantineAdd(uint64_t key, const std::string& desc, uint64_t frameIndex) {
++  if (!quarantineOn || !key) return;
++  bool persisted = false;
++  char hex[24];
++  std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long)key);
++  const std::string line = std::string(hex) + " " + desc;
++  {
++    std::lock_guard lock(quarantineMutex);
++    if (!quarantine.emplace(key, line).second) return;
++    // This session skips it at once; the file (every later session) only after a second hang on the same
++    // key, in this or an earlier session: one hang is not proof (another encoder may have caused it).
++    persisted = suspects.count(key) != 0;
++    if (!quarantineDir.empty()) {
++      std::error_code ec;
++      std::filesystem::create_directories(quarantineDir, ec);
++      std::ofstream out(std::filesystem::path(quarantineDir) / (persisted ? "quarantine.txt" : "suspects.txt"),
++                        std::ios::app);
++      out << line << "\n";
++    }
++    suspects.insert(key);
++  }
++  ++quarantineSerial;
++  info("gpu.quarantine f=" + std::to_string(frameIndex) + (persisted ? " persisted=1" : " persisted=0(suspect)") +
++       " pipeline=" + line);
++}
++
++// The MSL of a shader named in a hang report, next to the quarantine file (hang/<id>.metal), so
++// the report's ids can be read without VPVK_DUMP_DIR. Once per id.
++void MetalBackend::Impl::dumpShaderSource(uint64_t shaderId) {
++  if (!shaderId || quarantineDir.empty()) return;
++  static std::mutex m;
++  static std::unordered_set<uint64_t> done;
++  {
++    std::lock_guard lock(m);
++    if (!done.insert(shaderId).second) return;
++  }
++  MslShader msl;
++  if (!shaders.find(shaderId, msl)) return;
++  char name[40];
++  std::snprintf(name, sizeof name, "%016llx.metal", (unsigned long long)shaderId);
++  std::error_code ec;
++  const std::filesystem::path dir = std::filesystem::path(quarantineDir) / "hang";
++  std::filesystem::create_directories(dir, ec);
++  std::ofstream out(dir / name);
++  out << "// entry: " << msl.entry << "\n" << msl.source;
++  info("gpu.hang.msl id=" + std::string(name, 16) + " file=" + token((dir / name).string()));
++}
++
+ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
+   {
+     std::lock_guard lock(doneMutex);
+@@ -1433,14 +1562,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   }
+   dispatch_semaphore_wait(inFlight, DISPATCH_TIME_FOREVER);
+   if (queueRefused.exchange(false) && queueRebuilds < 16) {
+-    // A fresh queue (fences only order work inside one queue: the frontier's go with the old one).
++    // A fresh queue (fences only order work inside one queue: the frontier's go with the old one,
++    // and those a hung command buffer was to update never signal). The generation moves first: an
++    // old-queue frame completing meanwhile must not ask for yet another queue.
++    ++queueGen;
+     id<MTLCommandQueue> q = [device newCommandQueue];
+     if (q) {
+       ++queueRebuilds;
+       q.label = [NSString stringWithFormat:@"vpgpu.r%u", queueRebuilds];
+       if (residency) [q addResidencySet:residency];
+       queue = q;
+-      ++queueGen;
+       frontier.clear();
+       info("gpu.recover what=new_queue n=" + std::to_string(queueRebuilds) + " f=" + std::to_string(frameIndex));
+     } else {
+@@ -1480,12 +1611,45 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   std::unordered_map<uint64_t, uint64_t> fixOffsets;
+   if (slot.indirect) std::memset(slot.indirect.contents, 0, kIndirectHeader);
+   auto diag = std::make_shared<std::vector<EncDiag>>(compiled.encoders.size());
+-  auto noteState = [](EncDiag& g, id st) {
++  auto noteState = [](EncDiag& g, id st, uint64_t key) {
++    if (key && g.keys.size() < kMaxDiagKeys && std::find(g.keys.begin(), g.keys.end(), key) == g.keys.end())
++      g.keys.push_back(key);
+     if (!st || g.states.size() >= kMaxDiagStates) return;
+     for (id x : g.states)
+       if (x == st) return;
+     g.states.push_back(st);
+   };
++  // Fence bookkeeping: every wait must name a fence an EARLIER encoder updates — one of this command
++  // buffer (fenceOwner) or the frontier carried in from the previous one (carried). A wait on a
++  // fence that only a later encoder of this command buffer updates, or nobody, never completes:
++  // the GPU watchdog then kills the command buffer (Caused GPU Hang). Such a wait is dropped, logged.
++  std::unordered_map<const void*, int> fenceOwner;
++  std::unordered_set<const void*> carried;
++  for (id<MTLFence> f : frontier) carried.insert((__bridge const void*)f);
++  uint32_t curEnc = 0;  // core encoder being encoded (fence owner / diag)
++  uint32_t orphanWaits = 0, fenceCollisions = 0;
++  std::string firstOrphan;
++  // Returns whether `f` may be waited on; records who updated it in the current encoder's diag.
++  auto waitable = [&](id<MTLFence> f) -> bool {
++    const void* k = (__bridge const void*)f;
++    int owner;
++    if (auto it = fenceOwner.find(k); it != fenceOwner.end()) owner = it->second;
++    else if (carried.count(k)) owner = kOwnerPrevious;
++    else {
++      if (!orphanWaits++) firstOrphan = "e" + std::to_string(curEnc);
++      return false;
++    }
++    if (curEnc < diag->size() && (*diag)[curEnc].waits.size() < 16) (*diag)[curEnc].waits.push_back(owner);
++    return true;
++  };
++  // Quarantined pipelines (copied only when the set changed).
++  if (const uint32_t qs = quarantineSerial.load(); qs != quarantineSeen) {
++    std::lock_guard lock(quarantineMutex);
++    quarantineSnapshot.clear();
++    for (const auto& [k, line] : quarantine) quarantineSnapshot.insert(k);
++    quarantineSeen = qs;
++  }
++  uint32_t quarantinedNow = 0;
+   size_t fenceUsed = 0;
+   NSUInteger sampleUsed = 0;
+   // Per core encoder: first start sample and last end sample (NSNotFound = unsampled).
+@@ -1601,6 +1765,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   auto formatOf = [&](TextureId t) { return formatInfo(textures.at(t.index).desc.format); };
+   auto nextFence = [&]() -> id<MTLFence> {
+     if (fenceUsed == slot.fences.size()) slot.fences.push_back([device newFence]);
++    // A slot fence still in the carried frontier (frames skipped a wait long enough for the slots to
++    // wrap) would be waited on before this command buffer updates it: hand out a fresh one.
++    if (carried.count((__bridge const void*)slot.fences[fenceUsed])) {
++      ++fenceCollisions;
++      slot.fences[fenceUsed] = [device newFence];  // the old object lives on in `frontier`
++    }
+     return slot.fences[fenceUsed++];
+   };
+   // Two sample indices for the encoder about to open, recorded against core encoder `e`.
+@@ -1670,6 +1840,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     else if (open.compute) [open.compute updateFence:openFence];
+     else [open.blit updateFence:openFence];
+     [open.any() endEncoding];
++    fenceOwner[(__bridge const void*)openFence] = int(curEnc);
+     frontier.push_back(openFence);
+     open = {};
+     used.clear();
+@@ -1679,7 +1850,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     // waiting on them (every encoder is a boundary while dumping).
+     if (id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder]) {
+       bl.label = @"vpgpu.dump";
+-      for (id<MTLFence> f : frontier) [bl waitForFence:f];
++      for (id<MTLFence> f : frontier)
++        if (waitable(f)) [bl waitForFence:f];
+       for (const DumpCopy& c : dumpCopies) {
+         const DumpItem& it = (*dumpItems)[c.item];
+         [bl copyFromTexture:c.texture
+@@ -1696,6 +1868,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       id<MTLFence> f = nextFence();
+       [bl updateFence:f];
+       [bl endEncoding];
++      fenceOwner[(__bridge const void*)f] = kOwnerDump;
+       frontier.clear();
+       frontier.push_back(f);
+     } else {
+@@ -1709,6 +1882,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   // Starts waiting on everything unordered so far; `before` picks the first render stage held.
+   auto waitFrontier = [&](StageMask before) {
+     for (id<MTLFence> f : frontier) {
++      if (!waitable(f)) continue;
+       if (open.render)
+         [open.render waitForFence:f beforeStages:(before & stage::vertex) ? MTLRenderStageVertex : MTLRenderStageFragment];
+       else if (open.compute) [open.compute waitForFence:f];
+@@ -1854,7 +2028,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       return nil;
+     }
+     fx.label = [NSString stringWithFormat:@"indirect_fix%u", e];
+-    for (id<MTLFence> f : frontier) [fx waitForFence:f];
++    for (id<MTLFence> f : frontier)
++      if (waitable(f)) [fx waitForFence:f];
+     [fx setComputePipelineState:ps];
+     [fx setBuffer:slot.indirect offset:0 atIndex:2];
+     [fx setBuffer:slot.indirect offset:0 atIndex:3];  // diagnostic header (words 0..2)
+@@ -1913,12 +2088,15 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     id<MTLFence> f = nextFence();
+     [fx updateFence:f];
+     [fx endEncoding];
++    fenceOwner[(__bridge const void*)f] = kOwnerFixBase + int(e);
+     return f;
+   };
+ 
+   size_t b = 0;  // cursor into compiled.barriers (sorted by encoder, item)
+   for (uint32_t e = 0; e < compiled.encoders.size(); ++e) {
+     const Encoder& enc = compiled.encoders[e];
++    close();  // ends the previous core encoder's last Metal encoder under ITS index (fence owner)
++    curEnc = e;
+     // The first encoder of a frame always waits: frames are hazard-checked independently.
+     bool boundary = e == 0;
+     StageMask before = stage::vertex;
+@@ -1927,7 +2105,6 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       before = compiled.barriers[b++].before;
+     }
+     if (dumping) boundary = true, before = stage::vertex;  // serialised: dump copies sit between encoders
+-    close();
+ 
+     if (enc.kind == Encoder::Kind::Render) {
+       id<MTLFence> fixFence = encodeIndirectFix(e, enc);
+@@ -2003,7 +2180,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         continue;
+       }
+       opened([NSString stringWithFormat:@"render%u", e], boundary, before);
+-      if (fixFence) [open.render waitForFence:fixFence beforeStages:MTLRenderStageVertex];
++      if (fixFence && waitable(fixFence)) [open.render waitForFence:fixFence beforeStages:MTLRenderStageVertex];
+       {
+         EncDiag& g = (*diag)[e];
+         g.kind = 'r';
+@@ -2013,6 +2190,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         if (td) g.depth = td.pixelFormat;
+         if (id<MTLTexture> t = t0 ? t0 : td) g.width = uint32_t(t.width), g.height = uint32_t(t.height);
+         if (!enc.commands.empty()) g.label = std::get<RenderPass>(cmds[enc.commands[0]]).desc.label;
++        const Attachment& a0 = enc.pass.colors[0].texture ? enc.pass.colors[0] : enc.pass.depth;
++        g.load = int(a0.load), g.store = int(a0.store);
+       }
+       if (dumping) {
+         DumpItem it;
+@@ -2047,8 +2226,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+             continue;
+           }
+           const Pipeline* p = pipeline(d.pipeline);
++          if (p && (p->quarantined || (!quarantineSnapshot.empty() && quarantineSnapshot.count(p->key)))) {
++            ++quarantinedNow;
++            ++(*diag)[e].skipped;
++            continue;
++          }
+           if (!p || !p->render) {
+             ++missingPipelines;
++            ++(*diag)[e].skipped;
+             continue;
+           }
+           if (!sameFetch(fi, p->fetch)) {
+@@ -2068,7 +2253,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+           {
+             EncDiag& g = (*diag)[e];
+             ++g.draws;
+-            noteState(g, p->render);
++            noteState(g, p->render, p->key);
+             if (d.indirect) ++g.indirect;
+             else g.maxWork = std::max(g.maxWork, uint64_t{d.count} * d.instances);
+           }
+@@ -2203,8 +2388,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       if (isDispatch) {
+         const Dispatch& d = std::get<Dispatch>(cmd);
+         const Pipeline* p = pipeline(d.pipeline);
++        if (p && (p->quarantined || (!quarantineSnapshot.empty() && quarantineSnapshot.count(p->key)))) {
++          ++quarantinedNow;
++          ++(*diag)[e].skipped;
++          continue;
++        }
+         if (!p || !p->compute) {
+           ++missingPipelines;
++          ++(*diag)[e].skipped;
+           continue;
+         }
+         std::string why;
+@@ -2233,7 +2424,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         {
+           EncDiag& g = (*diag)[e];
+           ++g.draws;
+-          noteState(g, p->compute);
++          noteState(g, p->compute, p->key);
+           if (d.indirect) ++g.indirect;
+           else g.maxWork = std::max(g.maxWork, uint64_t{d.groups[0]} * d.groups[1] * d.groups[2]);
+           if (g.label.empty()) g.label = d.label;
+@@ -2344,6 +2535,21 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         (unsigned long long)frameIndex, missingPipelines, missingResources, argOverflow, skippedDraws,
+         skippedDraws ? token(firstSkip).c_str() : "-");
+ 
++  if (orphanWaits || fenceCollisions) {
++    static uint32_t fenceReports = 0;
++    if (++fenceReports <= 32 || fenceReports % 256 == 0)
++      err("what=fence f=%llu orphan_waits_dropped=%u first=%s slot_fence_collisions=%u reports=%u",
++          (unsigned long long)frameIndex, orphanWaits, firstOrphan.empty() ? "-" : firstOrphan.c_str(), fenceCollisions,
++          fenceReports);
++  }
++  if (quarantinedNow) {
++    const uint64_t before = quarantinedDraws;
++    quarantinedDraws += quarantinedNow;
++    if (!before || before / 4096 != quarantinedDraws / 4096)
++      info("gpu.quarantine skipped f=" + std::to_string(frameIndex) + " draws=" + std::to_string(quarantinedNow) +
++           " total=" + std::to_string(quarantinedDraws));
++  }
++
+   if (indirectOverflow)
+     err("what=indirect_scratch_full f=%llu dropped=%u kept=%u", (unsigned long long)frameIndex, indirectOverflow,
+         indirectDraws);
+@@ -2371,6 +2577,24 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     d.timings.frameMs = (finished.GPUEndTime - finished.GPUStartTime) * 1000.0;
+     d.timings.startNs = finished.GPUStartTime * 1e9;  // host time base (seconds), as CACurrentMediaTime
+     d.timings.endNs = finished.GPUEndTime * 1e9;
++    // Per core encoder: raw GPU ticks of its first start / last end sample (0 = not written: a render
++    // encoder without vertex work never writes its start, an encoder the watchdog killed never its end).
++    std::vector<std::pair<uint64_t, uint64_t>> raw(encSamples.size(), {0, 0});
++    if (sampleCount) {
++      NSData* data = [samples resolveCounterRange:NSMakeRange(0, sampleCount)];
++      const auto* ts = static_cast<const MTLCounterResultTimestamp*>(data.bytes);
++      for (size_t i = 0; i < encSamples.size(); ++i) {
++        const auto [s0, s1] = encSamples[i];
++        double ms = 0;
++        if (ts && s0 != NSNotFound) {
++          const uint64_t t0 = ts[s0].timestamp, t1 = ts[s1].timestamp;
++          raw[i] = {t0 == MTLCounterErrorValue ? 0 : t0, t1 == MTLCounterErrorValue ? 0 : t1};
++          if (t0 != MTLCounterErrorValue && t1 != MTLCounterErrorValue && t1 >= t0)
++            ms = double(t1 - t0) * impl->gpuTickNs / 1e6;
++        }
++        d.timings.encoderMs.push_back(ms);
++      }
++    }
+     if (finished.status == MTLCommandBufferStatusError) {
+       std::string encs;
+       NSArray* infos = finished.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+@@ -2381,46 +2605,137 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+                 token(str(finished.error)).c_str(), encs.c_str());
+       const std::string what = str(finished.error);
+       const bool ignored = what.find("SubmissionsIgnored") != std::string::npos;
+-      if ((ignored || finished.error.code == MTLCommandBufferErrorAccessRevoked) && gen == impl->queueGen.load())
++      const bool victim = what.find("InnocentVictim") != std::string::npos;
++      const bool hang = what.find("Hang") != std::string::npos || finished.error.code == MTLCommandBufferErrorTimeout;
++      // The queue that ran a hung command buffer keeps refusing work ("Ignored (for causing prior/
++      // excessive GPU errors)"): replace it after the hang itself, not only after the first refusal.
++      // A victim of someone else's hang (the compositor's) leaves our queue usable.
++      if ((ignored || hang || finished.error.code == MTLCommandBufferErrorAccessRevoked) && !victim &&
++          gen == impl->queueGen.load())
+         impl->queueRefused = true;
+-      // The encoders that did not complete, described (the first frames that fault or hang; an
+-      // ignored command buffer ran nothing, so it has nothing to name).
+-      if (!ignored && impl->hangReports.fetch_add(1) < 24) {
+-        unsigned lines = 0;
++      // The report: every encoder of the frame, the stuck one(s) marked, their pipelines quarantined.
++      // (An ignored or victim command buffer ran nothing of its own: nothing to name.)
++      if (!ignored && !victim && diag && impl->hangReports.fetch_add(1) < 8) {
++        const size_t n = diag->size();
++        std::vector<std::string> why(n);  // non-empty = stuck, with the reason
++        size_t hintOnly = n;               // marked in the report, but too weak a reason to quarantine
++        bool metalNamed = false;
++        // Only the encoder Metal says faulted (else the affected ones) is to blame: pending encoders never
++        // ran, and every encoder after a hang ends up affected or pending.
++        bool anyFaulted = false;
++        for (id<MTLCommandBufferEncoderInfo> i in infos) anyFaulted |= i.errorState == MTLCommandEncoderErrorStateFaulted;
+         for (id<MTLCommandBufferEncoderInfo> i in infos) {
+-          if (i.errorState == MTLCommandEncoderErrorStateCompleted || lines >= 8) continue;
+-          ++lines;
++          if (i.errorState == MTLCommandEncoderErrorStateCompleted) continue;
++          if (i.errorState != (anyFaulted ? MTLCommandEncoderErrorStateFaulted : MTLCommandEncoderErrorStateAffected)) continue;
+           const char* lab = i.label.UTF8String ?: "?";
+           const char* dig = lab;
+           while (*dig && (*dig < '0' || *dig > '9')) ++dig;
+           const unsigned long e = *dig ? std::strtoul(dig, nullptr, 10) : ~0ul;
+-          const char* st = i.errorState == MTLCommandEncoderErrorStateFaulted    ? "faulted"
+-                           : i.errorState == MTLCommandEncoderErrorStateAffected ? "affected"
+-                           : i.errorState == MTLCommandEncoderErrorStatePending  ? "pending"
+-                                                                                 : "unknown";
+-          std::string desc = "-";
+-          if (diag && e < diag->size()) {
+-            const EncDiag& g = (*diag)[e];
+-            char buf[320];
+-            std::snprintf(buf, sizeof buf, "kind=%c label=%s target=%ux%ux%u fmt=%lu depth=%lu items=%u indirect=%u max_work=%llu",
+-                          g.kind, token(g.label.empty() ? "-" : g.label).c_str(), g.width, g.height, g.layers,
+-                          (unsigned long)g.color0, (unsigned long)g.depth, g.draws, g.indirect,
+-                          (unsigned long long)g.maxWork);
+-            desc = buf;
+-            std::string pipes;
+-            for (id x : g.states) {
+-              NSString* l = [x respondsToSelector:@selector(label)] ? [x label] : nil;
+-              pipes += (pipes.empty() ? "" : "|") + token(l.UTF8String ?: "?");
++          const char* st = i.errorState == MTLCommandEncoderErrorStateFaulted    ? "metal_faulted"
++                           : i.errorState == MTLCommandEncoderErrorStateAffected ? "metal_affected"
++                           : i.errorState == MTLCommandEncoderErrorStatePending  ? "metal_pending"
++                                                                                 : "metal_unknown";
++          // "indirect_fix<e>" is core encoder e's too; Metal's faulted beats affected/pending.
++          if (e < n && (why[e].empty() || i.errorState == MTLCommandEncoderErrorStateFaulted)) why[e] = st;
++          metalNamed |= e < n;
++        }
++        // No encoder info (build 12/13: "enc=none_reported"): the timestamps say which one did not end.
++        uint64_t base = 0, lastEnd = 0;
++        size_t lastIdx = n;
++        for (size_t i = 0; i < raw.size(); ++i) {
++          if (raw[i].first && (!base || raw[i].first < base)) base = raw[i].first;
++          if (raw[i].second && raw[i].second >= lastEnd) lastEnd = raw[i].second, lastIdx = i;
++        }
++        if (!metalNamed) {
++          // Blame only an encoder that started and did not end, or ran absurdly long; every encoder after
++          // the hung one has no samples at all and is innocent.
++          for (size_t i = 0; i < raw.size() && i < n; ++i) {
++            if (encSamples[i].first == NSNotFound) continue;  // unsampled
++            const auto [t0, t1] = raw[i];
++            if (t0 && !t1) why[i] = "time_started_no_end";
++            else if (t0 && t1 >= t0 && double(t1 - t0) * impl->gpuTickNs / 1e6 > 500.0) why[i] = "time_over_500ms";
++          }
++          bool any = false;
++          for (const std::string& w : why) any |= !w.empty();
++          if (!any)  // nothing started-and-hung: the FIRST drawing encoder with no samples at all
++            for (size_t i = 0; i < raw.size() && i < n; ++i)
++              if (encSamples[i].first != NSNotFound && !raw[i].first && !raw[i].second && (*diag)[i].draws) {
++                why[i] = "time_first_unsampled_with_draws", any = true;
++                break;
++              }
++          // Only a hint, never quarantined: the encoder that ended last.
++          if (!any && lastIdx < n) hintOnly = lastIdx, why[lastIdx] = "hint_last_to_end";
++        }
++        auto offset = [&](uint64_t t) -> std::string {
++          if (!t) return "never";
++          if (!base || t < base) return "?";
++          char b[32];
++          std::snprintf(b, sizeof b, "%.3f", double(t - base) * impl->gpuTickNs / 1e6);
++          return b;
++        };
++        for (size_t e = 0; e < n; ++e) {
++          const EncDiag& g = (*diag)[e];
++          char buf[400];
++          std::snprintf(buf, sizeof buf,
++                        "gpu.hang.enc f=%llu i=%zu kind=%c label=%s target=%ux%ux%u fmt=%lu depth=%lu load=%d store=%d "
++                        "items=%u skipped=%u indirect=%u max_work=%llu",
++                        (unsigned long long)frameIndex, e, g.kind, token(g.label.empty() ? "-" : g.label).c_str(), g.width,
++                        g.height, g.layers, (unsigned long)g.color0, (unsigned long)g.depth, g.load, g.store, g.draws,
++                        g.skipped, g.indirect, (unsigned long long)g.maxWork);
++          std::string line = buf;
++          line += " start_ms=" + (e < raw.size() && encSamples[e].first != NSNotFound ? offset(raw[e].first) : std::string("unsampled"));
++          line += " end_ms=" + (e < raw.size() && encSamples[e].first != NSNotFound ? offset(raw[e].second) : std::string("unsampled"));
++          std::string waits;
++          for (int w : g.waits) waits += (waits.empty() ? "" : ",") + ownerName(w);
++          line += " waits=" + (waits.empty() ? std::string("-") : waits);
++          std::string pipes;
++          for (id x : g.states) {
++            NSString* l = [x respondsToSelector:@selector(label)] ? [x label] : nil;
++            pipes += (pipes.empty() ? "" : "|") + token(l.UTF8String ?: "?");
++          }
++          line += " pipelines=" + (pipes.empty() ? std::string("-") : pipes) + " keys=" + std::to_string(g.keys.size());
++          line += " stuck=" + (why[e].empty() ? std::string("0") : "1(" + why[e] + ")");
++          impl->info(line);
++        }
++        // Quarantine: the stuck encoder's pipelines; one that drew nothing (a load/store or a wait
++        // that never ended) passes the blame to the encoders whose fences it waited on.
++        uint32_t named = 0;
++        for (size_t e = 0; e < n; ++e) {
++          if (why[e].empty() || e == hintOnly) continue;
++          const EncDiag& g = (*diag)[e];
++          std::vector<std::pair<uint64_t, size_t>> blame;  // key, encoder
++          for (uint64_t k : g.keys) blame.push_back({k, e});
++          if (blame.empty())
++            for (int w : g.waits)
++              if (w >= 0 && size_t(w) < n)
++                for (uint64_t k : (*diag)[size_t(w)].keys) blame.push_back({k, size_t(w)});
++          if (blame.empty())
++            impl->info("gpu.hang.stuck f=" + std::to_string(frameIndex) + " enc=" + std::to_string(e) + " why=" + why[e] +
++                       " pipelines=none (no draw; nothing to quarantine)");
++          for (const auto& [k, from] : blame) {
++            if (named++ >= kMaxDiagKeys) break;
++            Pipeline pl;
++            bool found = false;
++            {
++              std::lock_guard lock(impl->pipelineMutex);
++              auto it = impl->pipelines.find(k);
++              if (it != impl->pipelines.end()) pl.key = it->second.key, pl.vs = it->second.vs, pl.fs = it->second.fs,
++                                               pl.cs = it->second.cs, pl.label = it->second.label, found = true;
+             }
+-            desc += " pipelines=" + (pipes.empty() ? std::string("-") : pipes);
++            char buf[256];
++            std::snprintf(buf, sizeof buf, "label=%s vs=%016llx fs=%016llx cs=%016llx enc=%zu why=%s f=%llu",
++                          found ? token(pl.label).c_str() : "?", (unsigned long long)pl.vs, (unsigned long long)pl.fs,
++                          (unsigned long long)pl.cs, from, token(from == e ? why[e] : "waited_on_by_e" + std::to_string(e)).c_str(),
++                          (unsigned long long)frameIndex);
++            char key[24];
++            std::snprintf(key, sizeof key, "%016llx", (unsigned long long)k);
++            impl->info(std::string("gpu.hang.stuck pipeline=") + key + " " + buf);
++            impl->dumpShaderSource(pl.vs);
++            impl->dumpShaderSource(pl.fs);
++            impl->dumpShaderSource(pl.cs);
++            impl->quarantineAdd(k, buf, frameIndex);
+           }
+-          // Not err(): its 512-byte line would cut the pipeline labels.
+-          impl->info("gpu.err what=encoder_fault f=" + std::to_string(frameIndex) + " enc=" + token(lab) + " state=" + st +
+-                     " code=" + std::to_string(long(finished.error.code)) + " " + desc);
+         }
+-        if (!lines)
+-          impl->err("what=encoder_fault f=%llu enc=none_reported encoders=%u", (unsigned long long)frameIndex,
+-                    unsigned(infos.count));
+       }
+     }
+     if (fixScratch) {
+@@ -2432,17 +2747,6 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+                     (unsigned long long)frameIndex, h[0], h[1], h[2], (unsigned long long)n);
+       }
+     }
+-    if (sampleCount) {
+-      NSData* data = [samples resolveCounterRange:NSMakeRange(0, sampleCount)];
+-      const auto* ts = static_cast<const MTLCounterResultTimestamp*>(data.bytes);
+-      for (const auto& [s0, s1] : encSamples) {
+-        double ms = 0;
+-        if (ts && s0 != NSNotFound && ts[s0].timestamp != MTLCounterErrorValue &&
+-            ts[s1].timestamp != MTLCounterErrorValue && ts[s1].timestamp >= ts[s0].timestamp)
+-          ms = double(ts[s1].timestamp - ts[s0].timestamp) * impl->gpuTickNs / 1e6;
+-        d.timings.encoderMs.push_back(ms);
+-      }
+-    }
+     {
+       std::lock_guard lock(impl->doneMutex);
+       impl->done.push_back(std::move(d));
+@@ -2571,6 +2875,28 @@ bool MetalBackend::compilePipeline(const PipelineState& s, std::string& error) {
+   }
+   @autoreleasepool {
+     Impl::Pipeline p;
++    p.key = s.key().value, p.vs = s.vertexShader, p.fs = s.fragmentShader, p.cs = s.computeShader, p.label = s.label;
++    // A quarantined pipeline (an earlier hang, possibly a previous launch) is neither compiled nor
++    // looked up in the binary archive, by the game's device and the launcher's prewarm alike: a stub
++    // marks it Ready so the cache does not retry it every frame.
++    bool held = false;
++    if (impl_->quarantineOn) {
++      std::lock_guard lock(impl_->quarantineMutex);
++      held = impl_->quarantine.count(p.key) != 0;
++    }
++    if (held) {
++      p.quarantined = true;
++      static std::atomic<uint32_t> said{0};
++      if (said.fetch_add(1) < 32) {
++        char key[24];
++        std::snprintf(key, sizeof key, "%016llx", (unsigned long long)p.key);
++        impl_->info(std::string("gpu.quarantine not_compiled key=") + key + " label=" + token(s.label));
++      }
++      const uint64_t key = p.key;
++      std::lock_guard lock(impl_->pipelineMutex);
++      impl_->pipelines.emplace(key, std::move(p));
++      return true;
++    }
+     const bool built = s.computeShader ? impl_->buildCompute(s, p, error) : impl_->buildRender(s, p, error);
+     if (!built) {
+       impl_->err("what=pipeline key=%016llx label=%s error=%s", (unsigned long long)s.key().value,
+diff --git a/gpu/shader/msl/include/vpmsl/msl.h b/gpu/shader/msl/include/vpmsl/msl.h
+index 92a91c2..6dab35f 100644
+--- a/gpu/shader/msl/include/vpmsl/msl.h
++++ b/gpu/shader/msl/include/vpmsl/msl.h
+@@ -66,9 +66,19 @@ struct EmitResult {
+     std::vector<std::string> errors;  // verifier errors; the shader is empty when set
+ };
+ 
++// Hang guards in the emitted loops. A loop whose exit depends on data the translation got wrong would
++// spin until the GPU watchdog kills the command buffer (and every other client's work with it).
++//   loopCap: iterations of one loop per entry (a `continue` counts); 0 = no per-loop cap.
++//   loopBudget: iterations of ALL loops of one function invocation together, so nested loops are
++//     bounded too (the per-loop cap alone allows loopCap^depth); 0 = no budget.
++struct EmitOptions {
++    uint32_t loopCap = 8192;
++    uint32_t loopBudget = 65536;
++};
++
+ // Verifies the module (run vpir::toFramebufferFetch before, so its output is checked too), runs
+ // vpir::optimize on a copy, verifies that again (a pass bug becomes an error, not bad MSL) and
+ // translates it.
+-EmitResult emitMsl(const vpir::Module& module);
++EmitResult emitMsl(const vpir::Module& module, const EmitOptions& options = {});
+ 
+ }  // namespace vpmsl
+diff --git a/gpu/shader/msl/src/msl.cpp b/gpu/shader/msl/src/msl.cpp
+index a867fc0..79e154f 100644
+--- a/gpu/shader/msl/src/msl.cpp
++++ b/gpu/shader/msl/src/msl.cpp
+@@ -139,7 +139,7 @@ std::string textureType(const Resource& r) {
+ 
+ class Emitter {
+ public:
+-    explicit Emitter(const Module& m) : m_(m) {}
++    explicit Emitter(const Module& m, const EmitOptions& o = {}) : m_(m), opt_(o) {}
+ 
+     MslShader run() {
+         MslShader sh;
+@@ -352,6 +352,12 @@ private:
+         }
+     }
+ 
++    static bool hasLoop(const Block& b) {
++        for (const Node& n : b)
++            if (n.kind == NodeKind::Loop || hasLoop(n.body) || hasLoop(n.elseBody)) return true;
++        return false;
++    }
++
+     void countUses(const Block& b) {
+         auto use = [&](ValueId v) {
+             ++uses_[v];
+@@ -402,6 +408,7 @@ private:
+             }
+         }
+         for (size_t i = 0; i < f.vars.size(); ++i) line(typeName(f.vars[i].type), " l", std::to_string(i), "{};");
++        if (opt_.loopBudget && hasLoop(f.body)) line("uint vp_budget = 0u;");
+         block(f.body);
+         if (vsfsOut && (f.body.empty() || f.body.back().kind != NodeKind::Return)) line(returnOut());
+     }
+@@ -525,12 +532,21 @@ private:
+                 // resets the whole GPU (kIOGPUCommandBufferCallbackErrorHang), taking every other
+                 // client's work with it. Past kLoopGuard trips (a `continue` counts too) it breaks:
+                 // wrong pixels instead of a lost device.
+-                const std::string guard = "vp_guard" + std::to_string(loops_++);
+-                line("uint ", guard, " = 0u;");
++                // Nested loops: a function-wide budget (vp_budget, declared at the function's top)
++                // bounds all its loops together; the per-loop counter restarts at every entry.
++                std::string cond;
++                if (opt_.loopCap) {
++                    const std::string guard = "vp_guard" + std::to_string(loops_++);
++                    line("uint ", guard, " = 0u;");
++                    cond = "++" + guard + " > " + std::to_string(opt_.loopCap) + "u";
++                }
++                if (opt_.loopBudget) cond += (cond.empty() ? "" : " || ") + std::string("++vp_budget > ") + std::to_string(opt_.loopBudget) + "u";
+                 line("while (true) {");
+-                ++depth_;
+-                line("if (++", guard, " > ", std::to_string(kLoopGuard), "u) break;");
+-                --depth_;
++                if (!cond.empty()) {
++                    ++depth_;
++                    line("if (", cond, ") break;");
++                    --depth_;
++                }
+                 nested(n.body);
+                 line("}");
+                 break;
+@@ -998,10 +1014,10 @@ private:
+     std::string out_;
+     unsigned depth_ = 0;
+     unsigned loops_ = 0;  // loop guard counters emitted so far (names vp_guardN)
+-    // Iterations a loop may run per invocation before the hang guard breaks it: far above real game
+-    // loops (lights, kernel taps, bones; a dispatch loop counts one per block run) and low enough
+-    // that a runaway loop over a full-screen pass finishes before the GPU watchdog fires.
+-    static constexpr unsigned kLoopGuard = 8192;
++    // EmitOptions::loopCap: iterations a loop may run per entry before the hang guard breaks it, far
++    // above real game loops (lights, kernel taps, bones; a dispatch loop counts one per block run)
++    // and low enough that a runaway loop over a full-screen pass finishes before the GPU watchdog.
++    const EmitOptions opt_;
+     const Function* fn_ = nullptr;
+     bool entry_ = false;
+     std::set<uint32_t> interpolated_;  // input indices read through interpolant<>
+@@ -1031,7 +1047,7 @@ bool usesSubgroups(const Module& m) {
+ 
+ }  // namespace
+ 
+-EmitResult emitMsl(const Module& module) {
++EmitResult emitMsl(const Module& module, const EmitOptions& options) {
+     EmitResult r;
+     r.errors = verify(module);
+     if (module.waveSize != 32 && usesSubgroups(module))
+@@ -1041,7 +1057,7 @@ EmitResult emitMsl(const Module& module) {
+     optimize(m);
+     for (const std::string& e : verify(m)) r.errors.push_back("after optimize: " + e);
+     if (!r.errors.empty()) return r;
+-    r.shader = Emitter(m).run();
++    r.shader = Emitter(m, options).run();
+     return r;
+ }
+ 
+diff --git a/gpu/shader/msl/tests/compute_loop.metal b/gpu/shader/msl/tests/compute_loop.metal
+index 50b7548..8faa386 100644
+--- a/gpu/shader/msl/tests/compute_loop.metal
++++ b/gpu/shader/msl/tests/compute_loop.metal
+@@ -16,12 +16,13 @@ struct VpArgs {
+     threadgroup uint4 vp_shared[16];
+     uint l0{};
+     uint l1{};
++    uint vp_budget = 0u;
+     const uint v6 = *(constant uint*)(vp_args.params);
+     l0 = 0u;
+     l1 = 0u;
+     uint vp_guard0 = 0u;
+     while (true) {
+-        if (++vp_guard0 > 8192u) break;
++        if (++vp_guard0 > 8192u || ++vp_budget > 65536u) break;
+         const uint v7 = l1;
+         const bool v8 = v7 >= v6;
+         if (v8) {
+diff --git a/gpu/shader/msl/tests/heavy_lighting_fs.metal b/gpu/shader/msl/tests/heavy_lighting_fs.metal
+index cfae707..372a03b 100644
+--- a/gpu/shader/msl/tests/heavy_lighting_fs.metal
++++ b/gpu/shader/msl/tests/heavy_lighting_fs.metal
+@@ -37,6 +37,7 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
+     float l3{};
+     uint l4{};
+     uint l5{};
++    uint vp_budget = 0u;
+     const float4 v5 = vp_args.albedo_map.sample(vp_args.aniso, vp_in.uv);
+     const float4 v6 = vp_args.normal_map.sample(vp_args.aniso, vp_in.uv);
+     const float4 v7 = vp_args.material_map.sample(vp_args.aniso, vp_in.uv);
+@@ -108,7 +109,7 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
+     l4 = 0u;
+     uint vp_guard0 = 0u;
+     while (true) {
+-        if (++vp_guard0 > 8192u) break;
++        if (++vp_guard0 > 8192u || ++vp_budget > 65536u) break;
+         const uint v97 = l4;
+         const bool v99 = v97 >= 9u;
+         if (v99) {
+@@ -158,7 +159,7 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
+     l2 = 0u;
+     uint vp_guard1 = 0u;
+     while (true) {
+-        if (++vp_guard1 > 8192u) break;
++        if (++vp_guard1 > 8192u || ++vp_budget > 65536u) break;
+         const uint v141 = l2;
+         const bool v142 = v141 >= v139.x;
+         if (v142) {
+@@ -212,7 +213,7 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
+     l2 = 0u;
+     uint vp_guard2 = 0u;
+     while (true) {
+-        if (++vp_guard2 > 8192u) break;
++        if (++vp_guard2 > 8192u || ++vp_budget > 65536u) break;
+         const uint v187 = l2;
+         const bool v188 = v187 >= v139.y;
+         if (v188) {
+@@ -276,7 +277,7 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
+     l2 = 0u;
+     uint vp_guard3 = 0u;
+     while (true) {
+-        if (++vp_guard3 > 8192u) break;
++        if (++vp_guard3 > 8192u || ++vp_budget > 65536u) break;
+         const uint v246 = l2;
+         const bool v247 = v246 >= v139.z;
+         if (v247) {
+@@ -317,7 +318,7 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
+     l2 = 0u;
+     uint vp_guard4 = 0u;
+     while (true) {
+-        if (++vp_guard4 > 8192u) break;
++        if (++vp_guard4 > 8192u || ++vp_budget > 65536u) break;
+         const uint v279 = l2;
+         const bool v280 = v279 >= v139.w;
+         if (v280) {
+diff --git a/gpu/shader/spirv/src/lower.cpp b/gpu/shader/spirv/src/lower.cpp
+index 92e34e1..2625905 100644
+--- a/gpu/shader/spirv/src/lower.cpp
++++ b/gpu/shader/spirv/src/lower.cpp
+@@ -1686,7 +1686,12 @@ private:
+             }
+             case OpKill:
+             case OpTerminateInvocation:
++                // OpKill ends the invocation. Metal's discard_fragment() only demotes it to a helper
++                // (MSL 2.3+ on Apple GPUs: execution goes on), so the code after the kill site would
++                // run: in a loop whose exit sits on the other path that spins until the loop guard.
++                // Every callee is inlined into "main", so a return here leaves the shader.
+                 b_->discard();
++                b_->ret();
+                 return 0;
+             case OpUnreachable: return 0;
+             default: fail("block without a known terminator");
+diff --git a/gpu/vulkan/src/recipes.h b/gpu/vulkan/src/recipes.h
+index f631bbd..2588f92 100644
+--- a/gpu/vulkan/src/recipes.h
++++ b/gpu/vulkan/src/recipes.h
+@@ -37,7 +37,7 @@ namespace vpvk {
+ // Bump whenever SPIR-V -> VPIR -> MSL output changes for the same input (stored recipes are then
+ // retranslated at the next prewarm instead of being discarded).
+ // 1: per-variable private slots (was recipe file version 2).
+-inline constexpr uint32_t kTranslatorVersion = 1;
++inline constexpr uint32_t kTranslatorVersion = 2;  // 2: OpKill returns, loop budget (0018)
+ 
+ // Content hash of a SPIR-V module (never 0).
+ uint64_t spirvHash(const uint32_t* words, size_t count);
+-- 
+2.43.0
+
