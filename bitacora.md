@@ -113,6 +113,12 @@ Hipótesis Init: fallaban pipelines de arranque por los shaders. Sin confirmar h
 features que MoltenVK daba y VPVulkan no (tessellation, int16/64, largePoints, multiViewport, inheritedQueries).
 No validable offline: compilación Metal del MSL (sale en el log del visor).
 
+## Patch 0012 (solo tests, sin efecto en runtime) [skip ci]
+- Goldens `gpu/shader/msl/tests/*.metal` regenerados (VPMSL_UPDATE=1): solo cabecera `VP_PSZ` y guardas `VP_NO_FDEPTH`.
+- `gpu_spirv.subpass`: el test mapeaba input 1 → color 1 (otra imagen, uvec4); ahora solo {0→0}. VPVulkan nunca
+  llama a `toFramebufferFetch` (lee input attachments como textura/copia, patch 0002): no afectaba a Alyx.
+- ctest VPKEngine con 0011+0012: 149/149.
+
 ## Siguiente
 Logs B7: (1) MoltenVK: `[guest] pacing`, `pace governor`, `[vrr] foveated map`, `[gputime]`; (2) VPKEngine:
 `klepton-boot-vpkengine.log` + crash; `vk.feature`, `vk.err`, `vk.unimpl`, `[taa]`, `[vrr] foveating 1x`.

@@ -1,0 +1,261 @@
+From e1db457bf055b78aaa8d83abbaebfe43c93d51d6 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Tue, 13 Oct 2026 11:45:00 +0000
+Subject: [PATCH] Tests: MSL goldens regenerated (VP_PSZ, VP_NO_FDEPTH guards);
+ subpass test maps only the input attachment that is its colour attachment
+
+---
+ gpu/shader/msl/tests/compute_loop.metal              | 3 +++
+ gpu/shader/msl/tests/deferred_light_fetched_fs.metal | 3 +++
+ gpu/shader/msl/tests/deferred_light_fs.metal         | 3 +++
+ gpu/shader/msl/tests/heavy_lighting_fs.metal         | 3 +++
+ gpu/shader/msl/tests/image_atomics.metal             | 3 +++
+ gpu/shader/msl/tests/mesh_stage.metal                | 3 +++
+ gpu/shader/msl/tests/object_stage.metal              | 3 +++
+ gpu/shader/msl/tests/passthrough_vs.metal            | 3 +++
+ gpu/shader/msl/tests/precise_fma.metal               | 3 +++
+ gpu/shader/msl/tests/private_memory.metal            | 3 +++
+ gpu/shader/msl/tests/quad_ops.metal                  | 3 +++
+ gpu/shader/msl/tests/query_lod.metal                 | 3 +++
+ gpu/shader/msl/tests/subgroup.metal                  | 3 +++
+ gpu/shader/msl/tests/syntax_tour.metal               | 7 +++++++
+ gpu/shader/msl/tests/textured_fs.metal               | 3 +++
+ gpu/shader/spirv/tests/spirv_tests.cpp               | 7 +++++--
+ 16 files changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/gpu/shader/msl/tests/compute_loop.metal b/gpu/shader/msl/tests/compute_loop.metal
+index 1ca0ae2..50b7548 100644
+--- a/gpu/shader/msl/tests/compute_loop.metal
++++ b/gpu/shader/msl/tests/compute_loop.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpArgs {
+     const device uchar* data;
+diff --git a/gpu/shader/msl/tests/deferred_light_fetched_fs.metal b/gpu/shader/msl/tests/deferred_light_fetched_fs.metal
+index e267a3b..9299242 100644
+--- a/gpu/shader/msl/tests/deferred_light_fetched_fs.metal
++++ b/gpu/shader/msl/tests/deferred_light_fetched_fs.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpArgs {
+     constant uchar* light;
+diff --git a/gpu/shader/msl/tests/deferred_light_fs.metal b/gpu/shader/msl/tests/deferred_light_fs.metal
+index f156a12..1176d5c 100644
+--- a/gpu/shader/msl/tests/deferred_light_fs.metal
++++ b/gpu/shader/msl/tests/deferred_light_fs.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpArgs {
+     constant uchar* light;
+diff --git a/gpu/shader/msl/tests/heavy_lighting_fs.metal b/gpu/shader/msl/tests/heavy_lighting_fs.metal
+index b9f88cd..cfae707 100644
+--- a/gpu/shader/msl/tests/heavy_lighting_fs.metal
++++ b/gpu/shader/msl/tests/heavy_lighting_fs.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpArgs {
+     constant uchar* frame;
+diff --git a/gpu/shader/msl/tests/image_atomics.metal b/gpu/shader/msl/tests/image_atomics.metal
+index f520108..e20e302 100644
+--- a/gpu/shader/msl/tests/image_atomics.metal
++++ b/gpu/shader/msl/tests/image_atomics.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpArgs {
+     texture2d_array<uint, access::read_write> layers;
+diff --git a/gpu/shader/msl/tests/mesh_stage.metal b/gpu/shader/msl/tests/mesh_stage.metal
+index 51f0278..125e274 100644
+--- a/gpu/shader/msl/tests/mesh_stage.metal
++++ b/gpu/shader/msl/tests/mesh_stage.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpVertex {
+     float4 position [[position]];
+diff --git a/gpu/shader/msl/tests/object_stage.metal b/gpu/shader/msl/tests/object_stage.metal
+index 9c95c51..b904f30 100644
+--- a/gpu/shader/msl/tests/object_stage.metal
++++ b/gpu/shader/msl/tests/object_stage.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpArgs {
+     constant uchar* params;
+diff --git a/gpu/shader/msl/tests/passthrough_vs.metal b/gpu/shader/msl/tests/passthrough_vs.metal
+index 8863e56..a8a27d2 100644
+--- a/gpu/shader/msl/tests/passthrough_vs.metal
++++ b/gpu/shader/msl/tests/passthrough_vs.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpIn {
+     float4 pos [[attribute(0)]];
+diff --git a/gpu/shader/msl/tests/precise_fma.metal b/gpu/shader/msl/tests/precise_fma.metal
+index 8dc5ddf..2964cdb 100644
+--- a/gpu/shader/msl/tests/precise_fma.metal
++++ b/gpu/shader/msl/tests/precise_fma.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpIn {
+     float4 a [[user(loc0)]];
+diff --git a/gpu/shader/msl/tests/private_memory.metal b/gpu/shader/msl/tests/private_memory.metal
+index 9e48a0a..48d7860 100644
+--- a/gpu/shader/msl/tests/private_memory.metal
++++ b/gpu/shader/msl/tests/private_memory.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpIn {
+     float4 a [[user(loc0)]];
+diff --git a/gpu/shader/msl/tests/quad_ops.metal b/gpu/shader/msl/tests/quad_ops.metal
+index b8b461b..dad8b20 100644
+--- a/gpu/shader/msl/tests/quad_ops.metal
++++ b/gpu/shader/msl/tests/quad_ops.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpIn {
+     float4 a [[user(loc0)]];
+diff --git a/gpu/shader/msl/tests/query_lod.metal b/gpu/shader/msl/tests/query_lod.metal
+index f800059..68f6eb0 100644
+--- a/gpu/shader/msl/tests/query_lod.metal
++++ b/gpu/shader/msl/tests/query_lod.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpArgs {
+     texture2d_array<float> layers;
+diff --git a/gpu/shader/msl/tests/subgroup.metal b/gpu/shader/msl/tests/subgroup.metal
+index a27672f..363643a 100644
+--- a/gpu/shader/msl/tests/subgroup.metal
++++ b/gpu/shader/msl/tests/subgroup.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpArgs {
+     device uchar* out;
+diff --git a/gpu/shader/msl/tests/syntax_tour.metal b/gpu/shader/msl/tests/syntax_tour.metal
+index b8e655a..93c50e9 100644
+--- a/gpu/shader/msl/tests/syntax_tour.metal
++++ b/gpu/shader/msl/tests/syntax_tour.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpArgs {
+     device uchar* counters;
+@@ -18,7 +21,9 @@ struct VpIn {
+ 
+ struct VpOut {
+     float4 color [[color(0)]];
++#ifndef VP_NO_FDEPTH
+     float depth [[depth(any)]];
++#endif
+ };
+ 
+ static float fn_lerp3(float v0, float v1, float v2) {
+@@ -61,7 +66,9 @@ fragment VpOut vp_main(VpIn vp_in [[stage_in]],
+     const float v37 = float(v36);
+     const float v38 = fwidth(v37);
+     vp_out.color = v30;
++#ifndef VP_NO_FDEPTH
+     vp_out.depth = v38;
++#endif
+     l0 = half4(as_type<half>(ushort(0x7c00)), 0.5h, -2.0h, 65504.0h);
+     const bool v41 = v38 < 0.0f;
+     const bool v42 = false || v41;
+diff --git a/gpu/shader/msl/tests/textured_fs.metal b/gpu/shader/msl/tests/textured_fs.metal
+index 5923ed0..6ce85be 100644
+--- a/gpu/shader/msl/tests/textured_fs.metal
++++ b/gpu/shader/msl/tests/textured_fs.metal
+@@ -1,5 +1,8 @@
+ #include <metal_stdlib>
+ using namespace metal;
++#ifndef VP_PSZ
++#define VP_PSZ point_size
++#endif
+ 
+ struct VpArgs {
+     constant uchar* params;
+diff --git a/gpu/shader/spirv/tests/spirv_tests.cpp b/gpu/shader/spirv/tests/spirv_tests.cpp
+index 971976e..8c6315f 100644
+--- a/gpu/shader/spirv/tests/spirv_tests.cpp
++++ b/gpu/shader/spirv/tests/spirv_tests.cpp
+@@ -72,8 +72,11 @@ Result run(const std::string& path, const spirv::SpirvLowerOptions& o, bool fetc
+         return r;
+     }
+     if (fetch) {
+-        // The driver's step for input attachments: texture slot -> colour attachment.
+-        std::map<uint32_t, uint32_t> att{{0, 0}, {1, 1}};
++        // The driver's step for input attachments: texture slot -> colour attachment, only where the
++        // render pass makes the input attachment the SAME view as that colour attachment. In subpass.frag
++        // input 0 (gAlbedo) is colour 0; input 1 (gNormal) is another image (location 1 is a uvec4 `ids`
++        // target), so it stays a texture read.
++        std::map<uint32_t, uint32_t> att{{0, 0}};
+         auto rej = vpir::toFramebufferFetch(r.module, att, {});
+         for (auto& x : rej) std::fprintf(stderr, "  fbfetch rejected: %s\n", x.reason.c_str());
+         CHECK(rej.empty());
+-- 
+2.43.0
+
