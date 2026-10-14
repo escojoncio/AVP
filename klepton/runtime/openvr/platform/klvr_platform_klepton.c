@@ -253,12 +253,17 @@ static void pace_governor(void) {
     t0 = now; sum = 0; n = 0; late = 0;
     if (!nn) return;
     unsigned want = g_pace_extra;
-    if (!g_pace_extra) {                             // at the base: leave at once when it does not fit
-        over = (avg > 0.90 * 1000.0 / base || nl > 0.03 * nn) ? over + 1 : 0;
-        if (over >= 1) want = 1;
-    } else {                                         // at the fallback: up only with clear headroom
-        good = (avg < 0.75 * 1000.0 / base && nl == 0) ? good + 1 : 0;
-        if (good >= 5) want = 0;
+    // Build 31 (Logs 22): at 100 Hz the choice is 50 or 33 and nothing between. The base was left after ONE
+    // second with 2 late frames of 51 (3.9 %) at a 16 ms average, and taken back 5 s later: 33 fps most of
+    // the time with the GPU under 20 ms. visionOS reprojects a late frame, so a few are cheaper than the
+    // third refresh: leave the base only after 2 s in a row over 92 % of the budget or over 10 % late
+    // frames; come back after 3 s under 80 % with at most 2 % late.
+    if (!g_pace_extra) {                             // at the base: leave when it clearly does not fit
+        over = (avg > 0.92 * 1000.0 / base || nl > 0.10 * nn) ? over + 1 : 0;
+        if (over >= 2) want = 1;
+    } else {                                         // at the fallback: up with headroom
+        good = (avg < 0.80 * 1000.0 / base && nl <= 0.02 * nn) ? good + 1 : 0;
+        if (good >= 3) want = 0;
     }
     if (want != g_pace_extra) {
         fprintf(stderr, "  [openvr] pace governor: GPU %.2f ms per %.0f fps frame (%d of %d frames late) -> %s\n", avg, base,

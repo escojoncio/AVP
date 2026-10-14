@@ -181,7 +181,11 @@ struct AVPSettingsView: View {
                 Toggle(AVPL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $s.diagCaptures)
                 Toggle(AVPL("Medir GPU por pase (diagnóstico)", "Per-pass GPU timing (diagnostic)"), isOn: $s.gpuPassProfiling)
                 Toggle(AVPL("Orden de GPU por recursos (menos esperas)", "GPU ordering by resources (fewer waits)"), isOn: $s.trackedOrder)
+                Toggle(AVPL("MSAA resuelto en tile (menos ancho de banda)", "MSAA resolved on tile (less bandwidth)"), isOn: $s.msaaOnTile)
             }
+            Text(AVPL("MSAA en tile: al arrancar el juego. Si la escena sale negra o corrupta, apágalo.",
+                      "MSAA on tile: at game start. If the scene comes out black or corrupt, turn it off."))
+                .font(.footnote).foregroundStyle(.secondary)
             Text(AVPL("Orden por recursos: experimental, al arrancar el juego. Si ves geometría que explota, apágalo.",
                       "Ordering by resources: experimental, at game start. If geometry explodes, turn it off."))
                 .font(.footnote).foregroundStyle(.secondary)
