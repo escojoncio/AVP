@@ -376,6 +376,14 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
 5. Streaming de texturas (`vkCopyMemoryToImageEXT` espera la GPU por región) → staging asíncrono.
 6. Hidden area mesh: comprobar que klvr devuelve malla para la lente del Vision Pro.
 
+## Shaders: precarga
+- B41 (en main, sin build propia aún): `AVPPrepare.importExtraFoz` copia todo `*.foz` de la raíz de la carpeta AVP a
+  `<data>/klfz/user-<nombre>` (se replay-ea en prewarm y al arrancar; entra en el stamp de la lista → prewarm una vez).
+- `steamapp_pipeline_cache.foz` del PC (`shadercache/546560/fozpipelinesv6`, 2 974 gráficos + 22 compute + 9 869
+  módulos) NO es una descarga de Steam: es la grabación Fossilize local de partidas en PC con Vulkan. Steam solo
+  descarga `steam_shader_cache/*.swarc` (binarios NVIDIA, inútiles aquí). No hay depósito que bajar desde el visor.
+  Copia manual una vez a la raíz de AVP. El visor ya graba lo suyo (`klfz/recorded.foz`).
+
 ## No tocar (decisión del usuario)
 - `vr_expand_cull_frustum` (2): bajarlo ahorraría algo en exteriores pero puede meter popping en el borde al girar;
   descartado. Frustum culling es de CPU (Source 2) con las tangentes reales del visor (105x95°): no hay nada roto ahí.
