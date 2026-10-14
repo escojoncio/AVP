@@ -71,6 +71,15 @@ final class AVPSettings: ObservableObject {
     /// correct, no GPU faults, the scene's vertex time 8-12 ms -> ~4 ms. ON by default since build 34 (new key
     /// avp.amplify so every install gets it); off = instancing, the build 32 behaviour.
     @Published var amplify: Bool { didSet { save() } }
+    /// Build 36 (A/B, off): the unfoveated eye post passes (tonemap, bloom composite: fullscreen, texel for texel, no
+    /// depth) get their render target constrained to the rate map's physical size (KL_VRR_PHYS_POST, kl_gpu_time.m):
+    /// about half their tiles (1.3 + 1.3 ms a frame at 48 % physical). Outside the physical area the eye image stays
+    /// what it was (black: the scene's clear tonemapped by the first, full-area pass). Diagnostic until a run shows
+    /// the picture intact; the foveated passes' own version (KL_VRR_PHYS) broke the picture in build 29 and stays off.
+    @Published var postPhysical: Bool { didSet { save() } }
+    /// Build 37: the compositor samples the game's own eye image (KLVR_EYE_DIRECT=1, klvr_vk_submit.cpp) instead of
+    /// a copy of each eye into a platform image: 2 x 14.6 MB and ~0.6 ms of GPU per frame saved. Off = the copy.
+    @Published var eyeDirect: Bool { didSet { save() } }
 
     // Fixed since build 32 (they used to be settings; every validated value is now the only value):
     /// 12 command buffers in flight (build 24 orders them; 3 was the build-23 A/B test).
@@ -113,6 +122,8 @@ final class AVPSettings: ObservableObject {
         cloudSync = d.object(forKey: "avp.cloudSync") as? Bool ?? true
         handFingers = d.object(forKey: "avp.handFingers") as? Bool ?? true
         amplify = d.object(forKey: "avp.amplify") as? Bool ?? true
+        postPhysical = d.object(forKey: "avp.postPhys") as? Bool ?? false
+        eyeDirect = d.object(forKey: "avp.eyeDirect") as? Bool ?? true
         loading = false
     }
 
@@ -139,6 +150,8 @@ final class AVPSettings: ObservableObject {
         d.set(cloudSync, forKey: "avp.cloudSync")
         d.set(handFingers, forKey: "avp.handFingers")
         d.set(amplify, forKey: "avp.amplify")
+        d.set(postPhysical, forKey: "avp.postPhys")
+        d.set(eyeDirect, forKey: "avp.eyeDirect")
     }
 
     func resetToDefaults() {
@@ -153,6 +166,7 @@ final class AVPSettings: ObservableObject {
         anisotropy = fresh.anisotropy; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
+        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect
         AVPLog.log("Ajustes: valores por defecto")
     }
 
@@ -367,6 +381,7 @@ final class AVPSettings: ObservableObject {
             // Build 34: vertex amplification ON by default (validated in Logs_Alyx_2_8/2_9: both eyes and the foveation
             // correct, no GPU faults, scene vertex time 8-12 -> ~4 ms). B29 had it off after B27's faults.
             ("VPVK_AMPLIFY", amplify ? "1" : "0"),
+            ("KLVR_EYE_DIRECT", eyeDirect ? "1" : "0"),
             // Build 31: native half fetch back on, alone (B29 turned it off only because it shipped with amplification;
             // the translator's conversion is exact). Logs 22: the scene pass is vertex-bound (vtx 11 ms).
             ("VPVK_FETCH_NATIVE", "1"),
@@ -406,7 +421,7 @@ final class AVPSettings: ObservableObject {
             // Build 29: OFF. Logs 20/2_6: outside the physical area the eye textures kept a stale unfoveated frame that
             // the post chain and the compositor mixed in (picture inside a picture, black blocks), and the foveated
             // overlay pass faulted the GPU.
-            env += [("KL_VRR_PHYS", "0"), ("KL_VRR_PHYS_POST", "0")]
+            env += [("KL_VRR_PHYS", "0"), ("KL_VRR_PHYS_POST", postPhysical ? "1" : "0")]
         }
         // Captures (eye pictures as PNG at guest frames 120/600/1200) and a per-pass dump of one in-game frame: always on
         // while VPKEngine's picture is being validated. Core frame 6000 is ~35 s after the first picture (frame 540 in
@@ -459,7 +474,7 @@ final class AVPSettings: ObservableObject {
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
-                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify)")
+                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect)")
         return env
     }
 

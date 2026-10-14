@@ -38,3 +38,4 @@ void kl_gpu_time_scene(int to_grid);
 // KL_CP_DEPTH: an R32Float texture view over a linear MTLBuffer (retained, release with kl_mtl_release).
 void *kl_mtl_buffer_texture_r32f(void *mtl_buffer, unsigned w, unsigned h, unsigned pitch_bytes);
 void kl_mtl_release(void *obj);
+void *kl_mtl_retain(void *obj);   // +1 on a Metal object handed over unretained (returns it)

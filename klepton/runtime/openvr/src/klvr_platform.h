@@ -138,6 +138,10 @@ int      klvr_plat_begin_stage(void);   // next stage to fill, and marks it busy
 // VkImage (as uint64) for one eye of a stage, created on first use. 0 if the
 // platform has no Vulkan path.
 uint64_t klvr_plat_eye_image(int stage, int eye, uint32_t w, uint32_t h, int srgb);
+// Build 37: publish the guest's own eye image (array layer `layer`) for the compositor to sample, instead of a
+// copy into klvr_plat_eye_image's: 1 when done (no copy needed this submit), 0 when the platform cannot.
+int      klvr_plat_eye_publish_guest(int stage, int eye, uint64_t vk_image, int layer, uint32_t w, uint32_t h);
+void     klvr_plat_eye_unpublish_guest(int stage, int eye);   // this submit copies: the platform image is sampled again
 // The game's depth for one eye of a stage (KL_CP_DEPTH): an R32_SFLOAT VkImage the compositor samples, a
 // staging VkBuffer for the depth-aspect copy (host-visible; *mapped for a readback, may be NULL), and the depth
 // mapping the game rendered with (OpenVR row-major: clip.z = m22*z + m23, clip.w = -z). 0 / no-op if the
