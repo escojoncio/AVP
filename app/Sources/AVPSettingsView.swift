@@ -128,13 +128,20 @@ struct AVPSettingsView: View {
                 Text(AVPL("A la altura de la vista", "At eye level")).tag(AVPSettings.SubtitlePlacement.eyeLevel)
                 Text(AVPL("Por encima de la vista", "Above eye level")).tag(AVPSettings.SubtitlePlacement.high)
             }
+            Picker(AVPL("Tamaño de subtítulos", "Subtitle size"), selection: $s.subtitleSize) {
+                Text(AVPL("Pequeño", "Small")).tag(AVPSettings.SubtitleSize.small)
+                Text(AVPL("Medio", "Medium")).tag(AVPSettings.SubtitleSize.medium)
+                Text(AVPL("Grande", "Large")).tag(AVPSettings.SubtitleSize.large)
+            }
+            Stepper(AVPL("Altura del jugador: \(Int(s.heightOffsetCm)) cm", "Player height: \(Int(s.heightOffsetCm)) cm"),
+                    value: $s.heightOffsetCm, in: -60...30, step: 5)
             Toggle(AVPL("Sincronizar partidas con Steam Cloud", "Sync saves with Steam Cloud"), isOn: $s.cloudSync)
             Toggle(AVPL("Dedos reales (seguimiento de manos del visor)", "Real fingers (the headset's hand tracking)"), isOn: $s.handFingers)
         } header: {
             Text(AVPL("Juego", "Game"))
         } footer: {
-            Text(AVPL("Las voces siempre en inglés. El movimiento solo se aplica mientras el juego no tenga opciones guardadas. Subtítulos: el juego los pone abajo; las otras opciones los suben y usan la letra grande del juego. Dedos reales: los dedos del jugador siguen a tus dedos de verdad (como con los mandos Index de Valve) cuando el visor ve la mano; pide permiso de seguimiento de manos la primera vez. Con un mando Sense en la mano el visor NO da el seguimiento de esa mano (medido): solo actúa con las manos libres. Al arrancar el juego.",
-                      "Voices are always English. Movement only applies until the game has saved options. Subtitles: the game puts them low; the other options raise them and use the game's large font. Real fingers: the player's fingers follow your own (as with Valve's Index controllers) when the headset sees the hand; asks for the hand-tracking permission once. With a Sense controller in the hand the headset does NOT track that hand (measured): it only acts with free hands. At game start."))
+            Text(AVPL("Las voces siempre en inglés. El movimiento solo se aplica mientras el juego no tenga opciones guardadas. Subtítulos: el juego los pone abajo; las otras opciones los suben. Altura del jugador: negativo = Alyx más baja (jugando sentado, o si el suelo del juego queda demasiado lejos de las manos); se aplica en vivo desde la pausa. Dedos reales: los dedos del jugador siguen a tus dedos de verdad (como con los mandos Index de Valve) cuando el visor ve la mano; pide permiso de seguimiento de manos la primera vez. Con un mando Sense en la mano el visor NO da el seguimiento de esa mano (medido): solo actúa con las manos libres. Al arrancar el juego.",
+                      "Voices are always English. Movement only applies until the game has saved options. Subtitles: the game puts them low; the other options raise them. Player height: negative = Alyx lower (playing seated, or when the game's floor sits too far from your hands); applies live from the pause menu. Real fingers: the player's fingers follow your own (as with Valve's Index controllers) when the headset sees the hand; asks for the hand-tracking permission once. With a Sense controller in the hand the headset does NOT track that hand (measured): it only acts with free hands. At game start."))
         }
     }
 
@@ -146,6 +153,7 @@ struct AVPSettingsView: View {
             Toggle(AVPL("Amplificación de vértices", "Vertex amplification"), isOn: $s.amplify)
             Toggle(AVPL("Post-procesado solo en el área foveada (prueba)", "Post-processing on the foveated area only (test)"), isOn: $s.postPhysical)
             Toggle(AVPL("Ojos al compositor sin copia", "Eyes to the compositor without a copy"), isOn: $s.eyeDirect)
+            Toggle(AVPL("Foveado del pase de subtítulos", "Foveation of the subtitle pass"), isOn: $s.subtitleFoveation)
             Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
                    role: .destructive) { confirmQuarantine = true }
                 .disabled(quarantined == 0)

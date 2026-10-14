@@ -127,6 +127,8 @@ int  kl_app_guest_start(void);
 void kl_app_guest_publish(void);
 // The panel rate the compositor latched (canonical Hz); the guest pacer and the OpenVR pace plan divide it.
 void kl_guest_set_panel_hz(float hz);
+// Build 38: the player height offset the game sees (metres, negative = lower), live (klvr_platform_klepton.c).
+void klvr_plat_set_height_offset(float m);
 void kl_app_guest_stop(void);
 
 // Where the guest thread has got to. 0 = still in _begin (nothing to present

@@ -12,6 +12,7 @@
 // Built inside the Klepton fork (runtime/xr/), not in this repo's host build:
 // it includes Klepton's headers. See README.md, "Integrating into Klepton".
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -335,6 +336,7 @@ static double host_wait_frame(void) {
 // the frontend's words to the game's actions is the one the device runs.
 static void qrot(const float q[4], const float v[3], float o[3]);
 static void qmul(const float a[4], const float b[4], float o[4]);
+static void klvr_plat_head_raw(double t, klvr_tracked *out);   // without the player height offset (added once, by klvr_plat_hand)
 static void fake_input_tick(void) {
     static int state = -1;       // -1 unread, 0 off, 1 on
     static double t0;
@@ -399,7 +401,7 @@ static void fake_input_tick(void) {
         kl_ovrp_set_head_pose(0, hy, 0, q[0], q[1], q[2], q[3]);
     }
     klvr_tracked head;
-    klvr_plat_head(klvr_plat_now(), &head);
+    klvr_plat_head_raw(klvr_plat_now(), &head);
     for (int hand = 0; hand < 2; hand++) {
         float off[3] = { hand ? 0.2f : -0.2f, -0.35f, -0.35f }, o[3];
         qrot(head.pose.q, off, o);
@@ -543,7 +545,29 @@ void klvr_plat_display(klvr_display *out) {
 }
 
 // ---- tracking -------------------------------------------------------------
+// Build 38: player height. The game's floor is visionOS's (the origin of the immersive space, on the floor under
+// the player when it opened), so a player sitting down has Alyx's eyes a metre up and the floor out of reach.
+// KLVR_HEIGHT_OFFSET (metres, negative = lower; the launcher's "Altura del jugador", live) moves every tracked
+// pose the GAME sees (head and both hands) by the same amount; the compositor keeps the device's own poses, and its
+// reprojection is rotational, so a constant shift of the game's camera changes nothing there.
+static _Atomic float g_height_off;
+static int g_height_off_read;
+void klvr_plat_set_height_offset(float m) { atomic_store(&g_height_off, m); g_height_off_read = 1; }
+static float height_off(void) {
+    if (!g_height_off_read) {
+        const char *e = getenv("KLVR_HEIGHT_OFFSET");
+        klvr_plat_set_height_offset(e && *e ? (float)atof(e) : 0.0f);
+        if (atomic_load(&g_height_off) != 0.0f)
+            fprintf(stderr, "  [openvr] player height offset %.2f m (KLVR_HEIGHT_OFFSET)\n", (double)atomic_load(&g_height_off));
+    }
+    return atomic_load(&g_height_off);
+}
+static void klvr_plat_head_raw(double t, klvr_tracked *out);
 void klvr_plat_head(double t, klvr_tracked *out) {
+    klvr_plat_head_raw(t, out);
+    if (out->valid) out->pose.p[1] += height_off();
+}
+static void klvr_plat_head_raw(double t, klvr_tracked *out) {
     memset(out, 0, sizeof *out);
     float *p = out->pose.p, *q = out->pose.q;
     if (host()) { host_head(p, q); out->valid = 1; return; }
@@ -579,7 +603,12 @@ static double ctrl_grace(void) {
     return g;
 }
 
+static void klvr_plat_hand_raw(int hand, double t, klvr_tracked *out);
 void klvr_plat_hand(int hand, double t, klvr_tracked *out) {
+    klvr_plat_hand_raw(hand, t, out);
+    if (out->valid) out->pose.p[1] += height_off();
+}
+static void klvr_plat_hand_raw(int hand, double t, klvr_tracked *out) {
     memset(out, 0, sizeof *out);
     if (host()) {
         // Waist height, a forearm in front of the fixed head, pointing ahead.
