@@ -1,4 +1,4 @@
-From f83b720a0cf468c72ba3a6d62c1b33b2be553620 Mon Sep 17 00:00:00 2001
+From 7e0720ef81720cb132ec540f312f5d3c921954ff Mon Sep 17 00:00:00 2001
 From: Claude <claude@users.invalid>
 Date: Wed, 14 Oct 2026 23:17:28 +0000
 Subject: [PATCH] VPKEngine 0038: producer-only fence waits, redundant
@@ -10,8 +10,8 @@ Subject: [PATCH] VPKEngine 0038: producer-only fence waits, redundant
  gpu/core/src/device.cpp                      |   4 +-
  gpu/core/src/frame_compiler.cpp              |  23 +-
  gpu/core/tests/core_tests.cpp                | 122 ++++++-
- gpu/metal2/src/metal_backend.mm              | 333 ++++++++++++++++++-
- 5 files changed, 479 insertions(+), 21 deletions(-)
+ gpu/metal2/src/metal_backend.mm              | 350 ++++++++++++++++++-
+ 5 files changed, 496 insertions(+), 21 deletions(-)
 
 diff --git a/gpu/core/include/vpgpu/core/frame_compiler.h b/gpu/core/include/vpgpu/core/frame_compiler.h
 index c7a8c89..f5ea53f 100644
@@ -296,7 +296,7 @@ index d4df6ff..435db82 100644
    for (const auto& [name, fn] : groups) {
      if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
 diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
-index 1a19c9c..c7e8440 100644
+index 1a19c9c..efe0ea9 100644
 --- a/gpu/metal2/src/metal_backend.mm
 +++ b/gpu/metal2/src/metal_backend.mm
 @@ -40,6 +40,7 @@
@@ -307,7 +307,7 @@ index 1a19c9c..c7e8440 100644
  #include "vpgpu/core/pipeline_cache.h"
  
  namespace vpgpu::metal2 {
-@@ -67,6 +68,24 @@ constexpr uint32_t kVisSlots = 8192;          // visibility results per frame sl
+@@ -67,6 +68,27 @@ constexpr uint32_t kVisSlots = 8192;          // visibility results per frame sl
  // GPU hangs this process caused (not victims, not ignored submissions): read by VPVulkan (motion kill switch).
  std::atomic<uint32_t> gGpuHangs{0};
  std::atomic<bool> gDumpRequest{false};  // vpgpu_metal2_request_dump: the next real frame, pass by pass
@@ -315,6 +315,9 @@ index 1a19c9c..c7e8440 100644
 +// "one shader out" probe; 0 = none). The counters are cumulative; the host reads deltas per window.
 +std::atomic<uint64_t> gKnockKey{0};
 +std::atomic<uint32_t> gCleanEpoch{0};  // bumped by a failed command buffer: its depth clears may never have run
++// Encoders of the latest real frame and when it was encoded (steady clock ms): the host's A/B test waits for the menu.
++std::atomic<uint32_t> gLastRealEncoders{0};
++std::atomic<int64_t> gLastRealMs{0};
 +std::atomic<uint64_t> gIndirectCountDraws{0}, gIndirectEncoded{0}, gIndirectReal{0};  // indirect-count draws
 +std::atomic<uint64_t> gOptCbs{0}, gProdCbs{0}, gFenceWaits{0}, gClearCandidates{0}, gClearSkipped{0}, gKnocked{0};
 +// Pipeline census (vpgpu_metal2_census_*): per pipeline key, in how many real frames (the big command buffer:
@@ -332,7 +335,7 @@ index 1a19c9c..c7e8440 100644
  // Exclusive GPU time of each completed command buffer (vpgpu_metal2_cb_busy_ms, for the host's pace governor):
  // its encoders' stage-boundary timestamps placed on one timeline, each counted only for how far it moves the
  // latest end seen so far. A command buffer's [GPUStartTime, GPUEndTime] span holds the waits on earlier command
-@@ -726,6 +745,17 @@ struct MetalBackend::Impl {
+@@ -726,6 +748,17 @@ struct MetalBackend::Impl {
    // and leaves only itself, so ordering is transitive and each barrier costs few waits. It carries
    // over between frames: a frame's first encoder waits on the previous frame's tail.
    std::vector<id<MTLFence>> frontier;
@@ -350,7 +353,7 @@ index 1a19c9c..c7e8440 100644
  
    // Per-pass dump (VP_DUMP_FRAME=<n>, VP_DUMP_DIR=<dir>); -1 = off.
    int64_t dumpFrame = -1;
-@@ -1166,6 +1196,7 @@ kernel void vp_indirect_fix(device const uint* src [[buffer(0)]], device const u
+@@ -1166,6 +1199,7 @@ kernel void vp_indirect_fix(device const uint* src [[buffer(0)]], device const u
      device uint* o = dst + p.dstWord + i * words;
      uint n = p.maxCount;
      if (p.hasCount) n = min(n, cnt[p.countWord]);
@@ -358,7 +361,19 @@ index 1a19c9c..c7e8440 100644
      if (i >= n) {
          for (uint k = 0; k < words; ++k) o[k] = 0u;
          return;
-@@ -2333,6 +2364,24 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+@@ -2317,6 +2351,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   bool dumpLayered = false;
+   for (const Encoder& en : compiled.encoders) dumpLayered |= en.kind == Encoder::Kind::Render && en.pass.layerCount > 1;
+   const bool realFrame = compiled.encoders.size() >= 8 && dumpLayered;
++  if (realFrame) {
++    gLastRealEncoders.store(uint32_t(compiled.encoders.size()), std::memory_order_relaxed);
++    gLastRealMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
++                      std::memory_order_relaxed);
++  }
+   // A sequence already started takes the following command buffers too, whatever they hold.
+   bool dumping = dumpSeqLeft > 0;
+   bool startSeq = !dumping && dumpFrame >= 0 && !dumpTaken && frameIndex >= uint64_t(dumpFrame) && realFrame;
+@@ -2333,6 +2372,24 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
      info("gpu.dump sequence f=" + std::to_string(frameIndex) + " command_buffers=" + std::to_string(kDumpSequence));
    }
    if (dumping) --dumpSeqLeft;
@@ -383,7 +398,7 @@ index 1a19c9c..c7e8440 100644
    auto dumpItems = std::make_shared<std::vector<DumpItem>>();
    std::vector<DumpCopy> dumpCopies;
    std::unordered_set<uintptr_t> dumpSeen;  // storage textures already queued for the open encoder
-@@ -2388,6 +2437,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+@@ -2388,6 +2445,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
      [open.any() endEncoding];
      fenceOwner[(__bridge const void*)openFence] = int(curEnc);
      frontier.push_back(openFence);
@@ -391,7 +406,7 @@ index 1a19c9c..c7e8440 100644
      open = {};
      used.clear();
      dumpSeen.clear();
-@@ -2426,20 +2476,48 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+@@ -2426,20 +2484,48 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
      dumpCopies.clear();
    };
    // Starts waiting on everything unordered so far; `before` picks the first render stage held.
@@ -449,7 +464,7 @@ index 1a19c9c..c7e8440 100644
      // Ordered after the whole previous command buffer, not only through this one's first encoder
      // (VP_CB_ORDER=2: only the encoders that touch what a command buffer in flight uses).
      const uint8_t join = curEnc < needJoin.size() ? needJoin[curEnc] : 2;
-@@ -2584,8 +2662,22 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+@@ -2584,8 +2670,22 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
        return nil;
      }
      fx.label = [NSString stringWithFormat:@"indirect_fix%u", e];
@@ -474,7 +489,7 @@ index 1a19c9c..c7e8440 100644
      // The previous command buffer may write these arguments.
      if (joinFence && (e >= needJoin.size() || needJoin[e])) [fx waitForFence:joinFence];
      [fx setComputePipelineState:ps];
-@@ -2768,6 +2860,77 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+@@ -2768,6 +2868,77 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
        if (cbTracked) frontier.clear();
      }
    }
@@ -552,7 +567,7 @@ index 1a19c9c..c7e8440 100644
    size_t b = 0;  // cursor into compiled.barriers (sorted by encoder, item)
    for (uint32_t e = 0; e < compiled.encoders.size(); ++e) {
      const Encoder& enc = compiled.encoders[e];
-@@ -2776,12 +2939,43 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+@@ -2776,12 +2947,43 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
      // The first encoder of a frame always waits: frames are hazard-checked independently.
      bool boundary = e == 0;
      StageMask before = stage::vertex;
@@ -596,7 +611,7 @@ index 1a19c9c..c7e8440 100644
      if (enc.kind == Encoder::Kind::Render) {
        id<MTLFence> fixFence = encodeIndirectFix(e, enc);
        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-@@ -2995,6 +3189,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+@@ -2995,6 +3197,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
              continue;
            }
            const Pipeline* p = pipeline(d.pipeline);
@@ -613,7 +628,7 @@ index 1a19c9c..c7e8440 100644
            if (p && (huntAll || (!huntSnapshot.empty() && huntSnapshot.count(p->key)))) {
              ++huntedNow;
              ++(*diag)[e].skipped;
-@@ -3048,6 +3252,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+@@ -3048,6 +3260,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
              EncDiag& g = (*diag)[e];
              ++g.draws;
              noteState(g, p->render, p->key);
@@ -624,7 +639,7 @@ index 1a19c9c..c7e8440 100644
              if (d.indirect) ++g.indirect;
              else g.maxWork = std::max(g.maxWork, uint64_t{d.count} * d.instances);
            }
-@@ -3153,26 +3361,53 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+@@ -3153,26 +3369,53 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
      // cover that item's hazards too).
      bool carryWait = false;
      StageMask carryBefore = 0;
@@ -682,7 +697,7 @@ index 1a19c9c..c7e8440 100644
          }
          continue;
        }
-@@ -3207,6 +3442,17 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+@@ -3207,6 +3450,17 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
        if (isDispatch) {
          const Dispatch& d = std::get<Dispatch>(cmd);
          const Pipeline* p = pipeline(d.pipeline);
@@ -700,7 +715,7 @@ index 1a19c9c..c7e8440 100644
          if (p && (huntAll || (!huntSnapshot.empty() && huntSnapshot.count(p->key)))) {
            ++huntedNow;
            ++(*diag)[e].skipped;
-@@ -3348,8 +3594,22 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+@@ -3348,8 +3602,22 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
        }
        ++missingResources;
      }
@@ -723,7 +738,7 @@ index 1a19c9c..c7e8440 100644
    if (cbTracked) {
      // Encoders that skipped the join may still run when the next command buffer starts: its join follows
      // this one's tail AND this join (transitively, every earlier command buffer).
-@@ -3463,6 +3723,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+@@ -3463,6 +3731,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
      if (impl->exclOn && sampleCount && diag && finished.status == MTLCommandBufferStatusCompleted)
        impl->exclAccount(exclType, *diag, raw, stg, finished.GPUEndTime, d.timings.frameMs);
      if (finished.status == MTLCommandBufferStatusError) {
@@ -731,7 +746,7 @@ index 1a19c9c..c7e8440 100644
        std::string encs;
        NSArray* infos = finished.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
        for (id<MTLCommandBufferEncoderInfo> i in infos)
-@@ -3617,6 +3878,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+@@ -3617,6 +3886,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
      }
      if (fixScratch) {
        const uint32_t* h = static_cast<const uint32_t*>(fixScratch.contents);
@@ -739,7 +754,7 @@ index 1a19c9c..c7e8440 100644
        if (h[0]) {
          const uint64_t n = ++impl->indirectClampedFrames;
          if (n <= 32 || n % 256 == 0)
-@@ -4633,6 +4895,47 @@ bool MetalBackend::saveArchive() {
+@@ -4633,6 +4903,56 @@ bool MetalBackend::saveArchive() {
  extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_request_dump(void) {
    vpgpu::metal2::gDumpRequest.store(true);
  }
@@ -760,6 +775,15 @@ index 1a19c9c..c7e8440 100644
 +  out[0] = gOptCbs.load(), out[1] = gProdCbs.load(), out[2] = gFenceWaits.load();
 +  out[3] = gClearCandidates.load(), out[4] = gClearSkipped.load(), out[5] = gKnocked.load();
 +  out[6] = gIndirectCountDraws.load(), out[7] = gIndirectEncoded.load(), out[8] = gIndirectReal.load();
++}
++// Encoders of the latest real frame (8+ encoders, a layered pass): Alyx's Valve logo has ~28, the menu ~80. 0 when
++// no real frame was encoded in the last 500 ms (a loading screen): a stale value is never reported.
++extern "C" __attribute__((visibility("default"))) uint32_t vpgpu_metal2_last_real_encoders(void) {
++  using namespace vpgpu::metal2;
++  const int64_t now =
++      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++  if (now - gLastRealMs.load() > 500) return 0;
++  return gLastRealEncoders.load();
 +}
 +// Pipeline census: on = 1 starts (clearing the previous one), 0 stops. Returns the real frames counted.
 +extern "C" __attribute__((visibility("default"))) uint64_t vpgpu_metal2_census(int on) {
