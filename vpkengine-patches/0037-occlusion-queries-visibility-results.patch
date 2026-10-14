@@ -1,0 +1,512 @@
+From c3c54bab3d2794004f374f8ce8d16e8cd3a28949 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Wed, 14 Oct 2026 16:23:44 +0000
+Subject: [PATCH] Occlusion queries measured with Metal visibility results
+ (VPVK_OCCLUSION, default on)
+
+- core: Draw::visibility (one 8-byte slot per queried draw), GpuTimings::visibility,
+  Device::frameVisibility (last 64 frames).
+- metal2: a 64 KB visibility buffer per frame slot, zeroed on the host before use;
+  render passes of a frame with queried draws bind it; MTLVisibilityResultModeCounting
+  at the draw's slot; slots no draw was encoded for (or an errored frame) read 1.
+- vulkan: vkCmdBeginQuery/EndQuery tag the recorded draws (occlusion pools); the
+  translator gives each a slot (cap 8192 per submission, beyond = unknown = visible);
+  stampQueries keeps the query's slots; vkGetQueryPoolResults sums the counts, 0 for a
+  query without draws, 1 when anything is unknown. Before: every occlusion query read 1.
+---
+ gpu/core/include/vpgpu/core/backend.h  |  3 ++
+ gpu/core/include/vpgpu/core/commands.h |  5 +++
+ gpu/core/include/vpgpu/core/device.h   |  5 +++
+ gpu/core/src/device.cpp                | 12 ++++++
+ gpu/metal2/src/metal_backend.mm        | 32 ++++++++++++++++
+ gpu/vulkan/src/commands.cpp            | 17 ++++++++-
+ gpu/vulkan/src/commands.h              | 23 ++++++++++++
+ gpu/vulkan/src/pipelines.cpp           |  2 +
+ gpu/vulkan/src/queries.cpp             | 51 ++++++++++++++++++++++++--
+ gpu/vulkan/src/sync.cpp                | 35 ++++++++++++++++--
+ gpu/vulkan/src/vpvk.h                  |  5 +++
+ 11 files changed, 182 insertions(+), 8 deletions(-)
+
+diff --git a/gpu/core/include/vpgpu/core/backend.h b/gpu/core/include/vpgpu/core/backend.h
+index a40af1e..18b55ee 100644
+--- a/gpu/core/include/vpgpu/core/backend.h
++++ b/gpu/core/include/vpgpu/core/backend.h
+@@ -18,6 +18,9 @@ struct GpuTimings {
+   // Absolute GPU start / end of the frame in nanoseconds of the host clock (0 = unknown).
+   double startNs = 0, endNs = 0;
+   std::vector<double> encoderMs;  // parallel to CompiledFrame::encoders when available
++  // Passed-sample counts per visibility slot (Draw::visibility) of the frame; a slot whose draw was
++  // not executed reads 1 (unknown = visible, never culled by a skip).
++  std::vector<uint64_t> visibility;
+ };
+ 
+ class Backend {
+diff --git a/gpu/core/include/vpgpu/core/commands.h b/gpu/core/include/vpgpu/core/commands.h
+index 007b279..107fb26 100644
+--- a/gpu/core/include/vpgpu/core/commands.h
++++ b/gpu/core/include/vpgpu/core/commands.h
+@@ -198,6 +198,11 @@ struct Draw {
+   // Set: first/count/instances/baseVertex come from the buffer (the whole index buffer is then a
+   // hazard read). gpu/metal (one draw) and gpu/metal2 (Indirect::drawCount draws).
+   std::optional<Indirect> indirect;
++  // Occlusion query: the frame's visibility slot this draw's passed-sample count goes to (8 bytes each,
++  // GpuTimings::visibility[slot] once the frame completes). kNoVisibility = not queried. One slot per draw
++  // (never shared), so a pass the backend splits across encoders still adds up on the host.
++  static constexpr uint32_t kNoVisibility = UINT32_MAX;
++  uint32_t visibility = kNoVisibility;
+ };
+ 
+ struct Dispatch {
+diff --git a/gpu/core/include/vpgpu/core/device.h b/gpu/core/include/vpgpu/core/device.h
+index 2a1d8d1..59fb5dd 100644
+--- a/gpu/core/include/vpgpu/core/device.h
++++ b/gpu/core/include/vpgpu/core/device.h
+@@ -7,6 +7,7 @@
+ #include <mutex>
+ #include <tuple>
+ #include <functional>
++#include <memory>
+ #include <string>
+ #include <utility>
+ #include <vector>
+@@ -52,6 +53,9 @@ class Device {
+   // GPU start / end (host-clock ns) of a finished frame, if the backend reported it and it is
+   // among the last few hundred (timestamp queries). Thread-safe.
+   bool frameTimes(uint64_t frame, double& startNs, double& endNs);
++  // The occlusion-query visibility counts of a finished frame (GpuTimings::visibility), kept for the
++  // last 64 frames that had any. Thread-safe. false when unknown (the game must treat as visible).
++  std::shared_ptr<const std::vector<uint64_t>> frameVisibility(uint64_t frame);
+ 
+  private:
+   Backend& backend_;
+@@ -84,6 +88,7 @@ class Device {
+   void drainTimings();
+   std::mutex timesMutex_;
+   std::deque<std::tuple<uint64_t, double, double>> times_;  // frame, startNs, endNs
++  std::deque<std::pair<uint64_t, std::shared_ptr<const std::vector<uint64_t>>>> visibility_;  // frame, slot counts
+ };
+ 
+ }  // namespace vpgpu
+diff --git a/gpu/core/src/device.cpp b/gpu/core/src/device.cpp
+index 9d2dfb1..00a028d 100644
+--- a/gpu/core/src/device.cpp
++++ b/gpu/core/src/device.cpp
+@@ -204,6 +204,14 @@ bool Device::frameTimes(uint64_t frame, double& startNs, double& endNs) {
+   return false;
+ }
+ 
++std::shared_ptr<const std::vector<uint64_t>> Device::frameVisibility(uint64_t frame) {
++  drainTimings();
++  std::lock_guard lock(timesMutex_);
++  for (const auto& [f, v] : visibility_)
++    if (f == frame) return v;
++  return nullptr;
++}
++
+ void Device::drainTimings() {
+   std::lock_guard lock(timesMutex_);
+   uint64_t done;
+@@ -211,6 +219,10 @@ void Device::drainTimings() {
+   while (backend_.takeTimings(done, t)) {
+     times_.emplace_back(done, t.startNs, t.endNs);
+     while (times_.size() > 512) times_.pop_front();
++    if (!t.visibility.empty()) {
++      visibility_.emplace_back(done, std::make_shared<const std::vector<uint64_t>>(std::move(t.visibility)));
++      while (visibility_.size() > 64) visibility_.pop_front();
++    }
+     while (!passPending_.empty() && passPending_.front().first < done) passPending_.pop_front();
+     if (!passPending_.empty() && passPending_.front().first == done) {
+       const auto& desc = passPending_.front().second;
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 6619946..1a19c9c 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -63,6 +63,7 @@ constexpr MTLResourceOptions kSharedUntracked = MTLResourceStorageModeShared | M
+ constexpr uint64_t kArgRingBytes = 1 << 20;   // per frame slot
+ constexpr uint64_t kArgAlign = 256;           // safe offset alignment for buffer bindings on every GPU
+ constexpr NSUInteger kMaxSamples = 2048;      // timestamp samples per frame slot (2 per sub-encoder)
++constexpr uint32_t kVisSlots = 8192;          // visibility results per frame slot (Metal: offsets up to 65528)
+ // GPU hangs this process caused (not victims, not ignored submissions): read by VPVulkan (motion kill switch).
+ std::atomic<uint32_t> gGpuHangs{0};
+ std::atomic<bool> gDumpRequest{false};  // vpgpu_metal2_request_dump: the next real frame, pass by pass
+@@ -424,6 +425,7 @@ struct MetalBackend::Impl {
+     id<MTLBuffer> args;
+     id<MTLBuffer> indirect;  // fix-up kernel output (kIndirectScratchBytes)
+     id<MTLCounterSampleBuffer> samples;
++    id<MTLBuffer> visibility;  // occlusion queries: kVisSlots x 8 bytes (Draw::visibility), zeroed on the host per use
+     std::vector<id<MTLFence>> fences;
+     std::vector<id> retired;  // destroyed resources kept alive until the slot is reused
+     uint64_t frame = UINT64_MAX;  // the frame that last used the slot (reused only once it completed)
+@@ -817,6 +819,8 @@ void MetalBackend::Impl::init() {
+     s.args.label = @"vpgpu.args";
+     s.indirect = [device newBufferWithLength:kIndirectScratchBytes options:kSharedUntracked];
+     s.indirect.label = @"vpgpu.indirect";
++    s.visibility = [device newBufferWithLength:kVisSlots * 8 options:kSharedUntracked];
++    s.visibility.label = @"vpgpu.visibility";
+     if (!stageSamples) continue;
+     MTLCounterSampleBufferDescriptor* sd = [MTLCounterSampleBufferDescriptor new];
+     sd.counterSet = timestamps;
+@@ -2148,6 +2152,17 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   uint32_t quarantinedNow = 0, huntedNow = 0;
+   size_t fenceUsed = 0;
+   NSUInteger sampleUsed = 0;
++  // Occlusion queries: slots this frame uses (the highest Draw::visibility + 1, capped), zeroed before any
++  // encoder runs (the slot's previous frame has completed: it was reused only after that), and which of them
++  // a draw was actually encoded for (the rest read as visible when the frame completes).
++  uint32_t visUsed = 0;
++  for (const Command& c : cmds)
++    if (const auto* rpc = std::get_if<RenderPass>(&c))
++      for (const Draw& d : rpc->draws)
++        if (d.visibility != Draw::kNoVisibility && d.visibility < kVisSlots) visUsed = std::max(visUsed, d.visibility + 1);
++  if (visUsed && slot.visibility) std::memset(slot.visibility.contents, 0, size_t(visUsed) * 8);
++  if (!slot.visibility) visUsed = 0;
++  auto visEncoded = std::make_shared<std::vector<uint8_t>>(visUsed, uint8_t{0});
+   // Per core encoder: first start sample and last end sample (NSNotFound = unsampled).
+   std::vector<std::pair<NSUInteger, NSUInteger>> encSamples(compiled.encoders.size(), {NSNotFound, NSNotFound});
+   // Render encoders: vertex-end / fragment-start sample indices (gpu.excl's vertex / fragment split).
+@@ -2770,6 +2785,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     if (enc.kind == Encoder::Kind::Render) {
+       id<MTLFence> fixFence = encodeIndirectFix(e, enc);
+       MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
++      if (visUsed) rp.visibilityResultBuffer = slot.visibility;
+       std::unordered_map<uint64_t, size_t> taken;
+       // Tile-local attachments render into a memoryless stand-in: same shape, no memory.
+       auto target = [&](const Attachment& src, int slot) -> id<MTLTexture> {
+@@ -2966,6 +2982,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         dumpQueue(std::move(it), t, level, slice);
+       }
+       NSUInteger curAmp = 1;  // the encoder's vertex amplification count (a new encoder starts at 1)
++      bool visOn = false;     // visibility counting enabled on this encoder (a new encoder starts disabled)
+       for (uint32_t ci : enc.commands) {
+         const auto& draws = std::get<RenderPass>(cmds[ci]).draws;
+         for (uint32_t j = 0; j < draws.size(); ++j) {
+@@ -3034,6 +3051,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+             if (d.indirect) ++g.indirect;
+             else g.maxWork = std::max(g.maxWork, uint64_t{d.count} * d.instances);
+           }
++          if (d.visibility != Draw::kNoVisibility && d.visibility < visUsed) {
++            [open.render setVisibilityResultMode:MTLVisibilityResultModeCounting offset:NSUInteger(d.visibility) * 8];
++            visOn = true;
++            (*visEncoded)[d.visibility] = 1;
++          } else if (visOn) {
++            [open.render setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
++            visOn = false;
++          }
+           [open.render setDepthStencilState:d.depthStencil ? dynamicDepthStencil(*d.depthStencil) : p->depth];
+           [open.render setCullMode:d.cull ? (*d.cull == uint8_t(CullMode::Front) ? MTLCullModeFront
+                                              : *d.cull == uint8_t(CullMode::Back) ? MTLCullModeBack
+@@ -3373,6 +3398,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     err("what=indirect_scratch_full f=%llu dropped=%u kept=%u", (unsigned long long)frameIndex, indirectOverflow,
+         indirectDraws);
+   id<MTLBuffer> fixScratch = indirectDraws ? slot.indirect : nil;
++  id<MTLBuffer> visBuffer = visUsed ? slot.visibility : nil;
+   id<MTLCounterSampleBuffer> samples = slot.samples;
+   const NSUInteger sampleCount = sampleUsed;
+   dispatch_semaphore_t sem = inFlight;
+@@ -3395,6 +3421,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     }
+     Done d{frameIndex, {}};
+     d.timings.frameMs = (finished.GPUEndTime - finished.GPUStartTime) * 1000.0;
++    if (visUsed && visBuffer) {
++      const uint64_t* v = static_cast<const uint64_t*>(visBuffer.contents);
++      d.timings.visibility.assign(v, v + visUsed);
++      for (uint32_t i = 0; i < visUsed; ++i)
++        if (!(*visEncoded)[i] || finished.status != MTLCommandBufferStatusCompleted) d.timings.visibility[i] = 1;
++    }
+     d.timings.startNs = finished.GPUStartTime * 1e9;  // host time base (seconds), as CACurrentMediaTime
+     d.timings.endNs = finished.GPUEndTime * 1e9;
+     // Per core encoder: raw GPU ticks of its first start / last end sample (0 = not written: a render
+diff --git a/gpu/vulkan/src/commands.cpp b/gpu/vulkan/src/commands.cpp
+index d1cac5a..ed5fc04 100644
+--- a/gpu/vulkan/src/commands.cpp
++++ b/gpu/vulkan/src/commands.cpp
+@@ -634,7 +634,21 @@ struct Translator {
+     return b->memory->host + b->offset + offset;
+   }
+ 
+-  void draw(const OpDraw& d) {
++  // Occlusion queries: a queried draw gets its own visibility slot before any of the paths below can skip
++  // it (a slot no draw is encoded for reads as visible in gpu/metal2, so a skip never culls). Over the
++  // frame's cap the draw goes without a slot and the query is marked unknown (visible).
++  void draw(const OpDraw& d0) {
++    if (!d0.query) return drawInner(d0);
++    OpDraw d = d0;
++    uint32_t slot = kVisUnknown;
++    if (st.visSlots < kVisMaxSlots) {
++      slot = st.visSlots++;
++      d.draw.visibility = slot;
++    }
++    st.queryDraws.push_back({d.query, d.queryIndex, slot});
++    drawInner(d);
++  }
++  void drawInner(const OpDraw& d) {
+     if (!d.ok || !passOpen) {
+       ++st.skippedDraws;
+       return;
+@@ -778,6 +792,7 @@ void translate(const Recorder& rec, vpgpu::Frame& frame, TranslateStats& st, Dev
+   Translator t{frame, st, device};
+   t.run(rec);
+   t.close();
++  for (const auto& [pool, index] : rec.queryUnknown) st.queryDraws.push_back({pool, index, kVisUnknown});
+ }
+ 
+ }  // namespace vpvk
+diff --git a/gpu/vulkan/src/commands.h b/gpu/vulkan/src/commands.h
+index 11efa70..937f8a5 100644
+--- a/gpu/vulkan/src/commands.h
++++ b/gpu/vulkan/src/commands.h
+@@ -136,6 +136,9 @@ struct OpDraw {
+   bool ok = true;  // false: the pipeline or a binding was missing (counted as skipped)
+   // After an in-pass barrier only: attachments of the open pass this draw reads as textures.
+   std::vector<const Image*> images;
++  // Recorded between vkCmdBeginQuery / vkCmdEndQuery of an occlusion pool: the query this draw counts for.
++  QueryPoolObj* query = nullptr;
++  uint32_t queryIndex = 0;
+ };
+ struct OpDispatch {
+   vpgpu::Dispatch dispatch;
+@@ -228,6 +231,15 @@ struct QueryWrite {
+   uint32_t index = 0;
+   bool top = false;
+ };
++// An occlusion query's draw in the submitted frame: its visibility slot (Draw::visibility), or
++// kVisUnknown when the draw got no slot (over the frame's cap): the query then reads as visible.
++struct QueryDraw {
++  QueryPoolObj* pool = nullptr;
++  uint32_t index = 0;
++  uint32_t slot = 0;
++};
++constexpr uint32_t kVisUnknown = UINT32_MAX;
++constexpr uint32_t kVisMaxSlots = 8192;  // gpu/metal2's visibility buffer (Metal offsets up to 65528)
+ struct QueryReset {
+   QueryPoolObj* pool = nullptr;
+   uint32_t first = 0, count = 0;
+@@ -238,6 +250,11 @@ struct Recorder {
+   std::vector<Op> ops;
+   std::vector<QueryReset> queryResets;  // applied at submit, before queryWrites
+   std::vector<QueryWrite> queryWrites;
++  QueryPoolObj* activeQuery = nullptr;  // the occlusion query open on this command buffer, if any
++  uint32_t activeQueryIndex = 0;
++  // Queries that read as visible whatever was drawn: a secondary command buffer executed inside one (its
++  // draws carry no query tag).
++  std::vector<std::pair<QueryPoolObj*, uint32_t>> queryUnknown;
+   uint32_t barriers = 0;  // vkCmdPipelineBarrier calls dropped (the core derives its own)
+   bool inPass = false;
+   BoundState bound;
+@@ -246,6 +263,8 @@ struct Recorder {
+     ops.clear();
+     queryResets.clear();
+     queryWrites.clear();
++    activeQuery = nullptr;
++    queryUnknown.clear();
+     barriers = 0;
+     inPass = false;
+     bound = BoundState{};
+@@ -262,6 +281,10 @@ struct TranslateStats {
+   // hang otherwise); `clampWhat` names the first one.
+   uint32_t indirectCpu = 0, indirectGpu = 0, indirectClamped = 0;
+   std::string clampWhat;
++  // Occlusion queries: visibility slots handed out in this submission (one per queried draw) and the
++  // draws' (pool, query, slot) for stampQueries.
++  uint32_t visSlots = 0;
++  std::vector<QueryDraw> queryDraws;
+ };
+ 
+ // Appends the recorded work to `frame`. Ops whose resources are not bound yet are dropped
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index da3ba13..8ad3f2a 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -1489,6 +1489,7 @@ void applyDynamicState(const BoundState& b, const PipelineObj& p, vpgpu::Draw& d
+ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances, uint32_t firstInstance,
+                 int32_t baseVertex, bool indexed) {
+   OpDraw op;
++  op.query = r.activeQuery, op.queryIndex = r.activeQueryIndex;   // before any early return: a skipped draw reads visible
+   const PipelineObj* p = r.bound.graphics;
+   if (!p || !p->ok) {
+     op.ok = false;
+@@ -1769,6 +1770,7 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdClearDepthStencilImage(VkCommandBuff
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer* cbs) {
+   Recorder& r = rec(cb);
+   for (uint32_t i = 0; i < n; ++i) r.ops.emplace_back(OpExecute{from<CommandBuffer>(cbs[i])->rec.get()});
++  if (r.activeQuery && n) r.queryUnknown.emplace_back(r.activeQuery, r.activeQueryIndex);
+ }
+ 
+ // =================================================================================================
+diff --git a/gpu/vulkan/src/queries.cpp b/gpu/vulkan/src/queries.cpp
+index bc955ab..0913f42 100644
+--- a/gpu/vulkan/src/queries.cpp
++++ b/gpu/vulkan/src/queries.cpp
+@@ -5,7 +5,9 @@
+ // (Source 2's adaptive fidelity reads frame GPU time); per-pass timings would need Metal counter
+ // sample buffers at encoder boundaries, which the backend already takes for its own diagnostics.
+ // Occlusion queries report 1 sample passed (visible): no visibility buffer is bound yet.
++#include <cstdlib>
+ #include <cstring>
++#include <mutex>
+ 
+ #include "commands.h"
+ #include "vpvk.h"
+@@ -16,6 +18,14 @@ using namespace vpvk;
+ 
+ namespace {
+ Recorder& rec(VkCommandBuffer cb) { return *from<CommandBuffer>(cb)->rec; }
++// Occlusion queries measured (VPVK_OCCLUSION=0: every one reads visible, the behaviour up to VPKEngine 0036).
++bool occlusionOn() {
++  static const bool on = [] {
++    const char* e = std::getenv("VPVK_OCCLUSION");
++    return !(e && *e == '0');
++  }();
++  return on;
++}
+ 
+ // Result of query `q`; false when not available yet.
+ bool result(Device& d, const QueryPoolObj& p, uint32_t q, uint64_t& value) {
+@@ -31,7 +41,31 @@ bool result(Device& d, const QueryPoolObj& p, uint32_t q, uint64_t& value) {
+       value = uint64_t(x.top ? s : e);
+       return true;
+     }
+-    case VK_QUERY_TYPE_OCCLUSION: value = 1; return true;
++    case VK_QUERY_TYPE_OCCLUSION: {
++      // The sum of the query's draws' passed-sample counts; a draw without a slot, a frame whose counts are
++      // gone (older than the backend keeps) or a frame with no counts at all reads as visible: the game
++      // must never cull on a count this driver did not measure.
++      if (!occlusionOn()) { value = 1; return true; }
++      std::vector<uint32_t> slots;
++      uint64_t frame;
++      {
++        // The slots and the frame they belong to, as one (stampQueries sets them under the same lock, frame last).
++        std::lock_guard<std::mutex> lock(const_cast<QueryPoolObj&>(p).slotsMutex);
++        slots = x.slots;
++        frame = x.frame.load();
++      }
++      if (frame == kNoFrame || !d.frameDone(frame)) return false;
++      if (slots.empty()) { value = 0; return true; }   // begin/end with no draw: nothing passed (the spec's 0)
++      const auto counts = d.gpu->frameVisibility(frame);   // shared: no copy per query
++      uint64_t sum = 0;
++      bool unknown = !counts;
++      for (uint32_t s : slots) {
++        if (unknown || s == kVisUnknown || s >= counts->size()) { unknown = true; break; }
++        sum += (*counts)[s];
++      }
++      value = unknown ? 1 : sum;
++      return true;
++    }
+     default: value = 0; return true;
+   }
+ }
+@@ -94,10 +128,21 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkResetQueryPool(VkDevice, VkQueryPool po
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdResetQueryPool(VkCommandBuffer cb, VkQueryPool pool, uint32_t first, uint32_t n) {
+   rec(cb).queryResets.push_back({from<QueryPoolObj>(pool), first, n});
+ }
+-VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginQuery(VkCommandBuffer, VkQueryPool, uint32_t, VkQueryControlFlags) {}
++// Occlusion queries: every draw recorded between Begin and End is tagged with the query; the translator gives
++// each a visibility slot and gpu/metal2 counts its passed samples there (MTLVisibilityResultModeCounting); the
++// result is the sum once the frame completes.
++VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdBeginQuery(VkCommandBuffer cb, VkQueryPool pool, uint32_t q, VkQueryControlFlags) {
++  QueryPoolObj* p = from<QueryPoolObj>(pool);
++  if (p->type != VK_QUERY_TYPE_OCCLUSION || q >= p->count || !occlusionOn()) return;
++  Recorder& r = rec(cb);
++  r.activeQuery = p;
++  r.activeQueryIndex = q;
++}
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdEndQuery(VkCommandBuffer cb, VkQueryPool pool, uint32_t q) {
+   QueryPoolObj* p = from<QueryPoolObj>(pool);
+-  if (q < p->count) rec(cb).queryWrites.push_back({p, q, false});
++  Recorder& r = rec(cb);
++  if (r.activeQuery == p && r.activeQueryIndex == q) r.activeQuery = nullptr;
++  if (q < p->count) r.queryWrites.push_back({p, q, false});
+ }
+ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkCmdWriteTimestamp(VkCommandBuffer cb, VkPipelineStageFlagBits stage, VkQueryPool pool,
+                                                            uint32_t q) {
+diff --git a/gpu/vulkan/src/sync.cpp b/gpu/vulkan/src/sync.cpp
+index e0da776..872de35 100644
+--- a/gpu/vulkan/src/sync.cpp
++++ b/gpu/vulkan/src/sync.cpp
+@@ -105,7 +105,7 @@ bool waitSemaphore(Device& d, Semaphore& s, uint64_t value, uint64_t timeoutNs)
+ }
+ 
+ struct Batch;
+-void stampQueries(const std::vector<Batch>& batches, uint64_t frame);
++void stampQueries(const std::vector<Batch>& batches, uint64_t frame, const std::vector<QueryDraw>& queryDraws);
+ 
+ struct SemOp {
+   Semaphore* sem = nullptr;
+@@ -118,18 +118,45 @@ struct Batch {
+   std::vector<const CommandBuffer*> cbs;
+ };
+ 
+-void stampQueries(const std::vector<Batch>& batches, uint64_t frame) {
++void stampQueries(const std::vector<Batch>& batches, uint64_t frame, const std::vector<QueryDraw>& queryDraws) {
+   for (const Batch& b : batches)
+     for (const CommandBuffer* c : b.cbs) {
+       for (const QueryReset& r : c->rec->queryResets)
+-        for (uint32_t i = r.first; i < r.first + r.count && i < r.pool->count; ++i) r.pool->queries[i].written = false;
++        for (uint32_t i = r.first; i < r.first + r.count && i < r.pool->count; ++i) {
++          r.pool->queries[i].written = false;
++          std::lock_guard<std::mutex> lock(r.pool->slotsMutex);
++          r.pool->queries[i].slots.clear();
++        }
+       for (const QueryWrite& w : c->rec->queryWrites) {
+         QueryPoolObj::Query& q = w.pool->queries[w.index];
++        if (w.pool->type == VK_QUERY_TYPE_OCCLUSION) {
++          // Not available while this submission's slots replace the last ones (a reader between the clear and
++          // the push would see an empty query: 0, a cull). Frame and written come back below, slots in hand.
++          q.written = false;
++          std::lock_guard<std::mutex> lock(w.pool->slotsMutex);
++          q.slots.clear();
++          continue;
++        }
+         q.top = w.top;
+         q.frame = frame;
+         q.written = true;
+       }
+     }
++  for (const QueryDraw& qd : queryDraws) {
++    if (qd.index >= qd.pool->count) continue;
++    std::lock_guard<std::mutex> lock(qd.pool->slotsMutex);
++    qd.pool->queries[qd.index].slots.push_back(qd.slot);
++  }
++  for (const Batch& b : batches)
++    for (const CommandBuffer* c : b.cbs)
++      for (const QueryWrite& w : c->rec->queryWrites) {
++        if (w.pool->type != VK_QUERY_TYPE_OCCLUSION) continue;
++        QueryPoolObj::Query& q = w.pool->queries[w.index];
++        std::lock_guard<std::mutex> lock(w.pool->slotsMutex);
++        q.top = false;
++        q.frame = frame;
++        q.written = true;
++      }
+ }
+ 
+ // Submits batches in order. Timeline waits on values no earlier work promises block here until the
+@@ -169,7 +196,7 @@ VkResult submit(Device& d, std::vector<Batch>& batches, Fence* fence) {
+     memFrameSubmitted(d, d.lastFrame);
+   }
+   ++d.submits;
+-  stampQueries(batches, d.lastFrame);
++  stampQueries(batches, d.lastFrame, st.queryDraws);
+   if (st.dropped || st.skippedDraws || st.skippedDispatches || d.submits <= 3 || d.submits % 600 == 0)
+     logf("vk.submit n=%llu cbs=%u passes=%u draws=%u dispatches=%u copies=%u clears=%u vk_barriers=%u "
+          "draws_skipped=%u dispatch_skipped=%u dropped=%u local_reads=%u",
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index 3dd203d..4ff0738 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -289,8 +289,13 @@ struct QueryPoolObj {
+     std::atomic<uint64_t> frame{kNoFrame};  // frame it was submitted in
+     std::atomic<bool> top{false};           // TOP_OF_PIPE timestamp
+     std::atomic<bool> written{false};       // recorded and submitted since the last reset
++    // Occlusion: the frame's visibility slots of the query's draws (kVisUnknown = a draw without a
++    // slot: the query reads as visible). Guarded by the pool's slotsMutex (the submit thread writes,
++    // the game's vkGetQueryPoolResults reads).
++    std::vector<uint32_t> slots;
+   };
+   std::unique_ptr<Query[]> queries;
++  std::mutex slotsMutex;
+ };
+ 
+ struct Framebuffer {
+-- 
+2.43.0
+
