@@ -603,6 +603,11 @@ final class KleptonCompositor {
     // window is one panel period whatever frames were held, snapped to the canonical rates. Logged every ~5 s and,
     // with a timestamp, whenever it changes (two windows in a row agreeing) — visionOS picks 90, 120 or 60 Hz itself.
     private var cadenceMin = Double.infinity
+    /// Build 34: the shortest gap between two presentations with NO skipped refresh between them (refreshes == 1) in
+    /// the window — the one measurement of the panel that the skipped-refresh accounting cannot distort.
+    private var cadenceMinDirect = Double.infinity
+    private var fasterPanelSeen = 0   // consecutive windows agreeing on a faster canonical panel rate
+    private var rateCandidateFaster = 0.0
     private var rateHz = 0.0, rateCandidate = 0.0, rateCandidateSeen = 0, rateWindows = 0
     private let noFence = klEnvOn("KL_CP_NOFENCE", default: false)
     // The last device anchor the tracker actually answered with, and how often
@@ -4905,6 +4910,7 @@ final class KleptonCompositor {
         cadenceSum += seconds
         cadenceMax = max(cadenceMax, seconds)
         cadenceMin = min(cadenceMin, seconds)
+        if refreshes <= 1 { cadenceMinDirect = min(cadenceMinDirect, seconds) }
         if gap >= 1.5 { cadenceRepeats += 1 }
     }
 
@@ -4956,7 +4962,7 @@ final class KleptonCompositor {
             cadenceDisagreed = 0
         }
         notePanelRate()
-        cadenceN = 0; cadenceSum = 0; cadenceMax = 0; cadenceMin = .infinity
+        cadenceN = 0; cadenceSum = 0; cadenceMax = 0; cadenceMin = .infinity; cadenceMinDirect = .infinity
         cadenceRepeats = 0; missedDeadline = 0
         anchorWalkedBack = 0; anchorHeld = 0; anchorUnknown = 0
         return out
@@ -4965,6 +4971,21 @@ final class KleptonCompositor {
     /// The running panel rate (see cadenceMin): "[cp] display rate N Hz" every ~5 s, and
     /// "[cp] DISPLAY RATE CHANGED a -> b Hz at HH:mm:ss.SSS" when two half-second windows in a row agree on a new one.
     private static let rateClock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss.SSS"; return f }()
+    /// Panel rates this hardware runs immersive content at. A measured rate under `panelHzFloor` is a held cadence.
+    private static let panelHz: [Double] = [120, 100, 96, 90]
+    private static let panelHzFloor = 85.0
+    /// `period` measured under the floor: the period of the panel rate it is a x2 / x3 hold of (within 6 %), or nil
+    /// when it is at or above the floor (a real rate) or no canonical multiple fits.
+    private static func unheldPanelPeriod(_ period: TimeInterval) -> TimeInterval? {
+        let hz = 1.0 / period
+        // 55..85 Hz is left alone: a real 60 Hz panel (a 59.98 Hz demotion has been seen on this hardware) would
+        // otherwise pass as 120 held x2. Only 50/48/45 (x2) and 40/33/32/30 (x3) are holds.
+        guard hz < 55 else { return nil }
+        for k in 2...3 {
+            if let c = panelHz.first(where: { abs(hz * Double(k) - $0) <= 0.06 * $0 }) { return 1.0 / c }
+        }
+        return nil
+    }
     private func notePanelRate() {
         guard cadenceN >= 10, cadenceMin.isFinite, cadenceMin > 0 else { return }
         let raw = 1.0 / cadenceMin
@@ -4983,6 +5004,29 @@ final class KleptonCompositor {
             }
         } else {
             rateCandidateSeen = 0
+        }
+        // Build 34: the panel never runs faster than it is, so a FASTER canonical rate seen in three windows in a row
+        // is the truth and the boot latch was a held cadence (Logs_Alyx_2_8: 50 Hz latched, 10 ms gaps seen later).
+        // Only upward, only canonical: a slower cadence is holds (the GPU late, visionOS repeating a drawable),
+        // never a slower panel, and a raw rate between canonicals is noise from skipped-refresh accounting.
+        // Measured only from gaps with no skipped refresh in between (cadenceMinDirect), snapped to a canonical rate,
+        // and agreed by three windows in a row.
+        var faster = 0.0
+        if displayPeriod > 0, cadenceMinDirect.isFinite, cadenceMinDirect > 0 {
+            let direct = 1.0 / cadenceMinDirect
+            if let c = Self.panelHz.first(where: { abs(direct - $0) <= 0.06 * $0 }), c > (1.0 / displayPeriod) * 1.06 {
+                faster = c
+            }
+        }
+        fasterPanelSeen = faster > 0 && faster == rateCandidateFaster ? fasterPanelSeen + 1 : (faster > 0 ? 1 : 0)
+        rateCandidateFaster = faster
+        if faster > 0, fasterPanelSeen >= 3 {
+            NSLog(String(format: "[cp] PANEL RATE RE-LATCHED %.2f -> %.0f Hz at %@ (the boot measurement was a held "
+                         + "cadence; skips, the pacer and the pace plan now run on %.0f Hz)",
+                         1.0 / displayPeriod, faster, f.string(from: Date()), faster))
+            displayPeriod = 1.0 / faster
+            kl_guest_set_panel_hz(Float(faster))
+            fasterPanelSeen = 0
         }
         rateWindows += 1
         if rateWindows % 10 == 0 {
@@ -5694,12 +5738,24 @@ final class KleptonCompositor {
                              hzSettleTimeoutMs, hzSettleMs, hzSettleTol * 100, gaps.count))
             }
         }
-        if let mid = chosen, mid > 0 {
+        if var mid = chosen, mid > 0 {
+            // Build 34 (Logs_Alyx_2_8): the priming frames can be HELD — every one shown for two refreshes while the
+            // launch is busy — and 120 held frames look like a steady 50 Hz panel. That 50 then paced everything
+            // (skips, pacer, governor: no 33 fps step, 20 fps in dense scenes) although the panel is 100 Hz. The
+            // panel never runs slower than ~85 Hz on this hardware: a settled rate under that is a held multiple
+            // (x2, x3) of a canonical rate, and the canonical one is latched.
+            if let fixed = Self.unheldPanelPeriod(mid) {
+                NSLog(String(format: "[cp] display rate %.2f Hz is a HELD cadence of the panel (every priming frame "
+                             + "shown %.0fx): latching the panel's %.2f Hz instead",
+                             1.0 / mid, (mid / fixed).rounded(), 1.0 / fixed))
+                mid = fixed
+            }
             displayPeriod = mid          // what the cadence check measures against
             let hz = Float(1.0 / mid)
             NSLog(String(format: "[cp] display %.2f Hz measured over %d frames",
                          hz, chosenGaps))
             kl_ovrp_set_display_frequency(hz)
+            kl_guest_set_panel_hz(hz)
         } else {
             NSLog("[cp] could not measure the display rate — the guest keeps "
                   + "\(kl_ovrp_display_frequency()) Hz")

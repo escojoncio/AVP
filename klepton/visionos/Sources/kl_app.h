@@ -125,6 +125,8 @@ void kl_app_lifecycle_report(void);
 // the time the caller continues.
 int  kl_app_guest_start(void);
 void kl_app_guest_publish(void);
+// The panel rate the compositor latched (canonical Hz); the guest pacer and the OpenVR pace plan divide it.
+void kl_guest_set_panel_hz(float hz);
 void kl_app_guest_stop(void);
 
 // Where the guest thread has got to. 0 = still in _begin (nothing to present

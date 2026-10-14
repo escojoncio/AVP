@@ -57,9 +57,11 @@ final class AVPSettings: ObservableObject {
     /// the OpenVR skeleton), as Valve's Index controllers animate them; off = fingers from the buttons only and no
     /// hand-tracking permission asked.
     @Published var handFingers: Bool { didSet { save() } }
-    /// Build 33 test switch: VPKEngine vertex amplification (VPVK_AMPLIFY=1, one tiling for both eyes). Known broken
-    /// in B27/B28 (right eye shrunk, GPU fault in the overlay pass): only for a diagnostic run with captures.
-    @Published var amplifyTest: Bool { didSet { save() } }
+    /// VPKEngine vertex amplification (VPVK_AMPLIFY=1): both eyes from one vertex pass (Metal vertex amplification)
+    /// instead of multiview by instancing. Validated in build 33 (Logs_Alyx_2_8/2_9): both eyes and the foveation
+    /// correct, no GPU faults, the scene's vertex time 8-12 ms -> ~4 ms. ON by default since build 34 (new key
+    /// avp.amplify so every install gets it); off = instancing, the build 32 behaviour.
+    @Published var amplify: Bool { didSet { save() } }
 
     // Fixed since build 32 (they used to be settings; every validated value is now the only value):
     /// 12 command buffers in flight (build 24 orders them; 3 was the build-23 A/B test).
@@ -100,7 +102,7 @@ final class AVPSettings: ObservableObject {
         movement = Movement(rawValue: d.object(forKey: "avp.movement") as? Int ?? 3) ?? .continuousHand
         cloudSync = d.object(forKey: "avp.cloudSync") as? Bool ?? true
         handFingers = d.object(forKey: "avp.handFingers") as? Bool ?? true
-        amplifyTest = d.object(forKey: "avp.amplifyTest") as? Bool ?? false
+        amplify = d.object(forKey: "avp.amplify") as? Bool ?? true
         loading = false
     }
 
@@ -125,7 +127,7 @@ final class AVPSettings: ObservableObject {
         d.set(movement.rawValue, forKey: "avp.movement")
         d.set(cloudSync, forKey: "avp.cloudSync")
         d.set(handFingers, forKey: "avp.handFingers")
-        d.set(amplifyTest, forKey: "avp.amplifyTest")
+        d.set(amplify, forKey: "avp.amplify")
     }
 
     func resetToDefaults() {
@@ -139,7 +141,7 @@ final class AVPSettings: ObservableObject {
         vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
         anisotropy = fresh.anisotropy; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling
-        movement = fresh.movement; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplifyTest = fresh.amplifyTest
+        movement = fresh.movement; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
         AVPLog.log("Ajustes: valores por defecto")
     }
 
@@ -342,12 +344,12 @@ final class AVPSettings: ObservableObject {
             ("KL_CP_RECON_SHARP", String(format: "%.2f", vpktaaSharpness)),
             ("VPVK_TEXTURE_CAP", String(textureCap)),
             ("KL_FPS_HUD", showFps ? "1" : "0"),
-            ("KL_CAPTURE", (diagCaptures || amplifyTest) ? "1" : "0"),
+            ("KL_CAPTURE", diagCaptures ? "1" : "0"),
             ("VP_FRAMES_IN_FLIGHT", String(Self.gpuQueueDepth)),
             ("KL_CP_SKIP_SAME", Self.composeNewOnly ? "1" : "0"),
-            // Build 29: vertex amplification OFF (logs 20/2_6: the right eye was rasterized shrunk into a corner and the
-            // overlay pass faulted the GPU). Build 33: back as a diagnostic test switch (captures forced on with it).
-            ("VPVK_AMPLIFY", amplifyTest ? "1" : "0"),
+            // Build 34: vertex amplification ON by default (validated in Logs_Alyx_2_8/2_9: both eyes and the foveation
+            // correct, no GPU faults, scene vertex time 8-12 -> ~4 ms). B29 had it off after B27's faults.
+            ("VPVK_AMPLIFY", amplify ? "1" : "0"),
             // Build 31: native half fetch back on, alone (B29 turned it off only because it shipped with amplification;
             // the translator's conversion is exact). Logs 22: the scene pass is vertex-bound (vtx 11 ms).
             ("VPVK_FETCH_NATIVE", "1"),
@@ -392,7 +394,7 @@ final class AVPSettings: ObservableObject {
         // Captures (eye pictures as PNG at guest frames 120/600/1200) and a per-pass dump of one in-game frame: always on
         // while VPKEngine's picture is being validated. Core frame 6000 is ~35 s after the first picture (frame 540 in
         // build 19, ~150 core frames per second); 600 fell inside the loading screen.
-        if diagCaptures || amplifyTest, let logs = AVPFolder.shared.logs {
+        if diagCaptures, let logs = AVPFolder.shared.logs {
             env += [("KL_CAPTURE_DIR", logs.path), ("VP_DUMP_FRAME", "6000"), ("VP_DUMP_DIR", logs.path)]
         }
         // GPU time per render pass ([passes] in the boot log, kl_gpu_time.m KL_GPU_PASSES), exclusive time grouped by
@@ -440,7 +442,7 @@ final class AVPSettings: ObservableObject {
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
-                   + "dedos por manos \(handFingers), amplificación (prueba) \(amplifyTest)")
+                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify)")
         return env
     }
 
