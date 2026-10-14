@@ -1257,7 +1257,39 @@ enum { kCxSamples = 1024, kCxCbs = 32, kCxPerCb = 24 };
 static id<MTLCounterSampleBuffer> g_cx_buf;
 static int g_cx_failed;                      // no sample buffer / no stage sampling: compositor stays on the union
 static unsigned g_cx_next;                   // next free sample index (a ring: 256 encoders in flight at most)
-static struct { void *cb; uint32_t idx[kCxPerCb]; int n, tainted; } g_cx_cbs[kCxCbs];   // tainted: an encoder went untimed
+static struct { void *cb; uint32_t idx[kCxPerCb]; uint8_t sig[kCxPerCb]; int n, tainted; } g_cx_cbs[kCxCbs];   // tainted: an encoder went untimed
+// Per pass signature (colour attachment size, layers, format, load action): exclusive ms and count, reported every
+// 30 s as "[gputime] compositor passes:" so the composite's cost can be split (the composite itself, the wide view,
+// the clear/present of a skipped refresh...).
+enum { kCxSigs = 16 };
+static struct { char sig[64]; double ms; unsigned n; } g_cx_sigs[kCxSigs];
+static int g_cx_nsigs;
+static double g_cx_sig_at;
+static uint8_t cx_sig_of(MTLRenderPassDescriptor *d) {   // under g_cx_lk
+    id<MTLTexture> t = d.colorAttachments[0].texture ? d.colorAttachments[0].texture : d.depthAttachment.texture;
+    char sig[64];
+    snprintf(sig, sizeof sig, "%lux%lu L%lu f%lu ld%lu%s", t ? (unsigned long)t.width : 0ul, t ? (unsigned long)t.height : 0ul,
+             (unsigned long)(d.renderTargetArrayLength ? d.renderTargetArrayLength : 1), t ? (unsigned long)t.pixelFormat : 0ul,
+             (unsigned long)d.colorAttachments[0].loadAction, d.depthAttachment.texture ? " z" : "");
+    for (int i = 0; i < g_cx_nsigs; i++) if (!strcmp(g_cx_sigs[i].sig, sig)) return (uint8_t)i;
+    if (g_cx_nsigs == kCxSigs) return kCxSigs - 1;   // the last bucket takes the rest
+    snprintf(g_cx_sigs[g_cx_nsigs].sig, sizeof g_cx_sigs[0].sig, "%s", sig);
+    return (uint8_t)g_cx_nsigs++;
+}
+static void cx_sig_report(double now) {   // under g_cx_lk
+    if (!g_cx_sig_at) { g_cx_sig_at = now; return; }
+    if (now - g_cx_sig_at < 30.0) return;
+    double span = now - g_cx_sig_at;
+    char line[800];
+    int u = snprintf(line, sizeof line, "[gputime] compositor passes (exclusive ms per pass, passes/s):");
+    for (int i = 0; i < g_cx_nsigs && u < (int)sizeof line - 80; i++) {
+        if (!g_cx_sigs[i].n) continue;
+        u += snprintf(line + u, sizeof line - u, " [%s] %.2f x%.1f", g_cx_sigs[i].sig, g_cx_sigs[i].ms / g_cx_sigs[i].n, g_cx_sigs[i].n / span);
+        g_cx_sigs[i].ms = 0; g_cx_sigs[i].n = 0;
+    }
+    fprintf(stderr, "%s\n", line);
+    g_cx_sig_at = now;
+}
 static uint64_t g_cx_last_end;               // GPU ticks: the latest encoder end placed on the timeline
 static MTLTimestamp g_cx_cpu0, g_cx_gpu0;    // calibration: ticks -> ns
 static double g_cx_ns_per_tick, g_cx_cal_at;
@@ -1324,6 +1356,7 @@ static int cx_attach(id<MTLCommandBuffer> cb, MTLRenderPassDescriptor *d, unsign
     if (slot == kProfSampleSlots || g_cx_cbs[e].n == kCxPerCb) { g_cx_cbs[e].tainted = 1; os_unfair_lock_unlock(&g_cx_lk); return -1; }
     *i0 = g_cx_next;
     g_cx_next = (g_cx_next + 4) % kCxSamples;
+    g_cx_cbs[e].sig[g_cx_cbs[e].n] = cx_sig_of(d);
     g_cx_cbs[e].idx[g_cx_cbs[e].n++] = *i0;
     g_cx_attached++;
     os_unfair_lock_unlock(&g_cx_lk);
@@ -1354,12 +1387,14 @@ static double cx_resolve(void *cb, double span_ms) {
     if (g_cx_failed) return -1;    // the union stands in for the whole session
     if (!g_cx_buf) return 0;       // no render pass of the compositor's has opened yet: nothing to time
     uint32_t idx[kCxPerCb];
+    uint8_t sig[kCxPerCb];
     int n = 0, tainted = 0;
     os_unfair_lock_lock(&g_cx_lk);
     for (int i = 0; i < kCxCbs; i++)
         if (g_cx_cbs[i].cb == cb) {
             n = g_cx_cbs[i].n; tainted = g_cx_cbs[i].tainted;
             memcpy(idx, g_cx_cbs[i].idx, n * sizeof idx[0]);
+            memcpy(sig, g_cx_cbs[i].sig, n * sizeof sig[0]);
             g_cx_cbs[i].cb = NULL; g_cx_cbs[i].n = 0; g_cx_cbs[i].tainted = 0;
             break;
         }
@@ -1383,9 +1418,12 @@ static double cx_resolve(void *cb, double span_ms) {
         if (!end && v1 != MTLCounterErrorValue) end = v1;
         if (!start || !end || end < start) { ok = 0; break; }
         uint64_t from = start > g_cx_last_end ? start : g_cx_last_end;
-        if (end > from) ms += (double)(end - from) * g_cx_ns_per_tick / 1e6;
+        double enc_ms = end > from ? (double)(end - from) * g_cx_ns_per_tick / 1e6 : 0;
+        ms += enc_ms;
+        if (sig[j] < kCxSigs) { g_cx_sigs[sig[j]].ms += enc_ms; g_cx_sigs[sig[j]].n++; }
         if (end > g_cx_last_end) g_cx_last_end = end;
     }
+    cx_sig_report(CACurrentMediaTime());
     // The scale check: a buffer's exclusive time cannot exceed its own GPU span by more than the overlap between
     // its encoders allows (a little); far past it, the tick unit is wrong and the figure is dropped.
     if (ok && span_ms > 0 && ms > 1.5 * span_ms + 0.5) {
