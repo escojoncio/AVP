@@ -3459,10 +3459,25 @@ unsigned long long kl_vulkan_eye_image(int stage, int eye, unsigned w, unsigned 
 // again until the next publish.
 static struct { VkImage img; void *tex; } g_eye_guest[KLVK_EYE_STAGES][2];
 static pthread_mutex_t g_eye_guest_mu = PTHREAD_MUTEX_INITIALIZER;
+static void eye_guest_drop(int s, int e, const char *why);
+static int g_eye_guest_refused;   // the guest renders every frame into ONE image: nothing to hand over without a copy
 int kl_vulkan_eye_publish_guest(int stage, int eye, unsigned long long vk_image, int layer, unsigned w, unsigned h) {
     klvk_device *d = g_devs[0];
     VkImage img = (VkImage)(uintptr_t)vk_image;
-    if (!d || !img || stage < 0 || stage >= KLVK_EYE_STAGES || eye < 0 || eye > 1 || !w || !h) return 0;
+    if (!d || !img || stage < 0 || stage >= KLVK_EYE_STAGES || eye < 0 || eye > 1 || !w || !h || g_eye_guest_refused) return 0;
+    // Build 40 (Logs_Alyx_28/29): Source 2 submits the SAME image for every stage, so the compositor was sampling
+    // the texture the game was drawing the next frame into (subtitles and menus half-written, judder). Direct
+    // hand-over needs the guest to cycle images; one image for two stages means it does not: copy, for good.
+    for (int s = 0; s < KLVK_EYE_STAGES; s++)
+        if (s != stage && g_eye_guest[s][eye].img == img) {
+            g_eye_guest_refused = 1;
+            VKI("eye %d: the guest submits one image (%#llx) for every stage; it cannot be sampled directly (it is "
+                "being drawn into): the shim copies from now on\n", eye, (unsigned long long)(uintptr_t)img);
+            for (int t = 0; t < KLVK_EYE_STAGES; t++)
+                for (int e = 0; e < 2; e++)
+                    if (g_eye_guest[t][e].tex) eye_guest_drop(t, e, "single guest image");
+            return 0;
+        }
     pthread_mutex_lock(&g_eye_guest_mu);
     void *tex = g_eye_guest[stage][eye].img == img ? g_eye_guest[stage][eye].tex : NULL;
     if (!tex) {

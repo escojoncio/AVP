@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0035).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B39).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B40).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -342,7 +342,24 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
 - Qué mirar en el log de B39: draws por escena en `gpu.excl` (antes 240–1 813) y `[passes] scene-msaa` vtx/frag;
   cualquier geometría que desaparezca indebidamente → apagar el ajuste y reportar.
 
-## Siguiente (al llegar el log de B37/B38/B39)
+## Logs_Alyx_28/29 (B39) — medido
+- OCCLUSION CULLING FUNCIONA: escena MSAA 3,6–10,7 ms (antes 8–16), draws máx. 183 (antes 1 813), juego 7–12,8 ms
+  de GPU, **50 fps sostenidos** (250 frames/5 s), 0 fallos de GPU. Nada desaparece reportado.
+- PARPADEO de subtítulos/menús y TIRONES al mover la cabeza (con y sin foveado de subtítulos): la entrega de ojos
+  sin copia. Alyx usa UNA sola imagen de ojo para las 3 etapas (`0x7064c1e880`, capas 0/1): el compositor muestreaba
+  la textura en la que el juego dibujaba el frame siguiente. B40: `avp.eyeDirect2` OFF por defecto y
+  `kl_vulkan_eye_publish_guest` lo rechaza para siempre en cuanto ve la misma imagen en dos etapas
+  (`[vk] eye N: the guest submits one image ... the shim copies from now on`). El toggle «Foveado del pase de
+  subtítulos» queda (no era la causa; dejar ON).
+- Compositor por pase (exclusivo): composición `1856x1760 L2 f81 z` 1,3–2,4 ms × 37–79/s; **vista ancha `211x173`
+  0,33–0,83 ms × 29–93/s (2 ojos por imagen)**: absurdo para 36k píxeles → sospechoso #1 del compositor (¿la malla
+  `grid`/overdraw o los 16 taps bilineales sobre 2112x1728?). Compositor total 2,5–3,5 ms/frame.
+
+## Siguiente (al llegar el log de B40)
+1. Confirmar sin parpadeo ni tirones con la copia de ojos (B40). Si siguieran: comparar con B36b (no los tenía).
+2. Vista ancha: medir por qué 0,6–0,8 ms por ojo (reducir taps a 2 con mips del ojo, o 1 muestra bilineal sobre
+   un mip 1/4): −1 ms/frame del compositor.
+3. Post foveado (toggle de B37) si el usuario lo prueba limpio → ON.
 1. Repartir los ~5 ms del compositor por pase y recortar el mayor (recon / composite): candidatos: recon a menos
    taps, componer la periferia a menor resolución, o `KL_CP_QUALITY` (hoy 0,40).
 2. Confirmar `[vk] ... samples the guest's image ... directly` y que la imagen es correcta; `gpu.excl` tipo 1c9d…
