@@ -50,7 +50,10 @@ ListenToGameEvent("player_activate", function()
         -- build 31: culling and LOD state (read only; answers "is occlusion / per-draw culling on?")
         "r_occlusion_culling", "sc_perdrawculling", "sc_bounds_group_cull", "sc_no_cull", "vr_expand_cull_frustum",
         "r_size_cull_threshold", "r_size_cull_threshold_shadow", "r_worldlod", "sc_force_lod_level",
-        "sc_lod_distance_scale_override", "r_stereo_true_multiview", "r_stereo_multiview_instancing" }) do
+        "sc_lod_distance_scale_override", "r_stereo_true_multiview", "r_stereo_multiview_instancing",
+        -- build 35: the VR subtitle panel's placement (the app scales cc_vr_vertical_offset; defaults wanted in the log)
+        "closecaption", "cc_subtitles", "cc_vr_vertical_offset", "cc_vr_forward_offset", "cc_vr_font_size", "cc_vr_width",
+        "cc_vr_depth_test", "cc_vr_epsilon" }) do
       local ok, v = pcall(Convars.GetStr, Convars, k)
       out[#out + 1] = k .. "=" .. ((ok and v ~= nil) and tostring(v) or "nil")
       if #out == 12 then Msg("KLPERF " .. table.concat(out, " ") .. "\n"); out = {} end   -- short console lines

@@ -255,14 +255,19 @@ static void pace_governor(void) {
     unsigned want = g_pace_extra;
     // Build 31 (Logs 22): at 100 Hz the choice is 50 or 33 and nothing between. The base was left after ONE
     // second with 2 late frames of 51 (3.9 %) at a 16 ms average, and taken back 5 s later: 33 fps most of
-    // the time with the GPU under 20 ms. visionOS reprojects a late frame, so a few are cheaper than the
+    // the time with the GPU under 20 ms (build 31 rule, superseded below). visionOS reprojects a late frame, so a few are cheaper than the
     // third refresh: leave the base only after 2 s in a row over 92 % of the budget or over 10 % late
     // frames; come back after 3 s under 80 % with at most 2 % late.
+    // Build 35 (Logs_Alyx_27): with amplification the base frame costs 17.4-17.6 ms (87 %) with 12-20 % late frames
+    // (> 19.2 ms); the 10 % rule left the base every 2 s and the 80 % rule took it back 3 s later: 50 <-> 33 all
+    // through scene 2 with the GPU at 14-15 ms. A late frame at the base is one refresh held by visionOS's
+    // reprojection; a session at the fallback is every frame held. Leave the base only when the average passes
+    // 95 % of the budget or over 30 % of the frames are late; come back under 85 % with at most 10 % late.
     if (!g_pace_extra) {                             // at the base: leave when it clearly does not fit
-        over = (avg > 0.92 * 1000.0 / base || nl > 0.10 * nn) ? over + 1 : 0;
+        over = (avg > 0.95 * 1000.0 / base || nl > 0.30 * nn) ? over + 1 : 0;
         if (over >= 2) want = 1;
     } else {                                         // at the fallback: up with headroom
-        good = (avg < 0.80 * 1000.0 / base && nl <= 0.02 * nn) ? good + 1 : 0;
+        good = (avg < 0.85 * 1000.0 / base && nl <= 0.10 * nn) ? good + 1 : 0;
         if (good >= 3) want = 0;
     }
     if (want != g_pace_extra) {

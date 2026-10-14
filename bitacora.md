@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0035).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B34).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B35).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -215,13 +215,38 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
    (VPVK_AMPLIFY=1) → la cuarentena anterior se descarta sola.
 4. Pie de «Dedos reales»: solo con las manos libres (con Sense en la mano el visor no trackea esa mano).
 
-## Siguiente (al llegar el log de B34)
-1. Comprobar en el log: `display N Hz measured` = 100 (o la línea HELD/RE-LATCHED), `[guest] panel rate 100.0 Hz`,
-   `pace governor: 1/2 of 100 → 50` y `1/3 → 33` en zonas densas, y `with a picture` ≈ fps del juego (no la mitad).
-2. Con amplificación por defecto: ritmo real (tramos a 50 y mínimo en zonas densas), `vtx` en `[passes]`.
-3. Streaming de texturas (`vkCopyMemoryToImageEXT` espera la GPU por región) → staging asíncrono.
-4. Compositor 3,3 ms por imagen nueva: perfilar `kl_reproject` por etapa.
-5. Hidden area mesh: comprobar que klvr devuelve malla para la lente del Vision Pro.
+## Logs_Alyx_27 (B34) — medido
+- B34 correcto: `display 100.00 Hz measured`, `[guest] panel rate 100.0 Hz`, pacer `1/2 → 50` / `1/3 → 33`, el
+  compositor muestra todas las imágenes del juego.
+- Con amplificación, escena 2 (W7/W8, 33 fps): escena MSAA **10,1–10,4 ms = vtx 2,1–2,9 + frag 8,2–8,4**; eye-1x
+  3,4–3,6 (tonemap 2112x1728 f70 1,5–1,7 + bloom 528x432 1,35–1,45 + cadena); compute 1,2; blit 0,85 (x11);
+  other-rt 1,1–1,2. Busy 17 ms/frame, `gpu.time` p50 14,4 / p90 15,4 en los últimos 2 min. Zona ligera: 12 ms.
+- Regulador: oscilaba 50 ↔ 33 cada 2–3 s en escena 2: en la base 17,4–17,6 ms (87 %) con 6–10/50 tardíos (12–20 % >
+  19,2 ms) → fallback por la regla del 10 %; en el fallback 14,9–15,7 (< 16) → base; bucle. 33 fps la mayor parte
+  del tiempo con la GPU a 14–15 ms.
+- `[gputime] compositor avg 6 ms` es span (incluye trabajo del juego intercalado), no exclusivo: pendiente medirlo.
+
+## B35 — cambios
+1. Regulador (`klvr_platform_klepton.c`): deja la base solo con media > 95 % o > 30 % tardíos (2 s); vuelve con
+   media < 85 % y ≤ 10 % tardíos (3 s). Un frame tardío en la base = un refresco retenido por la reproyección; el
+   fallback = todos retenidos.
+2. Subtítulos: ajuste «Subtítulos» (`avp.subtitles`, `SubtitlePlacement`, por defecto «A la altura de la vista»).
+   Valores por defecto del juego sacados de libclient.so ARM64: `cc_vr_vertical_offset` −6,5 (positivo = arriba,
+   unidades del juego), `cc_vr_forward_offset` 30, `cc_vr_font_size` 0/1/2 (defecto 1, archivado), `cc_vr_width`
+   0/1/2. Forzados como absolutos en `forcedConvars` (args + Lua cada 5 s): Más arriba = 0, A la altura de la vista
+   = 6, Por encima = 12; letra 2 (grande). «Como el juego» no fuerza nada (un "+cvar -6.5" en la línea de comandos
+   se leería como switch). KLPERF vuelca ahora `closecaption`, `cc_subtitles`, `cc_vr_*` para verificar.
+3. Notificaciones en inmersivo: sin API en visionOS; solución = Modo de concentración con activación automática al
+   abrir la app (Ajustes → Concentración → programar por app). Documentado al usuario, no en la app.
+
+## Siguiente (al llegar el log de B35)
+1. Regulador: contar cambios 50 ↔ 33 y tardíos en la base en escena 2; ajustar umbrales si hace falta.
+2. Subtítulos: confirmar altura/tamaño (AVPFORCE/KLPERF `cc_vr_vertical_offset=6`); afinar valores.
+3. Compositor: medir tiempo EXCLUSIVO (sample buffers en el pase de composición) y recortar `kl_reproject`
+   (vista ancha a la resolución de la periferia).
+4. Post foveado (tonemap + bloom al área física, con limpieza del área exterior): ~1,5 ms, riesgo medio.
+5. Streaming de texturas (`vkCopyMemoryToImageEXT` espera la GPU por región) → staging asíncrono.
+6. Hidden area mesh: comprobar que klvr devuelve malla para la lente del Vision Pro.
 
 ## Pendiente menor
 - Ajustes en vivo que faltan: resolución/texturas (convars), anisotrópico, zona nítida; activar/desactivar foveado requiere reiniciar.

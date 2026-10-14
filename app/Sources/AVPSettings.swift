@@ -19,6 +19,14 @@ final class AVPSettings: ObservableObject {
     // MARK: Values
 
     enum Movement: Int, CaseIterable { case teleport = 0, continuousHead = 2, continuousHand = 3 }
+    /// Build 35: where the game's VR subtitles sit. Defaults read from the ARM64 libclient.so's ConVar registrations:
+    /// `cc_vr_vertical_offset` -6.5 ("Subtitle vertical offset distance (positive is up)", game units), `cc_vr_forward_offset`
+    /// 30, `cc_vr_font_size` 0/1/2 = small/med/large (default 1, archived). Forced as absolute values (forcedConvars:
+    /// launch arguments + the Lua re-apply), so nothing compounds across maps or launches.
+    enum SubtitlePlacement: Int, CaseIterable { case game = 0, higher = 1, eyeLevel = 2, high = 3
+        var verticalOffset: String { self == .game ? "-6.5" : self == .higher ? "0" : self == .eyeLevel ? "6" : "12" }
+        var fontSize: String { self == .game ? "1" : "2" }
+    }
 
     /// Vision Pro's native per-eye render size (what visionOS asks for at 100 %).
     static let nativeEye = (width: 3072, height: 2464)
@@ -52,6 +60,7 @@ final class AVPSettings: ObservableObject {
     /// timing (VP_EXCL_TIMING). Off by default since build 32: sample buffers on 28-120 encoders per frame are not free.
     @Published var gpuPassProfiling: Bool { didSet { save() } }
     @Published var movement: Movement { didSet { save() } }
+    @Published var subtitles: SubtitlePlacement { didSet { save() } }
     @Published var cloudSync: Bool { didSet { save() } }
     /// Build 33: the player's fingers follow the headset's hand tracking (KL_HANDS=1, kl_ovrp_set_finger_curls →
     /// the OpenVR skeleton), as Valve's Index controllers animate them; off = fingers from the buttons only and no
@@ -100,6 +109,7 @@ final class AVPSettings: ObservableObject {
         diagCaptures = d.object(forKey: "avp.diagCaptures") as? Bool ?? false
         gpuPassProfiling = d.object(forKey: "avp.gpuPasses2") as? Bool ?? false
         movement = Movement(rawValue: d.object(forKey: "avp.movement") as? Int ?? 3) ?? .continuousHand
+        subtitles = SubtitlePlacement(rawValue: d.object(forKey: "avp.subtitles") as? Int ?? 2) ?? .eyeLevel
         cloudSync = d.object(forKey: "avp.cloudSync") as? Bool ?? true
         handFingers = d.object(forKey: "avp.handFingers") as? Bool ?? true
         amplify = d.object(forKey: "avp.amplify") as? Bool ?? true
@@ -125,6 +135,7 @@ final class AVPSettings: ObservableObject {
         d.set(diagCaptures, forKey: "avp.diagCaptures")
         d.set(gpuPassProfiling, forKey: "avp.gpuPasses2")
         d.set(movement.rawValue, forKey: "avp.movement")
+        d.set(subtitles.rawValue, forKey: "avp.subtitles")
         d.set(cloudSync, forKey: "avp.cloudSync")
         d.set(handFingers, forKey: "avp.handFingers")
         d.set(amplify, forKey: "avp.amplify")
@@ -141,7 +152,7 @@ final class AVPSettings: ObservableObject {
         vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
         anisotropy = fresh.anisotropy; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling
-        movement = fresh.movement; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
+        movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
         AVPLog.log("Ajustes: valores por defecto")
     }
 
@@ -252,6 +263,12 @@ final class AVPSettings: ObservableObject {
             ("r_texture_stream_throttle_amount", "20"),
         ]
         c.append(("vr_fidelity_level", "0"))
+        // Build 35: the VR subtitle panel's height and size (SubtitlePlacement). «As the game» forces nothing: the
+        // game's default is -6.5 and a negative value on the command line ("+cvar -6.5") would read as a switch.
+        if subtitles != .game {
+            c.append(("cc_vr_vertical_offset", subtitles.verticalOffset))
+            c.append(("cc_vr_font_size", subtitles.fontSize))
+        }
         return c + effectsConvars
     }
 
@@ -440,7 +457,7 @@ final class AVPSettings: ObservableObject {
                    + "(o 50/33 según la pantalla), texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveationOn) (zona nítida "
                    + "\(Int(wideDegrees))°, periferia \(Int((periphery * 100).rounded())) %), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % "
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
-                   + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), FPS \(showFps), capturas \(diagCaptures), "
+                   + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
                    + "dedos por manos \(handFingers), amplificación de vértices \(amplify)")
         return env
@@ -532,6 +549,7 @@ ListenToGameEvent("player_activate", function()
   local w = Entities:First()
   if w then w:SetThink(function() avp_enforce("tick"); return 5.0 end, "avpforce", 5.0) end
 end, nil)
+
 
 """
         return lua
