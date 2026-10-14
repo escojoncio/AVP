@@ -53,6 +53,8 @@ final class AVPSettings: ObservableObject {
     /// Build 26: the compositor composes only when the game has a new picture (KL_CP_SKIP_SAME); otherwise visionOS
     /// reprojects the last one. Log 18: re-compositing the same picture at 100 Hz took 7-19 ms of GPU per game frame.
     @Published var composeNewOnly: Bool { didSet { save() } }
+    /// Ambient occlusion (r_ssao). On by default on every headset: fidelity is kept, performance comes from resolution.
+    @Published var ssao: Bool { didSet { save() } }
     /// Build 27 (VPKEngine 0031): multiview by Metal vertex amplification (VPVK_AMPLIFY + VPVK_FETCH_NATIVE) instead of
     /// drawing every instance once per eye; the scene pass does not scale with resolution (logs 18/2_5), so its vertex
     /// work is the suspect. Changing it retranslates the shaders once (longer first preparation).
@@ -98,6 +100,7 @@ final class AVPSettings: ObservableObject {
         halfRate = d.object(forKey: "avp.halfRate") as? Bool ?? true
         showFps = d.object(forKey: "avp.showFps") as? Bool ?? false
         composeNewOnly = d.object(forKey: "avp.cpSkipSame") as? Bool ?? true
+        ssao = d.object(forKey: "avp.ssao") as? Bool ?? true
         vertexAmplification = d.object(forKey: "avp.vkAmplify") as? Bool ?? true
         trackedOrder = d.object(forKey: "avp.cbOrder2") as? Bool ?? true
         diagCaptures = d.object(forKey: "avp.diagCaptures") as? Bool ?? false
@@ -132,6 +135,7 @@ final class AVPSettings: ObservableObject {
         d.set(halfRate, forKey: "avp.halfRate")
         d.set(showFps, forKey: "avp.showFps")
         d.set(composeNewOnly, forKey: "avp.cpSkipSame")
+        d.set(ssao, forKey: "avp.ssao")
         d.set(vertexAmplification, forKey: "avp.vkAmplify")
         d.set(trackedOrder, forKey: "avp.cbOrder2")
         d.set(diagCaptures, forKey: "avp.diagCaptures")
@@ -154,7 +158,7 @@ final class AVPSettings: ObservableObject {
         vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
         anisotropy = fresh.anisotropy; engine = fresh.engine
         systemLanguage = fresh.systemLanguage; refreshHz = fresh.refreshHz; halfRate = fresh.halfRate
-        showFps = fresh.showFps; composeNewOnly = fresh.composeNewOnly
+        showFps = fresh.showFps; composeNewOnly = fresh.composeNewOnly; ssao = fresh.ssao
         vertexAmplification = fresh.vertexAmplification; trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling; gpuQueueDepth = fresh.gpuQueueDepth; movement = fresh.movement; cloudSync = fresh.cloudSync
         AVPLog.log("Ajustes: valores por defecto")
     }
@@ -272,8 +276,8 @@ final class AVPSettings: ObservableObject {
     /// video2.txt). The fidelity table alone did not rule them: the build 26 run read sc_disable_spotlight_shadows 0
     /// back (KLTAB) with the table saying 1, so they are forced here too. An M2 drops what Quest-class headsets never
     /// pay for; an M5 keeps it.
-    ///  - r_ssao: screen-space AO runs over the whole eye texture, unfoveated (the outer 64 % of the foveated layout
-    ///    included). Alyx bakes its AO and has the AO proxies off already: off on M2.
+    ///  - r_ssao: the app's «SSAO» setting (`ssao`), on by default on every headset (build 28: fidelity is kept;
+    ///    performance is taken from resolution, foveation and the engine, not from effects).
     ///  - r_post_bloom: the bloom chain is fixed-size (1024², 512², 256², 128² RG11B10F, ~16 tiny passes) and part of
     ///    Alyx's look: kept.
     ///  - sc_disable_spotlight_shadows 0: the flashlight's and the spotlights' shadows stay (the table said 1).
@@ -284,7 +288,7 @@ final class AVPSettings: ObservableObject {
     var effectsConvars: [(String, String)] {
         let m5 = Self.isM5
         return [
-            ("r_ssao", m5 ? "1" : "0"),
+            ("r_ssao", ssao ? "1" : "0"),
             ("r_post_bloom", "1"),
             ("sc_disable_spotlight_shadows", "0"),
             ("r_high_quality_shadows", m5 ? "1" : "0"),
@@ -438,7 +442,7 @@ final class AVPSettings: ObservableObject {
                    + "texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveation) (zona nítida \(Int(wideDegrees))°), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % "
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA), aniso x\(anisotropy), motor \(engine.rawValue), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), FPS \(showFps), capturas \(diagCaptures), "
-                   + "cola GPU \(gpuQueueDepth), componer solo imágenes nuevas \(composeNewOnly), amplificación de vértices \(vertexAmplification), orden por recursos \(trackedOrder)")
+                   + "cola GPU \(gpuQueueDepth), componer solo imágenes nuevas \(composeNewOnly), amplificación de vértices \(vertexAmplification), orden por recursos \(trackedOrder), SSAO \(ssao)")
         return env
     }
 

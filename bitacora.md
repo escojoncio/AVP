@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0030).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B27).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B28).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -62,7 +62,7 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
   textura a área completa, `NSHashTable`); `KL_VRR_PHYS_POST` (post sin mapa) OFF. (4) Perfilador `[passes]` por
   escena (`g<s>` desde `FadeGrid(out)`, `t<s>`), cubre compute/blit con descriptor, sample buffer en el 1.er índice
   libre (VPKEngine usa el 0), guarda de reentrada, se apaga solo si Metal lo rechaza; ajuste «Medir GPU por pase».
-  (5) Convars de efectos M2 (`effectsConvars`): `r_ssao 0` (M5 1), tabla de fidelidad ahora coherente
+  (5) Convars de efectos M2 (`effectsConvars`): `r_ssao` = ajuste «SSAO» (B28: ON por defecto en todos; la fidelidad no se recorta), tabla de fidelidad ahora coherente
   (`sc_disable_spotlight_shadows 0`); Lua con `pcall`, `AVPMISSING/AVPSTUCK`; `KLPERF` vuelca ~34 convars por spawn.
   (6) VPKEngine `0031`: `gpu.excl` (tiempo EXCLUSIVO por encoder, vtx/frag, load/store MB, cada 5 s),
   `VP_CB_ORDER=2` (espera solo por dependencias reales entre command buffers), `VPVK_AMPLIFY=1` (multiview por

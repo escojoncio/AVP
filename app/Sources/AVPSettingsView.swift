@@ -83,6 +83,7 @@ struct AVPSettingsView: View {
                           "4096 needs more memory than the headset has (~3.3 GB): textures may pop in late."))
                     .font(.caption).foregroundStyle(.orange)
             }
+            Toggle(AVPL("Oclusión ambiental (SSAO)", "Ambient occlusion (SSAO)"), isOn: $s.ssao)
         }
     }
 
