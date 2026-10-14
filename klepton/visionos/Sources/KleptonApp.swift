@@ -332,11 +332,10 @@ struct KleptonApp: App {
         // VisionQuestPro: the launcher (VQLauncher.swift) is the window; BootView is its
         // "running" page.
         // AVP: AlyxBootHost hands the window's openImmersiveSpace/openWindow/dismissWindow to AlyxBoot.launch.
-        // Build 36: a single-instance `Window`, not a `WindowGroup`. The launcher is reopened from several places
-        // (pause, the space lost to Home/PS, scenePhase back to .active with spaceLost, the game ending) and two of
-        // them can fire for one event; openWindow(id:) on a WindowGroup made a SECOND launcher each time, while on a
-        // Window it brings the existing one forward. Same fix as StrikersVision.
-        Window("Half-Life: Alyx", id: AVPMainWindow.id) { AVPRootView().modifier(AlyxBootHost()) }
+        // Build 36 tried a single-instance `Window` here (so reopening the launcher would not make a second one): the
+        // app then died on tap before any window showed. Back to the WindowGroup that works; the double launcher is
+        // handled elsewhere.
+        WindowGroup(id: AVPMainWindow.id) { AVPRootView().modifier(AlyxBootHost()) }
             .defaultSize(width: 1280, height: 800)
             // On the app's phase, not this window's: closing the boot window
             // while the immersive space is up is not backgrounding, and must
@@ -350,7 +349,7 @@ struct KleptonApp: App {
         // untouched. visionOS centres a freshly opened window on the viewer's gaze,
         // which is the whole point — the hidden field is anchored to a 2D window
         // off to the side of an immersive guest, so its keyboard is never in view.
-        Window("Text", id: "kbentry") { KeyboardEntryView() }
+        WindowGroup(id: "kbentry") { KeyboardEntryView() }
             .defaultSize(width: 560, height: 240)
             .windowResizability(.contentSize)
 
