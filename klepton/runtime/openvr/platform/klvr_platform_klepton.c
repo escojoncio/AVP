@@ -226,6 +226,7 @@ static void pace_governor(void) {
         return;
     }
     float comp = 0, game = klvr_plat_gpu_ms(0, &comp);
+    int excl = klvr_plat_gpu_ms_exclusive();
     // Without the game's GPU time (a driver whose queue kl_gpu_time cannot watch: VPKEngine until it
     // exports its MTLCommandQueue) the governor can never see headroom, so starting at the fallback
     // pinned the game to 1/3 of the panel for good while logging "the GPU cannot hold the target".
@@ -237,20 +238,24 @@ static void pace_governor(void) {
         fprintf(stderr, "  [openvr] pace governor: starting at the fallback, %.1f fps\n", fb);
     }
     static double t0, sum;
-    static int n, late, over, good;
+    static int n, late, over, good, nexcl;
     if (game > 0) {
         // The compositor draws once per panel refresh; at the fallback pace a frame
         // holds more refreshes than at the base, so scale its share to the base frame.
         float per = game + (g_pace_extra ? comp * fb / base : comp);
         sum += per; n++;
-        if (per > (g_pace_extra ? 0.90f : 0.96f) * 1000.0f / base) late++;   // 60: 15/16 ms, 50: 18/19.2 ms
+        if (excl & 1) nexcl++;
+        // Build 36: with the exclusive figure a "late" frame is one whose GPU work alone exceeds the base frame
+        // (it cannot have met its refresh); with the union (no VPVulkan) the old 90/96 % margins stay.
+        float lim = excl & 1 ? 1.0f : g_pace_extra ? 0.90f : 0.96f;
+        if (per > lim * 1000.0f / base) late++;   // 60: 15/16 ms, 50: 18/19.2 ms
     }
     double now = klvr_plat_now();
     if (!t0) t0 = now;
     if (now - t0 < 1.0) return;
     double avg = n ? sum / n : 0;
-    int nl = late, nn = n;
-    t0 = now; sum = 0; n = 0; late = 0;
+    int nl = late, nn = n, ne = nexcl;
+    t0 = now; sum = 0; n = 0; late = 0; nexcl = 0;
     if (!nn) return;
     unsigned want = g_pace_extra;
     // Build 31 (Logs 22): at 100 Hz the choice is 50 or 33 and nothing between. The base was left after ONE
@@ -263,16 +268,37 @@ static void pace_governor(void) {
     // through scene 2 with the GPU at 14-15 ms. A late frame at the base is one refresh held by visionOS's
     // reprojection; a session at the fallback is every frame held. Leave the base only when the average passes
     // 95 % of the budget or over 30 % of the frames are late; come back under 85 % with at most 10 % late.
-    if (!g_pace_extra) {                             // at the base: leave when it clearly does not fit
+    // Build 36 (Logs_Alyx 2_10): the figure was the union of the buffers' GPU spans, which in play read about twice the
+    // GPU's real work (34 ms against 17 busy: waits on earlier buffers and the compositor's turns on the GPU), so the
+    // fallback never saw headroom (13.5-16 ms busy, 33 fps). With the EXCLUSIVE time (kl_gpu_time build 36) the
+    // thresholds mean what they say: leave the base after 2 s averaging over 95 % of the frame or with over 25 % of
+    // the frames' GPU work past it; come back after 3 s under 88 % with at most 5 % such frames.
+    if (ne > nn / 2) {
+        if (!g_pace_extra) {
+            over = (avg > 0.95 * 1000.0 / base || nl > 0.25 * nn) ? over + 1 : 0;
+            if (over >= 2) want = 1;
+        } else {
+            good = (avg < 0.88 * 1000.0 / base && nl <= 0.05 * nn) ? good + 1 : 0;
+            if (good >= 3) want = 0;
+        }
+    } else if (!g_pace_extra) {                      // at the base: leave when it clearly does not fit
         over = (avg > 0.95 * 1000.0 / base || nl > 0.30 * nn) ? over + 1 : 0;
         if (over >= 2) want = 1;
     } else {                                         // at the fallback: up with headroom
         good = (avg < 0.85 * 1000.0 / base && nl <= 0.10 * nn) ? good + 1 : 0;
         if (good >= 3) want = 0;
     }
+    // Once a minute while nothing changes: what the governor sees (the 5 s [gputime] line is the same figure).
+    static double said_at;
+    if (want == g_pace_extra && now - said_at >= 60.0) {
+        said_at = now;
+        fprintf(stderr, "  [openvr] pace governor: at the %s, GPU %.2f ms per %.0f fps frame (%s; %d of %d frames late)\n",
+                g_pace_extra ? "fallback" : "base", avg, base, ne > nn / 2 ? "exclusive" : "union", nl, nn);
+    }
     if (want != g_pace_extra) {
-        fprintf(stderr, "  [openvr] pace governor: GPU %.2f ms per %.0f fps frame (%d of %d frames late) -> %s\n", avg, base,
-                nl, nn, want ? "fallback pace, top quality kept" : "base pace");
+        said_at = now;
+        fprintf(stderr, "  [openvr] pace governor: GPU %.2f ms per %.0f fps frame (%s; %d of %d frames late) -> %s\n", avg, base,
+                ne > nn / 2 ? "exclusive" : "union", nl, nn, want ? "fallback pace, top quality kept" : "base pace");
         g_pace_extra = want;
         over = good = 0;
         kl_guest_pace_extra(want);
@@ -690,6 +716,9 @@ void klvr_plat_scene_fade(int to_grid) {
 }
 // KLVR_GPU_MS_SCALE multiplies it: a Mac stands in for a slower GPU, to check
 // that the game's auto-fidelity reacts before a device run.
+// kl_gpu_time.m (build 36): whether the figure just returned was the exclusive one (bit 0 guest, bit 1 compositor).
+extern int kl_gpu_time_frame_exclusive(void) __attribute__((weak));
+int klvr_plat_gpu_ms_exclusive(void) { return kl_gpu_time_frame_exclusive ? kl_gpu_time_frame_exclusive() : 0; }
 float klvr_plat_gpu_ms(uint32_t frames_ago, float *compositor) {
     static float scale = -1;
     if (scale < 0) {
