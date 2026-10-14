@@ -360,7 +360,7 @@ static id kl_bce(id self, SEL sel) {
 
 // After the window's frames are final: resolve, group, print.
 static void prof_report(void) {
-    if (g_prof <= 0 || g_prof_done || !g_prof_buf || g_prof_from == UINT32_MAX || g_frame < g_prof_from + g_prof_n + 3) return;
+    if (g_prof <= 0 || g_prof_done || !g_prof_buf || g_prof_from == UINT32_MAX || g_frame < g_prof_from + g_prof_n + 8) return;   // 8: VPKEngine keeps 12 command buffers (~2 frames) in flight
     g_prof_done = 1;
     unsigned pairs = g_prof_used;
     // Resolve every buffer that was handed pairs into one array, pair k at [2k], [2k+1].
@@ -425,22 +425,35 @@ static void prof_report(void) {
         row[j].t += t; row[j].n++;
         vtx[j] += vs; frg[j] += fs;
     }
+    // Frames that actually got encoders (the sample buffers can run out before the window ends: a game frame of
+    // ~150 render passes takes 300 pairs): averages are over those, not over the window's length.
+    unsigned nf = 0;
+    {
+        static unsigned char seen[1024];
+        memset(seen, 0, sizeof seen);
+        for (unsigned k = 0; k < pairs; k++) {
+            if (g_prof_meta[k].sig[0] == '~') continue;
+            uint32_t d = g_prof_meta[k].frame - g_prof_from;
+            if (d < sizeof seen && !seen[d]) { seen[d] = 1; nf++; }
+        }
+    }
+    if (!nf) nf = 1;
     // Units: Apple GPUs report these counters in ns, although sampleTimestamps' GPU clock ticks at
     // 24 MHz; take whichever puts the frame's busy time in a sane range (0.2..40 ms).
-    double per_frame = total / g_prof_n, scale = 1e-6;          // raw ns -> ms
+    double per_frame = total / nf, scale = 1e-6;          // raw ns -> ms
     if (per_frame * scale < 0.2 || per_frame * scale > 40) scale = ns_per_tick * 1e-6;
     for (int i = 0; i < rows; i++) for (int j = i + 1; j < rows; j++)
         if (row[j].t > row[i].t) {
             __typeof__(row[0]) tmp = row[i]; row[i] = row[j]; row[j] = tmp;
             double x = vtx[i]; vtx[i] = vtx[j]; vtx[j] = x; x = frg[i]; frg[i] = frg[j]; frg[j] = x;
         }
-    fprintf(stderr, "[passes] %u encoders over %u frames (%u without timestamps): %.2f GPU ms per frame busy "
-            "(units: %s); exclusive time by what they draw into:\n", pairs, g_prof_n, bad, per_frame * scale,
+    fprintf(stderr, "[passes] %u encoders over %u of %u frames (%u without timestamps): %.2f GPU ms per frame busy "
+            "(units: %s); exclusive time by what they draw into:\n", pairs, nf, g_prof_n, bad, per_frame * scale,
             scale == 1e-6 ? "ns" : "GPU ticks");
     for (int i = 0; i < rows; i++)
-        fprintf(stderr, "[passes] %6.3f ms/frame %5.1f%%  x%-5.1f vtx %6.3f frag %6.3f  %s\n", row[i].t * scale / g_prof_n,
-                total > 0 ? 100.0 * row[i].t / total : 0, (double)row[i].n / g_prof_n, vtx[i] * scale / g_prof_n,
-                frg[i] * scale / g_prof_n, row[i].sig);
+        fprintf(stderr, "[passes] %6.3f ms/frame %5.1f%%  x%-5.1f vtx %6.3f frag %6.3f  %s\n", row[i].t * scale / nf,
+                total > 0 ? 100.0 * row[i].t / total : 0, (double)row[i].n / nf, vtx[i] * scale / nf,
+                frg[i] * scale / nf, row[i].sig);
     if (++g_prof_win < g_prof_nwin) {             // the next window reuses the sample buffers
         g_prof_used = 0;
         g_prof_from = g_prof_at[g_prof_win] >= 0 ? UINT32_MAX : g_prof_fr[g_prof_win];

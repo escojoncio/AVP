@@ -385,6 +385,26 @@ final class KleptonCompositor {
     private var lastGuestFrame: UInt64 = 0
     private var staleInARow = 0
 
+    // AVP build 26 — compose only new pictures (KL_CP_SKIP_SAME=1, app setting «Componer solo imágenes nuevas»).
+    // Log 18: this loop re-composited the SAME guest picture at every panel refresh (100 Hz) while the game
+    // made 20-33 fps: ~3 ms of GPU per composite, 7-19 ms per game frame taken from a GPU the game already
+    // fills (game 23-27 ms), which is what dropped it to 16-23 fps. With nothing new from the guest the frame
+    // is abandoned before any drawable is asked for (the bail paths' shape): visionOS keeps showing the last
+    // drawable, reprojected to the head by its own compositor, as for any app under the panel rate. The pose is
+    // still published every refresh (above the check), so the guest's pacing does not change. At most
+    // `skipMax` in a row (3: never under a quarter of the panel rate), so fades and a held guest still move.
+    nonisolated(unsafe) static var skipSameEnabled: Bool = (getenv("KL_CP_SKIP_SAME").map { String(cString: $0) } ?? "0") == "1"
+    private static let skipMax: Int = {
+        if let e = getenv("KL_CP_SKIP_MAX"), let n = Int(String(cString: e)) { return max(1, min(5, n)) }
+        return 3
+    }()
+    private var lastPresentedPicture: UInt64 = 0   // pictureId of the last composite that showed a guest picture
+    private var skippedInARow = 0                  // refreshes abandoned since the last composite
+    private var skippedTotal = 0                   // for the liveness line
+    private static func pictureId(_ stage: Int, _ serial: UInt64) -> UInt64 {
+        (UInt64(stage + 1) << 48) ^ serial
+    }
+
     // Keyed by (eye, stage). Indexed by stage from the start rather than kept
     // as a "last texture" global, because ovrp_GetEyeTextureStageCount is ours
     // to answer and Unity cycles stages: a pose or an image keyed to anything
@@ -1948,6 +1968,7 @@ final class KleptonCompositor {
                 nextReport = Date().addingTimeInterval(0.5)
                 cmdLock.lock(); let done = cmdCompleted; let cmdErrs = cmdErrors; cmdLock.unlock()
                 let errNote: String = cmdErrs > 0 ? " (\(cmdErrs) with errors)" : ""
+                let skipNote = Self.skipSameEnabled ? " skipped(same picture)=\(skippedTotal)" : ""
                 NSLog("[cp] alive: \(iterations) iters, \(presented) with a picture, "
                       + "\(blackFrames) black, guest=\(kl_app_guest_state()), "
                       + "bail(frame/drawable/pipeline)="
@@ -1958,7 +1979,7 @@ final class KleptonCompositor {
                       + "cmdbuf \(done)/\(cmdCommitted) done" + errNote
                       + " fence=\(lastGlFenceSeen) layers=\(lastProjLayersSeen) enc=\(lastEncodedSeen)"
                       + (fenceBacklogSkips > 0 ? " fence-skips \(fenceBacklogSkips)" : "")
-                      + (noFence ? " (NOFENCE)" : ""))
+                      + (noFence ? " (NOFENCE)" : "") + skipNote)
                 NSLog("[cp] \(cadenceSummary())")
                 NSLog("[cp] \(stageSummary())")
             }
@@ -2296,6 +2317,26 @@ final class KleptonCompositor {
                 loggedGuestEnd = true
                 NSLog("[cp] the guest thread has ended (\(String(cString: kl_app_status())))"
                       + " — everything from here is its last picture, reprojected")
+            }
+        }
+
+        // Nothing new from the guest since the last composite: abandon this refresh (see skipSameEnabled).
+        // Only once a guest picture has been shown and the loading panel is gone, and never more than
+        // skipMax refreshes in a row.
+        // Not while the loading video plays either: that skybox is ours and moves every refresh while the guest's
+        // serial stands still.
+        if Self.skipSameEnabled && !syncGuest && loggedFirstPicture && (loadingDone || !Self.loadingEnabled)
+            && kl_loadingvideo_active() == 0 && loadingVideo == nil
+            && lastPresentedPicture != 0 && skippedInARow < Self.skipMax {
+            let cs = Int(kl_ovrp_last_complete_stage())
+            if cs >= 0 {
+                var r = kl_ovrp_render_pose()
+                let have = withUnsafeMutablePointer(to: &r) { kl_ovrp_stage_render_pose(Int32(cs), $0) != 0 }
+                if have && r.complete != 0 && Self.pictureId(cs, UInt64(r.serial)) == lastPresentedPicture {
+                    skippedInARow += 1
+                    skippedTotal += 1
+                    return 0
+                }
             }
         }
 
@@ -2718,7 +2759,11 @@ final class KleptonCompositor {
             NSLog("[cp] trace f\(startupTrace) fence=\(glFence) layers=\(projLayerCount) "
                   + "enc=\(encoded) cmd=\(cmdCommitted)/\(dn)")
         }
-        noteCadence(presentation: presentation, drawable: main)
+        noteCadence(presentation: presentation, drawable: main, refreshes: skippedInARow + 1)
+        // What this composite showed, for the next refresh's skip check (0: no guest picture, never skipped against).
+        lastPresentedPicture = encoded > 0 && haveRendered && completeStage >= 0
+            ? Self.pictureId(completeStage, UInt64(rendered.serial)) : 0
+        skippedInARow = 0
         frame.endSubmission()      // only here — see startSubmission above
         return encoded > 0 ? 1 : 0
     }
@@ -2791,7 +2836,7 @@ final class KleptonCompositor {
             let game = Double(hudGuestFrames) / dt, comp = Double(hudPresents) / dt
             let res = haveRendered && rendered.viewport_of.0 > 0
                 ? "\(rendered.viewport_of.0)x\(rendered.viewport_of.1)" : "-"
-            hudLine = String(format: "Juego %.0f fps  Visor %.0f Hz  %@  VPKTAA %@",
+            hudLine = String(format: "Juego %.0f fps  Comp %.0f/s  %@  VPKTAA %@",
                              game, comp, res, !taaOut.isEmpty ? "on" : Self.reconOn ? "periferia" : "off")
             hudGuestFrames = 0; hudPresents = 0; hudWindowStart = Date()
             hudTex = makeHudTexture(hudLine) ?? hudTex
@@ -4602,7 +4647,7 @@ final class KleptonCompositor {
     /// is the point — staleness is reprojection's job and it does it every
     /// period. A repeat is the case reprojection cannot reach.
     private func noteCadence(presentation: TimeInterval,
-                             drawable: LayerRenderer.Drawable) {
+                             drawable: LayerRenderer.Drawable, refreshes: Int = 1) {
         // The deadline for THIS frame, against the same clock it is expressed
         // in. Checked after commit, so it measures the encode we just did.
         let now = LayerRenderer.Clock.Instant.epoch
@@ -4623,7 +4668,9 @@ final class KleptonCompositor {
             let hz = Double(kl_ovrp_display_frequency())
             displayPeriod = hz > 1 ? 1.0 / hz : 0
         }
-        let seconds = presentation - lastPresentation
+        // Per panel refresh: with composites skipped on purpose (skipSameEnabled) the gap spans `refreshes`
+        // refreshes, which is not a held frame and not a different panel rate.
+        let seconds = (presentation - lastPresentation) / Double(max(1, refreshes))
         let gap = displayPeriod > 0 ? seconds / displayPeriod : 0
         // A gap of zero or a negative one is the same drawable seen twice or a
         // clock that moved backwards; neither is a cadence measurement.

@@ -143,6 +143,11 @@ struct AVPSettingsView: View {
             Toggle(AVPL("El juego dibuja a la mitad (\(s.refreshHz / 2) fps, más estable)", "Game renders at half rate (\(s.refreshHz / 2) fps, steadier)"),
                    isOn: $s.halfRate)
             Toggle(AVPL("Mostrar FPS", "Show FPS"), isOn: $s.showFps)
+            Toggle(AVPL("Componer solo imágenes nuevas (más rendimiento)", "Compose only new pictures (more performance)"),
+                   isOn: $s.composeNewOnly)
+            Text(AVPL("Si el juego no ha dibujado nada nuevo, visionOS reproyecta la última imagen en vez de recomponerla: deja más GPU al juego. Se aplica en vivo.",
+                      "When the game has drawn nothing new, visionOS reprojects the last picture instead of composing it again: more GPU for the game. Applied live."))
+                .font(.caption).foregroundStyle(.secondary)
         }
     }
 

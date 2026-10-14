@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0030).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B25).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B26).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -38,31 +38,39 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
   depth 2D-array también a 1x (log `[vrr] foveating a 1x layered pass with depth` / `... NOT foveated`). (2) mapa wide
   a 32 zonas evaluadas en su centro (antes 16 y "punto más cercano": zona nítida +~13° por lado); zonas por mapa en
   `g_vrr_maps[].zones`. (3) crash `Impl::texture()` bajo submit: `tableMutex` (metal2) + `resMutex_` (core).
+  **Confirmado por el usuario (Logs_Alyx_18): el renderizado de los ojos ya es correcto.**
+- B26: (1) compositor: si la última imagen completa del juego (`kl_ovrp_last_complete_stage` + serial) es la misma
+  que mostró el último composite, el refresco se abandona ANTES de `queryDrawables` (visionOS reproyecta el último
+  drawable); la pose se sigue publicando cada refresco (pacing del juego intacto); máx. 3 saltos seguidos
+  (`skipMax`, `KL_CP_SKIP_MAX`); nunca con panel de carga ni vídeo de carga. `KL_CP_SKIP_SAME`, ajuste «Componer solo
+  imágenes nuevas» (`avp.cpSkipSame`, por defecto sí, en vivo). `noteCadence(refreshes:)` divide el hueco; línea
+  `alive` añade `skipped(same picture)=N`; HUD "Comp N/s". (2) `KL_GPU_PASSES=t75,t110,t150,t200,t260,t330`,
+  `KL_GPU_PASSES_N=40` siempre con VPKEngine (instrumentación TEMPORAL: quitar cuando se decida el siguiente paso);
+  `prof_report` promedia sobre los frames realmente perfilados (`nf`) y espera 8 frames antes de resolver.
 
-## Estado del foveado (para el siguiente log)
-- Usuario (B25, por sus ojos): **rendimiento fatal, el foveado no funciona como en P.T. y no gana nada de rendimiento.**
-- Lo que hay: el "M2" del launcher es un mapa de Klepton (`MTLRasterizationRateMap`, `kl_gpu_time.m` `vrr_fov_map`,
-  KL_VRR_MAP=wide) inyectado por hook a los render passes del juego con target MSAA ≥4x o (B25) 1x con 2 capas y depth;
-  NO es el foveado del sistema (el de CompositorServices: `[cp] ... max render quality 0.4`, intocable).
-- Medidas previas: B21 mapa wide 60° = 49 % de píxeles, GPU juego 23 ms; sin foveado (B23/B24) 30-37 ms. Ganancia
-  real ~30 %, muy lejos de P.T. Motivos conocidos: (a) mapa separable = rectángulo/cruz (≈49 % a 60°, ≈20 % a 40°);
-  (b) solo se fovean los pases con el mapa: sombras (D32F 4096², RGBA16F 2048x1024), post/bloom, compute y el
-  tonemap van a resolución completa; (c) MSAA 4x a 2784x2208 por ojo; (d) P.T. usa quad views (vista ancha al 10 % +
-  inset nítido dibujados por su motor), que aquí exigiría repetir el fotograma del juego con otra proyección.
-- Governor: 50 fps exige GPU total < 20 ms (juego + compositor); por encima cae a 33,3 (1/3 de 100 Hz).
+## Medidas Logs_Alyx_18 (B25, a2_drainage)
+- GPU juego 22-27 ms/frame (menú 22,8); compositor 7 ms/frame en menú, 11-19 ms jugando: componía a 100 Hz la misma
+  imagen (~2,3-3,5 ms por composite) → suma 42-46 ms → 16-23 fps (`[openvr] render 42-63 ms`, wait 0). Arreglo: B26 (1).
+- Foveado activo: mapa wide 60° = 36 % de píxeles (1536x1428 de 2784x2208). Ahorra poco: el coste no está en los
+  píxeles de los pases de escena. 6 pases de ojo 1x RG11B10F (post, sin depth) y el tonemap RGBA8 recorren la textura
+  ENTERA 2784x2208 aunque solo el 36 % físico tiene datos (candidato: render area = tamaño físico, ver riesgo de
+  scissor > render target sin rate map).
+- Comparación P.T. M2: zona nítida a ~0,5x del drawable, sin MSAA, VPKTAA al 80 %; Alyx 2784x2208 MSAA 4x ≈ 3-4x de
+  trabajo por ojo. Mapa separable = rectángulo 60°x60° (P.T.: inset 60° x ~49°).
+- Consola: `Stencil mask reduces rendering area by: 0.00%` (sin hidden area mesh; visionOS no da uno).
+- `gpu.time enc_ms` de VPKEngine son spans solapados (no exclusivos): no sirven para repartir el tiempo.
 
-## Siguiente (al llegar el log de B25)
-1. Leer entero: `[vrr] foveated map (wide N deg, Z zones) ... (N% of the pixels)`, líneas `[vrr] foveating 1x` /
-   `NOT foveated`, `[gputime] game avg` y compositor, `[openvr] frames` (render/wait/after), `gpu.order`, crash.
-2. Antes de tocar nada (X-Y): medir DÓNDE va la GPU por pase — `VP_PASS_TIMING` existe en VPKEngine (`gpu.passtime`
-   por encoder); exponerlo como ajuste de diagnóstico en la app (no .txt) y comparar foveado off / M2 60° / M2 40°.
-   Sin ese desglose no se decide entre: bajar MSAA (2x) con foveado, resolución del juego + foveado, foveado de
-   sombras/post, o quad views en VPKEngine.
-3. Comprobar en capturas que menú/manos salen iguales en ambos ojos y el borde nítido donde en P.T.
-4. Renombrar "M2/M5" en el launcher (p. ej. "P.T. 60°") para no confundirlo con el foveado del sistema.
-5. Pendiente gráfico: "algún efecto o sombra" (linterna sin sombra visible, captura 3600 de Logs_Alyx_2_4); volcar con
-   L3+R3 (incluye el pase D32F 4096² de sombras).
-6. VPKTAA periferia fase 2 (temporal: jitter + depth linealizada z = 0.95 - 0.0375/d + pose).
+## Siguiente (al llegar el log de B26)
+1. `[cp] alive`: iters/s ≈ 100 (si `queryNextFrame` re-ofreciera el mismo frame tras un salto, iters se dispararía)
+   y `skipped(same picture)`; `[gputime]` compositor por frame (esperado ~3-4 ms a 33 fps) y fps estables.
+2. Leer las 6 ventanas `[passes]`: tiempo exclusivo por pase (escena MSAA, sombras D32F 4096², RGBA16F 2048x1024,
+   post 1x eye-size, tonemap, overlays 1x, UI). Con eso decidir: post al tamaño físico, MSAA 2x, sombras, o vistas
+   tipo P.T. (inset + vista ancha) en VPKEngine.
+3. Si el usuario ve tirones en contenido pegado a la cabeza (HUD), es la reproyección del sistema en los refrescos
+   saltados: comparar con el ajuste apagado.
+4. Pendiente gráfico: "algún efecto o sombra" (linterna sin sombra visible); volcar con L3+R3.
+5. VPKTAA periferia fase 2 (temporal: jitter + depth linealizada z = 0.95 - 0.0375/d + pose).
+6. Renombrar "M2/M5" del launcher (p. ej. "P.T. 60°").
 
 ## Pendiente menor
 - Ajustes en vivo que faltan: resolución/texturas (convars), anisotrópico; activar/desactivar foveado requiere reiniciar.
