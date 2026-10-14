@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0035).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B41).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B42).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -370,7 +370,23 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
 3. Revisión adversarial: 4 hallazgos corregidos (factor por densidad, mismo fichero origen/destino, extensión en
    mayúsculas, copia síncrona).
 
-## Siguiente (al llegar el log de B41)
+## Logs_Alyx_30 (B41) — medido
+- Subtítulos rotos otra vez: el usuario tenía `avp.subFov` OFF (`KL_VRR_SRGB_1X=0`) desde la A/B del parpadeo. B42:
+  siempre 1, toggle quitado (la clave queda sin uso).
+- Recon precalculada: composición 1,15–2,06 ms (antes 1,31–2,43), vista ancha 0,34–0,72 (antes 0,33–0,83), recon
+  0,10–0,25: compositor ~2,7–3,0 ms/frame (antes ~3,0). GANANCIA PEQUEÑA (~0,3 ms): el coste de la composición no
+  es la reconstrucción. No seguir recortando sin medir dentro del pase.
+- "Marca 50 y se siente 25": en la base, tramos con 27–42 de 50 frames tardíos (GPU juego 16–19 + comp 3–4,6 >
+  20 ms) → imagen 2/3/2/3 refrescos; 6 cambios 50↔33 en ~2 min; cada salida de la base tardaba 2 s.
+- B42: regulador sale de la base en 1 s con > 40 % tardíos (o 2 s > 25 % / > 95 %), vuelve tras 5 s < 85 % y ≤ 5 %;
+  log `[cp] refreshes per composited picture (last 250): 1:a 2:b 3:c 4:d 5+:e` (2 = 50 parejos, 3 = 33 parejos).
+
+## Siguiente (al llegar el log de B42)
+1. Histograma de refrescos: si la mezcla 2/3 persiste en la base, el umbral de "tardío" (trabajo > 20 ms) no
+   predice el refresco perdido: usar la cadencia real del compositor como señal del regulador.
+2. Composición 1,2–2 ms: medir dentro (pase sin muestreo de ojo / sin depth) antes de tocar nada.
+
+## Siguiente (al llegar el log de B41) — sustituido por lo anterior
 1. Confirmar sin parpadeo ni tirones con la copia de ojos (B40). Si siguieran: comparar con B36b (no los tenía).
 2. Vista ancha: medir por qué 0,6–0,8 ms por ojo (reducir taps a 2 con mips del ojo, o 1 muestra bilineal sobre
    un mip 1/4): −1 ms/frame del compositor.

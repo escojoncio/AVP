@@ -155,7 +155,6 @@ struct AVPSettingsView: View {
             Toggle(AVPL("Amplificación de vértices", "Vertex amplification"), isOn: $s.amplify)
             Toggle(AVPL("Post-procesado solo en el área foveada (prueba)", "Post-processing on the foveated area only (test)"), isOn: $s.postPhysical)
             Toggle(AVPL("Ojos al compositor sin copia", "Eyes to the compositor without a copy"), isOn: $s.eyeDirect)
-            Toggle(AVPL("Foveado del pase de subtítulos", "Foveation of the subtitle pass"), isOn: $s.subtitleFoveation)
             Toggle(AVPL("Occlusion culling medido (consultas de GPU)", "Measured occlusion culling (GPU queries)"), isOn: $s.occlusionQueries)
             Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
                    role: .destructive) { confirmQuarantine = true }
