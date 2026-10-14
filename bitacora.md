@@ -276,7 +276,10 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
    - Esperado: 50 fps en zonas con ocupado ≤ ~15 ms (+ compositor), 33 en densas. Si en el log sale `missed` > 0 en
      el juego de forma sistemática, el orden de completed handlers no es el supuesto (VPVulkan antes que klepton):
      entonces se queda en unión y hay que pasar el exclusivo por otra vía (acumulador global en vez de anillo).
-3. Launcher: `Window(id:)` para launcher y "kbentry" (ya en main desde B35, primera IPA con ello).
+3. Launcher: `Window(id:)` para launcher y "kbentry" (ya en main desde B35, primera IPA con ello). **La app moría al
+   tocarla sin mostrar nada** (usuario, B36): revertido a `WindowGroup` en B36b sin más cambios. Si B36b arranca, el
+   culpable es `Window` (no usarlo en AVP; la doble ventana del launcher queda pendiente por otra vía). Si tampoco
+   arranca, mirar el `.ips` (dyld / símbolo) de los cambios de `kl_gpu_time.m` (`__thread`, dlopen RTLD_NOLOAD).
 
 ## Siguiente (al llegar el log de B36)
 1. Confirmar `[vrr] ... (subtitles)` y subtítulos correctos en ambos ojos; afinar `cc_vr_vertical_offset` si la altura
