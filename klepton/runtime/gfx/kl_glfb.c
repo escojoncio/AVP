@@ -3202,9 +3202,11 @@ void kl_glfb_note_eye_mtl_texture(int eye, int stage, void *texture, int slice,
     g_eye_mtl[eye][stage].h = h;
     // Vulkan's framebuffer origin is the top left, like Metal's and unlike GL's.
     g_eye_mtl[eye][stage].top_left = 1;
-    fprintf(stderr, "  [glfb] eye %d stage %d is MTLTexture %p slice %d (%dx%d), "
-                    "from Vulkan — top-left origin, the compositor can sample it\n",
-            eye, stage, texture, slice, w, h);
+    static int said;   // build 37: the guest's own images rotate through the stages, so this can change per frame
+    if (said++ < 24)
+        fprintf(stderr, "  [glfb] eye %d stage %d is MTLTexture %p slice %d (%dx%d), "
+                        "from Vulkan — top-left origin, the compositor can sample it\n",
+                eye, stage, texture, slice, w, h);
 }
 
 int kl_glfb_eye_mtl_origin_top_left(int eye, int stage) {

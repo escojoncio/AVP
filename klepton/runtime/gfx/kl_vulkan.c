@@ -69,6 +69,10 @@ int   kl_vulkan_gpu_ids(unsigned *v, unsigned *d) { (void)v; (void)d; return 0; 
 unsigned long long kl_vulkan_eye_image(int s, int e, unsigned w, unsigned h, int srgb) {
     (void)s; (void)e; (void)w; (void)h; (void)srgb; return 0;
 }
+int kl_vulkan_eye_publish_guest(int s, int e, unsigned long long img, int layer, unsigned w, unsigned h) {
+    (void)s; (void)e; (void)img; (void)layer; (void)w; (void)h; return 0;
+}
+void kl_vulkan_eye_unpublish_guest(int s, int e) { (void)s; (void)e; }
 // Was missing, and it is what kl_ovrp.c actually calls — so a checkout that has
 // never run `make mvk` did not fail to *compile*, it failed to LINK, which is
 // the one failure this whole `#if` exists to prevent. Every entry point in the
@@ -3443,6 +3447,72 @@ unsigned long long kl_vulkan_eye_image(int stage, int eye, unsigned w, unsigned 
     return kl_vulkan_eye_image_layers(stage, eye, w, h, srgb, 1);
 }
 
+// Build 37: zero-copy eye hand-off. The OpenVR shim used to blit each submitted eye (a full-bounds, same-format,
+// same-size layer of Source 2's eye image) into the platform image of the stage: 2 x 14.6 MB per frame, 0.3 ms of
+// GPU each (Logs_Alyx 2_10, gpu.excl type 1c9d9e5ec8c45b50). Here the guest's own image is what the compositor
+// samples: its MTLTexture (VK_EXT_metal_objects) goes into the eye table with the eye's layer as the slice, retained
+// so a texture the driver drops while a composite still references it stays valid. The shim still submits the
+// stage's (now empty) command buffer with its fence, so "the stage is complete" still means the guest's rendering
+// has finished on the queue. Source 2 cycles three eye images and the compositor is paced one frame behind it at
+// most, so the image it samples is not the one the guest is drawing into. When the guest destroys a published
+// image (a fidelity or resolution change) the platform image of that stage is republished and the shim copies
+// again until the next publish.
+static struct { VkImage img; void *tex; } g_eye_guest[KLVK_EYE_STAGES][2];
+static pthread_mutex_t g_eye_guest_mu = PTHREAD_MUTEX_INITIALIZER;
+int kl_vulkan_eye_publish_guest(int stage, int eye, unsigned long long vk_image, int layer, unsigned w, unsigned h) {
+    klvk_device *d = g_devs[0];
+    VkImage img = (VkImage)(uintptr_t)vk_image;
+    if (!d || !img || stage < 0 || stage >= KLVK_EYE_STAGES || eye < 0 || eye > 1 || !w || !h) return 0;
+    pthread_mutex_lock(&g_eye_guest_mu);
+    void *tex = g_eye_guest[stage][eye].img == img ? g_eye_guest[stage][eye].tex : NULL;
+    if (!tex) {
+        tex = eye_mtl_texture(d, img);
+        if (!tex) { pthread_mutex_unlock(&g_eye_guest_mu); return 0; }
+        kl_mtl_retain(tex);
+        if (g_eye_guest[stage][eye].tex)   // the previous one may be in a composite being encoded: let go later
+            klvk_retire_any(d, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, g_eye_guest[stage][eye].tex);
+        g_eye_guest[stage][eye].img = img;
+        g_eye_guest[stage][eye].tex = tex;
+        static int said;
+        if (said++ < 8)
+            VKI("eye %d stage %d: the compositor samples the guest's image %#llx layer %d (%ux%u) directly (no copy)\n",
+                eye, stage, (unsigned long long)(uintptr_t)img, layer, w, h);
+    }
+    pthread_mutex_unlock(&g_eye_guest_mu);
+    kl_glfb_note_eye_mtl_texture(eye, stage, tex, layer, (int)w, (int)h);
+    return 1;
+}
+// Put the stage's own image back in the table for (s, e) and let go of the guest's texture (released with the
+// retired images, KLVK_RETIRE_FRAMES later: a composite that read the table a moment ago may still be encoding it).
+static void eye_guest_drop(int s, int e, const char *why) {
+    pthread_mutex_lock(&g_eye_guest_mu);
+    void *tex = g_eye_guest[s][e].tex;
+    VkImage img = g_eye_guest[s][e].img;
+    g_eye_guest[s][e].img = VK_NULL_HANDLE; g_eye_guest[s][e].tex = NULL;
+    pthread_mutex_unlock(&g_eye_guest_mu);
+    if (!tex) return;
+    // Under the Array layout the platform image of the stage lives in eye 0's slot and serves both eyes.
+    klvk_img_slot *slot = g_eye[s][0].layers > 1 ? &g_eye[s][0] : &g_eye[s][e];
+    if (slot->img) eye_publish_mtl(s, slot == &g_eye[s][0] && slot->layers > 1 ? 0 : e, (int)slot->layers);
+    static int said;
+    if (said++ < 12)
+        VKI("eye %d stage %d: guest image %#llx no longer sampled (%s); the stage's own image is back\n",
+            e, s, (unsigned long long)(uintptr_t)img, why);
+    klvk_retire_any(g_devs[0], VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, tex);
+}
+// A submit that copies again (partial or flipped bounds, a size change): the table must not stay on the guest's image.
+void kl_vulkan_eye_unpublish_guest(int stage, int eye) {
+    if (stage < 0 || stage >= KLVK_EYE_STAGES || eye < 0 || eye > 1) return;
+    if (!g_eye_guest[stage][eye].tex) return;   // racy read, checked again under the lock inside
+    eye_guest_drop(stage, eye, "the shim copies this submit");
+}
+// The guest is destroying an image: if the compositor samples it, put the stage's own image back first.
+static void eye_guest_forget(VkImage img) {
+    for (int s = 0; s < KLVK_EYE_STAGES; s++)
+        for (int e = 0; e < 2; e++)
+            if (g_eye_guest[s][e].img == img) eye_guest_drop(s, e, "destroyed by the guest");
+}
+
 // ---------------------------------------------------------------------------
 // The OpenXR seam — XR_KHR_vulkan_enable. See kl_vulkan.h for why it exists.
 // ---------------------------------------------------------------------------
@@ -4718,6 +4788,7 @@ static void VKAPI_CALL klvk_DestroyImage(VkDevice dev, VkImage img,
     klvk_img_info_del(img);
     klvk_depth_info_del(img);
     klvk_shadow_forget(img);
+    eye_guest_forget(img);
     if (img && msaa_trace_on()) {            // which multisampled images the game lets go (e.g. after a vr_msaa change)
         pthread_mutex_lock(&g_msaa_mu);
         for (int i = 0; i < g_msaa_nimg; i++) if (g_msaa_imgs[i].img == img) {

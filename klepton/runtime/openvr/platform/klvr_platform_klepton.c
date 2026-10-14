@@ -758,6 +758,10 @@ uint64_t klvr_plat_eye_image(int stage, int eye, uint32_t w, uint32_t h, int srg
     return kl_vulkan_eye_image(stage, eye, w, h, srgb);
 }
 
+int klvr_plat_eye_publish_guest(int stage, int eye, uint64_t vk_image, int layer, uint32_t w, uint32_t h) {
+    return kl_vulkan_eye_publish_guest(stage, eye, vk_image, layer, w, h);
+}
+void klvr_plat_eye_unpublish_guest(int stage, int eye) { kl_vulkan_eye_unpublish_guest(stage, eye); }
 uint64_t klvr_plat_eye_depth_half(int eye, uint32_t w, uint32_t h) { return kl_vulkan_eye_depth_half(eye, w, h); }
 uint64_t klvr_plat_eye_depth_image(int stage, int eye, uint32_t w, uint32_t h) {
     return kl_vulkan_eye_depth_image(stage, eye, w, h);

@@ -144,6 +144,8 @@ struct AVPSettingsView: View {
             Toggle(AVPL("Medir el tiempo de GPU por pase", "Per-pass GPU timing"), isOn: $s.gpuPassProfiling)
             Toggle(AVPL("Orden de GPU por recursos", "GPU ordering by resources"), isOn: $s.trackedOrder)
             Toggle(AVPL("Amplificación de vértices", "Vertex amplification"), isOn: $s.amplify)
+            Toggle(AVPL("Post-procesado solo en el área foveada (prueba)", "Post-processing on the foveated area only (test)"), isOn: $s.postPhysical)
+            Toggle(AVPL("Ojos al compositor sin copia", "Eyes to the compositor without a copy"), isOn: $s.eyeDirect)
             Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
                    role: .destructive) { confirmQuarantine = true }
                 .disabled(quarantined == 0)

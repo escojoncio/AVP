@@ -167,6 +167,8 @@ int vk_copy_eye(int stage, int eye, const vr::VRVulkanTextureData_t *t, uint32_t
 
     VkImage dst = (VkImage)klvr_plat_eye_image(stage, eye, w, h, is_srgb((VkFormat)t->m_nFormat));
     if (!dst) return vr::VRCompositorError_TextureUsesUnsupportedFormat;
+    static int direct_ok = -1;   // KLVR_EYE_DIRECT (default on): sample the guest's image instead of copying it
+    if (direct_ok < 0) direct_ok = env_on("KLVR_EYE_DIRECT", true) ? 1 : 0;
 
     DeviceState &ds = g_devices[{ dev, t->m_nQueueFamilyIndex }];
     if (!ds.pool) {
@@ -211,6 +213,10 @@ int vk_copy_eye(int stage, int eye, const vr::VRVulkanTextureData_t *t, uint32_t
     g_fns.CmdPipelineBarrier(s.cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, pre);
 
+    const bool direct = direct_ok && t->m_nSampleCount <= 1 && sx0 == 0 && sy0 == 0 && sx1 > sx0 && sy1 > sy0 &&
+                        w == t->m_nWidth && h == t->m_nHeight && !env_on("KLVR_DEBUG_EYE_COLOR", false) &&
+                        klvr_plat_eye_publish_guest(stage, eye, (uint64_t)src, array_index, w, h);
+    if (!direct) klvr_plat_eye_unpublish_guest(stage, eye);   // whatever this submit copies is what is sampled
     if (t->m_nSampleCount > 1) {
         // A multisampled eye can only be resolved, and a resolve cannot crop,
         // flip or convert. Source 2 resolves its own MSAA before submitting,
@@ -235,6 +241,12 @@ int vk_copy_eye(int stage, int eye, const vr::VRVulkanTextureData_t *t, uint32_t
         c.float32[3] = 1.0f;
         VkImageSubresourceRange r{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         g_fns.CmdClearColorImage(s.cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &r);
+    } else if (direct) {
+        // Build 37: the whole, unflipped layer is what the compositor wants: it samples the guest's image itself
+        // (klvr_plat_eye_publish_guest); nothing to copy. The command buffer still carries the barriers and its
+        // fence, so the stage completes when the guest's rendering of this frame has.
+        static unsigned direct_n;
+        if (++direct_n == 1) logf("Submit: eye images handed to the compositor without a copy (KLVR_EYE_DIRECT=0 copies)");
     } else {
         VkImageBlit b{};
         b.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, array_index, 1 };

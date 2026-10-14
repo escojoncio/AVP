@@ -281,6 +281,23 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
    culpable es `Window` (no usarlo en AVP; la doble ventana del launcher queda pendiente por otra vía). Si tampoco
    arranca, mirar el `.ips` (dyld / símbolo) de los cambios de `kl_gpu_time.m` (`__thread`, dlopen RTLD_NOLOAD).
 
+## B37 — cambios (en main; build cuando B36b esté confirmada)
+1. Ojos sin copia: `klvr_vk_submit.cpp` (`KLVR_EYE_DIRECT`, ajuste «Ojos al compositor sin copia», `avp.eyeDirect`,
+   ON): si el submit es la capa entera sin flip, `klvr_plat_eye_publish_guest` → `kl_vulkan_eye_publish_guest`
+   exporta el MTLTexture de la imagen del JUEGO (VK_EXT_metal_objects), lo retiene y lo mete en la tabla de ojos
+   (`kl_glfb_note_eye_mtl_texture`, slice = capa); el blit se omite, el command buffer vacío con su fence sigue
+   (la etapa se completa cuando el render del juego acaba). Si un submit vuelve a copiar (bounds parciales/flip,
+   tamaño distinto) `kl_vulkan_eye_unpublish_guest` repone la imagen de la plataforma; al destruir el juego la imagen
+   (`klvk_DestroyImage` → `eye_guest_forget`) igual. Texturas soltadas vía `klvk_retire_any` (KLVK_RETIRE_FRAMES).
+   Log `[vk] eye N stage M: the compositor samples the guest's image ... directly`; `[glfb] eye ... is MTLTexture`
+   limitado a 24 líneas. Ahorro esperado: 2 copias de 14,6 MB por frame (~0,6 ms, gpu.excl tipo 1c9d…: 3 CB/frame
+   de 0,3 ms; el tercero queda por identificar).
+2. Ajuste de prueba «Post-procesado solo en el área foveada (prueba)» (`avp.postPhys`, OFF) = `KL_VRR_PHYS_POST=1`:
+   tonemap y composición del bloom (1,3 + 1,3 ms a área completa) limitados al área física del mapa (~−1,3 ms).
+   Fuera del área la imagen del ojo queda negra (tonemap del clear). Si se ve bien → ON por defecto en B38.
+3. Compositor: la vista ancha YA se construye a la densidad de la periferia (`buildWideView`, dens = edge, taps 4):
+   nada que recortar ahí; medir primero con `cx` (B36).
+
 ## Siguiente (al llegar el log de B36)
 1. Confirmar `[vrr] ... (subtitles)` y subtítulos correctos en ambos ojos; afinar `cc_vr_vertical_offset` si la altura
    no convence (6 ≈ justo sobre el centro).

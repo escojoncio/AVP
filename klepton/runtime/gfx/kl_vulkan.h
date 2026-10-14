@@ -96,6 +96,13 @@ int kl_vulkan_gpu_ids(unsigned *vendor, unsigned *device);
 // ovrp_GetLayerTexture2's out-parameter carries.
 unsigned long long kl_vulkan_eye_image(int stage, int eye, unsigned w, unsigned h,
                                        int srgb);
+// Build 37: the compositor samples the GUEST's own eye image (array layer `layer` of `vk_image`) for this stage
+// and eye instead of a copy of it into kl_vulkan_eye_image's: the MTLTexture behind it is published (retained)
+// into the eye table. Returns 1 when published, 0 when it cannot be (no Metal export): the caller then copies.
+// The platform image of the stage is republished the moment the guest destroys that image.
+int kl_vulkan_eye_publish_guest(int stage, int eye, unsigned long long vk_image, int layer, unsigned w, unsigned h);
+// ...and back to the stage's own image (the shim copies into it this submit). No-op when nothing was published.
+void kl_vulkan_eye_unpublish_guest(int stage, int eye);
 
 // ...and the same thing for the layout where the two eyes are ARRAY LAYERS of
 // one image rather than two images — ovrpLayout_Array, which is what Unity

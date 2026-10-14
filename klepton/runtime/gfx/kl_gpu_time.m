@@ -1861,3 +1861,4 @@ void *kl_mtl_buffer_texture_r32f(void *mtl_buffer, unsigned w, unsigned h, unsig
     return t ? (void *)CFBridgingRetain(t) : NULL;
 }
 void kl_mtl_release(void *obj) { if (obj) CFRelease(obj); }
+void *kl_mtl_retain(void *obj) { if (obj) CFRetain(obj); return obj; }
