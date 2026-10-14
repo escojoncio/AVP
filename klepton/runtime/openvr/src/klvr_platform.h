@@ -118,6 +118,9 @@ int      klvr_plat_presents(void);
 float    klvr_plat_gpu_ms(uint32_t frames_ago, float *compositor);
 // The game has submitted both eyes: GPU work it issues from now on is the next frame's.
 void     klvr_plat_frame_closed(void);
+// The game asked for the grid (IVRCompositor::FadeGrid): to_grid = 1 fades it in (Source 2 does before a level
+// load), 0 fades it out (the scene is shown: the start-up or a load is over). Diagnostics key on it.
+void     klvr_plat_scene_fade(int to_grid);
 // What the GPU time reported to the game is multiplied by: below 1 while the pace
 // governor holds a slower frame rate, so auto-fidelity budgets for that frame
 // (its vr_target_fps stays 60) and climbs back to top quality.

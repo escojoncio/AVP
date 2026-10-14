@@ -668,6 +668,11 @@ extern void kl_gpu_time_frame_end(void) __attribute__((weak));
 void klvr_plat_frame_closed(void) {
     if (kl_gpu_time_frame_end) kl_gpu_time_frame_end();
 }
+// kl_gpu_time.m: per-pass profiling windows timed from each scene start (KL_GPU_PASSES "g<s>").
+extern void kl_gpu_time_scene(int to_grid) __attribute__((weak));
+void klvr_plat_scene_fade(int to_grid) {
+    if (kl_gpu_time_scene) kl_gpu_time_scene(to_grid);
+}
 // KLVR_GPU_MS_SCALE multiplies it: a Mac stands in for a slower GPU, to check
 // that the game's auto-fidelity reacts before a device run.
 float klvr_plat_gpu_ms(uint32_t frames_ago, float *compositor) {

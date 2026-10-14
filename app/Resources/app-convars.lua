@@ -31,3 +31,26 @@ ListenToGameEvent("player_activate", function()
     end
     return nil end, "klstream", 2.0)
 end, nil)
+
+-- AVP build 27: which performance convars this build has, and their values at spawn (KLPERF; "nil" = not a convar
+-- here). The next cuts of fixed GPU cost (shadow atlas, fog volume, Panorama effects) are picked from this list.
+ListenToGameEvent("player_activate", function()
+  local w = Entities:First(); if not w then return end
+  w:SetThink(function()
+    local out = {}
+    for _, k in ipairs({ "r_ssao", "r_post_bloom", "sc_disable_spotlight_shadows", "r_high_quality_shadows",
+        "vr_shadow_map_culling", "vr_enable_cached_lights", "vr_shadow_level_placeholder", "vr_enable_volume_fog",
+        "volume_fog_enable_stereo", "volume_fog_width", "volume_fog_height", "volume_fog_depth", "vr_depth_prepass",
+        "vr_stencil_hidden_pixels", "vr_multiview_instancing", "vr_character_level_placeholder", "cl_enable_eye_occlusion",
+        "r_particle_max_detail_level", "cl_particle_fallback_base", "cl_particle_fallback_multiplier", "vr_fast_hologram",
+        "r_light_flickering_enabled", "lb_shadow_texture_width_override", "lb_shadow_texture_height_override",
+        "lb_enable_shadow_casting", "csm_max_num_cascades_override", "@panorama_max_fps", "@panorama_max_overlay_fps",
+        "@panorama_experimental_fast_box_shadow", "@panorama_disable_box_shadow", "@panorama_disable_blur",
+        "vr_perf_mode_override2", "vr_fidelity_level", "vr_msaa" }) do
+      local ok, v = pcall(Convars.GetStr, Convars, k)
+      out[#out + 1] = k .. "=" .. ((ok and v ~= nil) and tostring(v) or "nil")
+      if #out == 12 then Msg("KLPERF " .. table.concat(out, " ") .. "\n"); out = {} end   -- short console lines
+    end
+    if #out > 0 then Msg("KLPERF " .. table.concat(out, " ") .. "\n") end
+    return nil end, "klperf", 3.0)
+end, nil)

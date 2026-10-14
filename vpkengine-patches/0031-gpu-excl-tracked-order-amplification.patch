@@ -1,0 +1,1376 @@
+From 167e03d0e63d42a521dcab1513cdd67dce97357c Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Wed, 14 Oct 2026 01:26:56 +0000
+Subject: [PATCH] VPVulkan + Metal: exclusive per-encoder GPU time (gpu.excl,
+ vertex/fragment split, attachment traffic), opt-in tracked command-buffer
+ ordering (VP_CB_ORDER=2), opt-in multiview through Metal vertex amplification
+ (VPVK_AMPLIFY=1) and native half vertex fetch (VPVK_FETCH_NATIVE=1)
+
+- metal2: render encoders sample vertex start/end and fragment start/end; every
+  completed command buffer is placed on one GPU timeline and each encoder gets
+  its exclusive time (how far it moved the latest end), summed per command-buffer
+  type and logged every VP_EXCL_SECONDS (5) s as gpu.excl lines with format, size,
+  samples, draws, load/store actions + tile verdicts and their MB, vtx/frag spans
+  (VP_EXCL_TIMING=0 turns it off).
+- metal2: VP_CB_ORDER=2 joins only the encoders whose accesses (buffers by host
+  address range, textures by identity) overlap a write of / are writes to what a
+  command buffer still in flight uses, before the vertex or only the fragment stage;
+  the join fence stays in the frontier. Default stays 1 (build 24 behaviour).
+- shader/vulkan/metal2: VPVK_AMPLIFY=1 translates two-view multiview vertex shaders
+  with [[amplification_id]] (layer/viewport index 0 + view mappings, no instance
+  multiplication; ClipDistance/Layer writers keep instancing) and fragment ViewIndex
+  through a flat varying; the backend sets maxVertexAmplificationCount and the
+  encoder's amplification count per draw.
+- spirv: VPVK_FETCH_NATIVE=1 converts half vertex attributes with one half2 conversion.
+- Translator modes are part of the recipe store's translator id (kTranslatorVersion |
+  modes << 16): a mode change retranslates the stored recipes; all off = id 4 as before.
+---
+ .../include/vpgpu/metal2/metal_backend.h      |   1 +
+ gpu/metal2/src/metal_backend.mm               | 421 +++++++++++++++++-
+ gpu/shader/ir/include/vpir/ir.h               |   1 +
+ gpu/shader/ir/src/ir.cpp                      |   3 +-
+ gpu/shader/ir/src/parse.cpp                   |   2 +-
+ gpu/shader/msl/src/msl.cpp                    |   6 +-
+ gpu/shader/spirv/CMakeLists.txt               |   2 +-
+ gpu/shader/spirv/src/lower.cpp                |  97 +++-
+ gpu/shader/spirv/tests/spirv_tests.cpp        |  93 +++-
+ gpu/vulkan/CMakeLists.txt                     |   3 +
+ gpu/vulkan/include/vpvk/spirv_frontend.h      |  11 +-
+ gpu/vulkan/src/commands.h                     |   2 +-
+ gpu/vulkan/src/entry.cpp                      |   1 +
+ gpu/vulkan/src/pipelines.cpp                  |  22 +-
+ gpu/vulkan/src/precompile.cpp                 |   2 +
+ gpu/vulkan/src/recipes.cpp                    |  30 ++
+ gpu/vulkan/src/recipes.h                      |  15 +-
+ gpu/vulkan/src/vpvk.h                         |   4 +
+ gpu/vulkan/tests/vk_tests.cpp                 |   6 +-
+ 19 files changed, 685 insertions(+), 37 deletions(-)
+
+diff --git a/gpu/metal2/include/vpgpu/metal2/metal_backend.h b/gpu/metal2/include/vpgpu/metal2/metal_backend.h
+index 6ff14a8..3ec8269 100644
+--- a/gpu/metal2/include/vpgpu/metal2/metal_backend.h
++++ b/gpu/metal2/include/vpgpu/metal2/metal_backend.h
+@@ -89,6 +89,7 @@ struct MetalCaps {
+   int argumentBuffersTier = 0;   // 1 or 2 (0 = no device)
+   bool bindless = false;         // Metal 3 + tier 2: gpuAddress / gpuResourceID argument tables
+   bool residencySet = false;     // false: bound resources made resident per encoder (useResource)
++  bool vertexAmplification = false;  // supportsVertexAmplificationCount:2 (multiview without instancing)
+ };
+ 
+ struct MetalOptions {
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index a5c186d..e273a60 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -317,6 +317,8 @@ std::string token(std::string s) {
+   return s;
+ }
+ 
++struct EncDiag;  // per-encoder diagnostics of a submitted frame (defined with the submission code)
++
+ }  // namespace
+ 
+ struct MetalBackend::Impl {
+@@ -324,6 +326,9 @@ struct MetalBackend::Impl {
+     uint32_t generation = 0;
+     id<MTLBuffer> buffer;
+     uint64_t base = 0;  // guest pointer's offset inside a page-aligned no-copy buffer
++    // Host address of byte 0 of the client's range and its usable length (VP_CB_ORDER=2 hazards by address).
++    uintptr_t host = 0;
++    uint64_t span = 0;
+   };
+   struct Texture {
+     uint32_t generation = 0;
+@@ -358,6 +363,9 @@ struct MetalBackend::Impl {
+     id<MTLDepthStencilState> depth;
+     MTLCullMode cull = MTLCullModeNone;
+     FetchInputs fetch;
++    // 2: the vertex shader multiviews through vertex amplification ([[amplification_id]]): its draws run with
++    // the encoder's amplification count 2 and view mappings (view v -> viewport v, layer v).
++    NSUInteger amp = 1;
+     id<MTLComputePipelineState> compute;
+     MTLSize threads{1, 1, 1};
+     Table stage[2];  // render: vertex, fragment; compute: [0]
+@@ -617,6 +625,50 @@ struct MetalBackend::Impl {
+   uint64_t cbCompleted = 0, cbOverlaps = 0, cbOutOfOrder = 0;  // doneMutex
+   std::atomic<uint64_t> slotBusyWaits{0};
+   double cbMaxOverlapMs = 0;
++  // VP_CB_ORDER=2 (tracked, off by default): the previous command buffer's tail still goes through the join
++  // fence, but only the encoders that touch what a command buffer still in flight writes (or write what it
++  // reads) wait on it; the rest may overlap the previous command buffers (vertex work of the next pass
++  // under the fragment tail of the last one). Hazards are checked by memory: buffer ranges by host address
++  // (aliased VkBuffers of one VkDeviceMemory overlap there), textures by identity. The join fence stays in
++  // the frontier, so the next command buffer's join still follows everything. The joined encoders are
++  // the old behaviour; build 24's vertex explosions were a copy overwriting vertex data a render pass of
++  // the previous command buffer still read: a write against an in-flight read, which joins here.
++  bool cbTracked = false;
++  struct CbAccess {
++    uint64_t frame = 0;
++    std::vector<std::pair<uintptr_t, uintptr_t>> bufW, bufR;  // host address ranges [begin, end)
++    std::vector<uint64_t> texW, texR;                         // (generation << 32) | index
++  };
++  std::deque<CbAccess> cbAccess;  // submit thread: command buffers submitted and possibly still running
++  std::atomic<uint64_t> trackedJoined{0}, trackedFree{0};
++
++  // Exclusive GPU time per encoder (gpu.excl; VP_EXCL_TIMING=0 turns it off, VP_EXCL_SECONDS the window).
++  // Every encoder's start/end timestamps (render: vertex start/end and fragment start/end) are placed on
++  // one GPU timeline across command buffers: an encoder's exclusive time is how far it moved the latest
++  // end seen so far (submission order), so the exclusive times plus the idle gaps add up to the GPU's busy
++  // span. Summed per command-buffer type (same encoders, formats, sizes) over the window, then logged.
++  struct ExclEnc {
++    std::string desc;  // kind, size, format, samples, attachments: from the first command buffer seen
++    double excl = 0, span = 0, vtx = 0, frag = 0, draws = 0, loadMb = 0, storeMb = 0;
++    uint32_t vtxN = 0, fragN = 0, joined = 0;
++  };
++  struct ExclType {
++    uint32_t n = 0;  // command buffers of this type in the window
++    double gpu = 0, excl = 0, idle = 0;
++    std::vector<ExclEnc> enc;
++  };
++  bool exclOn = true;
++  double exclWindowS = 5.0;
++  std::mutex exclMutex;  // guards everything below
++  std::map<uint64_t, ExclType> exclTypes;
++  uint64_t exclLastEnd = 0;     // GPU ticks: the latest encoder end seen
++  double exclWindowStart = 0;   // host seconds (command buffer GPUEndTime) of the window's first one
++  uint64_t exclCbs = 0, exclReports = 0;
++  void exclReportLocked(double now);
++  // One completed command buffer: per core encoder its first start / last end ticks (`span`) and, for
++  // render encoders, the vertex end / fragment start ticks (`stages`); 0 = not sampled.
++  void exclAccount(uint64_t type, const std::vector<EncDiag>& diag, const std::vector<std::pair<uint64_t, uint64_t>>& span,
++                   const std::vector<std::pair<uint64_t, uint64_t>>& stages, double hostEnd, double cbMs);
+ 
+   // Fences of encoders not yet ordered before any later encoder. A barrier waits on all of them
+   // and leaves only itself, so ordering is transitive and each barrier costs few waits. It carries
+@@ -738,7 +790,15 @@ void MetalBackend::Impl::init() {
+   if (dumpFrame >= 0 && dumpDir.empty()) dumpFrame = -1;
+   if (dumpFrame >= 0) info("gpu.dump armed frame=" + std::to_string(dumpFrame) + " dir=" + token(dumpDir));
+   if (const char* o = std::getenv("VP_CB_ORDER"); o && *o == '0') cbOrder = false;
+-  info("gpu.order armed cb_order=" + std::to_string(cbOrder ? 1 : 0) + " slots=" + std::to_string(n));
++  if (const char* o = std::getenv("VP_CB_ORDER"); o && *o == '2') cbTracked = true;
++  info("gpu.order armed cb_order=" + std::to_string(cbOrder ? (cbTracked ? 2 : 1) : 0) + " slots=" + std::to_string(n));
++  if (const char* x = std::getenv("VP_EXCL_TIMING"); x && *x == '0') exclOn = false;
++  if (const char* x = std::getenv("VP_EXCL_SECONDS"); x && *x) exclWindowS = std::max(1.0, std::strtod(x, nullptr));
++  // Vertex amplification (multiview vertex shaders translated with VPVK_AMPLIFY=1 declare [[amplification_id]]).
++  caps.vertexAmplification = [device supportsVertexAmplificationCount:2];
++  info("gpu.excl armed on=" + std::to_string(exclOn ? 1 : 0) + " window_s=" + std::to_string(int(exclWindowS)) +
++       " stage_timestamps=" + std::to_string(stageSamples ? 1 : 0) + " vertex_amplification2=" +
++       std::to_string(caps.vertexAmplification ? 1 : 0));
+ 
+   if (!options.cacheRoot.empty()) openArchives();
+ 
+@@ -1177,6 +1237,14 @@ bool MetalBackend::Impl::buildRender(const PipelineState& s, Pipeline& p, std::s
+   }
+   d.vertexFunction = function(s.vertexShader, {}, vs, error, s.primitive != Primitive::Points);
+   if (!d.vertexFunction) return false;
++  if (vs.source.find("[[amplification_id]]") != std::string::npos) {
++    if (!caps.vertexAmplification) {
++      error = "vertex amplification x2 not supported by this GPU (VPVK_AMPLIFY=1)";
++      return false;
++    }
++    d.maxVertexAmplificationCount = 2;
++    p.amp = 2;
++  }
+   if (s.fragmentShader) {  // none = depth-only
+     // Vulkan ignores FragDepth writes without a depth attachment; Metal rejects the pipeline.
+     d.fragmentFunction = function(s.fragmentShader, s.fetch, fs, error, false, !formatInfo(s.depthFormat).depth(),
+@@ -1311,6 +1379,14 @@ struct EncDiag {
+   int load = -1, store = -1;  // render: colour 0 (or depth) load/store action
+   uint32_t resolves = 0;      // render: 1 = a colour attachment resolves, 2 = depth/stencil resolves
+   uint32_t hunted = 0;        // draws/dispatches the hang hunter skipped in this encoder
++  // gpu.excl: render sample count, the attachments' memory traffic from their load / store actions (MB at the
++  // render area's logical size, before any rasterization rate map), "c0:CR d:CD:Persistent" per attachment
++  // (load L/C/D, store S/R/SR/D, m = memoryless, then the frame compiler's tile verdict when not on tile),
++  // and whether the encoder waited on the previous command buffers' join fence.
++  uint32_t samples = 1;
++  double loadMb = 0, storeMb = 0;
++  std::string attach;
++  bool joined = false;
+   std::unordered_set<uint64_t> allKeys;  // every PipelineKey bound (hang hunter; capped at 8192)
+   std::string label;
+   std::vector<id> states;       // distinct pipeline states, first kMaxDiagStates
+@@ -1875,7 +1951,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     for (;;) {
+       {
+         std::lock_guard lock(doneMutex);
+-        if (!inFlightFrames.count(slot.frame)) break;
++        // Tracked ordering lets a command buffer finish before an earlier one: the slot's leftovers (retired
++        // resources) may still be used by those, so every frame up to the slot's must be done.
++        if (cbTracked ? (inFlightFrames.empty() || *inFlightFrames.begin() > slot.frame) : !inFlightFrames.count(slot.frame))
++          break;
+       }
+       busy = true;
+       std::this_thread::sleep_for(std::chrono::microseconds(50));
+@@ -1981,6 +2060,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   NSUInteger sampleUsed = 0;
+   // Per core encoder: first start sample and last end sample (NSNotFound = unsampled).
+   std::vector<std::pair<NSUInteger, NSUInteger>> encSamples(compiled.encoders.size(), {NSNotFound, NSNotFound});
++  // Render encoders: vertex-end / fragment-start sample indices (gpu.excl's vertex / fragment split).
++  std::vector<std::pair<NSUInteger, NSUInteger>> encStages(compiled.encoders.size(), {NSNotFound, NSNotFound});
+ 
+   // Draws not executed, with the first one named in the summary line (one line per frame, not per
+   // draw, so a broken draw repeated every frame cannot flood the log).
+@@ -2108,7 +2189,20 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     if (encSamples[e].first == NSNotFound) encSamples[e].first = start;
+     encSamples[e].second = end;
+   };
++  // Render encoders: vertex start, vertex end, fragment start, fragment end.
++  auto sampleQuad = [&](uint32_t e, NSUInteger (&q)[4]) {
++    q[0] = q[1] = q[2] = q[3] = MTLCounterDontSample;
++    if (!stageSamples || sampleUsed + 4 > kMaxSamples) return;
++    for (NSUInteger& x : q) x = sampleUsed++;
++    if (encSamples[e].first == NSNotFound) encSamples[e].first = q[0];
++    encSamples[e].second = q[3];
++    encStages[e] = {q[1], q[2]};
++  };
+ 
++  // Per core encoder, whether it waits on the join fence and from which render stage: 2 = before its vertex
++  // stage (always, unless VP_CB_ORDER=2), 1 = before its fragment stage (only fragment-stage accesses touch
++  // what a command buffer in flight uses), 0 = no wait (nothing in common).
++  std::vector<uint8_t> needJoin(compiled.encoders.size(), 2);
+   Open open;
+   id<MTLFence> openFence = nil;
+   // Per-pass dump of this frame (diagnostics): items to write after completion, copies waiting for
+@@ -2241,12 +2335,15 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     open.any().label = label;
+     openFence = nextFence();
+     if (wait) waitFrontier(before);
+-    // Ordered after the whole previous command buffer, not only through this one's first encoder.
+-    if (joinFence) {
+-      if (open.render) [open.render waitForFence:joinFence beforeStages:MTLRenderStageVertex];
++    // Ordered after the whole previous command buffer, not only through this one's first encoder
++    // (VP_CB_ORDER=2: only the encoders that touch what a command buffer in flight uses).
++    const uint8_t join = curEnc < needJoin.size() ? needJoin[curEnc] : 2;
++    if (joinFence && join) {
++      if (open.render) [open.render waitForFence:joinFence beforeStages:join > 1 ? MTLRenderStageVertex : MTLRenderStageFragment];
+       else if (open.compute) [open.compute waitForFence:joinFence];
+       else [open.blit waitForFence:joinFence];
+       carriedWaits.fetch_add(1, std::memory_order_relaxed);
++      if (curEnc < diag->size()) (*diag)[curEnc].joined = true;
+     }
+   };
+ 
+@@ -2384,7 +2481,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     fx.label = [NSString stringWithFormat:@"indirect_fix%u", e];
+     for (id<MTLFence> f : frontier)
+       if (waitable(f)) [fx waitForFence:f];
+-    if (joinFence) [fx waitForFence:joinFence];  // the previous command buffer may write these arguments
++    // The previous command buffer may write these arguments.
++    if (joinFence && (e >= needJoin.size() || needJoin[e])) [fx waitForFence:joinFence];
+     [fx setComputePipelineState:ps];
+     [fx setBuffer:slot.indirect offset:0 atIndex:2];
+     [fx setBuffer:slot.indirect offset:0 atIndex:3];  // diagnostic header (words 0..2)
+@@ -2447,6 +2545,112 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     return f;
+   };
+ 
++  // VP_CB_ORDER=2: this command buffer's memory accesses, and which encoders touch what an in-flight one does.
++  CbAccess mine;
++  if (cbTracked) {
++    using Range = std::pair<uintptr_t, uintptr_t>;
++    auto mergeRanges = [](std::vector<Range>& v) {
++      std::sort(v.begin(), v.end());
++      size_t o = 0;
++      for (size_t i = 0; i < v.size(); ++i) {
++        if (o && v[i].first <= v[o - 1].second) v[o - 1].second = std::max(v[o - 1].second, v[i].second);
++        else v[o++] = v[i];
++      }
++      v.resize(o);
++    };
++    auto uniqueKeys = [](std::vector<uint64_t>& v) {
++      std::sort(v.begin(), v.end());
++      v.erase(std::unique(v.begin(), v.end()), v.end());
++    };
++    {  // command buffers that completed can no longer conflict
++      std::lock_guard lock(doneMutex);
++      for (auto it = cbAccess.begin(); it != cbAccess.end();) it = inFlightFrames.count(it->frame) ? std::next(it) : cbAccess.erase(it);
++    }
++    std::vector<Range> inW, inR;
++    std::vector<uint64_t> inTW, inTR;
++    for (const CbAccess& a : cbAccess) {
++      inW.insert(inW.end(), a.bufW.begin(), a.bufW.end());
++      inR.insert(inR.end(), a.bufR.begin(), a.bufR.end());
++      inTW.insert(inTW.end(), a.texW.begin(), a.texW.end());
++      inTR.insert(inTR.end(), a.texR.begin(), a.texR.end());
++    }
++    mergeRanges(inW), mergeRanges(inR), uniqueKeys(inTW), uniqueKeys(inTR);
++    // Disjoint sorted ranges: the first one ending after r.first decides.
++    auto hits = [](const std::vector<Range>& v, const Range& r) {
++      auto it = std::upper_bound(v.begin(), v.end(), r.first, [](uintptr_t x, const Range& y) { return x < y.second; });
++      return it != v.end() && it->first < r.second;
++    };
++    std::vector<Range> eW, eR;
++    std::vector<uint64_t> eTW, eTR;
++    // Accesses of the encoder's vertex stage (or of any stage) mark `early`: the join then goes before the
++    // vertex stage; only fragment-stage accesses (attachments, fragment shader bindings) wait before fragments.
++    std::vector<uint8_t> eWEarly, eREarly, eTWEarly, eTREarly;
++    auto visit = [&](const Access& a) {
++      const ResourceRange& r = a.range;
++      const uint8_t early = (a.stages == 0 || (a.stages & ~stage::fragment)) ? 1 : 0;
++      // A pixel-local read makes the texture an attachment of the encoder (loaded and stored back): a write.
++      const bool wr = a.write || a.pixelLocal;
++      if (r.kind == ResourceRange::Kind::Texture) {
++        (wr ? eTW : eTR).push_back(uint64_t(r.generation) << 32 | r.index);
++        (wr ? eTWEarly : eTREarly).push_back(early);
++        return;
++      }
++      if (r.kind != ResourceRange::Kind::Buffer) return;
++      auto it = buffers.find(r.index);
++      if (it == buffers.end() || it->second.generation != r.generation || !it->second.host) return;
++      const uint64_t b0 = std::min<uint64_t>(r.begin, it->second.span), b1 = std::min<uint64_t>(r.end, it->second.span);
++      if (b1 <= b0) return;
++      (wr ? eW : eR).push_back({it->second.host + uintptr_t(b0), it->second.host + uintptr_t(b1)});
++      (wr ? eWEarly : eREarly).push_back(early);
++    };
++    for (uint32_t e = 0; e < compiled.encoders.size(); ++e) {
++      eW.clear(), eR.clear(), eTW.clear(), eTR.clear();
++      eWEarly.clear(), eREarly.clear(), eTWEarly.clear(), eTREarly.clear();
++      // The merged encoder's own attachments (slots a fetch brought in included), then each pass's.
++      if (compiled.encoders[e].kind == Encoder::Kind::Render)
++        for (const Access& a : attachmentAccesses(compiled.encoders[e].pass)) visit(a);
++      for (uint32_t ci : compiled.encoders[e].commands) {
++        const Command& c = cmds[ci];
++        if (const auto* rpc = std::get_if<RenderPass>(&c)) {
++          for (const Access& a : attachmentAccesses(rpc->desc)) visit(a);
++          for (const Draw& d : rpc->draws) {
++            for (const Access& a : d.bindings) visit(a);
++            // Index and indirect buffers: whole buffers (conservative: a join too many, never one too few).
++            if (d.index) visit(vpgpu::read(ResourceRange::wholeBuffer(d.index->buffer), stage::vertex));
++            if (d.indirect) {
++              visit(vpgpu::read(ResourceRange::wholeBuffer(d.indirect->buffer), stage::vertex));
++              if (d.indirect->countBuffer) visit(vpgpu::read(ResourceRange::wholeBuffer(d.indirect->countBuffer), stage::vertex));
++            }
++          }
++        } else if (const auto* dp = std::get_if<Dispatch>(&c)) {
++          for (const Access& a : dp->bindings) visit(a);
++          if (dp->indirect) visit(vpgpu::read(ResourceRange::wholeBuffer(dp->indirect->buffer), stage::compute));
++        } else {
++          for (const Access& a : copyAccesses(std::get<Copy>(c))) visit(a);
++        }
++      }
++      uint8_t join = 0;  // 2: some conflicting access is early (vertex or any stage), 1: fragment only
++      auto note = [&](bool conflict, uint8_t early) {
++        if (conflict) join = std::max<uint8_t>(join, early ? 2 : 1);
++      };
++      for (size_t k = 0; k < eW.size() && join < 2; ++k) note(hits(inW, eW[k]) || hits(inR, eW[k]), eWEarly[k]);
++      for (size_t k = 0; k < eR.size() && join < 2; ++k) note(hits(inW, eR[k]), eREarly[k]);
++      for (size_t k = 0; k < eTW.size() && join < 2; ++k)
++        note(std::binary_search(inTW.begin(), inTW.end(), eTW[k]) || std::binary_search(inTR.begin(), inTR.end(), eTW[k]),
++             eTWEarly[k]);
++      for (size_t k = 0; k < eTR.size() && join < 2; ++k) note(std::binary_search(inTW.begin(), inTW.end(), eTR[k]), eTREarly[k]);
++      // Compute and copy encoders have no stages to split; a dump serialises everything anyway.
++      if (join && compiled.encoders[e].kind != Encoder::Kind::Render) join = 2;
++      needJoin[e] = dumping ? 2 : join;
++      (needJoin[e] ? trackedJoined : trackedFree).fetch_add(1, std::memory_order_relaxed);
++      mine.bufW.insert(mine.bufW.end(), eW.begin(), eW.end());
++      mine.bufR.insert(mine.bufR.end(), eR.begin(), eR.end());
++      mine.texW.insert(mine.texW.end(), eTW.begin(), eTW.end());
++      mine.texR.insert(mine.texR.end(), eTR.begin(), eTR.end());
++    }
++    mergeRanges(mine.bufW), mergeRanges(mine.bufR), uniqueKeys(mine.texW), uniqueKeys(mine.texR);
++    mine.frame = frameIndex;
++  }
+   if (!carriedIn.empty()) {
+     if (id<MTLBlitCommandEncoder> jb = [cb blitCommandEncoder]) {
+       jb.label = @"vpgpu.join";
+@@ -2455,6 +2659,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       [jb updateFence:joinFence];
+       [jb endEncoding];
+       fenceOwner[(__bridge const void*)joinFence] = kOwnerPrevious;
++      // Tracked: this command buffer's own barriers order only its encoders; the previous tail is the join's.
++      if (cbTracked) frontier.clear();
+     }
+   }
+   size_t b = 0;  // cursor into compiled.barriers (sorted by encoder, item)
+@@ -2586,14 +2792,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         passW = t0 ? std::max<NSUInteger>(1, t0.width >> lv) : 1;
+         passH = t0 ? std::max<NSUInteger>(1, t0.height >> lv) : 1;
+       }
+-      NSUInteger s0, s1;
+-      samplePair(e, s0, s1);
+-      if (s0 != MTLCounterDontSample) {
++      NSUInteger sq[4];
++      sampleQuad(e, sq);
++      if (sq[0] != MTLCounterDontSample) {
+         rp.sampleBufferAttachments[0].sampleBuffer = slot.samples;
+-        rp.sampleBufferAttachments[0].startOfVertexSampleIndex = s0;
+-        rp.sampleBufferAttachments[0].endOfVertexSampleIndex = MTLCounterDontSample;
+-        rp.sampleBufferAttachments[0].startOfFragmentSampleIndex = MTLCounterDontSample;
+-        rp.sampleBufferAttachments[0].endOfFragmentSampleIndex = s1;
++        rp.sampleBufferAttachments[0].startOfVertexSampleIndex = sq[0];
++        rp.sampleBufferAttachments[0].endOfVertexSampleIndex = sq[1];
++        rp.sampleBufferAttachments[0].startOfFragmentSampleIndex = sq[2];
++        rp.sampleBufferAttachments[0].endOfFragmentSampleIndex = sq[3];
+       }
+       open.kind = Open::Render;
+       open.render = [cb renderCommandEncoderWithDescriptor:rp];
+@@ -2615,6 +2821,38 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         if (!enc.commands.empty()) g.label = std::get<RenderPass>(cmds[enc.commands[0]]).desc.label;
+         const Attachment& a0 = enc.pass.colors[0].texture ? enc.pass.colors[0] : enc.pass.depth;
+         g.load = int(a0.load), g.store = int(a0.store);
++        if (id<MTLTexture> t = t0 ? t0 : td) g.samples = uint32_t(t.sampleCount);
++        if (exclOn) {
++          // What the load/store actions move (logical size: the render area x views x samples).
++          auto traffic = [&](MTLRenderPassAttachmentDescriptor* a, const Attachment& src, const std::string& name, int tileSlot) {
++            id<MTLTexture> t = a.texture;
++            if (!t) return;
++            auto it = textures.find(src.texture.index);
++            const Format f = src.viewFormat != Format::Undefined ? src.viewFormat
++                             : it != textures.end()              ? it->second.desc.format
++                                                                 : Format::Undefined;
++            const double bpp = f != Format::Undefined ? double(formatInfo(f).bytesPerBlock) : 4.0;
++            const double mb = double(passW) * double(passH) * double(passViews) * double(t.sampleCount) * bpp / 1e6;
++            const bool memoryless = t.storageMode == MTLStorageModeMemoryless;
++            const bool stores = a.storeAction == MTLStoreActionStore || a.storeAction == MTLStoreActionStoreAndMultisampleResolve;
++            const bool resolves = a.storeAction == MTLStoreActionMultisampleResolve ||
++                                  a.storeAction == MTLStoreActionStoreAndMultisampleResolve;
++            if (a.loadAction == MTLLoadActionLoad && !memoryless) g.loadMb += mb;
++            if (stores && !memoryless) g.storeMb += mb;
++            if (resolves && a.resolveTexture) g.storeMb += mb / double(std::max<NSUInteger>(1, t.sampleCount));
++            g.attach += (g.attach.empty() ? "" : ",") + name + ":" +
++                        (a.loadAction == MTLLoadActionLoad ? "L" : a.loadAction == MTLLoadActionClear ? "C" : "D") +
++                        (stores && resolves ? "SR" : stores ? "S" : resolves ? "R" : "D") + (memoryless ? "m" : "");
++            const TileVerdict v = enc.tile[tileSlot];
++            if (v != TileVerdict::None && v != TileVerdict::TileLocal) g.attach += std::string(":") + toString(v);
++          };
++          for (int i = 0; i < kMaxColorAttachments; ++i)
++            if (enc.pass.colors[i].texture) traffic(rp.colorAttachments[i], enc.pass.colors[i], "c" + std::to_string(i), i);
++          if (enc.pass.depth.texture) {
++            if (rp.depthAttachment.texture) traffic(rp.depthAttachment, enc.pass.depth, "d", kDepthSlot);
++            else traffic(rp.stencilAttachment, enc.pass.depth, "s", kDepthSlot);
++          }
++        }
+       }
+       if (dumping) {
+         DumpItem it;
+@@ -2637,6 +2875,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         }
+         dumpQueue(std::move(it), t, level, slice);
+       }
++      NSUInteger curAmp = 1;  // the encoder's vertex amplification count (a new encoder starts at 1)
+       for (uint32_t ci : enc.commands) {
+         const auto& draws = std::get<RenderPass>(cmds[ci]).draws;
+         for (uint32_t j = 0; j < draws.size(); ++j) {
+@@ -2669,6 +2908,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+             skip(ci, j, "fetch_mismatch");
+             continue;
+           }
++          // An amplified pipeline maps view v to layer and viewport v: only in a pass with that many layers.
++          if (p->amp > passViews) {
++            skip(ci, j, "amplified_in_unlayered_pass");
++            continue;
++          }
+           std::string why;
+           pendingUse.clear();
+           const int64_t vt = table(p->stage[0], d.bindings, stage::vertex, why, d.views);
+@@ -2678,7 +2922,21 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+             continue;
+           }
+           useBound();
++          // Vertex amplification: the vertex shader writes layer / viewport index 0; the view mappings add the
++          // view (amplification id) to both, so view v lands on layer v with viewport v (the rate map's layer).
++          // The encoder's count never exceeds the bound pipeline's maxVertexAmplificationCount: raising it
++          // binds the amplified pipeline first, lowering it drops the count before the plain pipeline is bound.
++          if (p->amp < curAmp) {
++            [open.render setVertexAmplificationCount:1 viewMappings:nil];
++            curAmp = 1;
++          }
+           [open.render setRenderPipelineState:p->render];
++          if (p->amp > curAmp) {
++            MTLVertexAmplificationViewMapping maps[2];
++            for (uint32_t v = 0; v < 2; ++v) maps[v].viewportArrayIndexOffset = v, maps[v].renderTargetArrayIndexOffset = v;
++            [open.render setVertexAmplificationCount:p->amp viewMappings:maps];
++            curAmp = p->amp;
++          }
+           {
+             EncDiag& g = (*diag)[e];
+             ++g.draws;
+@@ -2977,6 +3235,18 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     }
+   }
+   close();
++  if (cbTracked) {
++    // Encoders that skipped the join may still run when the next command buffer starts: its join follows
++    // this one's tail AND this join (transitively, every earlier command buffer).
++    if (joinFence) frontier.push_back(joinFence);
++    cbAccess.push_back(std::move(mine));
++  }
++  // gpu.excl: command buffers with the same encoders (kind, formats, size, layers, samples) are one type.
++  uint64_t exclType = 1469598103934665603ull ^ uint64_t(compiled.encoders.size());
++  for (const EncDiag& g : *diag)
++    for (uint64_t v : {uint64_t(uint8_t(g.kind)), uint64_t(g.color0), uint64_t(g.depth), uint64_t(g.width) << 20 | g.height,
++                       uint64_t(g.layers) << 8 | g.samples})
++      exclType = (exclType ^ v) * 1099511628211ull;
+   if (residencyDirty) {  // render targets allocated lazily while encoding
+     [residency commit];
+     residencyDirty = false;
+@@ -3040,9 +3310,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     // Per core encoder: raw GPU ticks of its first start / last end sample (0 = not written: a render
+     // encoder without vertex work never writes its start, an encoder the watchdog killed never its end).
+     std::vector<std::pair<uint64_t, uint64_t>> raw(encSamples.size(), {0, 0});
++    std::vector<std::pair<uint64_t, uint64_t>> stg(encStages.size(), {0, 0});  // render: vertex end, fragment start
+     if (sampleCount) {
+       NSData* data = [samples resolveCounterRange:NSMakeRange(0, sampleCount)];
+       const auto* ts = static_cast<const MTLCounterResultTimestamp*>(data.bytes);
++      auto tick = [&](NSUInteger k) -> uint64_t {
++        if (!ts || k >= sampleCount) return 0;  // NSNotFound / MTLCounterDontSample: not sampled
++        const uint64_t t = ts[k].timestamp;
++        return t == MTLCounterErrorValue ? 0 : t;
++      };
++      for (size_t i = 0; i < encStages.size(); ++i) stg[i] = {tick(encStages[i].first), tick(encStages[i].second)};
+       for (size_t i = 0; i < encSamples.size(); ++i) {
+         const auto [s0, s1] = encSamples[i];
+         double ms = 0;
+@@ -3055,6 +3332,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         d.timings.encoderMs.push_back(ms);
+       }
+     }
++    if (impl->exclOn && sampleCount && diag && finished.status == MTLCommandBufferStatusCompleted)
++      impl->exclAccount(exclType, *diag, raw, stg, finished.GPUEndTime, d.timings.frameMs);
+     if (finished.status == MTLCommandBufferStatusError) {
+       std::string encs;
+       NSArray* infos = finished.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+@@ -3254,11 +3533,12 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+         char buf[256];
+         std::snprintf(buf, sizeof buf,
+                       "gpu.order f=%llu cbs=%llu overlapped=%llu max_overlap_ms=%.2f out_of_order=%llu slot_busy=%llu "
+-                      "carried_waits=%llu cb_order=%d",
++                      "carried_waits=%llu cb_order=%d tracked_joined=%llu tracked_free=%llu",
+                       (unsigned long long)frameIndex, (unsigned long long)impl->cbCompleted,
+                       (unsigned long long)impl->cbOverlaps, impl->cbMaxOverlapMs, (unsigned long long)impl->cbOutOfOrder,
+                       (unsigned long long)impl->slotBusyWaits.load(), (unsigned long long)impl->carriedWaits.load(),
+-                      impl->cbOrder ? 1 : 0);
++                      impl->cbOrder ? (impl->cbTracked ? 2 : 1) : 0, (unsigned long long)impl->trackedJoined.load(),
++                      (unsigned long long)impl->trackedFree.load());
+         orderLine = buf;
+       }
+     }
+@@ -3268,6 +3548,114 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   [cb commit];
+ }
+ 
++namespace {
++// gpu.excl description of one encoder (from the first command buffer of its type in the window).
++std::string exclDescribe(const EncDiag& g) {
++  char b[512];
++  std::string label = g.label.empty() ? "-" : token(g.label).substr(0, 24);
++  if (g.kind == 'r')
++    std::snprintf(b, sizeof b, "kind=r label=%s fmt=%s depth=%s %ux%ux%u s%u att=%s", label.c_str(),
++                  g.color0 ? dumpFormatToken(MTLPixelFormat(g.color0)).c_str() : "-",
++                  g.depth ? dumpFormatToken(MTLPixelFormat(g.depth)).c_str() : "-", g.width, g.height, g.layers, g.samples,
++                  g.attach.empty() ? "-" : g.attach.c_str());
++  else
++    std::snprintf(b, sizeof b, "kind=c label=%s", label.c_str());
++  return b;
++}
++}  // namespace
++
++void MetalBackend::Impl::exclAccount(uint64_t type, const std::vector<EncDiag>& diag,
++                                     const std::vector<std::pair<uint64_t, uint64_t>>& span,
++                                     const std::vector<std::pair<uint64_t, uint64_t>>& stages, double hostEnd, double cbMs) {
++  const double msPerTick = gpuTickNs / 1e6;
++  std::lock_guard lock(exclMutex);
++  if (exclWindowStart <= 0) exclWindowStart = hostEnd;
++  ExclType& t = exclTypes[type];
++  if (t.enc.size() < diag.size()) t.enc.resize(diag.size());
++  ++t.n, ++exclCbs;
++  t.gpu += cbMs;
++  for (size_t i = 0; i < diag.size() && i < span.size(); ++i) {
++    const EncDiag& g = diag[i];
++    ExclEnc& x = t.enc[i];
++    if (x.desc.empty()) x.desc = exclDescribe(g);
++    x.draws += g.draws;
++    x.loadMb += g.loadMb, x.storeMb += g.storeMb;
++    x.joined += g.joined ? 1 : 0;
++    uint64_t start = span[i].first, end = span[i].second;
++    if (g.kind == 'r' && i < stages.size()) {
++      const uint64_t vtxEnd = stages[i].first, fragStart = stages[i].second;
++      // A render encoder without vertex work never writes its vertex samples: it starts with its fragments.
++      if (fragStart && (!start || fragStart < start)) start = fragStart;
++      if (!end) end = vtxEnd;
++      if (span[i].first && vtxEnd >= span[i].first) x.vtx += double(vtxEnd - span[i].first) * msPerTick, ++x.vtxN;
++      if (fragStart && span[i].second >= fragStart) x.frag += double(span[i].second - fragStart) * msPerTick, ++x.fragN;
++    }
++    if (!start || !end || end < start) continue;  // not sampled (or a broken pair)
++    x.span += double(end - start) * msPerTick;
++    // Idle: the GPU had nothing of ours between the latest end and this start (another process's work,
++    // the compositor's, or waiting for the next submission).
++    if (exclLastEnd && start > exclLastEnd) t.idle += double(start - exclLastEnd) * msPerTick;
++    const uint64_t from = std::max(start, exclLastEnd);
++    if (end > from) {
++      const double ms = double(end - from) * msPerTick;
++      x.excl += ms, t.excl += ms;
++    }
++    exclLastEnd = std::max(exclLastEnd, end);
++  }
++  if (hostEnd - exclWindowStart >= exclWindowS) exclReportLocked(hostEnd);
++}
++
++// Per window: one summary line, then the heaviest command-buffer types (share of the exclusive time) with
++// their heaviest encoders, all per command buffer of that type (averages).
++void MetalBackend::Impl::exclReportLocked(double now) {
++  const double window = std::max(1e-3, now - exclWindowStart);
++  double total = 0, idle = 0;
++  std::vector<std::pair<double, uint64_t>> order;
++  for (const auto& [k, t] : exclTypes) {
++    total += t.excl, idle += t.idle;
++    order.push_back({t.excl, k});
++  }
++  std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
++  char buf[768];
++  std::snprintf(buf, sizeof buf, "gpu.excl window_s=%.1f cbs=%llu types=%zu busy_ms_per_s=%.1f idle_ms_per_s=%.1f report=%llu",
++                window, (unsigned long long)exclCbs, exclTypes.size(), total / window, idle / window,
++                (unsigned long long)++exclReports);
++  info(buf);
++  size_t shown = 0;
++  for (const auto& [ex, k] : order) {
++    if (shown >= 5 || (shown >= 2 && total > 0 && ex / total < 0.03)) break;
++    ++shown;
++    const ExclType& t = exclTypes[k];
++    const double n = std::max(1u, t.n);
++    std::snprintf(buf, sizeof buf,
++                  "gpu.excl type=%016llx cbs=%u per_s=%.1f gpu_ms=%.2f excl_ms=%.2f idle_before_ms=%.2f share=%.0f%% encoders=%zu",
++                  (unsigned long long)k, t.n, double(t.n) / window, t.gpu / n, t.excl / n, t.idle / n,
++                  total > 0 ? 100.0 * ex / total : 0.0, t.enc.size());
++    info(buf);
++    // Its encoders that matter (exclusive >= 0.05 ms or span >= 0.5 ms per command buffer), the 12
++    // heaviest, in submission order.
++    std::vector<size_t> pick;
++    for (size_t i = 0; i < t.enc.size(); ++i)
++      if (t.enc[i].excl / n >= 0.05 || t.enc[i].span / n >= 0.5) pick.push_back(i);
++    std::sort(pick.begin(), pick.end(), [&](size_t a, size_t b) { return t.enc[a].excl > t.enc[b].excl; });
++    if (pick.size() > 12) pick.resize(12);
++    std::sort(pick.begin(), pick.end());
++    for (size_t i : pick) {
++      const ExclEnc& x = t.enc[i];
++      std::snprintf(buf, sizeof buf,
++                    "gpu.excl type=%016llx i=%zu %s draws=%.0f excl_ms=%.3f span_ms=%.3f vtx_ms=%.3f frag_ms=%.3f load_mb=%.1f "
++                    "store_mb=%.1f joined=%.0f%%",
++                    (unsigned long long)k, i, x.desc.c_str(), x.draws / n, x.excl / n, x.span / n,
++                    x.vtxN ? x.vtx / x.vtxN : -1.0, x.fragN ? x.frag / x.fragN : -1.0, x.loadMb / n, x.storeMb / n,
++                    100.0 * x.joined / n);
++      info(buf);
++    }
++  }
++  exclTypes.clear();
++  exclCbs = 0;
++  exclWindowStart = now;
++}
++
+ // ---------------------------------------------------------------------------------------------
+ 
+ MetalBackend::MetalBackend(const ShaderProvider& shaders, LogSink log, MetalOptions options)
+@@ -3314,6 +3702,8 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
+     return;
+   }
+   if (!d.label.empty()) b.buffer.label = @(d.label.c_str());
++  b.host = reinterpret_cast<uintptr_t>(b.buffer.contents) + uintptr_t(b.base);
++  b.span = uint64_t(b.buffer.length) > b.base ? uint64_t(b.buffer.length) - b.base : 0;
+   if (m.residency) {
+     [m.residency addAllocation:b.buffer];
+     m.residencyDirty = true;
+@@ -3549,6 +3939,7 @@ uint64_t descriptorKey(id desc, bool compute) {
+   k.add(uint64_t(d.alphaToOneEnabled));
+   k.add(uint64_t(d.rasterizationEnabled));
+   k.add(uint64_t(d.inputPrimitiveTopology));
++  k.add(uint64_t(d.maxVertexAmplificationCount));
+   MTLVertexDescriptor* vd = d.vertexDescriptor;  // unused today (vertex pulling); hashed if set
+   if (vd) {
+     for (NSUInteger i = 0; i < 31; ++i) {
+diff --git a/gpu/shader/ir/include/vpir/ir.h b/gpu/shader/ir/include/vpir/ir.h
+index d66939d..18e1a0b 100644
+--- a/gpu/shader/ir/include/vpir/ir.h
++++ b/gpu/shader/ir/include/vpir/ir.h
+@@ -74,6 +74,7 @@ enum class Builtin : uint8_t {
+     ClipDistance,         // vertex/mesh out: f32 x N (N = 1..4; one [[clip_distance]] array of N)
+     ViewportIndex,        // vertex/mesh out: u32 ([[viewport_array_index]]; multiview: = the view, so a
+                           // rasterization rate map's layer follows the view, not layer 0 for every eye)
++    AmplificationId,      // vertex in: u32 ([[amplification_id]]: the view under Metal vertex amplification)
+ };
+ 
+ enum class Interp : uint8_t { Perspective, Linear, Flat };
+diff --git a/gpu/shader/ir/src/ir.cpp b/gpu/shader/ir/src/ir.cpp
+index bb81d90..0899d2d 100644
+--- a/gpu/shader/ir/src/ir.cpp
++++ b/gpu/shader/ir/src/ir.cpp
+@@ -46,7 +46,7 @@ const char* toString(Builtin b) {
+                               "primitive_id",  "layer",             "global_invocation_id",
+                               "local_invocation_id", "workgroup_id", "num_workgroups",
+                               "local_invocation_index", "subgroup_invocation", "subgroup_size",
+-                              "clip_distance", "viewport_index"};
++                              "clip_distance", "viewport_index", "amplification_id"};
+     return n[unsigned(b)];
+ }
+ const char* toString(Interp i) {
+@@ -112,6 +112,7 @@ BuiltinInfo builtinInfo(Builtin b, bool asInput) {
+         case Builtin::SubgroupSize: return {kU32, true, kGrid | kFrag};
+         case Builtin::ClipDistance: return {Type{Scalar::F32, 4}, false, kVtx | bit(Stage::Mesh)};  // width 1..4
+         case Builtin::ViewportIndex: return {kU32, false, kVtx | bit(Stage::Mesh)};
++        case Builtin::AmplificationId: return {kU32, true, kVtx};
+     }
+     return {kVoid, asInput, 0};
+ }
+diff --git a/gpu/shader/ir/src/parse.cpp b/gpu/shader/ir/src/parse.cpp
+index 4b3037c..28bc38a 100644
+--- a/gpu/shader/ir/src/parse.cpp
++++ b/gpu/shader/ir/src/parse.cpp
+@@ -239,7 +239,7 @@ private:
+         v.type = parseType();
+         if (acceptWord("builtin")) {
+             expectPunct('(');
+-            v.builtin = parseEnum<Builtin>(toString, Builtin::ViewportIndex, "builtin");
++            v.builtin = parseEnum<Builtin>(toString, Builtin::AmplificationId, "builtin");
+             if (v.builtin == Builtin::None) fail("expected builtin");
+             expectPunct(')');
+         } else {
+diff --git a/gpu/shader/msl/src/msl.cpp b/gpu/shader/msl/src/msl.cpp
+index db5de9d..2847d01 100644
+--- a/gpu/shader/msl/src/msl.cpp
++++ b/gpu/shader/msl/src/msl.cpp
+@@ -111,6 +111,7 @@ const char* builtinAttr(Builtin b) {
+         case Builtin::SubgroupSize: return "threads_per_simdgroup";
+         case Builtin::ClipDistance: return "clip_distance";
+         case Builtin::ViewportIndex: return "viewport_array_index";
++        case Builtin::AmplificationId: return "amplification_id";
+         case Builtin::None: break;
+     }
+     return "";
+@@ -340,7 +341,8 @@ private:
+         if (!m_.resources.empty()) params.push_back("constant VpArgs& vp_args [[buffer(0)]]");
+         for (const IoVar& v : m_.inputs)
+             if (v.builtin != Builtin::None)
+-                params.push_back(typeName(v.type) + " " + builtinParam(v) + " [[" + builtinAttr(v.builtin) + "]]");
++                params.push_back((v.builtin == Builtin::AmplificationId ? std::string("ushort") : typeName(v.type)) + " " +
++                                 builtinParam(v) + " [[" + builtinAttr(v.builtin) + "]]");
+         for (auto [n, t] : fetched_)
+             params.push_back(typeName(t) + " vp_fb" + std::to_string(n) + " [[color(" + std::to_string(n) + ")]]");
+ 
+@@ -787,6 +789,8 @@ private:
+ 
+     std::string inputExpr(uint32_t i) const {
+         const IoVar& v = m_.inputs[i];
++        // [[amplification_id]] is declared ushort (as Apple's samples do); VPIR reads it as u32.
++        if (v.builtin == Builtin::AmplificationId) return "uint(" + builtinParam(v) + ")";
+         if (v.builtin != Builtin::None) return builtinParam(v);
+         std::string e = "vp_in." + ident(v.name);
+         if (interpolated_.contains(i))
+diff --git a/gpu/shader/spirv/CMakeLists.txt b/gpu/shader/spirv/CMakeLists.txt
+index dedb07f..6775dc3 100644
+--- a/gpu/shader/spirv/CMakeLists.txt
++++ b/gpu/shader/spirv/CMakeLists.txt
+@@ -11,7 +11,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
+     add_executable(vpspirv_tests tests/spirv_tests.cpp)
+     target_link_libraries(vpspirv_tests PRIVATE vpspirv vpmsl)
+     target_compile_options(vpspirv_tests PRIVATE -Wall -Wextra)
+-    foreach(t mesh_multiview lit cull subpass motion)
++    foreach(t mesh_multiview lit cull subpass motion amplify)
+       foreach(v plain opt)
+         add_test(NAME gpu_spirv.${t}.${v} COMMAND vpspirv_tests ${t} ${v} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+       endforeach()
+diff --git a/gpu/shader/spirv/src/lower.cpp b/gpu/shader/spirv/src/lower.cpp
+index 897f6ae..9b6b8f0 100644
+--- a/gpu/shader/spirv/src/lower.cpp
++++ b/gpu/shader/spirv/src/lower.cpp
+@@ -19,6 +19,15 @@
+ //   * Multiview (viewCount > 1): the driver draws instances * viewCount; the vertex shader takes
+ //     view = instance_id % viewCount, instance = instance_id / viewCount and writes the view to the
+ //     render-target layer, which the fragment shader reads back as ViewIndex.
++//   * Multiview with SpirvLowerOptions::amplify (two views): Metal vertex amplification instead. The
++//     view is [[amplification_id]], instances are not multiplied, and the layer / viewport index
++//     outputs are 0: the encoder's view mappings add the view to both (Metal treats every built-in
++//     output but the position as shared between the views, so they must not depend on it). Vertex
++//     shaders that write Layer or ClipDistance keep instancing (SpirvInterface::amplified false).
++//     Either way, in this mode every multiview vertex shader also writes the view to a flat varying
++//     (kViewVaryingLocation) and the fragment shader reads ViewIndex from it.
++//   * SpirvLowerOptions::nativeFetch: 16-bit float vertex attributes convert through half2 (one
++//     native conversion) instead of the bit-exact integer expansion.
+ #include <algorithm>
+ #include <cmath>
+ #include <cstring>
+@@ -143,10 +152,14 @@ uint32_t floatBits(float f) {
+ 
+ class Lowering {
+ public:
+-    Lowering(const SpirvModule& m, const SpirvLowerOptions& o, vpir::Module& out, SpirvInterface& iface)
+-        : m_(m), o_(o), out_(out), iface_(iface) {}
++    Lowering(const SpirvModule& m, const SpirvLowerOptions& o, vpir::Module& out, SpirvInterface& iface,
++             bool allowAmp = true)
++        : m_(m), o_(o), out_(out), iface_(iface), allowAmp_(allowAmp) {}
+ 
+     void run();
++    // Amplified, but the shader writes ClipDistance: Metal would compute it once for both views (every
++    // built-in output but the position is shared), so lower() redoes this shader with instancing.
++    bool needsInstancing() const { return amp_ && clipWritten_; }
+ 
+ private:
+     const SpirvModule& m_;
+@@ -173,6 +186,13 @@ private:
+     int positionInput_ = -1, layerInput_ = -1, instanceInput_ = -1, vertexInput_ = -1;
+     int layerOutput_ = -1;
+     int viewportOutput_ = -1;  // multiview: [[viewport_array_index]] = the view (rate map layer per eye)
++    // Vertex amplification (SpirvLowerOptions::amplify): this vertex shader takes the view from
++    // [[amplification_id]] (ampInput_); viewOutput_/viewInput_ are the flat view varying of the mode.
++    bool amp_ = false;
++    const bool allowAmp_ = true;
++    bool clipWritten_ = false;  // a ClipDistance output is stored to
++    int ampInput_ = -1, viewOutput_ = -1, viewInput_ = -1;
++    static constexpr uint32_t kViewVaryingLocation = 63;  // past every Vulkan location (and motion's 30/31)
+     bool writesLayer_ = false;
+     // Motion variant (SpirvLowerOptions::motion).
+     bool prev_ = false;                 // lowering the previous-frame run of the vertex entry point
+@@ -1049,9 +1069,13 @@ private:
+     void storeIo(const RPtr& p, const Val& v) {
+         if (p.kind != RPtr::Output) fail("store to an input");
+         const IoVarInfo& io = io_.at(p.global);
++        auto noteClip = [&](const IoLeaf& leaf) {
++            if (leaf.index >= 0 && out_.outputs[size_t(leaf.index)].builtin == vpir::Builtin::ClipDistance) clipWritten_ = true;
++        };
+         if (p.element) {
+             const IoLeaf& leaf = io.leaves.at(p.leaf);
+             if (leaf.kind != IoLeaf::Io) return;
++            noteClip(leaf);
+             uint32_t var = shadowOf(leaf);
+             if (var == UINT32_MAX) return;
+             ValueId cur = loadVar(var);
+@@ -1066,6 +1090,7 @@ private:
+         for (size_t i = 0; i < v.v.size(); ++i) {
+             const IoLeaf& leaf = io.leaves.at(p.leaf + i);
+             if (leaf.kind != IoLeaf::Io) continue;
++            noteClip(leaf);
+             uint32_t var = shadowOf(leaf);
+             if (var == UINT32_MAX) continue;
+             if (leaf.component >= 0) {
+@@ -1086,14 +1111,24 @@ private:
+     ValueId viewIndex() {
+         if (stage_ == vpir::Stage::Fragment) {
+             if (o_.viewCount <= 1) return u32(0);
++            if (o_.amplify) {  // the vertex stage's flat view varying (declared on first use)
++                if (viewInput_ < 0) {
++                    vpir::IoVar v;
++                    v.name = "vp_view", v.type = vpir::kU32, v.location = kViewVaryingLocation;
++                    v.interp = vpir::Interp::Flat;
++                    viewInput_ = addInput(v);
++                }
++                return b_->loadInput(uint32_t(viewInput_), vpir::kU32);
++            }
+             return b_->loadInput(uint32_t(layerInput_), vpir::kU32);
+         }
++        if (amp_) return b_->loadInput(uint32_t(ampInput_), vpir::kU32);
+         if (o_.viewCount <= 1 || instanceInput_ < 0) return u32(0);
+         return bin(Op::Rem, b_->loadInput(uint32_t(instanceInput_), vpir::kU32), u32(o_.viewCount), vpir::kU32);
+     }
+     ValueId instanceIndex() {
+         ValueId i = b_->loadInput(uint32_t(instanceInput_), vpir::kU32);
+-        if (o_.viewCount > 1) i = bin(Op::Div, i, u32(o_.viewCount), vpir::kU32);
++        if (o_.viewCount > 1 && !amp_) i = bin(Op::Div, i, u32(o_.viewCount), vpir::kU32);
+         return i;
+     }
+     ValueId inputValue(const IoLeaf& leaf) {
+@@ -1279,8 +1314,18 @@ private:
+             walk(pointee, vd, 0, 0);
+             io_[id] = std::move(info);
+         }
++        // Vertex amplification: two views, and no built-in output that would have to differ per view
++        // (Metal computes those once for both). Otherwise this shader keeps multiview by instancing.
++        // (A ClipDistance the shader writes is found while lowering the body: see needsInstancing.)
++        if (stage_ == vpir::Stage::Vertex && allowAmp_ && o_.amplify && o_.viewCount == 2 && !writesLayer_) amp_ = true;
++        iface_.amplified = amp_;
++        if (amp_) {
++            vpir::IoVar v;
++            v.builtin = vpir::Builtin::AmplificationId, v.name = "amplification_id", v.type = vpir::kU32;
++            ampInput_ = addInput(v);
++        }
+         // What multiview and the input-attachment pattern need.
+-        if (stage_ == vpir::Stage::Vertex && (o_.viewCount > 1 || hasInstanceAttributes())) {
++        if (stage_ == vpir::Stage::Vertex && ((o_.viewCount > 1 && !amp_) || hasInstanceAttributes())) {
+             if (instanceInput_ < 0) {
+                 vpir::IoVar v;
+                 v.builtin = vpir::Builtin::InstanceId, v.name = "instance_id", v.type = vpir::kU32;
+@@ -1305,7 +1350,14 @@ private:
+             v.builtin = vpir::Builtin::ViewportIndex, v.name = "viewport_index", v.type = vpir::kU32;
+             viewportOutput_ = addOutput(v);
+         }
+-        if (stage_ == vpir::Stage::Fragment && o_.viewCount > 1) {
++        if (stage_ == vpir::Stage::Vertex && o_.viewCount > 1 && o_.amplify) {
++            for (const vpir::IoVar& o : out_.outputs)
++                if (o.builtin == vpir::Builtin::None && o.location == kViewVaryingLocation) fail("view varying location taken");
++            vpir::IoVar v;
++            v.name = "vp_view", v.type = vpir::kU32, v.location = kViewVaryingLocation, v.interp = vpir::Interp::Flat;
++            viewOutput_ = addOutput(v);
++        }
++        if (stage_ == vpir::Stage::Fragment && o_.viewCount > 1 && !o_.amplify) {
+             vpir::IoVar v;
+             v.builtin = vpir::Builtin::Layer, v.name = "layer", v.type = vpir::kU32;
+             v.interp = vpir::Interp::Flat;
+@@ -1392,8 +1444,10 @@ private:
+                 in.op = Op::Insert, in.type = o.type, in.args = {v, y}, in.lits = {1};
+                 v = b_->emit(in);
+             }
+-            if (int(i) == layerOutput_ && !writesLayer_) v = viewIndex();
+-            if (int(i) == viewportOutput_) v = viewIndex();
++            // Under amplification the encoder's view mappings add the view to both (0 + view).
++            if (int(i) == layerOutput_ && !writesLayer_) v = amp_ ? u32(0) : viewIndex();
++            if (int(i) == viewportOutput_) v = amp_ ? u32(0) : viewIndex();
++            if (int(i) == viewOutput_) v = viewIndex();
+             b_->storeOutput(uint32_t(i), v);
+         }
+     }
+@@ -1473,9 +1527,24 @@ private:
+         auto halves = [&](uint32_t n) {
+             if (limit && limit < n) n = limit;
+             std::vector<ValueId> c;
++            std::vector<std::pair<uint32_t, ValueId>> pairs;  // nativeFetch: word offset -> its two halves as f32x2
+             for (uint32_t i = 0; i < n; ++i) {
+                 uint32_t bit = bitShift + i * 16;
+                 ValueId w = word((bit / 32) * 4);
++                if (o_.nativeFetch && bit % 16 == 0) {
++                    // half -> float is exact (denormals, inf and NaN included): one native conversion of
++                    // the word's half2 instead of ~20 integer operations per component.
++                    const uint32_t at = (bit / 32) * 4;
++                    ValueId f2 = kNoValue;
++                    for (auto& [o, v] : pairs)
++                        if (o == at) f2 = v;
++                    if (f2 == kNoValue) {
++                        f2 = un(Op::Convert, bitcast(w, vpir::kF16.withWidth(2)), vpir::kF32.withWidth(2));
++                        pairs.push_back({at, f2});
++                    }
++                    c.push_back(ext(f2, (bit % 32) / 16));
++                    continue;
++                }
+                 c.push_back(halfToFloat(bits(w, bit % 32, 16, false)));
+             }
+             return c;
+@@ -3299,8 +3368,18 @@ bool lower(const SpirvModule& m, const SpirvLowerOptions& options, vpir::Module&
+            std::string& error) {
+     iface = SpirvInterface{};
+     try {
+-        Lowering l(m, options, out, iface);
+-        l.lowerAll();
++        bool instancing = false;
++        {
++            Lowering l(m, options, out, iface);
++            l.lowerAll();
++            instancing = l.needsInstancing();
++        }
++        if (instancing) {  // amplified but writes ClipDistance: again with multiview by instancing
++            iface = SpirvInterface{};
++            out = vpir::Module{};
++            Lowering l(m, options, out, iface, false);
++            l.lowerAll();
++        }
+     } catch (const LowerError& e) {
+         error = e.what();
+         out = vpir::Module{};
+diff --git a/gpu/shader/spirv/tests/spirv_tests.cpp b/gpu/shader/spirv/tests/spirv_tests.cpp
+index f719a5f..c911d17 100644
+--- a/gpu/shader/spirv/tests/spirv_tests.cpp
++++ b/gpu/shader/spirv/tests/spirv_tests.cpp
+@@ -50,9 +50,12 @@ struct Result {
+     vpmsl::MslShader msl;
+ };
+ 
++Result runWords(const std::vector<uint32_t>& words, const spirv::SpirvLowerOptions& o, bool fetch = false);
+ Result run(const std::string& path, const spirv::SpirvLowerOptions& o, bool fetch = false) {
++    return runWords(readWords(path), o, fetch);
++}
++Result runWords(const std::vector<uint32_t>& words, const spirv::SpirvLowerOptions& o, bool fetch) {
+     Result r;
+-    std::vector<uint32_t> words = readWords(path);
+     std::string error;
+     spirv::SpirvModule* m = spirv::parse(words.data(), words.size(), error);
+     if (!m) {
+@@ -230,6 +233,93 @@ void subpass(const std::string& dir, const std::string& v) {
+     CHECK(r.msl.source.find("[[color(1)]]") != std::string::npos);
+ }
+ 
++// Fragment shader writing gl_ViewIndex to a uint colour (tests/asm style, assembled with spvasm.py):
++//   OpCapability MultiView; %vi = Input uint BuiltIn ViewIndex Flat; out uint Location 0; store load(%vi).
++const std::vector<uint32_t> kViewIndexFrag = {
++    0x07230203, 0x00010000, 0x00000000, 0x0000000b, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
++    0x00001157, 0x0003000e, 0x00000000, 0x00000001, 0x0007000f, 0x00000004, 0x00000001, 0x6e69616d,
++    0x00000000, 0x00000002, 0x00000003, 0x00030010, 0x00000001, 0x00000007, 0x00040047, 0x00000002,
++    0x0000000b, 0x00001158, 0x00030047, 0x00000002, 0x0000000e, 0x00040047, 0x00000003, 0x0000001e,
++    0x00000000, 0x00020013, 0x00000004, 0x00030021, 0x00000005, 0x00000004, 0x00040015, 0x00000006,
++    0x00000020, 0x00000000, 0x00040020, 0x00000007, 0x00000001, 0x00000006, 0x00040020, 0x00000008,
++    0x00000003, 0x00000006, 0x0004003b, 0x00000007, 0x00000002, 0x00000001, 0x0004003b, 0x00000008,
++    0x00000003, 0x00000003, 0x00050036, 0x00000004, 0x00000001, 0x00000000, 0x00000005, 0x000200f8,
++    0x00000009, 0x0004003d, 0x00000006, 0x0000000a, 0x00000002, 0x0003003e, 0x00000003, 0x0000000a,
++    0x000100fd, 0x00010038};
++
++// Translator modes (VPVulkan's translatorMode): multiview through Metal vertex amplification and the
++// native half2 conversion of half vertex attributes.
++void amplify(const std::string& dir, const std::string& v) {
++    spirv::SpirvLowerOptions o;
++    o.entry = "main";
++    o.stage = vpir::Stage::Vertex;
++    o.viewCount = 2;
++    o.layout = {bind(0, 0, vpgpu::BindKind::ConstantBuffer, 0), bind(1, 0, vpgpu::BindKind::ConstantBuffer, 1)};
++    o.pushConstantSlot = 2;
++    o.vertexBuffers = {{0, 32, false, 3}, {1, 16, true, 4}};
++    o.vertexAttributes = {{0, 0, 0, vpgpu::Format::RGBA32Float}, {1, 0, 12, vpgpu::Format::RGBA8Snorm},
++                          {2, 0, 16, vpgpu::Format::RG16Float}, {3, 1, 0, vpgpu::Format::RGBA32Float}};
++    const std::string vs = dir + "/mesh_multiview.vert" + (v.empty() ? "" : ".opt") + ".spv";
++    {  // modes off: instancing, bit-exact half expansion
++        Result r = run(vs, o);
++        CHECK(r.ok && !r.iface.amplified);
++        CHECK(r.msl.source.find("amplification_id") == std::string::npos);
++        CHECK(r.msl.source.find("as_type<half2>") == std::string::npos);
++        CHECK(r.msl.source.find("% 2u") != std::string::npos && r.msl.source.find("/ 2u") != std::string::npos);
++        CHECK(r.msl.source.find("user(loc63)") == std::string::npos);
++    }
++    o.amplify = true, o.nativeFetch = true;
++    {
++        Result r = run(vs, o);
++        CHECK(r.ok && r.iface.amplified);
++        const std::string& s = r.msl.source;
++        CHECK(s.find("ushort in_amplification_id [[amplification_id]]") != std::string::npos);
++        CHECK(s.find("uint(in_amplification_id)") != std::string::npos);
++        // The view no longer comes from the instance: no modulo / division by the view count.
++        CHECK(s.find("% 2u") == std::string::npos && s.find("/ 2u") == std::string::npos);
++        // The per-instance attribute still reads instance_id (one instance per Vulkan instance).
++        CHECK(s.find("[[instance_id]]") != std::string::npos);
++        // Layer and viewport index stay 0 (the view mappings add the view); the view varying is flat.
++        CHECK(s.find("[[render_target_array_index]]") != std::string::npos && s.find("[[viewport_array_index]]") != std::string::npos);
++        CHECK(s.find("vp_out.layer = 0u;") != std::string::npos && s.find("vp_out.viewport_index = 0u;") != std::string::npos);
++        CHECK(s.find("[[user(loc63)]]") != std::string::npos);
++        CHECK(s.find("as_type<half2>") != std::string::npos);
++        bool viewOut = false;
++        for (auto& out : r.module.outputs)
++            viewOut |= out.location == 63 && out.builtin == vpir::Builtin::None && out.interp == vpir::Interp::Flat;
++        CHECK(viewOut);
++    }
++    {  // one view: nothing to amplify
++        spirv::SpirvLowerOptions one = o;
++        one.viewCount = 1;
++        Result r = run(vs, one);
++        CHECK(r.ok && !r.iface.amplified && r.msl.source.find("amplification_id") == std::string::npos);
++        CHECK(r.msl.source.find("user(loc63)") == std::string::npos);
++    }
++    {  // ClipDistance would be computed once for both views: this shader keeps instancing (still writes the varying)
++        spirv::SpirvLowerOptions c;
++        c.entry = "main", c.stage = vpir::Stage::Vertex, c.viewCount = 2, c.amplify = true;
++        Result r = run(dir + "/clip_invariant.vert.spv", c);
++        CHECK(r.ok && !r.iface.amplified);
++        CHECK(r.msl.source.find("amplification_id") == std::string::npos);
++        CHECK(r.msl.source.find("% 2u") != std::string::npos);
++        CHECK(r.msl.source.find("[[user(loc63)]]") != std::string::npos);
++    }
++    {  // fragment ViewIndex: the flat view varying in this mode, the layer otherwise
++        spirv::SpirvLowerOptions f;
++        f.entry = "main", f.stage = vpir::Stage::Fragment, f.viewCount = 2, f.amplify = true;
++        Result r = runWords(kViewIndexFrag, f);
++        CHECK(r.ok);
++        CHECK(r.msl.source.find("user(loc63), flat") != std::string::npos);
++        CHECK(r.msl.source.find("render_target_array_index") == std::string::npos);
++        f.amplify = false;
++        Result l = runWords(kViewIndexFrag, f);
++        CHECK(l.ok);
++        CHECK(l.msl.source.find("render_target_array_index") != std::string::npos);
++        CHECK(l.msl.source.find("loc63") == std::string::npos);
++    }
++}
++
+ }  // namespace
+ 
+ // Translation correctness probes (tests/asm/*.spvasm, assembled with tests/asm/spvasm.py):
+@@ -286,6 +376,7 @@ int main(int argc, char** argv) {
+     else if (c == "cull") cull(dir, v);
+     else if (c == "subpass") subpass(dir, v);
+     else if (c == "motion") motion(dir, v);
++    else if (c == "amplify") amplify(dir, v);
+     else if (c == "correctness") correctness(dir, v);
+     else {
+         std::fprintf(stderr, "unknown case %s\n", c.c_str());
+diff --git a/gpu/vulkan/CMakeLists.txt b/gpu/vulkan/CMakeLists.txt
+index f4abac1..46907d7 100644
+--- a/gpu/vulkan/CMakeLists.txt
++++ b/gpu/vulkan/CMakeLists.txt
+@@ -37,5 +37,8 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
+     foreach(t exports physical memory passes submit pipeline recipes alyx depth_resolve resolve_1x suspend_resume local_read sync host_image_copy motion)
+       add_test(NAME gpu_vulkan.${t} COMMAND vpvk_tests ${t} $<TARGET_FILE:VPVulkan>)
+     endforeach()
++    # The same multiview pipeline with the vertex-amplification translator mode.
++    add_test(NAME gpu_vulkan.pipeline_amplify COMMAND vpvk_tests pipeline $<TARGET_FILE:VPVulkan>)
++    set_tests_properties(gpu_vulkan.pipeline_amplify PROPERTIES ENVIRONMENT "VPVK_AMPLIFY=1")
+   endif()
+ endif()
+diff --git a/gpu/vulkan/include/vpvk/spirv_frontend.h b/gpu/vulkan/include/vpvk/spirv_frontend.h
+index e06b8f3..32871f3 100644
+--- a/gpu/vulkan/include/vpvk/spirv_frontend.h
++++ b/gpu/vulkan/include/vpvk/spirv_frontend.h
+@@ -19,7 +19,8 @@
+ //    `convert(position.xy) : vec2<u32>` (builtin Position), layer 0 / current view. The driver then
+ //    runs vpir::toFramebufferFetch on that slot, which recognises exactly this pattern.
+ //  * Multiview: `ViewIndex` becomes the render-target layer index (Builtin::Layer output in the vertex
+-//    stage when viewCount > 1, and the layer input in the fragment stage).
++//    stage when viewCount > 1, and the layer input in the fragment stage). With `amplify`, the view is
++//    [[amplification_id]] (two views) and travels to the fragment stage in a flat varying.
+ //  * Texel buffers: Buffer slot, byte-addressed; the element format is `texelFormats` of the binding
+ //    when known, otherwise the SPIR-V image format.
+ //  * Specialisation constants are folded before lowering.
+@@ -95,6 +96,11 @@ struct SpirvLowerOptions {
+   std::vector<VertexAttribute> vertexAttributes;              // vertex stage only
+   std::vector<VertexBufferBinding> vertexBuffers;             // vertex stage only
+   MotionOptions motion;                                       // VPKTAA motion-vector variant
++  // Translator modes (process-wide, VPVulkan's translatorMode(); not part of a recipe input's hash: the
++  // recipe store's translator id carries them). amplify: two-view multiview through Metal vertex
++  // amplification (see SpirvInterface::amplified). nativeFetch: half vertex attributes via half2.
++  bool amplify = false;
++  bool nativeFetch = false;
+ };
+ 
+ struct SpirvInterface {
+@@ -104,6 +110,9 @@ struct SpirvInterface {
+   std::array<uint32_t, 3> localSize{1, 1, 1};  // compute
+   std::vector<uint16_t> motionPrevSlots;       // motion vertex: ConstantBuffer slots read previous
+   std::vector<uint16_t> motionPrevBuffers;     // motion vertex: Buffer slots read previous
++  // Vertex: multiview through vertex amplification (SpirvLowerOptions::amplify accepted for this shader):
++  // the draw must NOT multiply instances by the view count, and the backend sets the amplification count.
++  bool amplified = false;
+ };
+ 
+ bool lower(const SpirvModule&, const SpirvLowerOptions&, vpir::Module& out, SpirvInterface& iface,
+diff --git a/gpu/vulkan/src/commands.h b/gpu/vulkan/src/commands.h
+index 6227db6..11efa70 100644
+--- a/gpu/vulkan/src/commands.h
++++ b/gpu/vulkan/src/commands.h
+@@ -132,7 +132,7 @@ struct OpDraw {
+   // vkCmdDraw*IndirectCount: the draw count is read from this buffer (capped by indirectCount).
+   const Buffer* countBuffer = nullptr;
+   VkDeviceSize countOffset = 0;
+-  uint32_t viewCount = 1;
++  uint32_t viewCount = 1;  // instance multiplier of multiview (PipelineObj::instanceViews; 1 when amplified)
+   bool ok = true;  // false: the pipeline or a binding was missing (counted as skipped)
+   // After an in-pass barrier only: attachments of the open pass this draw reads as textures.
+   std::vector<const Image*> images;
+diff --git a/gpu/vulkan/src/entry.cpp b/gpu/vulkan/src/entry.cpp
+index 3778b90..cfdf9d0 100644
+--- a/gpu/vulkan/src/entry.cpp
++++ b/gpu/vulkan/src/entry.cpp
+@@ -522,6 +522,7 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice pd,
+   //    available) and time, so it can never take the process down.
+   // Either way prewarmedRecipes = the recipes on disk, which noteRecipeKey counts the game's
+   // pipelines against (gpu.pso.recipe game hits/misses, read by the host).
++  refreshTranslatorMode();  // VPVK_AMPLIFY / VPVK_FETCH_NATIVE as the host set them for this device
+   d->recipes = std::make_unique<RecipeStore>(RecipeStore::defaultDir());
+   if (d->recipes->enabled() && prewarmEnabled()) {
+     constexpr uint64_t kPrewarmBudget = 512ull << 20, kPrewarmFloor = 3ull << 30;
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index d73737a..da3ba13 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -628,6 +628,7 @@ StageOut translateStage(Device* d, const VkPipelineShaderStageCreateInfo& st, co
+   }
+   opt.pushConstantSlot = pl.pushSlot;
+   if (motion) opt.motion = *motion;
++  applyTranslatorMode(opt);
+   if (opt.stage == vpir::Stage::Vertex) {
+     opt.vertexAttributes = attrs;
+     opt.vertexBuffers = vbs;
+@@ -786,6 +787,11 @@ void buildMotionVariants(Device* d, const VkGraphicsPipelineCreateInfo& ci, Pipe
+     // Vertex buffer slots sit after the layout's buffers: the previous copies go past both.
+     mv1.prevBufferBase = std::max<uint32_t>(64, uint32_t(p.layout->nextBuffer) + 16 + 32);
+     StageOut o1 = translateStage(d, vs, *p.layout, p.viewCount, attrs, p.vertexBuffers, st.label + ".mv", &mv1, true);
++    // The variant is drawn with the base pipeline's instance count: both must multiview the same way.
++    if (o1.ok && o1.iface.amplified != p.amplified) {
++      logf("vk.motion no_variant pipeline=%s why=\"amplification differs\"", st.label.c_str());
++      o1.ok = false;
++    }
+     StageOut o2 = o1.ok ? translateStage(d, fs, *p.layout, p.viewCount, {}, {}, st.label + ".mv", &mf, true) : StageOut{};
+     if (o1.ok && o2.ok) {
+       mv->motion = mv->formatOnly;
+@@ -830,6 +836,7 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
+   if (!p->layout) p->layout = std::make_shared<PipelineLayoutObj>();
+   vpgpu::PipelineState& st = p->state;
+   targetFormats(ci, st, p->viewCount);
++  p->instanceViews = p->viewCount;
+   if (const auto* dy = ci.pDynamicState) p->dynamic.assign(dy->pDynamicStates, dy->pDynamicStates + dy->dynamicStateCount);
+   static std::atomic<unsigned> counter{0};
+   st.label = "vk.pipe" + std::to_string(counter++);
+@@ -913,6 +920,9 @@ PipelineObj* createGraphics(Device* d, const VkGraphicsPipelineCreateInfo& ci) {
+       st.vertexShader = o.id;
+       inputs[0] = o.input;
+       collectUsed(*p, o, vpgpu::stage::vertex);
++      // Vertex amplification: one instance per Vulkan instance (the views come from the amplification).
++      p->amplified = o.iface.amplified;
++      p->instanceViews = o.iface.amplified ? 1 : p->viewCount;
+     } else {
+       st.fragmentShader = o.id;
+       inputs[1] = o.input;
+@@ -980,7 +990,9 @@ bool vpvk::translateRecipeStage(const spirv::SpirvModule& m, const spirv::SpirvL
+   spirv::SpirvInterface iface;
+   vpmsl::MslShader msl;
+   std::vector<std::string> errors;
+-  if (lowerAndEmit(m, opt, mod, iface, msl, mslId, errors) != TranslateFail::None) {
++  spirv::SpirvLowerOptions moded = opt;  // stored inputs do not carry the modes: this process's apply
++  applyTranslatorMode(moded);
++  if (lowerAndEmit(m, moded, mod, iface, msl, mslId, errors) != TranslateFail::None) {
+     error = errors.empty() ? "translate" : errors[0];
+     return false;
+   }
+@@ -1487,10 +1499,12 @@ OpDraw makeDraw(Recorder& r, uint32_t first, uint32_t count, uint32_t instances,
+   d.pipeline = p->key;
+   d.primitive = p->state.primitive;
+   d.first = first, d.count = count;
+-  d.instances = instances * p->viewCount;
+-  d.baseInstance = firstInstance * p->viewCount;
++  // Multiview by instancing: every Vulkan instance is drawn once per view (instanceViews = 1 when the
++  // vertex shader multiviews through vertex amplification instead).
++  d.instances = instances * p->instanceViews;
++  d.baseInstance = firstInstance * p->instanceViews;
+   d.baseVertex = baseVertex;
+-  op.viewCount = p->viewCount;
++  op.viewCount = p->instanceViews;
+   if (!resolveBindings(r, *p, r.bound.graphicsSets, d.bindings, d.views)) {
+     op.ok = false;
+     logSkip("unbound_descriptor", p);
+diff --git a/gpu/vulkan/src/precompile.cpp b/gpu/vulkan/src/precompile.cpp
+index 3fe660d..ff3d154 100644
+--- a/gpu/vulkan/src/precompile.cpp
++++ b/gpu/vulkan/src/precompile.cpp
+@@ -226,6 +226,7 @@ PrecompileResult precompileDir(Platform& platform, const std::string& dir, const
+         for (uint32_t views = 1; views <= (rf.viewIndex ? 2u : 1u); ++views) {
+           spirv::SpirvLowerOptions opt;
+           opt.entry = e.name, opt.stage = e.stage, opt.viewCount = views;
++          applyTranslatorMode(opt);  // the MSL the game will ask for in this process's mode
+           opt.layout = rf.bindings;
+           opt.pushConstantSlot = assign(opt.layout, rf.push);
+           if (e.stage == vpir::Stage::Vertex && !rf.inputs.empty()) {
+@@ -314,6 +315,7 @@ extern "C" {
+ __attribute__((visibility("default"))) uint32_t vpvk_precompile_spirv(const char* dir, vpvk_prewarm_progress progress,
+                                                                       void* user) {
+   if (!dir || !*dir) return 0;
++  vpvk::refreshTranslatorMode();
+   std::unique_ptr<vpvk::Platform> platform = vpvk::createPlatform();
+   const auto r = vpvk::precompileDir(*platform, dir, vpvk::RecipeStore::defaultDir(), [&](uint32_t d, uint32_t t) {
+     if (progress) progress(d, t, user);
+diff --git a/gpu/vulkan/src/recipes.cpp b/gpu/vulkan/src/recipes.cpp
+index 6500136..6fcb89f 100644
+--- a/gpu/vulkan/src/recipes.cpp
++++ b/gpu/vulkan/src/recipes.cpp
+@@ -184,6 +184,34 @@ uint64_t* shaderField(vpgpu::PipelineState& s, int stage) {
+ 
+ }  // namespace
+ 
++namespace {
++std::atomic<uint32_t> gTranslatorMode{~0u};  // ~0: not read yet
++}
++
++uint32_t refreshTranslatorMode() {
++  auto flag = [](const char* name, bool def) {
++    const char* e = std::getenv(name);
++    return e && *e ? *e != '0' : def;
++  };
++  const uint32_t m = (flag("VPVK_FETCH_NATIVE", false) ? 1u : 0u) | (flag("VPVK_AMPLIFY", false) ? 2u : 0u);
++  if (gTranslatorMode.exchange(m) != m)
++    logf("vk.translator mode=%u native_fetch=%u amplify=%u id=%u", m, m & 1, (m >> 1) & 1, kTranslatorVersion | m << 16);
++  return m;
++}
++
++uint32_t translatorMode() {
++  const uint32_t m = gTranslatorMode.load();
++  return m != ~0u ? m : refreshTranslatorMode();
++}
++
++uint32_t translatorId() { return kTranslatorVersion | translatorMode() << 16; }
++
++void applyTranslatorMode(spirv::SpirvLowerOptions& o) {
++  const uint32_t m = translatorMode();
++  o.nativeFetch = (m & 1) != 0;
++  o.amplify = (m & 2) != 0;
++}
++
+ uint64_t spirvHash(const uint32_t* words, size_t count) {
+   uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t(count) << 1);
+   for (size_t i = 0; i < count; ++i) h = (h ^ words[i]) * 0x100000001b3ull;
+@@ -814,6 +842,7 @@ extern "C" {
+ __attribute__((visibility("default"))) uint32_t vpvk_prewarm_count(void) {
+   const std::string dir = vpvk::RecipeStore::defaultDir();
+   if (dir.empty()) return 0;
++  vpvk::refreshTranslatorMode();
+   vpvk::RecipeStore store(dir);
+   return uint32_t(store.snapshot().pipelines.size());
+ }
+@@ -826,6 +855,7 @@ __attribute__((visibility("default"))) uint32_t vpvk_prewarm(vpvk_prewarm_progre
+     vpvk::log("gpu.prewarm skipped=no_cache_dir");
+     return 0;
+   }
++  vpvk::refreshTranslatorMode();  // the environment the host set for this run (it may change between runs)
+   vpvk::RecipeStore store(dir);
+   if (!store.pipelineCount()) {
+     vpvk::log("gpu.prewarm skipped=no_recipes");
+diff --git a/gpu/vulkan/src/recipes.h b/gpu/vulkan/src/recipes.h
+index fb640ec..c5d6f6e 100644
+--- a/gpu/vulkan/src/recipes.h
++++ b/gpu/vulkan/src/recipes.h
+@@ -41,6 +41,19 @@ namespace vpvk {
+ // VP_A2C1; 4: multiview vertex shaders write [[viewport_array_index]] = the view.
+ inline constexpr uint32_t kTranslatorVersion = 4;
+ 
++// Translator modes, read from the environment once per process (bits; every lowering applies them):
++//  bit 0 nativeFetch  VPVK_FETCH_NATIVE (default 0): half vertex attributes through one half2 conversion.
++//  bit 1 amplify      VPVK_AMPLIFY (default 0): two-view multiview through Metal vertex amplification.
++uint32_t translatorMode();
++// Re-reads the environment (the host may set it after an earlier prewarm in the same process): called where a
++// device or a prewarm starts, so the mode is fixed for its lifetime. Returns the mode.
++uint32_t refreshTranslatorMode();
++// What the recipe store records with every translated input: kTranslatorVersion | modes << 16. A mode
++// change is then a translator change: the stored recipes are retranslated (refresh) instead of being
++// compiled in the other mode's shape (all modes off = the plain kTranslatorVersion of earlier builds).
++uint32_t translatorId();
++void applyTranslatorMode(spirv::SpirvLowerOptions&);
++
+ // Content hash of a SPIR-V module (never 0).
+ uint64_t spirvHash(const uint32_t* words, size_t count);
+ 
+@@ -59,7 +72,7 @@ class RecipeStore {
+  public:
+   // dir empty: disabled (every call is a no-op). Loads existing records; a stale/corrupt file is
+   // discarded and started over. translatorVersion: tests only.
+-  explicit RecipeStore(std::string dir, uint32_t translatorVersion = kTranslatorVersion);
++  explicit RecipeStore(std::string dir, uint32_t translatorVersion = translatorId());
+   ~RecipeStore();
+ 
+   bool enabled() const { return file_ != nullptr; }
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index 2898671..3dd203d 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -244,6 +244,10 @@ struct PipelineObj {
+   vpgpu::StageMask pushStages = 0;
+   std::vector<spirv::VertexBufferBinding> vertexBuffers;
+   uint32_t viewCount = 1;
++  // Instance multiplier of multiview draws: viewCount, or 1 when the vertex shader is amplified
++  // (SpirvInterface::amplified; the backend then sets the encoder's vertex amplification count).
++  uint32_t instanceViews = 1;
++  bool amplified = false;
+   VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+   VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+   std::vector<VkDynamicState> dynamic;
+diff --git a/gpu/vulkan/tests/vk_tests.cpp b/gpu/vulkan/tests/vk_tests.cpp
+index 7fcc852..4d5c933 100644
+--- a/gpu/vulkan/tests/vk_tests.cpp
++++ b/gpu/vulkan/tests/vk_tests.cpp
+@@ -633,6 +633,9 @@ void testPipeline() {
+   const PipelineObj* po = from<PipelineObj>(pipe);
+   CHECK(po->ok && po->viewCount == 2 && po->state.vertexShader && po->state.fragmentShader);
+   CHECK(po->state.colorFormats[0] == vpgpu::Format::RGBA8Srgb && po->state.cull == vpgpu::CullMode::Back);
++  // VPVK_AMPLIFY=1 (gpu_vulkan.pipeline_amplify): vertex amplification, one instance per Vulkan instance.
++  const bool amplify = (translatorMode() & 2) != 0;
++  CHECK(po->amplified == amplify && po->instanceViews == (amplify ? 1u : 2u));
+   c.gpu().pipelines().waitIdle();
+   CHECK(c.gpu().pipelines().status(po->key) == vpgpu::PipelineCache::Status::Ready);
+ 
+@@ -675,7 +678,8 @@ void testPipeline() {
+   if (pass && pass->draws.size() == 1) {
+     const vpgpu::Draw& d = pass->draws[0];
+     CHECK(d.pipeline == po->key);
+-    CHECK(d.instances == 6 && d.baseInstance == 2 && d.count == 36 && d.first == 6 && d.baseVertex == 2);
++    CHECK(d.instances == 3 * po->instanceViews && d.baseInstance == 1 * po->instanceViews && d.count == 36 && d.first == 6 &&
++          d.baseVertex == 2);
+     CHECK(d.index && !d.index->wide);
+     CHECK(d.frontFace == vpgpu::Winding::Clockwise && d.viewport.width == 128);
+     int cbufs = 0, bufs = 0, texs = 0, smps = 0;
+-- 
+2.43.0
+

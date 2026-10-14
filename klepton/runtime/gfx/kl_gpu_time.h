@@ -26,6 +26,9 @@ void kl_vrr_set(int mode, float inner, float outer, float edge);   // mode: 0 ce
 void kl_vrr_s2p(void *ctx, float sx, float sy, float *px, float *py);
 // The frame the guest is recording now (counts from 1; 0 before GPU timing is on).
 unsigned kl_gpu_time_frame(void);
+// The OpenVR shim: the game faded the grid in (to_grid = 1: a level load starts) or out (0: a scene is shown).
+// Per-pass profiling windows "g<s>" (KL_GPU_PASSES) are timed from each scene start.
+void kl_gpu_time_scene(int to_grid);
 
 #ifdef __cplusplus
 }

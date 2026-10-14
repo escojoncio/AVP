@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0030).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B26).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B27).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -48,29 +48,43 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
   `KL_GPU_PASSES_N=40` siempre con VPKEngine (instrumentación TEMPORAL: quitar cuando se decida el siguiente paso);
   `prof_report` promedia sobre los frames realmente perfilados (`nf`) y espera 8 frames antes de resolver.
 
-## Medidas Logs_Alyx_18 (B25, a2_drainage)
-- GPU juego 22-27 ms/frame (menú 22,8); compositor 7 ms/frame en menú, 11-19 ms jugando: componía a 100 Hz la misma
-  imagen (~2,3-3,5 ms por composite) → suma 42-46 ms → 16-23 fps (`[openvr] render 42-63 ms`, wait 0). Arreglo: B26 (1).
-- Foveado activo: mapa wide 60° = 36 % de píxeles (1536x1428 de 2784x2208). Ahorra poco: el coste no está en los
-  píxeles de los pases de escena. 6 pases de ojo 1x RG11B10F (post, sin depth) y el tonemap RGBA8 recorren la textura
-  ENTERA 2784x2208 aunque solo el 36 % físico tiene datos (candidato: render area = tamaño físico, ver riesgo de
-  scissor > render target sin rate map).
-- Comparación P.T. M2: zona nítida a ~0,5x del drawable, sin MSAA, VPKTAA al 80 %; Alyx 2784x2208 MSAA 4x ≈ 3-4x de
-  trabajo por ojo. Mapa separable = rectángulo 60°x60° (P.T.: inset 60° x ~49°).
-- Consola: `Stencil mask reduces rendering area by: 0.00%` (sin hidden area mesh; visionOS no da uno).
-- `gpu.time enc_ms` de VPKEngine son spans solapados (no exclusivos): no sirven para repartir el tiempo.
+- B26 FALLÓ: abandonar un frame tras `queryNextFrame`+`startUpdate/endUpdate` sin submit → el siguiente
+  `queryNextFrame` aborta (`BUG IN CLIENT`, Logs_Alyx_19). REGLA: todo frame consultado se presenta.
+- B27: (1) compositor: un refresco con la misma imagen NO consulta frame: `skipRefreshIfSame()` espera al input
+  extrapolado (`predictTiming` del último frame real + k·`displayPeriod`), publica la pose al juego y vuelve; máx. 3
+  seguidos (`KL_CP_SKIP_MAX` 1–3); `owedRefresh` mantiene 1 publicación por refresco; el command buffer se crea
+  ANTES de `queryNextFrame` (pipeline nulo ya no abandona; `primeDisplay/clearAndPresent` igual). (2) Zona nítida
+  REDONDA tipo P.T. en el composite (`kl_eye_sample_round`, uniforms `fov_*` en `KLReproj`, 288 B): círculo de
+  `wideDegrees` centrado 10° bajo el eje (matemática de `inset_fragment` de P.T., borde 15 %); fuera, "vista ancha"
+  (`buildWideView`, rgba16F, ojo filtrado a la densidad de la periferia, 1 vez por imagen nueva) con `kl_eye_recon`.
+  `KL_CP_ROUND=0` = A/B. P.T. también dibuja el inset rectangular y compone un círculo: misma técnica. (3)
+  `KL_VRR_PHYS=1`: pases foveados con `renderTargetWidth/Height` = tamaño físico del mapa (el 1.er pase de cada
+  textura a área completa, `NSHashTable`); `KL_VRR_PHYS_POST` (post sin mapa) OFF. (4) Perfilador `[passes]` por
+  escena (`g<s>` desde `FadeGrid(out)`, `t<s>`), cubre compute/blit con descriptor, sample buffer en el 1.er índice
+  libre (VPKEngine usa el 0), guarda de reentrada, se apaga solo si Metal lo rechaza; ajuste «Medir GPU por pase».
+  (5) Convars de efectos M2 (`effectsConvars`): `r_ssao 0` (M5 1), tabla de fidelidad ahora coherente
+  (`sc_disable_spotlight_shadows 0`); Lua con `pcall`, `AVPMISSING/AVPSTUCK`; `KLPERF` vuelca ~34 convars por spawn.
+  (6) VPKEngine `0031`: `gpu.excl` (tiempo EXCLUSIVO por encoder, vtx/frag, load/store MB, cada 5 s),
+  `VP_CB_ORDER=2` (espera solo por dependencias reales entre command buffers), `VPVK_AMPLIFY=1` (multiview por
+  amplificación de vértices de Metal en vez de instancias x2), `VPVK_FETCH_NATIVE=1` (half nativo). Ajustes en app
+  «Amplificación de vértices» y «Orden de GPU por recursos», ambos ON (cambiar amplificación = retraducción única).
 
-## Siguiente (al llegar el log de B26)
-1. `[cp] alive`: iters/s ≈ 100 (si `queryNextFrame` re-ofreciera el mismo frame tras un salto, iters se dispararía)
-   y `skipped(same picture)`; `[gputime]` compositor por frame (esperado ~3-4 ms a 33 fps) y fps estables.
-2. Leer las 6 ventanas `[passes]`: tiempo exclusivo por pase (escena MSAA, sombras D32F 4096², RGBA16F 2048x1024,
-   post 1x eye-size, tonemap, overlays 1x, UI). Con eso decidir: post al tamaño físico, MSAA 2x, sombras, o vistas
-   tipo P.T. (inset + vista ancha) en VPKEngine.
-3. Si el usuario ve tirones en contenido pegado a la cabeza (HUD), es la reproyección del sistema en los refrescos
-   saltados: comparar con el ajuste apagado.
-4. Pendiente gráfico: "algún efecto o sombra" (linterna sin sombra visible); volcar con L3+R3.
-5. VPKTAA periferia fase 2 (temporal: jitter + depth linealizada z = 0.95 - 0.0375/d + pose).
-6. Renombrar "M2/M5" del launcher (p. ej. "P.T. 60°").
+## Medidas Logs_Alyx_19 / 2_5 (B26)
+- 70 % (2112x1728) vs 90 %: juego 19-22 ms vs 22-27 ms → la escena NO escala con píxeles. En el menú el juego pasa de
+  ~10 a ~20 ms al aparecer las manos/UI. Pase de escena en juego: un encoder de ~14 ms (span). Compositor 6-17 ms.
+- El objetivo 3456x2208 (2592x1728 al 70 %) es el blur de Panorama (eye width x 1,24), sí escala.
+- Alyx ARM64 trae foveado propio: FDM (`vr_fdm`, `fove_level`, `fove_square`, `fove_radial_inner/outer/min`,
+  subsampled + `unsubsample.vfx_ps`) y radial density masking (`vr_subview_mode` 3 = FixedFoveated2x,
+  `vr_foveated_inner/outer_scalar`, `vr_foveated_boundary`). FDM radial no es representable en Metal (rate maps
+  separables); VPKEngine no anuncia FDM. Subview stencil es incompatible con nuestro rate map (doble warp).
+
+## Siguiente (al llegar el log de B27)
+1. Crash/arranque: `[cp] alive` iters/s ≈ panel, `skipped(same picture)` creciendo; `[cp] round sharp zone on`.
+2. `gpu.excl`: tipo con mayor share; en la escena `vtx_ms` vs `frag_ms` (¿limitada por vértices?), `store_mb`/`att=`.
+3. `[passes] W# sceneN…` + `by kind`; `[vrr] … render area 2784x2208 -> …` y `full-area first pass` estable.
+4. Con amplificación: `vk.translator mode=… amplify=1`, sin `gpu.err what=pipeline`; ambos ojos correctos.
+5. `[gputime]` vs 19-22 (70 %) / 22-27 (90 %). Si sigue limitado por vértices: LOD/geom (convars), sombras.
+6. Siguiente paso grande si hace falta: vistas tipo P.T. (inset + ancha) en VPKEngine (PLAN §5.1-9).
 
 ## Pendiente menor
 - Ajustes en vivo que faltan: resolución/texturas (convars), anisotrópico; activar/desactivar foveado requiere reiniciar.
