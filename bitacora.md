@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0035).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B37).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B38).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -310,7 +310,21 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
   Sospechosos: reconstrucción de periferia (`KL_CP_RECON=1`, multi-tap) y el muestreo redondo; B37 saca
   `[gputime] compositor passes (exclusive ms per pass, passes/s)` cada 30 s con la firma de cada pase para repartirlo.
 
-## Siguiente (al llegar el log de B37)
+## B38 — cambios (sobre B37, sin log de B37 aún; el usuario reportó sobre B36b)
+1. Altura del jugador: `KLVR_HEIGHT_OFFSET` (m) sumado a la Y de cabeza y manos que ve el JUEGO
+   (`klvr_platform_klepton.c`: `klvr_plat_head/hand` envuelven `_raw`; `klvr_plat_set_height_offset` en vivo,
+   declarado en `kl_app.h`); el compositor sigue con las poses del dispositivo (reproyección rotacional: no afecta).
+   Ajuste «Altura del jugador» −60…+30 cm (`avp.heightCm`, 0), pantalla Juego, en vivo desde la pausa. Motivo: el
+   usuario juega con el suelo del juego demasiado lejos (no alcanza objetos sin agachar a Alyx).
+2. Subtítulos: ajuste «Tamaño de subtítulos» pequeño/medio/grande (`avp.subSize` → `cc_vr_font_size` 0/1/2, por
+   defecto pequeño, con cualquier colocación). B35 grande, B37 medio.
+3. Parpadeo de menús 2D y subtítulos "a veces" (B36b, sin captura): sin causa clara en el log (un solo mapa, sin
+   errores). A/B: ajuste «Foveado del pase de subtítulos» (`avp.subFov` → `KL_VRR_SRGB_1X`, ON) en Diagnóstico.
+   Pedido al usuario: probar con él apagado y L3+R3 cuando parpadee. Otra hipótesis: orden entre command buffers
+   (VP_CB_ORDER=2) con vista sRGB vs UNORM del mismo ojo (las lecturas muestreadas van por id de vista, las
+   attachments por id de imagen) → probar «Orden de GPU por recursos» apagado.
+
+## Siguiente (al llegar el log de B37/B38)
 1. Repartir los ~5 ms del compositor por pase y recortar el mayor (recon / composite): candidatos: recon a menos
    taps, componer la periferia a menor resolución, o `KL_CP_QUALITY` (hoy 0,40).
 2. Confirmar `[vk] ... samples the guest's image ... directly` y que la imagen es correcta; `gpu.excl` tipo 1c9d…

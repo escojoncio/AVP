@@ -25,10 +25,9 @@ final class AVPSettings: ObservableObject {
     /// launch arguments + the Lua re-apply), so nothing compounds across maps or launches.
     enum SubtitlePlacement: Int, CaseIterable { case game = 0, higher = 1, eyeLevel = 2, high = 3
         var verticalOffset: String { self == .game ? "-6.5" : self == .higher ? "0" : self == .eyeLevel ? "6" : "12" }
-        // Build 37: the game's medium size everywhere. Build 35's "large" (2) filled the view with a long line once
-        // the subtitle pass was foveated correctly (B36b); the panel is already close (30 units) and at eye height.
-        var fontSize: String { "1" }
     }
+    /// Build 38: cc_vr_font_size 0/1/2. Build 35's large filled the view with a long line; small by default.
+    enum SubtitleSize: Int, CaseIterable { case small = 0, medium = 1, large = 2 }
 
     /// Vision Pro's native per-eye render size (what visionOS asks for at 100 %).
     static let nativeEye = (width: 3072, height: 2464)
@@ -63,6 +62,10 @@ final class AVPSettings: ObservableObject {
     @Published var gpuPassProfiling: Bool { didSet { save() } }
     @Published var movement: Movement { didSet { save() } }
     @Published var subtitles: SubtitlePlacement { didSet { save() } }
+    @Published var subtitleSize: SubtitleSize { didSet { save() } }
+    /// Build 38 (A/B for a flicker report on B36b): the subtitle pass (sRGB eye view, no depth) gets the rate map
+    /// (KL_VRR_SRGB_1X). Off = drawn in screen space over the foveated layout (B35: misplaced and sheared).
+    @Published var subtitleFoveation: Bool { didSet { save() } }
     @Published var cloudSync: Bool { didSet { save() } }
     /// Build 33: the player's fingers follow the headset's hand tracking (KL_HANDS=1, kl_ovrp_set_finger_curls →
     /// the OpenVR skeleton), as Valve's Index controllers animate them; off = fingers from the buttons only and no
@@ -82,6 +85,9 @@ final class AVPSettings: ObservableObject {
     /// Build 37: the compositor samples the game's own eye image (KLVR_EYE_DIRECT=1, klvr_vk_submit.cpp) instead of
     /// a copy of each eye into a platform image: 2 x 14.6 MB and ~0.6 ms of GPU per frame saved. Off = the copy.
     @Published var eyeDirect: Bool { didSet { save() } }
+    /// Build 38: player height offset in cm (negative = Alyx lower: for sitting down, or a floor origin that came out
+    /// too low under the player). KLVR_HEIGHT_OFFSET, every tracked pose the game sees; live.
+    @Published var heightOffsetCm: Double { didSet { save() } }
 
     // Fixed since build 32 (they used to be settings; every validated value is now the only value):
     /// 12 command buffers in flight (build 24 orders them; 3 was the build-23 A/B test).
@@ -126,6 +132,9 @@ final class AVPSettings: ObservableObject {
         amplify = d.object(forKey: "avp.amplify") as? Bool ?? true
         postPhysical = d.object(forKey: "avp.postPhys") as? Bool ?? false
         eyeDirect = d.object(forKey: "avp.eyeDirect") as? Bool ?? true
+        heightOffsetCm = d.object(forKey: "avp.heightCm") as? Double ?? 0
+        subtitleSize = SubtitleSize(rawValue: d.object(forKey: "avp.subSize") as? Int ?? 0) ?? .small
+        subtitleFoveation = d.object(forKey: "avp.subFov") as? Bool ?? true
         loading = false
     }
 
@@ -154,6 +163,9 @@ final class AVPSettings: ObservableObject {
         d.set(amplify, forKey: "avp.amplify")
         d.set(postPhysical, forKey: "avp.postPhys")
         d.set(eyeDirect, forKey: "avp.eyeDirect")
+        d.set(heightOffsetCm, forKey: "avp.heightCm")
+        d.set(subtitleSize.rawValue, forKey: "avp.subSize")
+        d.set(subtitleFoveation, forKey: "avp.subFov")
     }
 
     func resetToDefaults() {
@@ -168,7 +180,8 @@ final class AVPSettings: ObservableObject {
         anisotropy = fresh.anisotropy; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
-        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect
+        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm
+        subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
         AVPLog.log("Ajustes: valores por defecto")
     }
 
@@ -281,9 +294,9 @@ final class AVPSettings: ObservableObject {
         c.append(("vr_fidelity_level", "0"))
         // Build 35: the VR subtitle panel's height and size (SubtitlePlacement). «As the game» forces nothing: the
         // game's default is -6.5 and a negative value on the command line ("+cvar -6.5") would read as a switch.
+        c.append(("cc_vr_font_size", String(subtitleSize.rawValue)))   // build 38: its own setting, any placement
         if subtitles != .game {
             c.append(("cc_vr_vertical_offset", subtitles.verticalOffset))
-            c.append(("cc_vr_font_size", subtitles.fontSize))
         }
         return c + effectsConvars
     }
@@ -384,6 +397,8 @@ final class AVPSettings: ObservableObject {
             // correct, no GPU faults, scene vertex time 8-12 -> ~4 ms). B29 had it off after B27's faults.
             ("VPVK_AMPLIFY", amplify ? "1" : "0"),
             ("KLVR_EYE_DIRECT", eyeDirect ? "1" : "0"),
+            ("KLVR_HEIGHT_OFFSET", String(format: "%.3f", heightOffsetCm / 100)),
+            ("KL_VRR_SRGB_1X", subtitleFoveation ? "1" : "0"),
             // Build 31: native half fetch back on, alone (B29 turned it off only because it shipped with amplification;
             // the translator's conversion is exact). Logs 22: the scene pass is vertex-bound (vtx 11 ms).
             ("VPVK_FETCH_NATIVE", "1"),
@@ -476,7 +491,7 @@ final class AVPSettings: ObservableObject {
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
-                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect)")
+                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm")
         return env
     }
 
@@ -579,6 +594,7 @@ end, nil)
         // No setenv here: the compositor and the guest read the environment on other threads, and setenv
         // racing getenv is a crash. Each live setting goes straight to its owner.
         KleptonCompositor.fpsHudEnabled = showFps
+        klvr_plat_set_height_offset(Float(heightOffsetCm / 100))
         KleptonCompositor.skipSameEnabled = Self.composeNewOnly
         KleptonTAA.reloadSettings(percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
         KleptonCompositor.setPeripheryRecon(on: reconActive, percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
