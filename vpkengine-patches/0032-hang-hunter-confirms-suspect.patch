@@ -1,0 +1,181 @@
+From 854210b5124fac295f8e726dfdfaa6cbd11f0723 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Wed, 14 Oct 2026 09:39:37 +0000
+Subject: [PATCH] Metal: the hang hunter confirms its suspect before
+ quarantining it
+
+- metal2: when the bisection is down to one candidate it is no longer
+  quarantined on the spot. It is drawn again with nothing skipped
+  ("gpu.hunt confirm"): a GPU hang within kHuntClean (12) frames convicts
+  it ("verdict=confirmed", quarantine.txt as before); 12 clean frames
+  acquit it ("verdict=indeterminate", nothing quarantined, the hunt ends).
+- Why: a hang that never recurs (a one-off address fault) answers "clean"
+  at every step, and the bisection then always keeps the first half and
+  converges on whatever pipeline happens to be first, which was persisted
+  for every later session (Logs 20/21: a compute pipeline of the light
+  binning, hence a black scene with only the HUD drawn).
+- huntOnClean(frame, skippedSomething): a test-set "clean" still needs a
+  frame in which the set was actually skipped; while confirming every
+  completed frame counts.
+---
+ gpu/metal2/src/metal_backend.mm | 87 ++++++++++++++++++++++++++-------
+ 1 file changed, 70 insertions(+), 17 deletions(-)
+
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index e273a60..db4c829 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -460,8 +460,11 @@ struct MetalBackend::Impl {
+   // pipelines of the hung frame are bisected at run time: step 0 skips ALL of them (still hanging =
+   // not a pipeline: an attachment/pass problem), then half of the remaining candidates at a time. A
+   // hang in a frame encoded with the test set skipped puts the culprit in the other half; kHuntClean
+-  // frames that complete with draws put it in the skipped half. One candidate left: quarantined for good
+-  // (quarantine.txt), its MSL printed into the log. Up to kHuntMax hunts per session (several culprits).
++  // frames that complete with draws put it in the skipped half. One candidate left: it is drawn again
++  // and must hang the GPU once more within kHuntClean frames to be quarantined for good (quarantine.txt,
++  // its MSL printed into the log); kHuntClean clean frames with it drawn = verdict indeterminate (a hang
++  // that never recurs, e.g. a one-off fault, bisects to the first candidate by "clean" verdicts alone and
++  // must not convict anything). Up to kHuntMax hunts per session (several culprits).
+   static constexpr uint32_t kHuntClean = 12, kHuntMax = 4;
+   struct Hunt {
+     std::mutex m;
+@@ -469,6 +472,11 @@ struct MetalBackend::Impl {
+     bool all = false;  // step 0: skip every draw and dispatch, not only the listed candidates
+     uint32_t hunts = 0, step = 0, clean = 0;
+     uint64_t appliedFrame = UINT64_MAX;  // first frame encoded with the current test set (submit thread)
++    // Confirmation: the last candidate runs again (nothing skipped); a hang within kHuntClean frames
++    // convicts it, kHuntClean clean frames acquit it (the hang never recurred: nothing quarantined).
++    bool confirming = false;
++    uint64_t suspect = 0;
++    std::atomic<uint64_t> suspectKey{0};  // the suspect while confirming, read lock-free by the completion handler
+     std::vector<uint64_t> cand, test;
+     std::atomic<uint32_t> serial{0};
+   } hunt;
+@@ -480,7 +488,7 @@ struct MetalBackend::Impl {
+   void huntCulprit(uint64_t key, uint64_t frameIndex);
+   void huntOnHang(uint64_t frameIndex, const std::vector<uint64_t>& keys);
+   uint64_t huntOnHangLocked(uint64_t frameIndex, const std::vector<uint64_t>& keys);  // hunt.m held
+-  void huntOnClean(uint64_t frameIndex);
++  void huntOnClean(uint64_t frameIndex, bool skippedSomething);
+   void logShaderSource(uint64_t shaderId);
+   std::string huntKeyName(uint64_t key);
+ 
+@@ -1755,20 +1763,20 @@ uint64_t MetalBackend::Impl::huntSplit(uint64_t frameIndex) {
+   hunt.appliedFrame = UINT64_MAX;
+   hunt.all = false;
+   if (hunt.cand.size() == 1 && hunt.step > 0) {
++    // One suspect left, found by bisection. Not proof yet: a hang that never recurred (a one-off fault)
++    // yields "clean" at every step and lands here on the first candidate. Draw it again, nothing skipped:
++    // huntOnHangLocked convicts it on a hang, huntOnClean acquits it after kHuntClean clean frames.
+     const uint64_t k = hunt.cand[0];
+-    hunt.active = false;
++    hunt.confirming = true;
++    hunt.suspect = k;
++    hunt.suspectKey.store(k);
+     hunt.test.clear();
+     hunt.cand.clear();
+-    // The culprit stays skipped: quarantined (session at once, file too) before the test set is dropped.
+-    if (quarantineOn) {
+-      {
+-        std::lock_guard lock(quarantineMutex);
+-        quarantine.emplace(k, "hang_hunt");
+-      }
+-      ++quarantineSerial;
+-    }
++    info("gpu.hunt confirm f=" + std::to_string(frameIndex) + " suspect=" + huntKeyName(k) +
++         " drawn again: a hang within " + std::to_string(kHuntClean) + " frames convicts it, " +
++         std::to_string(kHuntClean) + " clean frames acquit it");
+     hunt.serial.fetch_add(1);
+-    return k;  // reported (file, MSL) by the caller once hunt.m is released
++    return 0;
+   }
+   // Step 0: everything (is it a pipeline at all?); then the first half of what is left.
+   const size_t n = hunt.step == 0 ? hunt.cand.size() : (hunt.cand.size() + 1) / 2;
+@@ -1860,6 +1868,9 @@ uint64_t MetalBackend::Impl::huntOnHangLocked(uint64_t frameIndex, const std::ve
+     }
+     ++hunt.hunts;
+     hunt.active = true;
++    hunt.confirming = false;
++    hunt.suspect = 0;
++    hunt.suspectKey.store(0);
+     hunt.step = 0;
+     hunt.cand = std::move(cand);
+     info("gpu.hunt start n=" + std::to_string(hunt.hunts) + " f=" + std::to_string(frameIndex) + " pipelines=" +
+@@ -1867,6 +1878,26 @@ uint64_t MetalBackend::Impl::huntOnHangLocked(uint64_t frameIndex, const std::ve
+     return huntSplit(frameIndex);
+   }
+   if (hunt.appliedFrame == UINT64_MAX || frameIndex < hunt.appliedFrame) return 0;  // encoded before the test
++  if (hunt.confirming) {
++    // Hung again with the suspect drawn and nothing skipped: convicted. Skipped at once (placeholder in
++    // the session's quarantine); huntCulprit writes the real line and the file.
++    const uint64_t k = hunt.suspect;
++    info("gpu.hunt verdict=confirmed f=" + std::to_string(frameIndex) + " suspect=" + huntKeyName(k) +
++         " hung again while drawn");
++    hunt.confirming = false;
++    hunt.suspect = 0;
++    hunt.suspectKey.store(0);
++    hunt.active = false;
++    if (quarantineOn) {
++      {
++        std::lock_guard lock(quarantineMutex);
++        quarantine.emplace(k, "hang_hunt");
++      }
++      ++quarantineSerial;
++    }
++    hunt.serial.fetch_add(1);
++    return k;
++  }
+   if (hunt.test.size() == hunt.cand.size()) {
+     // Every pipeline of the hung frame skipped and it still hangs: the passes themselves (attachments,
+     // load/store/resolve, layered targets) or work outside draws.
+@@ -1896,11 +1927,28 @@ uint64_t MetalBackend::Impl::huntOnHangLocked(uint64_t frameIndex, const std::ve
+   return huntSplit(frameIndex);
+ }
+ 
+-void MetalBackend::Impl::huntOnClean(uint64_t frameIndex) {
++void MetalBackend::Impl::huntOnClean(uint64_t frameIndex, bool skippedSomething) {
+   uint64_t culprit = 0;
+   {
+     std::lock_guard lock(hunt.m);
+     if (!hunt.active || hunt.appliedFrame == UINT64_MAX || frameIndex < hunt.appliedFrame) return;
++    if (hunt.confirming) {
++      // Only a frame that drew the suspect says anything about it (nothing is skipped while confirming).
++      if (!skippedSomething) return;
++      if (++hunt.clean < kHuntClean) return;
++      info("gpu.hunt verdict=indeterminate f=" + std::to_string(frameIndex) + " suspect=" + huntKeyName(hunt.suspect) +
++           " drawn for " + std::to_string(kHuntClean) + " frames without a hang: the hang did not recur, nothing quarantined");
++      hunt.confirming = false;
++      hunt.suspect = 0;
++      hunt.suspectKey.store(0);
++      hunt.active = false;
++      hunt.clean = 0;
++      hunt.appliedFrame = UINT64_MAX;
++      hunt.serial.fetch_add(1);
++      return;
++    }
++    // Only a frame in which the test set was actually skipped says anything about it.
++    if (!skippedSomething) return;
+     if (++hunt.clean < kHuntClean) return;
+     info("gpu.hunt verdict=clean f=" + std::to_string(frameIndex) + " step=" + std::to_string(hunt.step) + ": " +
+          std::to_string(kHuntClean) + " frames without a hang with " + std::to_string(hunt.test.size()) + " skipped");
+@@ -3498,9 +3546,14 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     }
+     if (finished.status == MTLCommandBufferStatusCompleted && diag) {
+       bool drew = false;
+-      // Only a frame in which the test set was actually skipped says anything about it.
+-      for (const EncDiag& g : *diag) drew |= g.hunted > 0;
+-      if (drew) impl->huntOnClean(frameIndex);
++      // Whether the test set was actually skipped in this frame (the hunter needs that for a "clean"
++      // verdict on a test set); while confirming a suspect, whether the suspect was drawn in it.
++      if (const uint64_t sk = impl->hunt.suspectKey.load()) {
++        for (const EncDiag& g : *diag) drew |= g.allKeys.count(sk) != 0;
++      } else {
++        for (const EncDiag& g : *diag) drew |= g.hunted > 0;
++      }
++      impl->huntOnClean(frameIndex, drew);
+     }
+     // Ordering measurement: this command buffer's first encoder start / last encoder end (GPU ticks,
+     // one clock for every command buffer), against the command buffer submitted just before it.
+-- 
+2.43.0
+

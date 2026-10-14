@@ -475,7 +475,7 @@ enum AVPPipelineCache {
     /// Decided at writeConfig (before the prewarm), read by AVPPrepare.prewarm.
     nonisolated(unsafe) static var current: State?
 
-    static func configure(data: URL, pipelines: URL, engine: String) -> State {
+    static func configure(data: URL, pipelines: URL, engine: String, engineSignature: String = "") -> State {
         let fm = FileManager.default
         let dir = data.appendingPathComponent("vpcache", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -524,6 +524,24 @@ enum AVPPipelineCache {
         }
         if fm.fileExists(atPath: dir.appendingPathComponent("motion.off").path) {
             AVPLog.log("Gráficos: vectores de movimiento de VPKTAA desactivados tras un cuelgue de GPU (motion.off)")
+        }
+        // Build 30: the quarantine and the single-hang suspects are only valid for the engine configuration that
+        // produced them (VPVulkan build + the toggles that change translation and encoding, from AVPSettings). Logs
+        // 20/21: pipelines that faulted under VPVK_AMPLIFY=1 stayed quarantined with it off, together with a compute
+        // pipeline the hunter blamed after that fault (the light binning: black scene, only the HUD drawn). Another
+        // signature, or none recorded yet: both files are dropped and the new signature recorded.
+        let qkeyURL = dir.appendingPathComponent("quarantine.key")
+        let qkey = "\(driver)|\(engineSignature)"
+        let oldKey = try? String(contentsOf: qkeyURL, encoding: .utf8)
+        if oldKey != qkey {
+            let had = quarantineCount(dir: dir)
+            try? fm.removeItem(at: dir.appendingPathComponent("quarantine.txt"))
+            try? fm.removeItem(at: dir.appendingPathComponent("suspects.txt"))
+            try? qkey.write(to: qkeyURL, atomically: true, encoding: .utf8)
+            if had > 0 || oldKey != nil {
+                AVPLog.log("Gráficos: cuarentena de otra configuración del motor descartada (\(had) pipelines; "
+                           + (oldKey == nil ? "sin firma previa" : "firma anterior \(oldKey!)") + "; ahora \(qkey))")
+            }
         }
         let quarantined = quarantineCount(dir: dir)
         if quarantined > 0 {

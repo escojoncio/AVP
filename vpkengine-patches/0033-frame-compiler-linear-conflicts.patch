@@ -1,0 +1,200 @@
+From 44c3d3998f2edf651f3e156b8f0e358963c70da8 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Wed, 14 Oct 2026 09:49:10 +0000
+Subject: [PATCH] Core: frame compiler no longer quadratic in draws x bindings
+
+- frame_compiler: accessesOf folds the draws' accesses of one render pass
+  that are identical in resource, range, write, pixel-local and attachment
+  flags (stages are OR-ed: barriers can only widen); the per-encoder access
+  lists (and the sunk copies) carry an index by resource, and a second one
+  of the writes alone, so conflicts() tests each access of a pass only
+  against the accesses of the same resource, and a read only against writes.
+- Why: conflicts(acc, acc_[open_]) compared every binding of every draw of a
+  pass with every binding accumulated in the open encoder. Alyx in combat
+  (Logs 2_7): 35-40 ms of compileFrame per scene command buffer (passes=14,
+  merged=12) with the GPU done in 14 ms, the game's render thread at 40-150
+  ms. Synthetic Alyx-like frame (14 mergeable passes x 300 draws x 14
+  bindings): 2667 ms -> 5.2 ms; gpu/core tests unchanged and green.
+---
+ gpu/core/src/frame_compiler.cpp | 105 +++++++++++++++++++++++++++-----
+ 1 file changed, 91 insertions(+), 14 deletions(-)
+
+diff --git a/gpu/core/src/frame_compiler.cpp b/gpu/core/src/frame_compiler.cpp
+index 782fe0b..f720835 100644
+--- a/gpu/core/src/frame_compiler.cpp
++++ b/gpu/core/src/frame_compiler.cpp
+@@ -40,17 +40,84 @@ struct Tagged {
+ };
+ using AccessList = std::vector<Tagged>;
+ 
+-bool conflicts(const AccessList& a, const AccessList& b) {
+-  for (const Tagged& x : a)
+-    for (const Tagged& y : b) {
++uint64_t resourceKey(const ResourceRange& r) {
++  return (uint64_t{r.index} << 2 | static_cast<uint64_t>(r.kind)) ^ (uint64_t{r.generation} << 34);
++}
++
++// The accesses of one encoder (or of the sunk copies), indexed by resource: a conflict test against
++// a pass only compares accesses of the same resource. Without the index, a pass of a few hundred
++// draws tested against an encoder of a dozen merged passes compared every binding with every binding
++// (Alyx in combat: 35-40 ms of compileFrame per scene command buffer, the GPU done in 14).
++struct AccessIndex {
++  AccessList list;
++  // resourceKey -> indices in list: every access, and the writes alone. A conflict needs a write on
++  // one side, so a read of the pass is only tested against the writes of its resource (reads are
++  // the bulk: hundreds of per-draw constant ranges of one buffer).
++  std::unordered_map<uint64_t, std::vector<uint32_t>> byResource, writesByResource;
++
++  void append(const AccessList& from) {
++    list.reserve(list.size() + from.size());
++    for (const Tagged& t : from) {
++      const uint64_t k = resourceKey(t.access.range);
++      const uint32_t i = static_cast<uint32_t>(list.size());
++      byResource[k].push_back(i);
++      if (t.access.write) writesByResource[k].push_back(i);
++      list.push_back(t);
++    }
++  }
++  void clear() {
++    list.clear();
++    byResource.clear();
++    writesByResource.clear();
++  }
++};
++
++bool conflicts(const AccessList& a, const AccessIndex& b) {
++  for (const Tagged& x : a) {
++    const auto& map = x.access.write ? b.byResource : b.writesByResource;
++    auto it = map.find(resourceKey(x.access.range));
++    if (it == map.end()) continue;
++    for (uint32_t i : it->second) {
++      const Tagged& y = b.list[i];
+       if (x.attachment && y.attachment) continue;
+-      if ((x.access.write || y.access.write) && x.access.range.overlaps(y.access.range)) return true;
++      if (x.access.range.overlaps(y.access.range)) return true;
+     }
++  }
+   return false;
+ }
+ 
+ void append(AccessList& to, const AccessList& from) { to.insert(to.end(), from.begin(), from.end()); }
+ 
++// Folds accesses that are the same in everything but their stages (many draws of one pass bind the
++// same textures and buffers): the compiler's lists shrink by the draw count, every test stays exact
++// (a folded access keeps its range and flags; its stages are the union, which only widens barriers).
++struct FoldKey {
++  uint64_t index, generation, begin, end;
++  uint32_t mips, layers;
++  uint8_t kind, flags;
++  bool operator==(const FoldKey&) const = default;
++};
++struct FoldHash {
++  size_t operator()(const FoldKey& k) const {
++    uint64_t h = k.index * 0x9E3779B97F4A7C15ull;
++    h ^= (k.generation + 0x7F4A7C15ull) * 0xBF58476D1CE4E5B9ull;
++    h ^= (k.begin + 0x94D049BB133111EBull) * 0x94D049BB133111EBull;
++    h ^= k.end * 0xD6E8FEB86659FD93ull;
++    h ^= (uint64_t{k.mips} << 32 | k.layers) * 0x9E3779B97F4A7C15ull;
++    h ^= uint64_t{k.kind} << 8 | k.flags;
++    return static_cast<size_t>(h ^ (h >> 29));
++  }
++};
++void foldInto(AccessList& out, std::unordered_map<FoldKey, uint32_t, FoldHash>& seen, const Access& a, bool attachment) {
++  const ResourceRange& r = a.range;
++  const FoldKey k{r.index, r.generation, r.begin, r.end, uint32_t{r.mipBegin} << 16 | r.mipEnd,
++                  uint32_t{r.layerBegin} << 16 | r.layerEnd, static_cast<uint8_t>(r.kind),
++                  static_cast<uint8_t>(a.write | a.pixelLocal << 1 | attachment << 2)};
++  auto [it, fresh] = seen.try_emplace(k, static_cast<uint32_t>(out.size()));
++  if (fresh) out.push_back({a, attachment});
++  else out[it->second].access.stages |= a.stages;
++}
++
+ bool clears(const RenderPassDesc& d) {
+   if (d.depth.texture && d.depth.load == LoadAction::Clear) return true;
+   for (const Attachment& a : d.colors)
+@@ -149,8 +216,9 @@ AccessList accessesOf(const Command& cmd) {
+   };
+   if (const auto* rp = std::get_if<RenderPass>(&cmd)) {
+     add(attachmentAccesses(rp->desc), true);
++    std::unordered_map<FoldKey, uint32_t, FoldHash> seen;
+     for (const Draw& d : rp->draws)
+-      for (const Access& a : drawAccesses(d)) out.push_back({a, a.pixelLocal});
++      for (const Access& a : drawAccesses(d)) foldInto(out, seen, a, a.pixelLocal);
+   } else if (const auto* dp = std::get_if<Dispatch>(&cmd)) {
+     add(dp->bindings, false);
+     if (dp->indirect) out.push_back({read(ResourceRange::bytes(dp->indirect->buffer, dp->indirect->offset, 12), stage::compute), false});
+@@ -240,7 +308,7 @@ class Scheduler {
+     if (open_ < 0) return computeWork(i, CutReason::CopyWork, std::move(acc));
+     if (conflicts(acc, acc_[open_]) || conflicts(acc, sunkAcc_)) {
+       sunk_.push_back(i);
+-      append(sunkAcc_, acc);
++      sunkAcc_.append(acc);
+       ++out_.stats.copiesSunk;
+       return;
+     }
+@@ -253,7 +321,7 @@ class Scheduler {
+     }
+     if (target < 0) target = insertComputeBeforeOpen();
+     out_.encoders[target].commands.push_back(i);
+-    append(acc_[target], acc);
++    acc_[target].append(acc);
+     ++out_.stats.copiesHoisted;
+   }
+ 
+@@ -310,11 +378,20 @@ class Scheduler {
+     join(r.pass.depth, need.depth, desc.depth);
+     r.commands.push_back(i);
+     ++r.passes;
+-    append(acc_[open_], acc);
++    acc_[open_].append(acc);
+     ++out_.stats.passesMerged;
+   }
+ 
+   int push(Encoder::Kind kind, CutReason reason, uint32_t i, AccessList acc) {
++    Encoder e;
++    e.kind = kind;
++    e.reason = reason;
++    e.commands = {i};
++    out_.encoders.push_back(std::move(e));
++    acc_.emplace_back().append(acc);
++    return static_cast<int>(out_.encoders.size()) - 1;
++  }
++  int push(Encoder::Kind kind, CutReason reason, uint32_t i, AccessIndex acc) {
+     Encoder e;
+     e.kind = kind;
+     e.reason = reason;
+@@ -329,14 +406,14 @@ class Scheduler {
+     e.kind = Encoder::Kind::Compute;
+     e.reason = CutReason::CopyWork;
+     out_.encoders.insert(out_.encoders.begin() + open_, std::move(e));
+-    acc_.insert(acc_.begin() + open_, AccessList{});
++    acc_.insert(acc_.begin() + open_, AccessIndex{});
+     return open_++;
+   }
+ 
+   void computeWork(uint32_t i, CutReason reason, AccessList acc) {
+     if (!out_.encoders.empty() && out_.encoders.back().kind == Encoder::Kind::Compute) {
+       out_.encoders.back().commands.push_back(i);
+-      append(acc_.back(), acc);
++      acc_.back().append(acc);
+     } else {
+       push(Encoder::Kind::Compute, reason, i, std::move(acc));
+     }
+@@ -357,10 +434,10 @@ class Scheduler {
+   CompiledFrame& out_;
+   const ResourceTable* res_;
+   const CompileOptions& options_;
+-  std::vector<AccessList> acc_;  // parallel to out_.encoders
+-  int open_ = -1;                // open render encoder
+-  std::vector<uint32_t> sunk_;   // copies deferred to right after the open render encoder
+-  AccessList sunkAcc_;
++  std::vector<AccessIndex> acc_;  // parallel to out_.encoders
++  int open_ = -1;                 // open render encoder
++  std::vector<uint32_t> sunk_;    // copies deferred to right after the open render encoder
++  AccessIndex sunkAcc_;
+   RenderPassDesc lastRender_;
+   bool haveLastRender_ = false;
+ };
+-- 
+2.43.0
+

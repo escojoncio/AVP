@@ -421,7 +421,14 @@ final class AVPSettings: ObservableObject {
         // VPKEngine's persistent pipeline caches (recipes + Metal binary archive) and whether a full prewarm already
         // filled them for this VPVulkan build and this pipeline list (then neither the launcher nor the game replays).
         if engine == .vpkengine {
-            let cache = AVPPipelineCache.configure(data: p.dataDir, pipelines: p.pipelines, engine: engine.rawValue)
+            // The engine configuration the hang quarantine is valid for (AVPPipelineCache: quarantine.key). The values
+            // are read back from the env so the signature cannot drift from what VPKEngine actually gets.
+            let sigKeys = ["VPVK_AMPLIFY", "VPVK_FETCH_NATIVE", "VP_CB_ORDER", "KL_VRR", "KL_VRR_PHYS", "VPVK_FORCE_1X",
+                           "VPVK_MOTION", "VP_FRAMES_IN_FLIGHT"]
+            let signature = sigKeys.map { k in "\(k)=\(env.last { $0.0 == k }?.1 ?? "-")" }.joined(separator: "|")
+                + "|msaa=\(gameMSAA)"
+            let cache = AVPPipelineCache.configure(data: p.dataDir, pipelines: p.pipelines, engine: engine.rawValue,
+                                                   engineSignature: signature)
             env.append(("VP_PIPELINE_CACHE_DIR", cache.dir.path))
             if cache.archiveOff { env.append(("VP_PIPELINE_ARCHIVE", "0")) }
             env.append(("KL_VK_FOZ_GAME_REPLAY", cache.warm ? "0" : "1"))
