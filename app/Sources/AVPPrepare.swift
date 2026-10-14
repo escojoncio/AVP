@@ -405,6 +405,44 @@ enum AVPPrepare {
 
     // MARK: 4. Pipelines
 
+    /// *.foz files at the root of the AVP folder -> <data>/klfz/user-<name> (copied when size or date changed; removed
+    /// there when gone from the folder). Returns "<name>:<size>/<mtime>" per file, for the stamp.
+    static func importExtraFoz(root: URL) -> [String] {
+        let fm = FileManager.default
+        let klfz = AVPFolder.data.appendingPathComponent("klfz", isDirectory: true)
+        try? fm.createDirectory(at: klfz, withIntermediateDirectories: true)
+        var ids: [String] = []
+        var keep = Set<String>()
+        let names = ((try? fm.contentsOfDirectory(atPath: root.path)) ?? []).filter { $0.lowercased().hasSuffix(".foz") }.sorted()
+        for name in names {
+            let src = root.appendingPathComponent(name)
+            let a = (try? fm.attributesOfItem(atPath: src.path)) ?? [:]
+            let size = (a[.size] as? NSNumber)?.int64Value ?? 0
+            let mtime = Int64((a[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
+            guard size > 0 else { continue }
+            let id = "\(name):\(size)/\(mtime)"
+            ids.append(id)
+            let dstName = "user-" + name
+            keep.insert(dstName)
+            let dst = klfz.appendingPathComponent(dstName)
+            let idURL = klfz.appendingPathComponent(dstName + ".id")
+            if (try? String(contentsOf: idURL, encoding: .utf8)) == id, fm.fileExists(atPath: dst.path) { continue }
+            do {
+                try? fm.removeItem(at: dst)
+                try fm.copyItem(at: src, to: dst)
+                try id.write(to: idURL, atomically: true, encoding: .utf8)
+                AVPLog.log("Preparar: base de pipelines del usuario \(name) (\(size / 1_048_576) MB) copiada a klfz: se precompila")
+            } catch {
+                AVPLog.log("Preparar: no se pudo copiar \(name) a klfz: \(error.localizedDescription)")
+            }
+        }
+        for f in (try? fm.contentsOfDirectory(atPath: klfz.path)) ?? [] where f.hasPrefix("user-") {
+            let base = f.hasSuffix(".id") ? String(f.dropLast(3)) : f
+            if !keep.contains(base) { try? fm.removeItem(at: klfz.appendingPathComponent(f)) }
+        }
+        return ids
+    }
+
     private static func pipelines(game: URL, cache: URL, progress: @escaping (Double, String) -> Void) throws -> URL {
         let fm = FileManager.default
         let out = cache.appendingPathComponent("pipelines.foz")
@@ -422,8 +460,14 @@ enum AVPPrepare {
             guard let d = try? Data(contentsOf: u, options: .mappedIfSafe) else { return fileID(u) }
             return "sha256:" + SHA256.hash(data: d).prefix(12).map { String(format: "%02x", $0) }.joined()
         }
+        // Build 41: extra Fossilize databases the user drops into the AVP folder (Steam's own collection for the
+        // game, steamapps/shadercache/546560/fozpipelinesv6/steamapp_pipeline_cache.foz: every pipeline Steam users
+        // ever recorded, driver-independent) are copied into <data>/klfz, which both the prewarm and the game replay.
+        // Their identity joins the stamp so the prewarm runs again once when one is added or changed.
+        let extra = importExtraFoz(root: cache.deletingLastPathComponent())
         let want = [pipelinesVersion, contentID(recipe), fileID(game.appendingPathComponent("core/shaders_vulkan_dir.vpk")),
                     fileID(game.appendingPathComponent("hlvr/shaders_vulkan_dir.vpk"))].joined(separator: "|")
+            + (extra.isEmpty ? "" : "|extra " + extra.joined(separator: ","))
         if (try? String(contentsOf: stampURL, encoding: .utf8)) == want, fm.fileExists(atPath: out.path) {
             progress(1, AVPL("Ya lista", "Already done"))
             return out
