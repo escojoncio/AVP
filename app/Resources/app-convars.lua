@@ -61,3 +61,15 @@ ListenToGameEvent("player_activate", function()
     if #out > 0 then Msg("KLPERF " .. table.concat(out, " ") .. "\n") end
     return nil end, "klperf", 3.0)
 end, nil)
+
+-- AVP build 43 (Logs_Alyx_31): the GAME'S clock against the wall clock. Walking and the hands looked slow-motion at a
+-- clean 50 fps, which is a simulation-time symptom, not a frame-rate one. Every 5 s of GAME time: Time(), FrameTime()
+-- and host_timescale. The console log stamps each line with wall-clock seconds, so game/wall is read off the log
+-- directly (a KLTIME line every 5.0 s of wall time = real time; every 7 s = the game runs at 70 %).
+ListenToGameEvent("player_activate", function()
+  local w = Entities:First(); if not w then return end
+  w:SetThink(function()
+    local ok, ts = pcall(Convars.GetStr, Convars, "host_timescale")
+    Msg(string.format("KLTIME t=%.3f ft=%.5f timescale=%s\n", Time(), FrameTime(), (ok and ts ~= nil) and tostring(ts) or "nil"))
+    return 5.0 end, "kltime", 5.0)
+end, nil)
