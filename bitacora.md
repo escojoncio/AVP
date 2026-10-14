@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0035).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B38).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B39).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -324,7 +324,25 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
    (VP_CB_ORDER=2) con vista sRGB vs UNORM del mismo ojo (las lecturas muestreadas van por id de vista, las
    attachments por id de imagen) → probar «Orden de GPU por recursos» apagado.
 
-## Siguiente (al llegar el log de B37/B38)
+## B39 — occlusion culling medido (VPKEngine `0037`)
+- HALLAZGO (idea del usuario: "el juego no usa occlusion culling"): Alyx crea pools de consultas de oclusión y llama
+  `vkCmdBeginQuery` (`r_occlusion_culling 1`), pero `queries.cpp` respondía SIEMPRE "1 muestra visible": el juego
+  dibujaba todo lo del frustum. Ahora: `Draw::visibility` (un slot de 8 B por draw consultado, nunca compartido:
+  robusto a que metal2 parta un pase), `GpuTimings::visibility`, `Device::frameVisibility` (shared_ptr, 64 frames);
+  metal2: buffer de 64 KB por slot de frame (`vpgpu.visibility`, memset en CPU antes de codificar), lo liga como
+  `visibilityResultBuffer` en todo pase del frame, `MTLVisibilityResultModeCounting` en el draw; slots sin draw
+  codificado (skip, pipeline ausente, cuarentena, encoder fallido, CB con error) leen 1 (visible). Vulkan:
+  Begin/End marcan los draws grabados (`OpDraw::query`, puesto ANTES de cualquier return temprano), el traductor
+  reparte slots (tope 8192 por submit; sin slot = desconocido = visible; secundarios dentro de una consulta =
+  desconocido), `stampQueries` deja la consulta no disponible mientras sustituye sus slots y pone frame+written al
+  final bajo el mutex del pool; `vkGetQueryPoolResults` suma los contadores, 0 solo para consulta sin draws.
+  `VPVK_OCCLUSION=0` = todo visible (ajuste «Occlusion culling medido (consultas de GPU)», `avp.occlusion`, ON).
+- Revisión adversarial: 4 hallazgos corregidos (kill switch invertido, tag tras return temprano, secundarios, carrera
+  en stampQueries) + vector compartido en vez de copia por consulta.
+- Qué mirar en el log de B39: draws por escena en `gpu.excl` (antes 240–1 813) y `[passes] scene-msaa` vtx/frag;
+  cualquier geometría que desaparezca indebidamente → apagar el ajuste y reportar.
+
+## Siguiente (al llegar el log de B37/B38/B39)
 1. Repartir los ~5 ms del compositor por pase y recortar el mayor (recon / composite): candidatos: recon a menos
    taps, componer la periferia a menor resolución, o `KL_CP_QUALITY` (hoy 0,40).
 2. Confirmar `[vk] ... samples the guest's image ... directly` y que la imagen es correcta; `gpu.excl` tipo 1c9d…

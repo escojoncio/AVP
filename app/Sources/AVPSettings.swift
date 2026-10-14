@@ -88,6 +88,10 @@ final class AVPSettings: ObservableObject {
     /// Build 38: player height offset in cm (negative = Alyx lower: for sitting down, or a floor origin that came out
     /// too low under the player). KLVR_HEIGHT_OFFSET, every tracked pose the game sees; live.
     @Published var heightOffsetCm: Double { didSet { save() } }
+    /// Build 39: the game's occlusion queries measured (VPKEngine 0037, Metal visibility results) instead of
+    /// "always visible": Source 2 then skips what its occlusion test found hidden (r_occlusion_culling 1).
+    /// Off = every query reads visible, the behaviour up to build 38 (VPVK_OCCLUSION).
+    @Published var occlusionQueries: Bool { didSet { save() } }
 
     // Fixed since build 32 (they used to be settings; every validated value is now the only value):
     /// 12 command buffers in flight (build 24 orders them; 3 was the build-23 A/B test).
@@ -133,6 +137,7 @@ final class AVPSettings: ObservableObject {
         postPhysical = d.object(forKey: "avp.postPhys") as? Bool ?? false
         eyeDirect = d.object(forKey: "avp.eyeDirect") as? Bool ?? true
         heightOffsetCm = d.object(forKey: "avp.heightCm") as? Double ?? 0
+        occlusionQueries = d.object(forKey: "avp.occlusion") as? Bool ?? true
         subtitleSize = SubtitleSize(rawValue: d.object(forKey: "avp.subSize") as? Int ?? 0) ?? .small
         subtitleFoveation = d.object(forKey: "avp.subFov") as? Bool ?? true
         loading = false
@@ -164,6 +169,7 @@ final class AVPSettings: ObservableObject {
         d.set(postPhysical, forKey: "avp.postPhys")
         d.set(eyeDirect, forKey: "avp.eyeDirect")
         d.set(heightOffsetCm, forKey: "avp.heightCm")
+        d.set(occlusionQueries, forKey: "avp.occlusion")
         d.set(subtitleSize.rawValue, forKey: "avp.subSize")
         d.set(subtitleFoveation, forKey: "avp.subFov")
     }
@@ -180,7 +186,7 @@ final class AVPSettings: ObservableObject {
         anisotropy = fresh.anisotropy; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
-        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm
+        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; occlusionQueries = fresh.occlusionQueries
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
         AVPLog.log("Ajustes: valores por defecto")
     }
@@ -399,6 +405,7 @@ final class AVPSettings: ObservableObject {
             ("KLVR_EYE_DIRECT", eyeDirect ? "1" : "0"),
             ("KLVR_HEIGHT_OFFSET", String(format: "%.3f", heightOffsetCm / 100)),
             ("KL_VRR_SRGB_1X", subtitleFoveation ? "1" : "0"),
+            ("VPVK_OCCLUSION", occlusionQueries ? "1" : "0"),
             // Build 31: native half fetch back on, alone (B29 turned it off only because it shipped with amplification;
             // the translator's conversion is exact). Logs 22: the scene pass is vertex-bound (vtx 11 ms).
             ("VPVK_FETCH_NATIVE", "1"),
@@ -491,7 +498,7 @@ final class AVPSettings: ObservableObject {
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
-                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm")
+                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries)")
         return env
     }
 
