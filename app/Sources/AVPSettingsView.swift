@@ -123,11 +123,12 @@ struct AVPSettingsView: View {
                 Text(AVPL("Continuo (mano)", "Continuous (hand)")).tag(AVPSettings.Movement.continuousHand)
             }
             Toggle(AVPL("Sincronizar partidas con Steam Cloud", "Sync saves with Steam Cloud"), isOn: $s.cloudSync)
+            Toggle(AVPL("Dedos reales (seguimiento de manos del visor)", "Real fingers (the headset's hand tracking)"), isOn: $s.handFingers)
         } header: {
             Text(AVPL("Juego", "Game"))
         } footer: {
-            Text(AVPL("Las voces siempre en inglés. El movimiento solo se aplica mientras el juego no tenga opciones guardadas.",
-                      "Voices are always English. Movement only applies until the game has saved options."))
+            Text(AVPL("Las voces siempre en inglés. El movimiento solo se aplica mientras el juego no tenga opciones guardadas. Dedos reales: los dedos del jugador siguen a tus dedos de verdad (como con los mandos Index de Valve) cuando el visor ve la mano; pide permiso de seguimiento de manos la primera vez. Al arrancar el juego.",
+                      "Voices are always English. Movement only applies until the game has saved options. Real fingers: the player's fingers follow your own (as with Valve's Index controllers) when the headset sees the hand; asks for the hand-tracking permission once. At game start."))
         }
     }
 
@@ -136,6 +137,7 @@ struct AVPSettingsView: View {
             Toggle(AVPL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $s.diagCaptures)
             Toggle(AVPL("Medir el tiempo de GPU por pase", "Per-pass GPU timing"), isOn: $s.gpuPassProfiling)
             Toggle(AVPL("Orden de GPU por recursos", "GPU ordering by resources"), isOn: $s.trackedOrder)
+            Toggle(AVPL("Prueba: amplificación de vértices", "Test: vertex amplification"), isOn: $s.amplifyTest)
             Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
                    role: .destructive) { confirmQuarantine = true }
                 .disabled(quarantined == 0)
@@ -157,8 +159,8 @@ struct AVPSettingsView: View {
         } header: {
             Text(AVPL("Diagnóstico (solo si te lo piden)", "Diagnostics (only when asked)"))
         } footer: {
-            Text(AVPL("Déjalo como está salvo que se te pida para un registro. Capturas: imágenes de los ojos y un volcado pase a pase en Logs Alyx; con ellas activas, L3 + R3 a la vez guarda el fallo que estés viendo. Medir GPU: escribe los tiempos en el registro, cuesta algo de rendimiento. Orden por recursos: menos esperas en la GPU; si ves geometría que explota, apágalo. Todo al arrancar el juego.",
-                      "Leave it as it is unless asked for a log. Captures: eye pictures and a pass-by-pass dump in Logs Alyx; with them on, L3 + R3 together saves the glitch you are seeing. GPU timing: writes the timings to the log, costs some performance. Ordering by resources: fewer GPU waits; if geometry explodes, turn it off. All at game start."))
+            Text(AVPL("Déjalo como está salvo que se te pida para un registro. Capturas: imágenes de los ojos y un volcado pase a pase en Logs Alyx; con ellas activas, L3 + R3 a la vez guarda el fallo que estés viendo. Medir GPU: escribe los tiempos en el registro, cuesta algo de rendimiento. Orden por recursos: menos esperas en la GPU; si ves geometría que explota, apágalo. Prueba de amplificación: solo para una partida corta de diagnóstico (activa las capturas sola); se sabe que rompe la imagen del ojo derecho. Todo al arrancar el juego.",
+                      "Leave it as it is unless asked for a log. Captures: eye pictures and a pass-by-pass dump in Logs Alyx; with them on, L3 + R3 together saves the glitch you are seeing. GPU timing: writes the timings to the log, costs some performance. Ordering by resources: fewer GPU waits; if geometry explodes, turn it off. Amplification test: only for a short diagnostic run (it turns captures on by itself); known to break the right eye's picture. All at game start."))
         }
     }
 

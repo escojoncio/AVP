@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0035).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B32).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B33).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -163,19 +163,37 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
    ellas), «Medir GPU por pase» (default OFF, clave `avp.gpuPasses2`; `VP_EXCL_TIMING` va con ella), «Orden de GPU por
    recursos» (default ON, clave `avp.cbOrder2c`). Pantalla: Imagen / Foveado / Texturas y efectos / Juego / Diagnóstico.
 
-## Siguiente (al llegar el log de B32)
-1. `gpu.msaa rejected ... why=`: arreglar el veredicto en `placeTiles` si es resoluble (p. ej. `Partial` por
-   layers/layerCount, `LoadsContents` por stencil). Si es `SampledRead` (el juego lee las muestras en el mismo pase)
-   no se puede poner en tile: quitar `0034` del todo. Confirmar en `gpu.frame`: `tile_local=2 saved_mb>0` y
-   `store_mb` de la escena bajando de 58.
-2. fps con la instrumentación apagada (`[openvr] frames`, regulador): ¿sube a 50 en algún tramo?
-3. AMPLIFICACIÓN DE VÉRTICES (vtx 11 → ~6 ms). Bug (B27/B28): ojo derecho encogido en una esquina + page fault en el
-   pase overlay 1x con pipeline `wm4294967280` (= variante con write mask c0=0: dibujo solo depth/stencil, p. ej.
-   hidden-area/oclusión de ojo). Pistas: viewMappings vs capa del rate map por `[[viewport_array_index]]` (`0027`); los
-   VS que escriben Layer/ClipDistance siguen instanciados (`SpirvInterface::amplified=false`): mezcla en el mismo pase.
-4. Streaming de texturas (`vkCopyMemoryToImageEXT` espera la GPU por región) → staging asíncrono.
-5. Compositor 3,3 ms por imagen nueva: perfilar `kl_reproject` por etapa.
-6. Hidden area mesh: comprobar que klvr devuelve malla para la lente del Vision Pro.
+## Logs_Alyx_25 (B32) — medido
+- MSAA en tile (`0034`): FALSA PREMISA. `gpu.enc ... mem=c0:Persistent,d:Persistent` y ninguna línea `gpu.msaa rejected`:
+  el store de la escena es `R` (= solo Resolve: el juego pide storeOp DONT_CARE + resolve), no StoreAndResolve, así que
+  `0034` nunca entra y las muestras NUNCA se escribían a memoria. Los 58 MB de `store_mb` son los destinos del
+  resolve (color RG11B10F + depth, 2 capas). `Persistent` solo significa "no memoryless" (memoria, no ancho de banda).
+  `0034`/`0035` quedan (inocuos). No hay ganancia posible ahí.
+- Sin instrumentación: tramos a 50 fps reales (~1,5 min seguidos; regulador: GPU 11,9–14,6 ms por frame de 50) y
+  caídas a 33 en zonas densas (24–33 ms/frame). Ritmo final: 33 la mayor parte del tiempo. La diferencia entre zona
+  ligera y densa es ~2x: geometría (vtx) sigue siendo el límite.
+
+## B33 — cambios
+1. Dedos reales: `KleptonControllers.fingerCurls/publishFingers` (ángulos sumados por cadena de articulaciones ARKit →
+   curl 0..1 por dedo) → `kl_ovrp_set_finger_curls` / `kl_ovrp_finger_curls` (frescura 0,3 s) → `klvr_plat_finger_curls`
+   → `klvr_input.cpp curls_for` (máximo entre botones y manos) en `GetSkeletalBoneData`/`GetSkeletalSummaryData`.
+   Ajuste «Dedos reales» (`avp.handFingers`, ON) = `KL_HANDS=1` (pide permiso de manos). Log cada 30 s:
+   `[input] fingers with a Sense controller in hand: left tracked N/M, right N/M` → dice si visionOS da manos con el
+   mando sujeto (VisionQuestPro observó que NO en versiones anteriores).
+2. Ajuste «Prueba: amplificación de vértices» (`avp.amplifyTest`, OFF) = `VPVK_AMPLIFY=1` + capturas forzadas. Para una
+   partida corta de diagnóstico: PNG de ojos + `gpu.hunt` del fallo del pase overlay (`wm4294967280` = variante con
+   write mask c0=0).
+
+## Siguiente (al llegar el log de B33)
+1. Dedos: contador `fingers with a Sense controller in hand`; si 0/M, visionOS no da manos con el mando → la función
+   solo sirve sin mandos (dejar el ajuste, documentarlo).
+2. Amplificación (vtx 11 → ~6 ms; la única vía a 50 fps estables): con las capturas de la prueba, localizar el bug.
+   Pistas: viewMappings vs capa del rate map por `[[viewport_array_index]]` (`0027`); VS que escriben
+   Layer/ClipDistance siguen instanciados (`SpirvInterface::amplified=false`): mezcla en el mismo pase; kernel de
+   fix-up de draws indirectos (`kOwnerFixBase`) multiplicando ×2 también los amplificados.
+3. Streaming de texturas (`vkCopyMemoryToImageEXT` espera la GPU por región) → staging asíncrono.
+4. Compositor 3,3 ms por imagen nueva: perfilar `kl_reproject` por etapa.
+5. Hidden area mesh: comprobar que klvr devuelve malla para la lente del Vision Pro.
 
 ## Pendiente menor
 - Ajustes en vivo que faltan: resolución/texturas (convars), anisotrópico, zona nítida; activar/desactivar foveado requiere reiniciar.

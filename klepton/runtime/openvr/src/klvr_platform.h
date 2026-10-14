@@ -97,6 +97,9 @@ double klvr_plat_wait_frame(void);
 void   klvr_plat_head(double display_time, klvr_tracked *out);
 void   klvr_plat_hand(int hand, double display_time, klvr_tracked *out);
 void   klvr_plat_controller(int hand, klvr_controller *out);
+// AVP: the fingers as the headset's hand tracking sees them (0 straight .. 1 curled: thumb, index,
+// middle, ring, pinky). 1 when fresh; 0 = not tracked, the skeleton falls back to the buttons.
+int    klvr_plat_finger_curls(int hand, float curl[5]);
 
 // amplitude 0..1, frequency Hz (0 = device default), seconds <= 0 = a click.
 void   klvr_plat_haptic(int hand, float amplitude, float frequency, float seconds);
