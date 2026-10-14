@@ -93,9 +93,10 @@ final class AVPSettings: ObservableObject {
     /// "always visible": Source 2 then skips what its occlusion test found hidden (r_occlusion_culling 1).
     /// Off = every query reads visible, the behaviour up to build 38 (VPVK_OCCLUSION).
     @Published var occlusionQueries: Bool { didSet { save() } }
-    /// Build 43 (Logs_Alyx_31): the refresh rate the OpenVR shim tells Alyx (Prop_DisplayFrequency). Alyx steps its
-    /// clock from this number; `measured` = the game's own smoothed frame rate (the default since the start), the fixed
-    /// values are the A/B for walking and hands running in slow motion at a steady 50 fps (KLVR_REPORT_HZ_FIXED).
+    /// Build 43/44: the refresh rate the OpenVR shim tells Alyx (Prop_DisplayFrequency). Alyx steps its clock by
+    /// 1/this per frame and fixes its tick interval to 1/this at map load (Logs_Alyx_32/3_2/2_11). `measured` (the
+    /// default) = automatic since build 44: the pace governor's current rate, the base while loading
+    /// (klvr_game_hz); the fixed values are tests (KLVR_REPORT_HZ_FIXED): 90 runs the game at 55 % speed.
     enum ReportedHz: Int, CaseIterable { case measured = 0, fixed50 = 1, fixed90 = 2
         var env: String { self == .fixed50 ? "50" : self == .fixed90 ? "90" : "0" }
     }

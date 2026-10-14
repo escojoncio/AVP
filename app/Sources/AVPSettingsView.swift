@@ -157,7 +157,7 @@ struct AVPSettingsView: View {
             Toggle(AVPL("Ojos al compositor sin copia", "Eyes to the compositor without a copy"), isOn: $s.eyeDirect)
             Toggle(AVPL("Occlusion culling medido (consultas de GPU)", "Measured occlusion culling (GPU queries)"), isOn: $s.occlusionQueries)
             Picker(AVPL("Frecuencia que se le dice al juego", "Refresh rate told to the game"), selection: $s.reportedHz) {
-                Text(AVPL("Medida (la del juego)", "Measured (the game's own)")).tag(AVPSettings.ReportedHz.measured)
+                Text(AVPL("Automática (ritmo real)", "Automatic (the real pace)")).tag(AVPSettings.ReportedHz.measured)
                 Text(AVPL("Fija 50 Hz", "Fixed 50 Hz")).tag(AVPSettings.ReportedHz.fixed50)
                 Text(AVPL("Fija 90 Hz", "Fixed 90 Hz")).tag(AVPSettings.ReportedHz.fixed90)
             }
@@ -182,8 +182,8 @@ struct AVPSettingsView: View {
         } header: {
             Text(AVPL("Diagnóstico (solo si te lo piden)", "Diagnostics (only when asked)"))
         } footer: {
-            Text(AVPL("Déjalo como está salvo que se te pida para un registro. Capturas: imágenes de los ojos y un volcado pase a pase en Logs Alyx; con ellas activas, L3 + R3 a la vez guarda el fallo que estés viendo. Medir GPU: escribe los tiempos en el registro, cuesta algo de rendimiento. Orden por recursos: menos esperas en la GPU; si ves geometría que explota, apágalo. Amplificación de vértices: los dos ojos en una sola pasada de geometría (menos tiempo de GPU); si ves algo raro en un ojo, apágalo. Todo al arrancar el juego. Frecuencia al juego: Alyx avanza su reloj con este número; si andar o las manos van a cámara lenta, prueba las fijas (requiere reiniciar el juego).",
-                      "Leave it as it is unless asked for a log. Captures: eye pictures and a pass-by-pass dump in Logs Alyx; with them on, L3 + R3 together saves the glitch you are seeing. GPU timing: writes the timings to the log, costs some performance. Ordering by resources: fewer GPU waits; if geometry explodes, turn it off. Vertex amplification: both eyes in one geometry pass (less GPU time); if one eye looks wrong, turn it off. All at game start. Refresh rate told to the game: Alyx steps its clock from this number; if walking or the hands run in slow motion, try the fixed ones (game restart)."))
+            Text(AVPL("Déjalo como está salvo que se te pida para un registro. Capturas: imágenes de los ojos y un volcado pase a pase en Logs Alyx; con ellas activas, L3 + R3 a la vez guarda el fallo que estés viendo. Medir GPU: escribe los tiempos en el registro, cuesta algo de rendimiento. Orden por recursos: menos esperas en la GPU; si ves geometría que explota, apágalo. Amplificación de vértices: los dos ojos en una sola pasada de geometría (menos tiempo de GPU); si ves algo raro en un ojo, apágalo. Todo al arrancar el juego. Frecuencia al juego: Alyx avanza su reloj y fija su tick con este número. Automática = el ritmo real (50, o 33 en zonas densas; 50 durante las cargas). Las fijas son solo para pruebas: 90 va a cámara lenta (requiere reiniciar el juego).",
+                      "Leave it as it is unless asked for a log. Captures: eye pictures and a pass-by-pass dump in Logs Alyx; with them on, L3 + R3 together saves the glitch you are seeing. GPU timing: writes the timings to the log, costs some performance. Ordering by resources: fewer GPU waits; if geometry explodes, turn it off. Vertex amplification: both eyes in one geometry pass (less GPU time); if one eye looks wrong, turn it off. All at game start. Refresh rate told to the game: Alyx steps its clock and fixes its tick from this number. Automatic = the real pace (50, or 33 in dense areas; 50 during loads). The fixed ones are tests only: 90 runs in slow motion (game restart)."))
         }
     }
 

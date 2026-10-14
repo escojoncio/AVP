@@ -175,6 +175,12 @@ struct FrameTrace {
 };
 FrameTrace g_trace;   // under g_mu
 std::atomic<double> g_game_hz{0};
+// Build 44: what the game is doing, for klvr_game_hz. The grid is up from start-up until the first FadeGrid(out)
+// and across every level load (Source 2 fades to it before loading); a WaitGetPoses more than 100 ms ago is a stall
+// (a load, a pause) whatever the grid says.
+std::atomic<int>    g_grid_shown{1};
+std::atomic<double> g_last_wait_at{0};
+std::atomic<double> g_steady_since{0};   // when the current run of frames < 0.5 s apart began
 
 // Per-frame timing for GetFrameTiming, indexed by frame id.
 struct Timing { uint32_t id = 0, vsyncs = 1; double start = 0, interval = 0; };
@@ -442,7 +448,9 @@ vr::EVRCompositorError IVRCompositor__WaitGetPoses(void *, vr::TrackedDevicePose
             walk_update(dt);
             clock_probe(dt);
         }
+        if (last_wait <= 0 || now_w - last_wait > 0.5 || g_steady_since.load() <= 0) g_steady_since.store(now_w);
         last_wait = now_w;
+        g_last_wait_at.store(now_w);
     }
     if (g_trace.on) {
         std::lock_guard<std::mutex> l(g_mu);
@@ -822,6 +830,7 @@ void IVRCompositor__FadeGrid(void *, float seconds, bool fade_in) {
     // platform may log or take its own locks.
     static std::atomic<int> s_last_fade{-1};
     const int now_fade = fade_in ? 1 : 0;
+    g_grid_shown.store(now_fade);
     if (s_last_fade.exchange(now_fade) != now_fade) klvr_plat_scene_fade(now_fade);
 }
 float IVRCompositor__GetCurrentGridAlpha(void *) {
@@ -881,22 +890,46 @@ uint32_t IVRCompositor__GetLastError(void *, char *buf, uint32_t size) { return 
 }} // namespace klvr::impl
 
 namespace klvr {
-// What Prop_DisplayFrequency should say. In VR Alyx steps its clock by one
-// display period per rendered frame (measured on the Mac: at 24 fps against a
-// 72 Hz report, scripted intro events took 3x as long; desktop mode keeps
-// time), so reporting the panel's rate while rendering at 28 fps ran the game
-// at a quarter speed on Vision Pro. KLVR_REPORT_GAME_HZ=1 (default) reports
-// the game's smoothed frame rate instead, clamped to [20, panel].
+// What Prop_DisplayFrequency should say. Measured (Logs_Alyx_32/3_2/2_11, build 43 KLTIME probe): Alyx advances its
+// clock by 1/Prop_DisplayFrequency per rendered frame — the CURRENT value, re-read when it changes ("Converting
+// display frequency") — and fixes its server tick interval to 1/Prop_DisplayFrequency AS READ AT MAP LOAD, for the
+// whole map (FrameTime() stayed 1/33 after the game was told 50). So:
+//   * the number must equal the pace the game is actually held at, or its clock runs slow (told 90 at 50 fps: 55 %)
+//     or fast — the pace governor's current rate, not a smoothed measurement that trails it;
+//   * while a map loads (grid up, or no frame for 100 ms) it must be the BASE pace, or the map's tick interval is
+//     whatever the governor sat at during the load (build 42 logs: a map loaded during the 33 fps fallback simulated
+//     at 33 ticks/s for the rest of the session while rendering 50 fps — the worst-feeling run of the three).
+// KLVR_REPORT_HZ_FIXED=<hz> overrides everything (the A/B that found this). KLVR_REPORT_GAME_HZ=0 reports the panel.
+// Without the governor (KLVR_PACE_FALLBACK unset: a host run) the game's smoothed frame rate is reported, as before.
 static std::atomic<float> g_hz_held{0};   // the whole-Hz value last reported (hysteresis state)
 float klvr_game_hz(float panel) {
     static bool on = env_on("KLVR_REPORT_GAME_HZ", true);
-    // Build 43: KLVR_REPORT_HZ_FIXED=<hz> reports one fixed number whatever the game's rate (the A/B for a game clock
-    // that runs slow at a steady 50 fps, Logs_Alyx_31): 0 or unset = the measured rate below.
     static float fixed = -1;
     if (fixed < 0) { const char *e = getenv("KLVR_REPORT_HZ_FIXED"); fixed = e && *e ? (float)atof(e) : 0; }
     if (fixed > 0) return fixed > panel ? panel : fixed;
+    if (!on) return panel;
+    float base = 0, cur = 0;
+    if (klvr_plat_pace_hz(&base, &cur) && base > 0) {
+        // A stall (no frame for 0.5 s) reports the base and keeps reporting it for 1 s after frames resume, so one
+        // hitch does not flip the number twice (each flip makes Alyx re-derive its timing). The grid flag alone is
+        // trusted for 5 s of steady frames at most: a path that never fades the grid out must not pin the base.
+        static std::atomic<double> hold_until{0};
+        double now = klvr_plat_now(), last = g_last_wait_at.load(), steady = g_steady_since.load();
+        bool stalled = last <= 0 || now - last > 0.5;
+        if (stalled) hold_until.store(now + 1.0);
+        bool grid = g_grid_shown.load() && (steady <= 0 || now - steady < 5.0);
+        bool loading = stalled || now < hold_until.load() || grid;
+        float h = (loading || !(cur > 0)) ? base : cur;
+        if (h > panel) h = panel;
+        float had = g_hz_held.exchange(h);
+        if (had != h)
+            fprintf(stderr, "  [openvr] display frequency told to the game: %.1f Hz (%s; base %.1f, pace %.1f)\n",
+                    (double)h, loading ? "loading or stalled: the base pace" : cur < base ? "the fallback pace" : "the base pace",
+                    (double)base, (double)cur);
+        return h;
+    }
     double g = g_game_hz.load();
-    if (!on || g <= 0) return panel;
+    if (g <= 0) return panel;
     if (g > panel) g = panel;
     if (g < 20) g = 20;
     // Whole hertz, moved only when the rate is more than 1 Hz off: Alyx
