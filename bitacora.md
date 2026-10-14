@@ -422,6 +422,12 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
    como prueba (`KLVR_REPORT_HZ_FIXED`). Ajuste renombrado «Automática (ritmo real)».
 2. Revisión adversarial: 3 hallazgos corregidos (ruta sin regulador inalcanzable, oscilación por tirones > 100 ms en
    fallback, grid que nunca se apaga).
+3. B44b: por debajo del ritmo mantenido (exteriores que no caben ni a 33): tras 2 s con la media medida < 90 % del
+   ritmo, se reporta la medida redondeada (entera, mín. 20, < ritmo), en saltos ≥ 2 Hz; vuelve al ritmo tras 2 s
+   ≥ 97 %. Banda muerta 90–97 % reinicia el temporizador del cambio pendiente. Bajo `below_mu`. Log `below the pace`.
+   Revisión: 2 fallos corregidos (temporizadores congelados en la banda muerta, valor fraccionario 32,3).
+4. Pendiente anotado por el usuario: el regulador arranca en el fallback (33) y el menú/primeros segundos van así; con
+   la medida exclusiva fiable podría arrancar en la base.
 
 ## Siguiente (al llegar el log de B44)
 1. KLTIME: `ft=0.02000` en todos los mapas y `t` a 5 s/5 s reales también en tramos de fallback (allí Alyx debe
