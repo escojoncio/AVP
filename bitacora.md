@@ -2,9 +2,9 @@
 
 Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en el visor: Steam oficial → descarga →
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
-juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0034).
+juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0035).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B31).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B32).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -136,25 +136,49 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
    ≤ 2 % tardíos (antes: 1 s / 3 % y 5 s / 0).
 4. `r_occlusion_culling 1` forzado (AVPMISSING si no existe); KLPERF vuelca los convars de cull/LOD/multiview.
 
-## Siguiente (al llegar el log de B31)
-1. Comprobar: `msaa_stale` ausente; `tile_local=2` en el CB de escena; `gpu.excl` escena: `store_mb` y `excl_ms`;
-   `vtx_ms` con fetch nativo vs 11; imagen correcta (si no: ajuste «MSAA resuelto en tile» OFF). KLPERF:
-   `r_occlusion_culling`, `sc_perdrawculling`.
-2. AMPLIFICACIÓN DE VÉRTICES (la mayor ganancia posible: un tiling para los dos ojos). Bug conocido (B27/B28): ojo
-   derecho encogido en una esquina + page fault en el pase overlay 1x con `wm4294967280`. Pistas: viewMappings vs capa
-   del rate map elegida por `[[viewport_array_index]]` (regla de `0027`); los VS que escriben Layer/ClipDistance
-   siguen instanciados (`SpirvInterface::amplified=false`): mezcla de pases amplificados y no amplificados sobre el
-   mismo rate map. Objetivo vtx 11 → ~6 ms.
-3. Streaming de texturas: `vkCreateImage` 2048² en ráfagas + `vkCopyMemoryToImageEXT` que espera la GPU por región
-   (bitácora B18) → copias por staging asíncrono en un blit por frame. Blit 2-3 ms/frame x20 en W3/W4.
-4. Compositor 3,3 ms por imagen nueva (wide view + círculo + recon VPKTAA): perfilar `kl_reproject` por etapa.
-5. Hidden area mesh: `vr_stencil_hidden_pixels=1` solo ahorra si `GetHiddenAreaMesh` devuelve una malla; comprobar
-   que klvr la devuelve para la lente del Vision Pro (si no, fragmentos de la periferia invisible se pintan).
-6. Instrumentación: `KL_GPU_PASSES` + `VP_EXCL_TIMING` en cada encoder (28-120/frame) cuestan algo; dejarlos OFF
-   por defecto cuando el reparto esté claro (ajuste «Medir GPU por pase» ya existe).
+## Logs_Alyx_23 (B31) — medido
+- «MSAA resuelto en tile» (`0034`) NO se aplica nunca: `tile_local=0 tile_rejected=2` en todos los frames, escena sigue
+  `att=c0:CR:Persistent,d:CR:Persistent store_mb=58.4`; `msaa_stale` ausente solo porque nunca entró. El log no decía el
+  veredicto (`gpu.enc` con `mem=` solo salía con `setDetailEvery`, sin env). Imágenes MSAA del juego (census): color
+  B10G11R11 s4 usage 0x97 y D32S8 s4 usage 0xa7 (SAMPLED + INPUT_ATTACHMENT + TRANSFER): candidatos `SampledRead`
+  (lectura por muestra en el mismo pase) o `Partial`/`OtherEncoder`; sin confirmar.
+- `VPVK_FETCH_NATIVE=1`: vtx igual (8,6–11,8 ms en escena). Se deja (exacto).
+- `VP_CB_ORDER=2` toda la sesión (el usuario lo activó): 0 cuelgues, 0 explosiones, `out_of_order=0`,
+  `overlapped=14746`. Default ON desde B32.
+- 33 fps clavados: regulador sube a 50 y cae (GPU 23–26 ms/frame en juego: escena 13–18 = vtx 8–12 + frag 6–8, post 3,4,
+  compute 1,6, compositor 3,3). Para 50 fps hacen falta ≤18 ms: faltan 5–8 ms. Fuentes sin tocar fidelidad: MSAA en tile
+  real (~2–3 ms), instrumentación (algo), amplificación de vértices (~5 ms, la única que llega).
+- La pantalla va SIEMPRE a 100 Hz (medida); el ajuste «90 Hz» solo cambiaba lo que se le decía al juego.
+
+## B32 — cambios
+1. VPKEngine `0035`: `CompiledFrame::msaaRejects` + log `gpu.msaa rejected f= enc= slot= why=<TileVerdict> tex= WxHxL sN
+   mips= type= layer_count= layer= persistent= transient= load= attached_in= first_read= last_use= multi= sampled=
+   elsewhere= bad_fetch=` (12 primeras + las de 1 frame cada `VP_FRAME_DETAIL`, tope 120). `VP_FRAME_DETAIL=N` (env
+   nuevo) → `gpu.enc ... tile=c0 mem=d:SampledRead` cada N frames; la app pasa 3000.
+2. Limpieza de ajustes (`AVPSettings`/`AVPSettingsView`): quitados res. dinámica, memoria de texturas (ahora derivada del
+   tamaño máximo: 1024→1536, 2048→2560, 4096→2816 MB), presets M2/M5/Personalizado (→ `foveationOn`, clave `avp.fovOn`,
+   migra de `avp.fov2`), zona redonda (siempre), 90/100 Hz y «dibuja a la mitad» (fijos: guest 90 Hz, pace 45, fallback),
+   «componer solo imágenes nuevas» (fijo ON), motor MoltenVK (solo si la build no trae VPVulkan), cola GPU (12),
+   «MSAA en tile» (fijo ON), amplificación. Diagnóstico: capturas (default OFF; `KL_CAPTURE`/`VP_DUMP_FRAME` solo con
+   ellas), «Medir GPU por pase» (default OFF, clave `avp.gpuPasses2`; `VP_EXCL_TIMING` va con ella), «Orden de GPU por
+   recursos» (default ON, clave `avp.cbOrder2c`). Pantalla: Imagen / Foveado / Texturas y efectos / Juego / Diagnóstico.
+
+## Siguiente (al llegar el log de B32)
+1. `gpu.msaa rejected ... why=`: arreglar el veredicto en `placeTiles` si es resoluble (p. ej. `Partial` por
+   layers/layerCount, `LoadsContents` por stencil). Si es `SampledRead` (el juego lee las muestras en el mismo pase)
+   no se puede poner en tile: quitar `0034` del todo. Confirmar en `gpu.frame`: `tile_local=2 saved_mb>0` y
+   `store_mb` de la escena bajando de 58.
+2. fps con la instrumentación apagada (`[openvr] frames`, regulador): ¿sube a 50 en algún tramo?
+3. AMPLIFICACIÓN DE VÉRTICES (vtx 11 → ~6 ms). Bug (B27/B28): ojo derecho encogido en una esquina + page fault en el
+   pase overlay 1x con pipeline `wm4294967280` (= variante con write mask c0=0: dibujo solo depth/stencil, p. ej.
+   hidden-area/oclusión de ojo). Pistas: viewMappings vs capa del rate map por `[[viewport_array_index]]` (`0027`); los
+   VS que escriben Layer/ClipDistance siguen instanciados (`SpirvInterface::amplified=false`): mezcla en el mismo pase.
+4. Streaming de texturas (`vkCopyMemoryToImageEXT` espera la GPU por región) → staging asíncrono.
+5. Compositor 3,3 ms por imagen nueva: perfilar `kl_reproject` por etapa.
+6. Hidden area mesh: comprobar que klvr devuelve malla para la lente del Vision Pro.
 
 ## Pendiente menor
-- Ajustes en vivo que faltan: resolución/texturas (convars), anisotrópico; activar/desactivar foveado requiere reiniciar.
+- Ajustes en vivo que faltan: resolución/texturas (convars), anisotrópico, zona nítida; activar/desactivar foveado requiere reiniciar.
 - Botón PS no capturable (solo "Button Menu"); mitigado por la pausa. QR de Steam. Subir 0011–0030 al repo VPKEngine.
 - Investigaciones abiertas de B18: modo polígono LINE ignorado; vistas de aspecto stencil devuelven depth;
   `vkCopyMemoryToImageEXT` espera la GPU por región.

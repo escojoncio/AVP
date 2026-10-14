@@ -15,17 +15,13 @@ enum AVPLaunch {
     /// The driver chosen by selectDriver() (KL_MVK_DYLIB), nil for Klepton's default (MoltenVK).
     nonisolated(unsafe) private(set) static var driverPath: String?
 
-    /// VPKEngine (default) is opened here first with RTLD_GLOBAL, so the settings reach it
-    /// (vpvk_config_set_*) before the game creates its device; Klepton's own dlopen of the same
-    /// path then returns this handle. MoltenVK is the diagnostic choice.
+    /// VPKEngine is opened here first with RTLD_GLOBAL, so the settings reach it (vpvk_config_set_*) before the
+    /// game creates its device; Klepton's own dlopen of the same path then returns this handle. MoltenVK only runs
+    /// when this build carries no VPVulkan (the setting that chose it is gone since build 32: it was a diagnostic
+    /// nobody plays with).
     static func selectDriver() {
         driverPath = nil
         unsetenv("KL_MVK_DYLIB")
-        let engine = AVPSettings.shared.engine
-        guard engine == .vpkengine else {
-            AVPLog.log("Gráficos: MoltenVK (diagnóstico, elegido en ajustes)")
-            return
-        }
         guard let path = vpvulkanPath else {
             AVPLog.log("Gráficos: esta build no trae VPVulkan; se usa MoltenVK")
             return
