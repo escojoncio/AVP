@@ -429,6 +429,22 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
 4. Pendiente anotado por el usuario: el regulador arranca en el fallback (33) y el menú/primeros segundos van así; con
    la medida exclusiva fiable podría arrancar en la base.
 
+## Logs_Alyx_33 (B44b, menú a 50 %) — el coste NO escala con la resolución
+- 50 % (1536x1248, confirmado en consola `Render target size is 1536x1248`): juego 13,6 ms + compositor 2 ms en el
+  menú, 50 fps estables, frame terminado a 15 ms. A 70 % (log 31, `[passes]` W1/W2 = menú): span 11,6–16 ms.
+- Reparto del menú a 70 % (W2, span 16 ms): solo ~6,5 ms escalan con píxeles (frag de escena 4,6, tonemap 1,3,
+  bloom 528x432 1,2 y cadena). FIJO ~9,5 ms:
+  * **Limpieza completa del atlas de sombras D32F 4096x4096 cada frame** (`R 0x0 L0 z 4096x4096 f252 ld2 st1`, sin
+    draws): encoder SIN timestamps (Metal no muestrea etapas de un encoder vacío) → aparece como "GPU idle inside the
+    span" 2,0–3,6 ms y NO entra en `[gputime]` ni en el regulador (subestiman el frame en esa cantidad).
+  * vtx de escena 2,4 ms; compute 1,35 ms; blits 0,9 ms (0,72 = copias de ojos del shim, `#027/#029`); pases
+    pequeños de bloom (66x54, 132x108) a 0,1–0,6 ms cada uno (drenaje entre pases dependientes).
+- Cuadra con 50 %: 6,5 × 0,53 + 9,5 ≈ 13 ms.
+- Candidato de B45 (VPKEngine 0038): limpieza diferida del atlas: un pase solo-clear de depth sin draws se convierte en
+  quads de clear sobre el área exacta (offset+extent) de cada pase posterior del frame que lo carga; lo no dibujado en
+  el frame queda sin limpiar (si el juego muestreara una zona no dibujada vería sombras viejas → toggle A/B).
+- Pedido al usuario (sin build): «Medir el tiempo de GPU por pase» ON, menú 40 s a 50 % y 40 s a 75 % en el mismo sitio.
+
 ## Siguiente (al llegar el log de B44)
 1. KLTIME: `ft=0.02000` en todos los mapas y `t` a 5 s/5 s reales también en tramos de fallback (allí Alyx debe
    loguear `Refresh Rate: 33` y volver a 50). Contar cambios `told to the game`: deben coincidir con los del regulador.
