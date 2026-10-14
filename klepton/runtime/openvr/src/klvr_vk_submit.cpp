@@ -255,6 +255,22 @@ int vk_copy_eye(int stage, int eye, const vr::VRVulkanTextureData_t *t, uint32_t
         b.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         b.dstOffsets[0] = { 0, 0, 0 };
         b.dstOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
+        // Eye-copy trim (klvr_plat_eye_trim: AVP's A/B test bit 2 or KL_EYE_TRIM=1). Foveated, the picture is only the
+        // rate map's physical area at the top-left and the compositor unwarps from there (screen -> physical), so
+        // only that part (+2 texels) is copied, 1:1 at the same place; the rest of the platform image keeps what it
+        // held, which nothing reads. Only the plain copy: unflipped, uncropped origin, single-sample.
+        uint32_t tw = 0, th = 0;
+        if (sx0 == 0 && sy0 == 0 && sx1 > sx0 && sy1 > sy0 && t->m_nSampleCount <= 1 &&
+            klvr_plat_eye_trim(w, h, &tw, &th)) {
+            b.srcOffsets[1] = { (int32_t)tw, (int32_t)th, 1 };
+            b.dstOffsets[1] = { (int32_t)tw, (int32_t)th, 1 };
+            static bool said = false;
+            if (!said) {
+                said = true;
+                logf("Submit: eye copy trimmed to the foveation map's physical area: %ux%u of %ux%u (%.0f %% of the texels)",
+                     tw, th, w, h, 100.0 * tw * th / ((double)w * h));
+            }
+        }
         g_fns.CmdBlitImage(s.cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
     }

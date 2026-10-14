@@ -81,6 +81,9 @@ int klvr_plat_eye_publish_guest(int stage, int eye, uint64_t vk_image, int layer
     (void)stage; (void)eye; (void)vk_image; (void)layer; (void)w; (void)h; return 0;
 }
 void klvr_plat_eye_unpublish_guest(int stage, int eye) { (void)stage; (void)eye; }
+int klvr_plat_eye_trim(uint32_t w, uint32_t h, uint32_t *tw, uint32_t *th) {
+    (void)w; (void)h; (void)tw; (void)th; return 0;
+}
 
 uint64_t klvr_plat_eye_depth_image(int stage, int eye, uint32_t w, uint32_t h) { (void)stage; (void)eye; (void)w; (void)h; return 0; }
 uint64_t klvr_plat_eye_depth_half(int eye, uint32_t w, uint32_t h) { (void)eye; (void)w; (void)h; return 0; }

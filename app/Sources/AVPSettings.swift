@@ -55,7 +55,7 @@ final class AVPSettings: ObservableObject {
     /// instead of all of them (0029, VP_CB_ORDER=1). Logs 23: a whole session with it, no hang, no vertex explosion,
     /// out_of_order=0 → on by default since build 32. If vertex explosions come back, turn it off.
     @Published var trackedOrder: Bool { didSet { save() } }
-    /// Diagnostic captures: eye PNGs at fixed frames, the frame-6000 pass dump, L3+R3 on-glitch dumps (KL_CAPTURE).
+    /// Diagnostic captures: eye PNGs at fixed frames, L3+R3 on-glitch captures and pass dumps (KL_CAPTURE).
     @Published var diagCaptures: Bool { didSet { save() } }
     /// Build 27: per-pass GPU timing windows (KL_GPU_PASSES, kl_gpu_time.m) + VPKEngine's exclusive per-encoder
     /// timing (VP_EXCL_TIMING). Off by default since build 32: sample buffers on 28-120 encoders per frame are not free.
@@ -105,6 +105,11 @@ final class AVPSettings: ObservableObject {
     /// the CPU while the GPU finishes the current one (SteamVR's running start). Off = the B44 pacing, where the GPU
     /// idled ~5 ms at the start of every frame whatever the resolution (KL_GUEST_PACE_LEAD_MS).
     @Published var runningStart: Bool { didSet { save() } }
+    /// Build 46: the automatic A/B performance test (KL_ABTEST=1, kl_gpu_time.m): ~2 min after the game loads, with the
+    /// player still, VPKEngine's runtime optimisations (patch 0038) and the eye-copy trim are measured on and off, then
+    /// each heavy shader is left out once; what saves stays on for the session and everything goes to the log. While on,
+    /// the compositor's diagnostic captures stop after guest frame 120 (each stalls ~250 ms).
+    @Published var abTest: Bool { didSet { save() } }
 
     // Fixed since build 32 (they used to be settings; every validated value is now the only value):
     /// 12 command buffers in flight (build 24 orders them; 3 was the build-23 A/B test).
@@ -153,6 +158,7 @@ final class AVPSettings: ObservableObject {
         occlusionQueries = d.object(forKey: "avp.occlusion") as? Bool ?? true
         reportedHz = ReportedHz(rawValue: d.object(forKey: "avp.reportHz") as? Int ?? 0) ?? .measured
         runningStart = d.object(forKey: "avp.runStart") as? Bool ?? true
+        abTest = d.object(forKey: "avp.abTest") as? Bool ?? false
         subtitleSize = SubtitleSize(rawValue: d.object(forKey: "avp.subSize") as? Int ?? 0) ?? .small
         subtitleFoveation = d.object(forKey: "avp.subFov") as? Bool ?? true
         loading = false
@@ -187,6 +193,7 @@ final class AVPSettings: ObservableObject {
         d.set(occlusionQueries, forKey: "avp.occlusion")
         d.set(reportedHz.rawValue, forKey: "avp.reportHz")
         d.set(runningStart, forKey: "avp.runStart")
+        d.set(abTest, forKey: "avp.abTest")
         d.set(subtitleSize.rawValue, forKey: "avp.subSize")
         d.set(subtitleFoveation, forKey: "avp.subFov")
     }
@@ -205,7 +212,7 @@ final class AVPSettings: ObservableObject {
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
         postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; occlusionQueries = fresh.occlusionQueries
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
-        reportedHz = fresh.reportedHz; runningStart = fresh.runningStart
+        reportedHz = fresh.reportedHz; runningStart = fresh.runningStart; abTest = fresh.abTest
         AVPLog.log("Ajustes: valores por defecto")
     }
 
@@ -381,6 +388,7 @@ final class AVPSettings: ObservableObject {
             ("KL_DISPLAY_HZ", String(Self.guestHz)),
             ("KL_GUEST_PACE_HZ", String(Self.guestHz / 2)),
             ("KL_GUEST_PACE_LEAD_MS", runningStart ? "6" : "0"),
+            ("KL_ABTEST", abTest ? "1" : "0"),
             // Klepton's encoder merging is MoltenVK's (MSAA scene chunks). VPKEngine merges same-target passes in its
             // own frame compiler, and now that its queue is watched those hooks would hold its encoders open across
             // its fences: off.
@@ -467,11 +475,13 @@ final class AVPSettings: ObservableObject {
             // overlay pass faulted the GPU.
             env += [("KL_VRR_PHYS", "0"), ("KL_VRR_PHYS_POST", postPhysical ? "1" : "0")]
         }
-        // Captures (eye pictures as PNG at guest frames 120/600/1200) and a per-pass dump of one in-game frame: always on
-        // while VPKEngine's picture is being validated. Core frame 6000 is ~35 s after the first picture (frame 540 in
-        // build 19, ~150 core frames per second); 600 fell inside the loading screen.
+        // Captures (eye pictures as PNG at guest frames 120/600/1200...) and, on L3 + R3, a per-pass dump of the next
+        // frame (VP_DUMP_DIR). Build 46: no automatic dump at core frame 6000 any more (VP_DUMP_FRAME): its GPU readback
+        // (~300 MB) froze the game ~1.5 s. With the A/B test on, the compositor's captures stop after guest frame 120
+        // (KL_CAPTURE_MAX_FRAME): each stalls ~250 ms and would land in the test's measurements.
         if diagCaptures, let logs = AVPFolder.shared.logs {
-            env += [("KL_CAPTURE_DIR", logs.path), ("VP_DUMP_FRAME", "6000"), ("VP_DUMP_DIR", logs.path)]
+            env += [("KL_CAPTURE_DIR", logs.path), ("VP_DUMP_DIR", logs.path)]
+            env.append(("KL_CAPTURE_MAX_FRAME", abTest ? "120" : "0"))
         }
         // GPU time per render pass ([passes] in the boot log, kl_gpu_time.m KL_GPU_PASSES), exclusive time grouped by
         // what each pass draws into, plus per-kind totals and the GPU idle inside each frame. Build 26 only had windows
@@ -518,7 +528,7 @@ final class AVPSettings: ObservableObject {
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
-                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart)")
+                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart), test A/B \(abTest)")
         return env
     }
 

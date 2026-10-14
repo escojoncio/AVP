@@ -3,11 +3,11 @@
 Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Todo en el visor: Steam oficial →
 descarga → conversión ELF→Mach-O (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `vpkengine.ref` + `vpkengine-patches/`
-0011–0037 (CI: `scripts/apply-vpkengine-patches.sh`; un parche nuevo = fichero `00NN-*.patch` en esa carpeta, generado
+0011–0038 (CI: `scripts/apply-vpkengine-patches.sh`; un parche nuevo = fichero `00NN-*.patch` en esa carpeta, generado
 con `git format-patch` sobre ref+parches). Sin MetalFX, sin MoltenVK (solo referencia), sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B45**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B46**, pendiente de compilar).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -35,6 +35,8 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
 - Nunca abandonar un frame tras `queryNextFrame` (aborta `BUG IN CLIENT`).
 - Medir con «Medir GPU por pase» ON añade coste (`VP_EXCL_TIMING` en todos los frames): comparar A/B con el mismo valor.
 - El usuario no tiene Mac y nunca obtiene `.ips`: todo diagnóstico va al log de la app.
+- B45 (arranque anticipado 6 ms) no reduce el hueco inicial: el juego no estaba esperando al pacer.
+- Nada de volcados/capturas pesadas automáticas en mitad del juego: congelan 0,25–1,5 s.
 
 ## Estado del rendimiento (Logs_Alyx_34 = 80 %, 2_12 = 50 %, menú con UI, mismo sitio)
 `[passes]` W4: span 25,3 → 18,5 ms, ocupado 21,6 → 13,4, GPU parada 3,7 → 5,1. Solo ~4 ms escalan con píxeles.
@@ -50,71 +52,36 @@ Reparto del fijo a 50 % (modelo 14,4 fijo + 4,2 escalable = 18,6 vs 18,5 medido)
 | borrado del atlas D32F 4096² (`R 0x0 L0 z 4096x4096 f252 ld2 st1`, sin draws, sin timestamps); en el menú nadie lo usa después | 2–3,6 (oculto en el hueco) | VPKEngine |
 | copias de ojos a tamaño lógico completo (#076/#078) + compositor (1,2 ms/composición + vista ancha 0,21x2) | ~1,5 | app |
 
-## B45 — en la IPA actual, PENDIENTE DE VALIDAR
-- `klepton/visionos/Sources/kl_app.c` `guest_pace_wait`: con `KL_GUEST_PACE_LEAD_MS` (> 0) espera eff−1 publicaciones
-  y suelta al juego `lead` ms antes del refresco que completa su turno (`g_guest.pub_t` = hora de la última
-  publicación; `owed` = la publicación siguiente ya pertenece al frame soltado). Log `[guest] running start: ...`.
-- App: ajuste «Arranque anticipado del frame (CPU en paralelo con la GPU)» en Diagnóstico, `avp.runStart`, ON → 6 ms,
-  OFF → 0 (= B44). `resetToDefaults` repone `reportedHz` y `runningStart`.
+## B46 — en la IPA, PENDIENTE DE VALIDAR (test A/B automático)
+Logs_Alyx_2_13 (B45, 80 %, menú): **B45 descartado**: el hueco de GPU parada sigue en 5,7 ms con el arranque anticipado.
+**Caída a 0 fps ~1,5 s = el volcado de pases `VP_DUMP_FRAME=6000`** (lectura de ~300 MB; `GPU finish worst 1523 ms`
+justo en ese frame, repetido en el log anterior): eliminado (el volcado L3+R3 sigue). Timeline W4: la UI de Panorama
+(~12 blits + pases 1058²) empieza a 7,7 ms pero espera hasta ~19,8 ms porque `waitFrontier` espera a TODO (escena y
+ojos incluidos) → se serializa al final. El hueco inicial coincide con el borrado sin timestamps del atlas 4096².
+- `vpkengine-patches/0038-*`: interruptores en caliente `vpgpu::gRuntimeOpts` (`vpgpu_metal2_set_opts`):
+  bit0 esperas solo a productores (`CompileOptions::producerWaits` → `Barrier::producers`, sin `covered()`; backend
+  `encFences`/`waitProducers`; un productor sin encoder Metal → espera todo; las fences propias se quedan en el frontier
+  = cola para el join; solo con `cbOrder`); bit1 borrado de profundidad redundante → blit vacío que conserva las fences
+  (`cleanDepth`, cualquier escritura lo invalida, un cb con error lo vacía vía `gCleanEpoch`). Además knockout de un
+  pipeline (`vpgpu_metal2_set_knockout`), censo de pipelines, contadores (`vpgpu_metal2_opt_counters`: cbs, esperas
+  de fence, clears saltados, draws indirect-count codificados vs reales leídos del kernel de fix-up, palabra 3).
+  Test `producers` en `gpu/core/tests` (3000 frames aleatorios, 0 violaciones; detecta la mutación).
+- Klepton `kl_gpu_time.m` (`KL_ABTEST=1`, ajuste «Test automático de rendimiento», `avp.abTest`, off por defecto):
+  espera 25 s fuera de cargas → censo 3 s → 3 rondas × 5 máscaras (OFF, ALL, ALL−bit) 0,6 s + 2 s → knockout de 26
+  pipelines (20 render + 6 compute, ≥ 80 % de frames) con línea base cada 5 → `[abtest] VERDICT` y aplica la máscara
+  ganadora. Métrica: span UNIÓN del frame (busy[0]). Bit2 = recorte de la copia de ojos al área física del mapa
+  (`klvr_plat_eye_trim`, `kl_vrr_phys_extent`, +2 texels; se desactiva solo si hay pases que leen el ojo entero).
+  HUD: línea amarilla con la fase y «TEST TERMINADO» (desaparece 60 s después). Capturas solo hasta el frame 120.
+- Validar con el log: `grep "\[abtest\]"`: ventanas, VERDICT (SAVES/NO EFFECT/WORSE/INACTIVE/BREAKS), top knockout,
+  sobre-codificación indirect-count. Preguntar al usuario si vio fallos visuales y en qué fase del HUD.
 
-## SIGUIENTES PASOS (en este orden; no saltar la validación)
-
-### Paso 1 — Validar B45 con el log del usuario (sin build)
-Pedido al usuario: menú al 50 % y al 80 %, mismo sitio, «Medir el tiempo de GPU por pase» ON, y una tanda con
-«Arranque anticipado» OFF para A/B. Mirar en `klepton-boot-vpkengine.log`:
-1. `[guest] running start: frames released 6.0 ms before their refresh` presente.
-2. `[passes] W3/W4 ...: GPU idle inside the span` debe bajar de ~5 ms a < 1 ms; en el timeline `[passes] W4 f<N> #004
-   at` debe estar < 1,5 ms (antes 5,1–5,3).
-3. `[openvr] frames: ... render` NO debe crecer (≈ 4–5 ms); que `wait` baje ~6 ms es normal.
-4. `[cp] refreshes per composited picture (last 250)`: a 50 % casi todo en `2:` (antes `2:184 3:66`).
-5. `[openvr] clock` y `KLTIME`: siguen al 100 % (el reloj no debe cambiar).
-6. Si el hueco NO baja: las fences propias de Source 2 serializan → relanzar con `KL_VK_FENCESTATS=1` (env) y mirar
-   qué espera el juego entre su primer y segundo submit.
-7. Si baja: el borrado del atlas 4096² ya no queda oculto y aparecerá como nuevo hueco tras #001 → Paso 3.3.
-
-### Paso 2 — Diagnóstico de draws indirectos (VPKEngine, parche 0038, solo log)
-Sospecha (sin verificar): `vkCmdDrawIndexedIndirectCount`/`vkCmdDrawIndirectCount` codifican `maxDrawCount` draws de
-Metal aunque el contador de GPU diga menos (`gpu/metal2/src/metal_backend.mm` ~3112–3138; `gpu/vulkan/src/
-commands.cpp:703` `in.drawCount = indirectCount`). Añadir a la línea `vk.submit`/`gpu.frame`: número de llamadas
-indirect-count, suma de `maxDrawCount` codificada y, leyendo el buffer de contador tras completar el command buffer,
-suma real. Si codificado ≫ real: siguiente parche = `MTLIndirectCommandBuffer` + `executeCommandsInBuffer:
-indirectBuffer:` (el rango sale del contador), o compactar en el kernel de fix-up y limitar al contador.
-
-### Paso 3 — Recortes de coste fijo sin pérdida (VPKEngine 0039+), uno por parche, cada uno con env de A/B
-1. **Blits de Panorama**: confirmar con `gpu.dump`/`gpu.enc label=` qué son los ~12 blits (#026–#073 en 2_12 W3).
-   Si son mips encadenados (`vkCmdBlitImage` nivel i → i+1 de la misma imagen): agruparlos en un solo encoder de blit
-   o `generateMipmapsForTexture`. Ahorro esperado ~1,3 ms en menús.
-2. **`waitFrontier` solo a productores** (`metal_backend.mm` ~2429–2438): hoy cada encoder con barrera espera a TODOS
-   los fences sin ordenar; guardar en cada `Barrier` las posiciones de los encoders que escriben lo que se lee y esperar
-   solo a sus fences. Igual en el fix-up de indirectos (~2587–2590, espera frontier + join). Esperado 1–2 ms.
-3. **Borrado redundante**: estado por textura «limpia con valor v» (cualquier escritura lo invalida: attachment con
-   Store, storage write de compute, destino de copia/blit, subida de host). Un pase solo-clear sin draws con el mismo
-   valor sobre una textura ya limpia se omite. En el menú el atlas no se dibuja → el borrado desaparece desde el 2.º
-   frame. Además `vkCmdClearColorImage/DepthStencilImage` crean un pase por mip × capa (`gpu/vulkan/src/commands.cpp`
-   ~394–425): agrupar capas con `renderTargetArrayLength`. Riesgo: una escritura no rastreada = sombras viejas → env
-   de A/B obligatorio.
-4. **`vkCmdClearAttachments`** (`commands.cpp` ~304–446) cierra el pase, borra la textura entera y reabre con Load
-   (+ `keepAll` fuerza Store en DontCare, MSAA incluido): sustituir por un quad de clear dentro del pase limitado a los
-   rects.
-5. **Timestamps**: `0036` muestrea etapas en TODOS los encoders siempre; dejar el muestreo completo solo en las ventanas
-   `[passes]` y para el regulador solo el primer y último encoder de cada command buffer (`VP_STAGE_TS`).
-6. Encoder `vpgpu.join` por command buffer (~2759–2770): probar que esperen solo los encoders con `needJoin` a los
-   fences de `carriedIn`.
-
-### Paso 4 — App (sin VPKEngine)
-1. Copias de ojos (`klepton/runtime/openvr/src/klvr_vk_submit.cpp` ~251–259) recortadas al área física del rate map
-   (`physicalSizeForLayer`, publicada por `kl_gpu_time.m`); el compositor solo lee esa zona.
-2. Vista ancha del compositor (`KleptonCompositor.swift` `buildWideView`) desde la recon ya calculada por imagen o desde
-   un mip del ojo (0,72 ms x2 a 80 %).
-3. Probar el ajuste existente «Post-procesado solo en el área foveada» (`avp.postPhys`, `KL_VRR_PHYS_POST=1`): −0,8 ms
-   en tonemap si la imagen sale bien.
-
-### Paso 5 — Pendientes ajenos al rendimiento
-- Pasar a Klepton el tiempo de presentación predicho (`kl_ovrp_set_predicted_display_time` no lo llama nadie: el juego
-  predice a "ahora + 1/90" y la pose registrada no coincide con la rendida; con running start la diferencia crece).
-- El regulador arranca en el fallback (33) y el menú/primeros segundos van así.
-- Averiguar por qué P.T./VisionQuestPro obtienen 90 Hz y AVP 100 (tipo/formato de capa): 45→90 costaría menos GPU.
-- Menores: ajustes en vivo de resolución/texturas/aniso/zona nítida; QR de Steam; subir 0011–0037 al repo VPKEngine.
+## SIGUIENTES PASOS
+1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su
+   MSL/coste. Si indirect-count codificado ≫ real → `MTLIndirectCommandBuffer` / compactar en el fix-up.
+2. Si bit0 ahorra pero hay artefactos: algún acceso no declarado en VPVulkan (bindless/descriptor arrays).
+3. Pendientes de antes (no hechos en B46): blits de Panorama en un encoder, `vkCmdClearAttachments` como quad dentro
+   del pase, timestamps reducidos fuera de ventanas, join solo a `needJoin`, vista ancha del compositor desde la recon,
+   `KL_VRR_PHYS_POST`, tiempo de presentación predicho a Klepton, regulador que arranca en 33, 90 vs 100 Hz.
 
 ## No tocar (decisión del usuario)
 - `vr_expand_cull_frustum`, LOD, cull, SSAO off, sombras, MSAA: nada que cambie lo visible.

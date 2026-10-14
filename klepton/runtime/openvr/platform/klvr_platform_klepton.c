@@ -807,6 +807,24 @@ int klvr_plat_eye_publish_guest(int stage, int eye, uint64_t vk_image, int layer
     return kl_vulkan_eye_publish_guest(stage, eye, vk_image, layer, w, h);
 }
 void klvr_plat_eye_unpublish_guest(int stage, int eye) { kl_vulkan_eye_unpublish_guest(stage, eye); }
+// kl_gpu_time.m: the eye-copy trim's switch (the A/B test, KL_EYE_TRIM), the foveation map's physical extent for an
+// eye image of this size, and the test's trim counter.
+extern int kl_abtest_eye_trim(void) __attribute__((weak));
+extern void kl_abtest_note_trim(void) __attribute__((weak));
+extern int kl_vrr_phys_extent(unsigned w, unsigned h, unsigned *pw, unsigned *ph) __attribute__((weak));
+int klvr_plat_eye_trim(uint32_t w, uint32_t h, uint32_t *tw, uint32_t *th) {
+    if (!kl_abtest_eye_trim || !kl_vrr_phys_extent || !kl_abtest_eye_trim()) return 0;
+    unsigned pw = 0, ph = 0;
+    if (!kl_vrr_phys_extent(w, h, &pw, &ph) || !pw || !ph) return 0;
+    pw += 2; ph += 2;   // bilinear (and kl_eye_recon's Catmull-Rom) taps reach up to 2 texels past the physical edge
+    if (pw > w) pw = w;
+    if (ph > h) ph = h;
+    if (pw == w && ph == h) return 0;
+    *tw = pw;
+    *th = ph;
+    if (kl_abtest_note_trim) kl_abtest_note_trim();
+    return 1;
+}
 uint64_t klvr_plat_eye_depth_half(int eye, uint32_t w, uint32_t h) { return kl_vulkan_eye_depth_half(eye, w, h); }
 uint64_t klvr_plat_eye_depth_image(int stage, int eye, uint32_t w, uint32_t h) {
     return kl_vulkan_eye_depth_image(stage, eye, w, h);

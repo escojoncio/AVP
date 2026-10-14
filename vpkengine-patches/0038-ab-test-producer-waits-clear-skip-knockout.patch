@@ -1,0 +1,792 @@
+From f83b720a0cf468c72ba3a6d62c1b33b2be553620 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Wed, 14 Oct 2026 23:17:28 +0000
+Subject: [PATCH] VPKEngine 0038: producer-only fence waits, redundant
+ depth-clear skip, pipeline knockout/census, indirect-count counters (runtime
+ switches for AVP's A/B test)
+
+---
+ gpu/core/include/vpgpu/core/frame_compiler.h |  18 +
+ gpu/core/src/device.cpp                      |   4 +-
+ gpu/core/src/frame_compiler.cpp              |  23 +-
+ gpu/core/tests/core_tests.cpp                | 122 ++++++-
+ gpu/metal2/src/metal_backend.mm              | 333 ++++++++++++++++++-
+ 5 files changed, 479 insertions(+), 21 deletions(-)
+
+diff --git a/gpu/core/include/vpgpu/core/frame_compiler.h b/gpu/core/include/vpgpu/core/frame_compiler.h
+index c7a8c89..f5ea53f 100644
+--- a/gpu/core/include/vpgpu/core/frame_compiler.h
++++ b/gpu/core/include/vpgpu/core/frame_compiler.h
+@@ -15,6 +15,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <atomic>
+ #include <cstdint>
+ #include <vector>
+ 
+@@ -51,8 +52,20 @@ struct Barrier {
+   uint32_t encoder = 0, item = 0;
+   StageMask after = 0, before = 0;
+   uint8_t hazards = 0;  // bit per HazardKind
++  // CompileOptions::producerWaits: the earlier encoders (indices into CompiledFrame::encoders, this one included
++  // for an item barrier inside a compute encoder) whose accesses conflict with what the barrier orders. Sorted,
++  // unique. Empty without that option.
++  std::vector<uint32_t> producers;
+ };
+ 
++// Runtime optimisation switches (AVP's automatic A/B test flips them while the game runs; 0 = the behaviour
++// before patch 0038). Read once per submit. The host sets them through vpgpu_metal2_set_opts.
++enum RuntimeOpt : uint32_t {
++  kOptProducerWaits = 1u << 0,  // a barrier waits only on the encoders that produced what it orders
++  kOptClearSkip = 1u << 1,      // a draw-less clear of a depth texture already cleared to that value is skipped
++};
++extern std::atomic<uint32_t> gRuntimeOpts;
++
+ // Why an attachment did or did not stay on tile. Candidates are only attachments the client lets
+ // go of: store DontCare/Resolve, or TextureDesc::transient. Tile-local then requires every access of
+ // the texture in the frame to be inside one render encoder (as attachment or pixel-local read),
+@@ -141,6 +154,7 @@ struct CompiledFrame {
+   std::vector<DrawRef> badDraws;
+   CompileStats stats;
+   bool skipped(uint32_t command, uint32_t draw) const;
++  bool producerWaits = false;  // compiled with CompileOptions::producerWaits (Barrier::producers filled)
+ };
+ 
+ struct CompileOptions {
+@@ -159,6 +173,10 @@ struct CompileOptions {
+   // custom resolve) keeps the store. A read in a LATER submit would see undefined samples:
+   // CompiledFrame::stats.msaaStaleReads counts such reads (msaa_stale in the frame report).
+   bool msaaResolveOnTile = true;
++  // Fill Barrier::producers so a backend can wait on those encoders only instead of on everything unordered so
++  // far. Hazards a later barrier "covers" are NOT dropped in this mode: that barrier waited on its own producers
++  // only, so it orders nothing else (no transitivity through it), and every hazard names its producer.
++  bool producerWaits = false;
+ };
+ 
+ class ResourceTable;
+diff --git a/gpu/core/src/device.cpp b/gpu/core/src/device.cpp
+index 00a028d..a55b16b 100644
+--- a/gpu/core/src/device.cpp
++++ b/gpu/core/src/device.cpp
+@@ -69,7 +69,9 @@ FrameReport Device::submit(const Frame& frame) {
+   const uint64_t index = frame_++;
+   const auto start = std::chrono::steady_clock::now();
+   std::unique_lock resLock(resMutex_);
+-  const CompiledFrame compiled = compileFrame(frame, &resources_, compileOptions_);
++  CompileOptions opts = compileOptions_;
++  opts.producerWaits = (gRuntimeOpts.load(std::memory_order_relaxed) & kOptProducerWaits) != 0;
++  const CompiledFrame compiled = compileFrame(frame, &resources_, opts);
+   resLock.unlock();
+   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+   if (holdMs_) {
+diff --git a/gpu/core/src/frame_compiler.cpp b/gpu/core/src/frame_compiler.cpp
+index 0b4b787..7d35ca6 100644
+--- a/gpu/core/src/frame_compiler.cpp
++++ b/gpu/core/src/frame_compiler.cpp
+@@ -445,7 +445,7 @@ class Scheduler {
+ // Phase 2: walk the final order and place barriers only for real hazards.
+ class BarrierPlacer {
+  public:
+-  explicit BarrierPlacer(CompiledFrame& out) : out_(out) {}
++  explicit BarrierPlacer(CompiledFrame& out, bool producers = false) : out_(out), producers_(producers) {}
+ 
+   void access(const Access& a, uint32_t encoder, uint32_t item) {
+     if (a.range.kind == ResourceRange::Kind::Sampler) return;  // immutable: never a hazard
+@@ -453,13 +453,15 @@ class BarrierPlacer {
+     auto& records = records_[key(a.range)];
+     uint8_t kinds = 0;
+     StageMask after = 0;
++    prod_.clear();
+     for (const Record& r : records) {
+       if (r.pos == p || !r.access.range.overlaps(a.range)) continue;
+       if (!r.access.write && !a.write) continue;
+-      if (covered(r.pos, r.access.stages, a.stages)) continue;
++      if (!producers_ && covered(r.pos, r.access.stages, a.stages)) continue;
+       const HazardKind k = !r.access.write ? HazardKind::WAR : a.write ? HazardKind::WAW : HazardKind::RAW;
+       kinds |= 1 << static_cast<int>(k);
+       after |= r.access.stages;
++      if (producers_) prod_.push_back(r.pos.encoder);
+     }
+     if (kinds) addBarrier(p, after, a.stages, kinds);
+     // A write orders everything it fully covers (through the barrier just placed), so those
+@@ -516,16 +518,26 @@ class BarrierPlacer {
+ 
+   void addBarrier(Pos p, StageMask after, StageMask before, uint8_t kinds) {
+     auto& list = out_.barriers;
+-    if (list.empty() || Pos{list.back().encoder, list.back().item} != p) list.push_back({p.encoder, p.item, 0, 0, 0});
++    if (list.empty() || Pos{list.back().encoder, list.back().item} != p) {
++      Barrier nb;
++      nb.encoder = p.encoder, nb.item = p.item;
++      list.push_back(std::move(nb));
++    }
+     Barrier& b = list.back();
+     b.after |= after;
+     b.before |= before;
+     for (int k = 0; k < kHazardKinds; ++k)
+       if ((kinds >> k & 1) && !(b.hazards >> k & 1)) ++out_.stats.hazards[k];
+     b.hazards |= kinds;
++    if (producers_)
++      for (uint32_t e : prod_)
++        if (auto it = std::lower_bound(b.producers.begin(), b.producers.end(), e); it == b.producers.end() || *it != e)
++          b.producers.insert(it, e);
+   }
+ 
+   CompiledFrame& out_;
++  bool producers_ = false;
++  std::vector<uint32_t> prod_;
+   std::unordered_map<uint64_t, std::vector<Record>> records_;
+ };
+ 
+@@ -659,7 +671,8 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
+   scheduler.finish();
+   if (resources) placeTiles(out, cmds, accesses, *resources, options);
+ 
+-  BarrierPlacer placer(out);
++  out.producerWaits = options.producerWaits;
++  BarrierPlacer placer(out, options.producerWaits);
+   for (uint32_t e = 0; e < out.encoders.size(); ++e) {
+     const Encoder& enc = out.encoders[e];
+     ++out.stats.cuts[static_cast<int>(enc.reason)];
+@@ -673,4 +686,6 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
+   return out;
+ }
+ 
++std::atomic<uint32_t> gRuntimeOpts{0};
++
+ }  // namespace vpgpu
+diff --git a/gpu/core/tests/core_tests.cpp b/gpu/core/tests/core_tests.cpp
+index d4df6ff..435db82 100644
+--- a/gpu/core/tests/core_tests.cpp
++++ b/gpu/core/tests/core_tests.cpp
+@@ -877,6 +877,126 @@ void testTile() {
+   }
+ }
+ 
++// CompileOptions::producerWaits (patch 0038): with waits only on Barrier::producers, every conflicting pair of
++// accesses in different encoders must still be ordered, directly or through a chain of producer waits, and two
++// conflicting items of one compute encoder must have a barrier between them.
++void testProducerWaits() {
++  std::mt19937 rng(4321);
++  auto R = [&](int n) { return int(rng() % unsigned(n)); };
++  uint32_t violations = 0, pairs = 0, barriersLegacy = 0, barriersProd = 0;
++  for (int it = 0; it < 3000; ++it) {
++    Scene s;
++    std::vector<BufferId> bufs = {s.buf(), s.buf(), s.buf()};
++    std::vector<TextureId> tex = {s.rt(), s.rt(), s.rt(), s.depthRt()};
++    auto bufAcc = [&](bool w, StageMask st) {
++      const uint64_t off = uint64_t(R(4)) * 1024;
++      Access a{ResourceRange::bytes(bufs[R(3)], off, 1024), st, w};
++      return a;
++    };
++    auto texAcc = [&](bool w, StageMask st) {
++      Access a{ResourceRange::subresource(tex[R(3)], 0, 1, 0, 1), st, w};
++      return a;
++    };
++    Frame f;
++    for (int c = 3 + R(10); c > 0; --c) {
++      const int k = R(6);
++      if (k <= 1) {
++        std::vector<Access> b;
++        for (int n = 1 + R(3); n > 0; --n) b.push_back(R(2) ? bufAcc(R(2), stage::compute) : texAcc(R(3) == 0, stage::compute));
++        f.dispatch(Scene::compute(b));
++      } else if (k == 2) {
++        f.copyBuffer(Scene::span(bufs[R(3)], uint64_t(R(4)) * 1024, 1024), Scene::span(bufs[R(3)], uint64_t(R(4)) * 1024, 1024));
++      } else if (k == 3) {
++        f.fillBuffer(Scene::span(bufs[R(3)], uint64_t(R(4)) * 1024, 1024), 0);
++      } else {
++        RenderPassDesc pd;
++        pd.colors[0].texture = tex[R(3)];
++        pd.colors[0].load = LoadAction(R(3));
++        if (R(2)) pd.depth = {tex[3], 0, 0, LoadAction(R(3)), StoreAction::Store, {}, {}, 0, 0};
++        std::vector<Access> b;
++        for (int n = R(3); n > 0; --n) {
++          if (R(2)) b.push_back(bufAcc(false, R(2) ? stage::vertex : stage::fragment));
++          else {
++            const TextureId t = tex[R(3)];
++            if (t == pd.colors[0].texture) continue;
++            b.push_back(Scene::sample(t));
++          }
++        }
++        Scene::passWithDraw(f, pd, b);
++      }
++    }
++    CompileOptions po;
++    po.producerWaits = true;
++    const CompiledFrame cf = compileFrame(f, &s.res, po);
++    barriersLegacy += uint32_t(compileFrame(f, &s.res).barriers.size());
++    barriersProd += uint32_t(cf.barriers.size());
++    CHECK(cf.producerWaits);
++    const auto& cmds = f.commands();
++    // Position of every command.
++    std::vector<std::pair<uint32_t, uint32_t>> pos(cmds.size(), {UINT32_MAX, 0});
++    for (uint32_t e = 0; e < cf.encoders.size(); ++e)
++      for (uint32_t k = 0; k < cf.encoders[e].commands.size(); ++k)
++        pos[cf.encoders[e].commands[k]] = {e, cf.encoders[e].kind == Encoder::Kind::Render ? 0 : k};
++    // Producers each encoder waits on (any item), and the item barriers.
++    std::vector<std::set<uint32_t>> waits(cf.encoders.size());
++    for (const Barrier& b : cf.barriers)
++      for (uint32_t x : b.producers)
++        if (x != b.encoder) waits[b.encoder].insert(x);
++    auto reaches = [&](uint32_t from, uint32_t to) {  // `from` ordered after `to` through producer waits
++      std::vector<uint32_t> st = {from};
++      std::set<uint32_t> seen;
++      while (!st.empty()) {
++        const uint32_t x = st.back();
++        st.pop_back();
++        if (x == to) return true;
++        if (!seen.insert(x).second) continue;
++        for (uint32_t y : waits[x]) st.push_back(y);
++      }
++      return false;
++    };
++    auto accessesFor = [&](uint32_t ci) {
++      std::vector<Access> v;
++      if (const auto* rp = std::get_if<RenderPass>(&cmds[ci])) {
++        v = attachmentAccesses(rp->desc);
++        for (const Draw& d : rp->draws)
++          for (const Access& a : drawAccesses(d)) v.push_back(a);
++      } else if (const auto* d = std::get_if<Dispatch>(&cmds[ci])) {
++        v = d->bindings;
++      } else {
++        v = copyAccesses(std::get<Copy>(cmds[ci]));
++      }
++      return v;
++    };
++    for (uint32_t i = 0; i < cmds.size(); ++i) {
++      if (pos[i].first == UINT32_MAX) continue;
++      for (uint32_t j = 0; j < cmds.size(); ++j) {
++        if (pos[j].first == UINT32_MAX || !(pos[i] < pos[j])) continue;
++        bool conflict = false;
++        for (const Access& a : accessesFor(i))
++          for (const Access& b : accessesFor(j))
++            if (a.range.kind != ResourceRange::Kind::Sampler && a.range.overlaps(b.range) && (a.write || b.write) &&
++                !(a.pixelLocal || b.pixelLocal))
++              conflict = true;
++        if (!conflict) continue;
++        // Only pairs in submission order matter (the compiler may reorder independent work).
++        if (i > j) continue;
++        ++pairs;
++        if (pos[i].first != pos[j].first) {
++          violations += !reaches(pos[j].first, pos[i].first);
++        } else {
++          bool sep = false;
++          for (const Barrier& b : cf.barriers)
++            sep = sep || (b.encoder == pos[j].first && b.item > pos[i].second && b.item <= pos[j].second);
++          violations += !sep;
++        }
++      }
++    }
++  }
++  std::printf("  producers: 3000 frames, %u conflicting pairs, barriers legacy %u / producer mode %u, %u violations\n",
++              pairs, barriersLegacy, barriersProd, violations);
++  CHECK_EQ(violations, 0u);
++}
++
+ // Random frames (fixed seed) against the invariants Metal and the tile logic rely on: every render
+ // encoder has one size and sample count, no texture in two slots, tile-local slots never load nor
+ // store, released contents are not read by a later encoder, and skipped draws are exactly those
+@@ -1114,7 +1234,7 @@ int main(int argc, char** argv) {
+       {"copies", testCopies},       {"hazards", testHazards},   {"subresources", testSubresources},
+       {"cuts", testCuts},           {"diagnostics", testDiagnostics}, {"pipelines", testPipelines},
+       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
+-      {"astro", testAstroFrame},    {"fuzz", testFuzz}};
++      {"astro", testAstroFrame},    {"fuzz", testFuzz}, {"producers", testProducerWaits}};
+   bool ran = false;
+   for (const auto& [name, fn] : groups) {
+     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 1a19c9c..c7e8440 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -40,6 +40,7 @@
+ #include <unordered_set>
+ #include <vector>
+ 
++#include "vpgpu/core/frame_compiler.h"
+ #include "vpgpu/core/pipeline_cache.h"
+ 
+ namespace vpgpu::metal2 {
+@@ -67,6 +68,24 @@ constexpr uint32_t kVisSlots = 8192;          // visibility results per frame sl
+ // GPU hangs this process caused (not victims, not ignored submissions): read by VPVulkan (motion kill switch).
+ std::atomic<uint32_t> gGpuHangs{0};
+ std::atomic<bool> gDumpRequest{false};  // vpgpu_metal2_request_dump: the next real frame, pass by pass
++// AVP automatic A/B test (patch 0038). gKnockKey: draws/dispatches of this pipeline key are skipped (the
++// "one shader out" probe; 0 = none). The counters are cumulative; the host reads deltas per window.
++std::atomic<uint64_t> gKnockKey{0};
++std::atomic<uint32_t> gCleanEpoch{0};  // bumped by a failed command buffer: its depth clears may never have run
++std::atomic<uint64_t> gIndirectCountDraws{0}, gIndirectEncoded{0}, gIndirectReal{0};  // indirect-count draws
++std::atomic<uint64_t> gOptCbs{0}, gProdCbs{0}, gFenceWaits{0}, gClearCandidates{0}, gClearSkipped{0}, gKnocked{0};
++// Pipeline census (vpgpu_metal2_census_*): per pipeline key, in how many real frames (the big command buffer:
++// 8+ encoders, a layered pass) it was encoded and how many draws/dispatches it had there.
++struct CensusEntry {
++  std::string label;
++  uint64_t frames = 0, draws = 0;
++  uint64_t lastFrame = UINT64_MAX;
++  bool compute = false;
++};
++std::mutex gCensusMutex;
++std::unordered_map<uint64_t, CensusEntry> gCensus;
++std::atomic<bool> gCensusOn{false};
++uint64_t gCensusFrames = 0;  // under gCensusMutex
+ // Exclusive GPU time of each completed command buffer (vpgpu_metal2_cb_busy_ms, for the host's pace governor):
+ // its encoders' stage-boundary timestamps placed on one timeline, each counted only for how far it moves the
+ // latest end seen so far. A command buffer's [GPUStartTime, GPUEndTime] span holds the waits on earlier command
+@@ -726,6 +745,17 @@ struct MetalBackend::Impl {
+   // and leaves only itself, so ordering is transitive and each barrier costs few waits. It carries
+   // over between frames: a frame's first encoder waits on the previous frame's tail.
+   std::vector<id<MTLFence>> frontier;
++  // kOptClearSkip: depth textures whose whole subresource holds a clear value nothing has overwritten since
++  // (key: texture index, generation, mip, layer, layer count). Any write to the texture erases its entries.
++  struct CleanDepth {
++    uint32_t index = 0, generation = 0;
++    uint16_t mip = 0, layer = 0, layers = 0;
++    float depth = 0;
++    uint8_t stencil = 0;
++  };
++  std::vector<CleanDepth> cleanDepth;
++  uint32_t cleanEpochSeen = 0;
++  std::unordered_map<uint64_t, std::string> pipelineLabels;  // census: submit thread only
+ 
+   // Per-pass dump (VP_DUMP_FRAME=<n>, VP_DUMP_DIR=<dir>); -1 = off.
+   int64_t dumpFrame = -1;
+@@ -1166,6 +1196,7 @@ kernel void vp_indirect_fix(device const uint* src [[buffer(0)]], device const u
+     device uint* o = dst + p.dstWord + i * words;
+     uint n = p.maxCount;
+     if (p.hasCount) n = min(n, cnt[p.countWord]);
++    if (i == 0u && p.hasCount) atomic_fetch_add_explicit(&diag[3], n, memory_order_relaxed);  // 0038: real draws
+     if (i >= n) {
+         for (uint k = 0; k < words; ++k) o[k] = 0u;
+         return;
+@@ -2333,6 +2364,24 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     info("gpu.dump sequence f=" + std::to_string(frameIndex) + " command_buffers=" + std::to_string(kDumpSequence));
+   }
+   if (dumping) --dumpSeqLeft;
++  // Patch 0038 runtime switches (AVP's A/B test). A dump serialises everything: both stay off for it.
++  const uint32_t rtOpts = gRuntimeOpts.load(std::memory_order_relaxed);
++  // Producer waits rely on the join (VP_CB_ORDER 1/2) for ordering after the previous command buffer.
++  const bool prodMode = compiled.producerWaits && !dumping && cbOrder;
++  const bool clearSkipOn = (rtOpts & kOptClearSkip) && !dumping;
++  if (!clearSkipOn) cleanDepth.clear();  // turned back on later: nothing is known clean
++  if (const uint32_t ep = gCleanEpoch.load(std::memory_order_relaxed); ep != cleanEpochSeen) {
++    cleanDepth.clear();
++    cleanEpochSeen = ep;
++  }
++  const uint64_t knockKey = gKnockKey.load(std::memory_order_relaxed);
++  const bool censusNow = gCensusOn.load(std::memory_order_relaxed) && realFrame;
++  std::unordered_map<uint64_t, std::pair<uint64_t, bool>> censusFrame;  // key -> draws, compute
++  gOptCbs.fetch_add(1, std::memory_order_relaxed);
++  if (prodMode) gProdCbs.fetch_add(1, std::memory_order_relaxed);
++  // prodMode: the Metal fences each core encoder updated so far (a core encoder may end up as several Metal ones).
++  std::vector<std::vector<id<MTLFence>>> encFences(prodMode ? compiled.encoders.size() : 0);
++  uint64_t fenceWaits = 0;
+   auto dumpItems = std::make_shared<std::vector<DumpItem>>();
+   std::vector<DumpCopy> dumpCopies;
+   std::unordered_set<uintptr_t> dumpSeen;  // storage textures already queued for the open encoder
+@@ -2388,6 +2437,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     [open.any() endEncoding];
+     fenceOwner[(__bridge const void*)openFence] = int(curEnc);
+     frontier.push_back(openFence);
++    if (prodMode && curEnc < encFences.size()) encFences[curEnc].push_back(openFence);
+     open = {};
+     used.clear();
+     dumpSeen.clear();
+@@ -2426,20 +2476,48 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     dumpCopies.clear();
+   };
+   // Starts waiting on everything unordered so far; `before` picks the first render stage held.
++  auto waitOne = [&](id<MTLFence> f, StageMask before) {
++    if (!waitable(f)) return;
++    ++fenceWaits;
++    if (open.render)
++      [open.render waitForFence:f beforeStages:(before & stage::vertex) ? MTLRenderStageVertex : MTLRenderStageFragment];
++    else if (open.compute) [open.compute waitForFence:f];
++    else [open.blit waitForFence:f];
++  };
++  // An own encoder's fence (this command buffer) or a foreign one (the previous command buffer's tail, a dump copy).
++  auto ownFence = [&](id<MTLFence> f) {
++    auto it = fenceOwner.find((__bridge const void*)f);
++    return it != fenceOwner.end() && it->second >= 0;
++  };
+   auto waitFrontier = [&](StageMask before) {
+-    for (id<MTLFence> f : frontier) {
+-      if (!waitable(f)) continue;
+-      if (open.render)
+-        [open.render waitForFence:f beforeStages:(before & stage::vertex) ? MTLRenderStageVertex : MTLRenderStageFragment];
+-      else if (open.compute) [open.compute waitForFence:f];
+-      else [open.blit waitForFence:f];
+-    }
+-    frontier.clear();
++    for (id<MTLFence> f : frontier) waitOne(f, before);
++    // prodMode: own fences stay in the frontier: it is the tail the next command buffer joins on, and with
++    // producer-only waits no single encoder orders all of them.
++    if (prodMode) std::erase_if(frontier, [&](id<MTLFence> f) { return !ownFence(f); });
++    else frontier.clear();
+   };
++  // prodMode: waits on the producers' fences only (plus anything foreign still unordered).
++  auto waitProducers = [&](StageMask before, const std::vector<uint32_t>& prods) {
++    // A producer that encoded no Metal encoder (refused sampled blits, an encoder error) has no fence to stand
++    // for the producers IT ordered after: fall back to everything unordered (own fences stay in the frontier).
++    for (uint32_t pe : prods)
++      if (pe >= encFences.size() || encFences[pe].empty()) return waitFrontier(before);
++    for (uint32_t pe : prods)
++      for (id<MTLFence> f : encFences[pe]) waitOne(f, before);
++    bool foreign = false;
++    for (id<MTLFence> f : frontier)
++      if (!ownFence(f)) waitOne(f, before), foreign = true;
++    if (foreign) std::erase_if(frontier, [&](id<MTLFence> f) { return !ownFence(f); });
++  };
++  // What the next wait orders against: null = everything unordered (the frontier); else those producers.
++  const std::vector<uint32_t>* waitProds = nullptr;
+   auto opened = [&](NSString* label, bool wait, StageMask before) {
+     open.any().label = label;
+     openFence = nextFence();
+-    if (wait) waitFrontier(before);
++    if (wait) {
++      if (prodMode && waitProds) waitProducers(before, *waitProds);
++      else waitFrontier(before);
++    }
+     // Ordered after the whole previous command buffer, not only through this one's first encoder
+     // (VP_CB_ORDER=2: only the encoders that touch what a command buffer in flight uses).
+     const uint8_t join = curEnc < needJoin.size() ? needJoin[curEnc] : 2;
+@@ -2584,8 +2662,22 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       return nil;
+     }
+     fx.label = [NSString stringWithFormat:@"indirect_fix%u", e];
+-    for (id<MTLFence> f : frontier)
+-      if (waitable(f)) [fx waitForFence:f];
++    if (prodMode) {
++      // No barrier at this encoder: nothing of this command buffer wrote what its draws read.
++      // A producer without a Metal encoder (see waitProducers): everything unordered so far.
++      const bool all = waitProds && std::any_of(waitProds->begin(), waitProds->end(), [&](uint32_t pe) {
++        return pe >= encFences.size() || encFences[pe].empty();
++      });
++      if (waitProds && !all)
++        for (uint32_t pe : *waitProds)
++          for (id<MTLFence> f : encFences[pe])
++            if (waitable(f)) [fx waitForFence:f], ++fenceWaits;
++      for (id<MTLFence> f : frontier)
++        if ((all || !ownFence(f)) && waitable(f)) [fx waitForFence:f], ++fenceWaits;
++    } else {
++      for (id<MTLFence> f : frontier)
++        if (waitable(f)) [fx waitForFence:f], ++fenceWaits;
++    }
+     // The previous command buffer may write these arguments.
+     if (joinFence && (e >= needJoin.size() || needJoin[e])) [fx waitForFence:joinFence];
+     [fx setComputePipelineState:ps];
+@@ -2768,6 +2860,77 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       if (cbTracked) frontier.clear();
+     }
+   }
++  // kOptClearSkip bookkeeping: whatever an encoder may write erases what is known clean about that texture.
++  auto dirtyIndex = [&](uint32_t index) {
++    if (cleanDepth.empty()) return;
++    if (index & kViewBit) {
++      auto v = views.find(index);
++      if (v == views.end()) return cleanDepth.clear();  // unknown view: forget everything (safe side)
++      index = v->second.base.index;
++    }
++    std::erase_if(cleanDepth, [&](const CleanDepth& c) { return c.index == index; });
++  };
++  auto dirtyEncoder = [&](const Encoder& en) {
++    if (cleanDepth.empty()) return;
++    bool anyDraw = false;
++    for (uint32_t ci : en.commands)
++      if (const auto* rpc = std::get_if<RenderPass>(&cmds[ci])) anyDraw |= !rpc->draws.empty();
++    auto att = [&](const Attachment& a) {
++      if (!a.texture) return;
++      // A draw-less Load + Store leaves the contents as they were; anything else may change them.
++      if (anyDraw || a.load != LoadAction::Load || a.store != StoreAction::Store) dirtyIndex(a.texture.index);
++      if (a.resolve) dirtyIndex(a.resolve.index);
++    };
++    auto passAtt = [&](const RenderPassDesc& d) {
++      for (const Attachment& c : d.colors) att(c);
++      att(d.depth);
++    };
++    auto writes = [&](const Access& a) {
++      if (a.write && a.range.kind == ResourceRange::Kind::Texture) dirtyIndex(a.range.index);
++    };
++    if (en.kind == Encoder::Kind::Render) passAtt(en.pass);
++    for (uint32_t ci : en.commands) {
++      const Command& c = cmds[ci];
++      if (const auto* rpc = std::get_if<RenderPass>(&c)) {
++        passAtt(rpc->desc);
++        for (const Draw& d : rpc->draws)
++          for (const Access& a : d.bindings) writes(a);
++      } else if (const auto* dp = std::get_if<Dispatch>(&c)) {
++        for (const Access& a : dp->bindings) writes(a);
++      } else {
++        for (const Access& a : copyAccesses(std::get<Copy>(c))) writes(a);
++      }
++    }
++  };
++  // A render encoder that only clears one single-sample depth texture (no colours, no draws, whole area, Clear +
++  // Store, in memory): its CleanDepth key, or false.
++  auto clearOnlyDepth = [&](const Encoder& en, CleanDepth& key) -> bool {
++    const Attachment& d = en.pass.depth;
++    if (!d.texture || (d.texture.index & kViewBit) || d.load != LoadAction::Clear || d.store != StoreAction::Store) return false;
++    if (en.tileLocal(kDepthSlot)) return false;
++    for (const Attachment& c : en.pass.colors)
++      if (c.texture) return false;
++    for (uint32_t ci : en.commands) {
++      const auto* rpc = std::get_if<RenderPass>(&cmds[ci]);
++      if (!rpc || !rpc->draws.empty() || rpc->desc.renderWidth || rpc->desc.renderHeight) return false;
++      for (const Attachment& c : rpc->desc.colors)
++        if (c.texture) return false;
++      if (!rpc->desc.depth.texture || !rpc->desc.depth.sameTarget(d)) return false;
++    }
++    id<MTLTexture> t = texture(d.texture);
++    if (!t || t.sampleCount != 1 || t.storageMode == MTLStorageModeMemoryless) return false;
++    const MTLPixelFormat pf = t.pixelFormat;
++    if (pf != MTLPixelFormatDepth32Float && pf != MTLPixelFormatDepth16Unorm && pf != MTLPixelFormatDepth32Float_Stencil8)
++      return false;
++    key.index = d.texture.index;
++    key.generation = d.texture.generation;
++    key.mip = d.mip;
++    key.layer = d.layer;
++    key.layers = en.pass.layerCount;
++    key.depth = d.clear.depth;
++    key.stencil = d.clear.stencil;
++    return true;
++  };
+   size_t b = 0;  // cursor into compiled.barriers (sorted by encoder, item)
+   for (uint32_t e = 0; e < compiled.encoders.size(); ++e) {
+     const Encoder& enc = compiled.encoders[e];
+@@ -2776,12 +2939,43 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     // The first encoder of a frame always waits: frames are hazard-checked independently.
+     bool boundary = e == 0;
+     StageMask before = stage::vertex;
++    waitProds = nullptr;
+     if (b < compiled.barriers.size() && compiled.barriers[b].encoder == e && compiled.barriers[b].item == 0) {
+       boundary = true;
++      waitProds = &compiled.barriers[b].producers;
+       before = compiled.barriers[b++].before;
+     }
++    // e == 0 without a barrier keeps waitProds null: the frontier wait (only what was carried in is there yet).
+     if (dumping) boundary = true, before = stage::vertex;  // serialised: dump copies sit between encoders
+ 
++    // kOptClearSkip: a depth clear onto a texture nothing touched since the same clear becomes an empty blit
++    // encoder: it keeps the fences (waits and update) of the pass it stands for, so ordering stays exactly as
++    // before, without clearing and storing the texture again (Alyx's 4096x4096 shadow atlas in menus/loads).
++    if (clearSkipOn) {
++      CleanDepth key;
++      if (enc.kind == Encoder::Kind::Render && clearOnlyDepth(enc, key)) {
++        gClearCandidates.fetch_add(1, std::memory_order_relaxed);
++        const bool clean = std::any_of(cleanDepth.begin(), cleanDepth.end(), [&](const CleanDepth& c) {
++          return c.index == key.index && c.generation == key.generation && c.mip == key.mip && c.layer == key.layer &&
++                 c.layers == key.layers && c.depth == key.depth && c.stencil == key.stencil;
++        });
++        if (clean) {
++          open.kind = Open::Blit;
++          open.blit = [cb blitCommandEncoder];
++          if (open.blit) {
++            opened([NSString stringWithFormat:@"clearskip%u", e], boundary, before);
++            gClearSkipped.fetch_add(1, std::memory_order_relaxed);
++            continue;  // the next iteration's close() ends it under this encoder's index
++          }
++          open = {};
++        }
++        dirtyIndex(key.index);
++        cleanDepth.push_back(key);
++      } else {
++        dirtyEncoder(enc);
++      }
++    }
++
+     if (enc.kind == Encoder::Kind::Render) {
+       id<MTLFence> fixFence = encodeIndirectFix(e, enc);
+       MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+@@ -2995,6 +3189,16 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+             continue;
+           }
+           const Pipeline* p = pipeline(d.pipeline);
++          if (p && censusNow) {
++            auto& cf = censusFrame[p->key];
++            cf.first++;
++            if (!pipelineLabels.count(p->key)) pipelineLabels[p->key] = p->label;
++          }
++          if (p && knockKey && p->key == knockKey) {  // A/B "one shader out" probe
++            gKnocked.fetch_add(1, std::memory_order_relaxed);
++            ++(*diag)[e].skipped;
++            continue;
++          }
+           if (p && (huntAll || (!huntSnapshot.empty() && huntSnapshot.count(p->key)))) {
+             ++huntedNow;
+             ++(*diag)[e].skipped;
+@@ -3048,6 +3252,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+             EncDiag& g = (*diag)[e];
+             ++g.draws;
+             noteState(g, p->render, p->key);
++            if (d.indirect && d.indirect->countBuffer) {
++              gIndirectCountDraws.fetch_add(1, std::memory_order_relaxed);
++              gIndirectEncoded.fetch_add(std::max(1u, d.indirect->drawCount), std::memory_order_relaxed);
++            }
+             if (d.indirect) ++g.indirect;
+             else g.maxWork = std::max(g.maxWork, uint64_t{d.count} * d.instances);
+           }
+@@ -3153,26 +3361,53 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     // cover that item's hazards too).
+     bool carryWait = false;
+     StageMask carryBefore = 0;
++    // prodMode: the producers the item's wait orders against (encoder barrier at k == 0, item barriers, a
++    // carried wait); `all` = a frontier wait (encoder 0 without a barrier).
++    const std::vector<uint32_t>* encProds = waitProds;
++    std::vector<uint32_t> prodsV, carryProdsV;
++    bool carryAll = false;
++    auto mergeProds = [](std::vector<uint32_t>& into, const std::vector<uint32_t>& from) {
++      for (uint32_t x : from)
++        if (std::find(into.begin(), into.end(), x) == into.end()) into.push_back(x);
++    };
+     for (uint32_t k = 0; k < enc.commands.size(); ++k) {
+       const Command& cmd = cmds[enc.commands[k]];
+       const bool isDispatch = std::holds_alternative<Dispatch>(cmd);
+       bool wait = (k == 0 && boundary) || carryWait;
+       StageMask waitBefore = (k == 0 ? before : 0) | carryBefore;
++      prodsV.clear();
++      bool allWait = false;
++      if (k == 0 && boundary) {
++        if (encProds) prodsV = *encProds;
++        else allWait = true;
++      }
++      if (carryWait) mergeProds(prodsV, carryProdsV), allWait |= carryAll;
+       carryWait = false;
+       carryBefore = 0;
+       if (k > 0 && b < compiled.barriers.size() && compiled.barriers[b].encoder == e && compiled.barriers[b].item == k) {
+-        waitBefore |= compiled.barriers[b++].before;
++        const Barrier& ib = compiled.barriers[b++];
++        waitBefore |= ib.before;
+         // A memory barrier only orders work inside this encoder; earlier unordered encoders
+-        // (frontier) need a fence wait, which means a new encoder.
+-        if (open.kind == Open::Compute && isDispatch && frontier.empty())
++        // (frontier) need a fence wait, which means a new encoder. prodMode: the producers are this encoder
++        // only and none of its work has left the open Metal encoder yet (nothing foreign pending either).
++        bool inOpenOnly = frontier.empty();
++        if (prodMode) {
++          inOpenOnly = e < encFences.size() && encFences[e].empty() &&
++                       std::all_of(ib.producers.begin(), ib.producers.end(), [&](uint32_t x) { return x == e; }) &&
++                       std::all_of(frontier.begin(), frontier.end(), [&](id<MTLFence> f) { return ownFence(f); });
++        }
++        if (open.kind == Open::Compute && isDispatch && inOpenOnly && !wait)
+           [open.compute memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
+-        else wait = true;
++        else wait = true, mergeProds(prodsV, ib.producers);
+       }
++      waitProds = allWait ? nullptr : &prodsV;
+       // Sampled blits draw: each one runs in render encoders of its own.
+       if (!isDispatch && std::get<Copy>(cmd).kind == CopyKind::TextureBlit) {
+         if (!encodeBlit(std::get<Copy>(cmd), e, k, wait, waitBefore) && wait) {
+           carryWait = true;
+           carryBefore = waitBefore;
++          carryProdsV = prodsV;
++          carryAll = allWait;
+         }
+         continue;
+       }
+@@ -3207,6 +3442,17 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       if (isDispatch) {
+         const Dispatch& d = std::get<Dispatch>(cmd);
+         const Pipeline* p = pipeline(d.pipeline);
++        if (p && censusNow) {
++          auto& cf = censusFrame[p->key];
++          cf.first++;
++          cf.second = true;
++          if (!pipelineLabels.count(p->key)) pipelineLabels[p->key] = p->label;
++        }
++        if (p && knockKey && p->key == knockKey) {
++          gKnocked.fetch_add(1, std::memory_order_relaxed);
++          ++(*diag)[e].skipped;
++          continue;
++        }
+         if (p && (huntAll || (!huntSnapshot.empty() && huntSnapshot.count(p->key)))) {
+           ++huntedNow;
+           ++(*diag)[e].skipped;
+@@ -3348,8 +3594,22 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       }
+       ++missingResources;
+     }
++    waitProds = nullptr;  // never left pointing at prodsV (a local of this iteration)
+   }
+   close();
++  gFenceWaits.fetch_add(fenceWaits, std::memory_order_relaxed);
++  if (censusNow && !censusFrame.empty()) {
++    std::lock_guard lock(gCensusMutex);
++    ++gCensusFrames;
++    for (const auto& [k, v] : censusFrame) {
++      CensusEntry& c = gCensus[k];
++      c.frames++;
++      c.draws += v.first;
++      c.compute = v.second;
++      if (c.label.empty())
++        if (auto it = pipelineLabels.find(k); it != pipelineLabels.end()) c.label = it->second;
++    }
++  }
+   if (cbTracked) {
+     // Encoders that skipped the join may still run when the next command buffer starts: its join follows
+     // this one's tail AND this join (transitively, every earlier command buffer).
+@@ -3463,6 +3723,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     if (impl->exclOn && sampleCount && diag && finished.status == MTLCommandBufferStatusCompleted)
+       impl->exclAccount(exclType, *diag, raw, stg, finished.GPUEndTime, d.timings.frameMs);
+     if (finished.status == MTLCommandBufferStatusError) {
++      gCleanEpoch.fetch_add(1, std::memory_order_relaxed);
+       std::string encs;
+       NSArray* infos = finished.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+       for (id<MTLCommandBufferEncoderInfo> i in infos)
+@@ -3617,6 +3878,7 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     }
+     if (fixScratch) {
+       const uint32_t* h = static_cast<const uint32_t*>(fixScratch.contents);
++      gIndirectReal.fetch_add(h[3], std::memory_order_relaxed);
+       if (h[0]) {
+         const uint64_t n = ++impl->indirectClampedFrames;
+         if (n <= 32 || n % 256 == 0)
+@@ -4633,6 +4895,47 @@ bool MetalBackend::saveArchive() {
+ extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_request_dump(void) {
+   vpgpu::metal2::gDumpRequest.store(true);
+ }
++// Patch 0038: AVP's automatic A/B test. Runtime optimisation switches (vpgpu::RuntimeOpt bits).
++extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_set_opts(uint32_t mask) {
++  vpgpu::gRuntimeOpts.store(mask);
++}
++// Draws/dispatches of pipeline `key` are skipped from the next submit on (0 = none).
++extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_set_knockout(uint64_t key) {
++  vpgpu::metal2::gKnockKey.store(key);
++}
++// Cumulative counters: [0] command buffers, [1] of them encoded with producer waits, [2] fence waits encoded,
++// [3] clear-only depth passes seen (while clear skip is on), [4] of them skipped, [5] draws/dispatches knocked out.
++// [6] indirect-count draw calls, [7] Metal draws encoded for them (maxDrawCount each), [8] draws their GPU
++// counters actually asked for (read back when the command buffer completed).
++extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_opt_counters(uint64_t out[9]) {
++  using namespace vpgpu::metal2;
++  out[0] = gOptCbs.load(), out[1] = gProdCbs.load(), out[2] = gFenceWaits.load();
++  out[3] = gClearCandidates.load(), out[4] = gClearSkipped.load(), out[5] = gKnocked.load();
++  out[6] = gIndirectCountDraws.load(), out[7] = gIndirectEncoded.load(), out[8] = gIndirectReal.load();
++}
++// Pipeline census: on = 1 starts (clearing the previous one), 0 stops. Returns the real frames counted.
++extern "C" __attribute__((visibility("default"))) uint64_t vpgpu_metal2_census(int on) {
++  using namespace vpgpu::metal2;
++  std::lock_guard lock(gCensusMutex);
++  if (on) gCensus.clear(), gCensusFrames = 0;
++  gCensusOn.store(on != 0);
++  return gCensusFrames;
++}
++// The census' pipelines: up to `max` entries (any order); labels truncated to 47 characters.
++extern "C" __attribute__((visibility("default"))) int vpgpu_metal2_census_get(uint64_t* keys, uint64_t* frames,
++                                                                              uint64_t* draws, uint8_t* compute,
++                                                                              char (*labels)[48], int max) {
++  using namespace vpgpu::metal2;
++  std::lock_guard lock(gCensusMutex);
++  int n = 0;
++  for (const auto& [k, c] : gCensus) {
++    if (n >= max) break;
++    keys[n] = k, frames[n] = c.frames, draws[n] = c.draws, compute[n] = c.compute;
++    std::snprintf(labels[n], 48, "%s", c.label.c_str());
++    ++n;
++  }
++  return n;
++}
+ extern "C" __attribute__((visibility("default"))) uint32_t vpgpu_metal2_gpu_hangs(void) {
+   return vpgpu::metal2::gGpuHangs.load();
+ }
+-- 
+2.43.0
+
