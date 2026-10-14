@@ -20,6 +20,7 @@
 // any other queue (the compositor's, ANGLE's) pass straight through.
 // KL_GPU_TIME=0 leaves -commit alone.
 #include <os/lock.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdatomic.h>
 #include <execinfo.h>
@@ -362,8 +363,10 @@ static void prof_push_locked(double at, uint32_t frame, int scene, const char *t
     snprintf(r->tag, sizeof r->tag, "%s", tag);
 }
 
+static void ab_scene(int to_grid);   // the A/B test (KL_ABTEST, below) pauses over loads
 // The OpenVR shim: the game faded the grid in (to_grid = 1, a level load starting) or out (0, a scene shown).
 void kl_gpu_time_scene(int to_grid) {
+    ab_scene(to_grid);
     if (g_prof <= 0) return;
     double now = CACurrentMediaTime();
     int scene = 0, dropped = 0;
@@ -1236,6 +1239,23 @@ static id<MTLRasterizationRateMap> vrr_map_cached(NSUInteger w, NSUInteger h, NS
             return (__bridge id<MTLRasterizationRateMap>)g_vrr_maps[i].map;
     return nil;
 }
+// The eye-copy trim (klvr_vk_submit.cpp through klvr_plat_eye_trim): the maps are keyed by the scene passes' render
+// area, which is the submit's crop (Source 2 renders the top-left w x h of its larger targets and submits that), the
+// same size the compositor looks the map up by (kl_vrr_map_for with the copied image's size). Any layer count: the
+// compositor's lookup ignores it too. The largest physical size over the layers, so neither eye is cut.
+int kl_vrr_phys_extent(unsigned w, unsigned h, unsigned *pw, unsigned *ph) {
+    if (g_vrr_on <= 0 || !w || !h) return 0;
+    for (int i = 0; i < 8; i++) {
+        void *mp = g_vrr_maps[i].map;
+        if (!mp || g_vrr_maps[i].w != w || g_vrr_maps[i].h != h) continue;
+        MTLSize p = vrr_phys_size((__bridge id<MTLRasterizationRateMap>)mp);
+        if (!p.width || !p.height) return 0;
+        if (pw) *pw = (unsigned)p.width;
+        if (ph) *ph = (unsigned)p.height;
+        return 1;
+    }
+    return 0;
+}
 
 // KL_VK_MERGE_VIS=1 (with KL_VK_MERGE): the scene's first chunk issues no occlusion queries and so gets no
 // visibility-result buffer, while the chunk that resumes it does; Metal fixes that buffer per encoder, so the two
@@ -1800,6 +1820,635 @@ static void watch(void *mtl_queue, int role) {
     vrr_install(c);
 }
 
+// ---- Automatic A/B performance test (KL_ABTEST=1; AVP) ----------------------------------------------------------
+// One run says which of VPKEngine's runtime optimisations (patch 0038) and of our own pay on this headset, and in
+// which shaders the frame's cost sits, with the player standing still (the HUD asks for it). Driven from
+// kl_gpu_time_frame_end (the game thread, once per guest frame); VPVulkan's switches are resolved by name, like the
+// exclusive time above: a driver without them logs it and the test does nothing.
+//   wait      25 s after the first frame, never while the grid is shown (a load), 3 s after a scene is shown, and
+//             not while a [passes] window is open
+//   census    3 s: which pipelines the real frames encode. Candidates: present in >= 80 % of those frames, the 20
+//             non-compute and the 6 compute ones with the most draws
+//   opts      3 rounds x 5 masks (OFF, ALL, ALL without each bit), round r in an order rotated by r so drift spreads
+//             over the configs; 0.6 s to settle, 2.0 s measured. Bits: 0 producer-only fence waits, 1 redundant
+//             depth-clear skip (VPKEngine), 2 eye-copy trim (klvr_vk_submit.cpp, kl_abtest_eye_trim)
+//   knockout  mask 0; each candidate's draws skipped (0.4 s settle, 1.4 s measured) between baselines (first, after
+//             every 5 candidates, last): the saving is the baselines' median interpolated at the candidate minus its own
+//   verdict   per bit SAVES / NO EFFECT / WORSE / INACTIVE / BREAKS; the bits that save stay on for the session
+// The metric is the guest frame's UNION GPU span (busy[0], the frame's command buffers on the wall clock): producer-only
+// waits gain through overlap, which the exclusive time does not show. The exclusive time is logged beside it. A load
+// during a step pauses the test (everything back to legacy); the step is measured again once the scene has been shown
+// for 3 s. The [passes] windows do not open while the test measures (their timestamps would perturb it).
+enum { kAbMaxFrames = 512, kAbCfgs = 5, kAbRounds = 3, kAbCandMax = 26, kAbCensusMax = 4096, kAbBaseMax = 16, kAbStepsMax = 40 };
+enum { kAbOff, kAbWait, kAbCensus, kAbOpts, kAbKnock, kAbDone, kAbFailed };
+static const unsigned k_ab_mask[kAbCfgs] = { 0, 7, 6, 5, 3 };   // OFF, ALL, ALL minus bit 0, 1, 2
+static const char *const k_ab_cfg[kAbCfgs] = { "OFF", "ALL", "ALL-prodwait", "ALL-clearskip", "ALL-eyetrim" };
+static const char *const k_ab_bit[3] = { "producer-only fence waits (bit0)", "redundant depth-clear skip (bit1)",
+                                         "eye-copy trim (bit2)" };
+typedef struct {
+    double t0, m_t0;               // window start (settling), measurement start (0 = still settling)
+    double settle, measure;
+    uint32_t first_frame;          // final frames from this one on are measured
+    unsigned ends, n;              // guest frames closed during the measurement; final frames measured
+    float ms[kAbMaxFrames];        // their union ms
+    double sum, excl_sum;
+    unsigned excl_n;
+    uint64_t c0[9];                // vpgpu_metal2_opt_counters at the measurement start
+    uint32_t h0;                   // GPU hangs then
+    uint32_t hb;                   // GPU hangs at the window's start (settle included)
+    unsigned tr0;                  // eye-copy trims then
+} ab_window;
+typedef struct {
+    int valid;                     // enough frames (8+) for a median
+    unsigned n, ends;
+    double med, mean, excl, fps;   // union median / mean (ms), exclusive mean (ms, -1 = never accounted), guest fps
+    uint64_t dc[9];                // counter deltas
+    uint32_t hangs;
+    unsigned trims;
+} ab_result;
+static int g_ab_env;                          // KL_ABTEST=1 (ab_env)
+static _Atomic int g_ab_trim_flag;            // bit 2 of the mask in force: the eye copies read it per submit
+static _Atomic unsigned g_ab_trims;           // eye copies trimmed (kl_abtest_note_trim)
+static _Atomic int g_ab_loading;              // the grid is shown: a load is on
+static _Atomic unsigned g_ab_loads, g_ab_shows;   // grid fade-ins (load starts) and fade-outs (scenes shown)
+static os_unfair_lock g_ab_hud_lk = OS_UNFAIR_LOCK_INIT;
+static char g_ab_hud_text[160];               // the HUD line (under g_ab_hud_lk)
+static double g_ab_hud_until;                 // done/failed: the line goes away at this time (under g_ab_hud_lk; 0 = never)
+static void (*ab_set_opts)(uint32_t);
+static void (*ab_set_knock)(uint64_t);
+static void (*ab_counters)(uint64_t *);
+static uint64_t (*ab_census)(int);
+static int (*ab_census_get)(uint64_t *, uint64_t *, uint64_t *, uint8_t *, char (*)[48], int);
+static uint32_t (*ab_hangs)(void);
+// Game thread only (ab_tick and what it calls).
+static struct {
+    int state, paused;
+    double t_first, t_start, resume_at, phase_t0;
+    unsigned seen_loads, seen_shows;
+    uint32_t last_fed;                        // the newest final frame already fed to a window
+    ab_window w;
+    int step;                                 // opts: 0..14; knockout: index into steps
+    ab_result opt[kAbRounds][kAbCfgs];
+    int nc;                                   // candidates
+    uint64_t census_frames;
+    struct { uint64_t key; int compute; uint64_t frames, draws; char label[48]; } cand[kAbCandMax];
+    int nsteps, nbase, knock_done;
+    int steps[kAbStepsMax];                   // -1 = a baseline, else a candidate
+    ab_result knock[kAbCandMax], base[kAbBaseMax];
+    double save[kAbCandMax];
+    int save_ok[kAbCandMax];
+} g_ab;
+
+static void ab_hud(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void ab_hud(const char *fmt, ...) {
+    char t[sizeof g_ab_hud_text];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(t, sizeof t, fmt, ap);
+    va_end(ap);
+    os_unfair_lock_lock(&g_ab_hud_lk);
+    memcpy(g_ab_hud_text, t, sizeof t);
+    os_unfair_lock_unlock(&g_ab_hud_lk);
+}
+static int ab_env(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("KL_ABTEST");
+        g_ab_env = e && *e == '1';
+        if (g_ab_env) {
+            g_ab.state = kAbWait;
+            ab_hud("TEST: empieza en %d s · quédate quieto mirando al frente", 25);
+            fprintf(stderr, "[abtest] automatic A/B test on (KL_ABTEST=1): starts 25 s after the first frame, outside loads\n");
+        }
+    });
+    return g_ab_env;
+}
+static void ab_scene(int to_grid) {
+    if (!ab_env()) return;
+    if (to_grid) {
+        if (!atomic_exchange(&g_ab_loading, 1)) atomic_fetch_add(&g_ab_loads, 1u);
+    } else {
+        atomic_store(&g_ab_loading, 0);
+        atomic_fetch_add(&g_ab_shows, 1u);
+    }
+}
+static int ab_env_is(const char *name, const char *value) {
+    const char *e = getenv(name);
+    return e && (value ? !strcmp(e, value) : *e != 0);
+}
+int kl_abtest_eye_trim(void) {
+    // Compositor paths that read the whole eye image (KleptonCompositor eye prep: mips, FXAA's edge search, RCAS,
+    // MetalFX; the temporal VPKTAA): there a trimmed copy would bleed stale texels in. The composite itself, the wide
+    // view and kl_eye_recon read at most 2 texels past the physical area (bilinear + Catmull-Rom), which the 2-texel
+    // margin of the trim covers.
+    static dispatch_once_t once;
+    static int unsafe, env_trim;
+    dispatch_once(&once, ^{
+        const char *why = ab_env_is("KL_EYE_MIPS", "1") ? "KL_EYE_MIPS" : ab_env_is("KL_EYE_FXAA", "1") ? "KL_EYE_FXAA"
+                        : ab_env_is("KL_EYE_SHARPEN", NULL) ? "KL_EYE_SHARPEN" : ab_env_is("KL_EYE_FX", NULL) ? "KL_EYE_FX"
+                        : ab_env_is("KL_VPKTAA", "1") ? "KL_VPKTAA" : NULL;
+        unsafe = why != NULL;
+        env_trim = ab_env_is("KL_EYE_TRIM", "1");
+        if (why)
+            fprintf(stderr, "[abtest] eye-copy trim unsafe: %s reads the whole eye image; the trim stays off (bit 2 inactive)\n", why);
+        else if (!ab_env() && env_trim)
+            fprintf(stderr, "[abtest] eye-copy trim on (KL_EYE_TRIM=1)\n");
+    });
+    if (unsafe) return 0;
+    return ab_env() ? atomic_load(&g_ab_trim_flag) : env_trim;
+}
+void kl_abtest_note_trim(void) { atomic_fetch_add(&g_ab_trims, 1u); }
+int kl_abtest_hud(char *buf, int n) {
+    if (!ab_env()) return 0;
+    int shown = 1;
+    os_unfair_lock_lock(&g_ab_hud_lk);
+    if (g_ab_hud_until > 0 && CACurrentMediaTime() >= g_ab_hud_until) shown = 0;
+    else if (buf && n > 0) snprintf(buf, (size_t)n, "%s", g_ab_hud_text);
+    os_unfair_lock_unlock(&g_ab_hud_lk);
+    return shown;
+}
+// The test is over (done or failed): its last HUD line stays 60 s, then the HUD goes (unless «Mostrar FPS» is on).
+static void ab_hud_expire(double now) {
+    os_unfair_lock_lock(&g_ab_hud_lk);
+    g_ab_hud_until = now + 60.0;
+    os_unfair_lock_unlock(&g_ab_hud_lk);
+}
+
+static int ab_resolve(void) {
+    const char *path = getenv("KL_MVK_DYLIB");
+    void *h = path && *path ? dlopen(path, RTLD_NOW | RTLD_NOLOAD) : NULL;
+    void *s = h ? h : RTLD_DEFAULT;
+    ab_set_opts = (void (*)(uint32_t))dlsym(s, "vpgpu_metal2_set_opts");
+    ab_set_knock = (void (*)(uint64_t))dlsym(s, "vpgpu_metal2_set_knockout");
+    ab_counters = (void (*)(uint64_t *))dlsym(s, "vpgpu_metal2_opt_counters");
+    ab_census = (uint64_t (*)(int))dlsym(s, "vpgpu_metal2_census");
+    ab_census_get = (int (*)(uint64_t *, uint64_t *, uint64_t *, uint8_t *, char (*)[48], int))dlsym(s, "vpgpu_metal2_census_get");
+    ab_hangs = (uint32_t (*)(void))dlsym(s, "vpgpu_metal2_gpu_hangs");
+    const char *miss = !ab_set_opts ? "vpgpu_metal2_set_opts" : !ab_set_knock ? "vpgpu_metal2_set_knockout"
+                     : !ab_counters ? "vpgpu_metal2_opt_counters" : !ab_census ? "vpgpu_metal2_census"
+                     : !ab_census_get ? "vpgpu_metal2_census_get" : NULL;
+    if (miss) {
+        fprintf(stderr, "[abtest] VPVulkan has no %s (patch 0038 missing): the test does nothing\n", miss);
+        return 0;
+    }
+    if (!ab_hangs) fprintf(stderr, "[abtest] no vpgpu_metal2_gpu_hangs: BREAKS cannot be detected\n");
+    return 1;
+}
+// Bits 0-1 to VPKEngine, bit 2 to the eye copies.
+static void ab_apply(unsigned mask) {
+    if (ab_set_opts) ab_set_opts(mask & 3u);
+    atomic_store(&g_ab_trim_flag, (mask & 4u) ? 1 : 0);
+}
+static int ab_active(void) { return g_ab.state == kAbCensus || g_ab.state == kAbOpts || g_ab.state == kAbKnock; }
+
+// The latest final guest frame (the same choice as kl_gpu_time_frame_ms): its union span (ms) and its exclusive time
+// (ms, -1 unless every buffer was accounted). Returns its number, 0 when none is final.
+static uint32_t ab_frame_metrics(double *uni, double *excl) {
+    uint32_t got = 0;
+    os_unfair_lock_lock(&g_lk);
+    for (unsigned back = 1; back < kRing - 1 && back < g_frame; back++) {
+        uint32_t f = g_frame - back;
+        slot *s = &g_slots[f % kRing];
+        if (s->frame != f) break;
+        if (s->committed && s->completed == s->committed) {
+            *uni = s->busy[0] * 1e3;
+            *excl = s->excl_n[0] && !s->excl_miss[0] ? s->excl[0] * 1e3 : -1;
+            got = f;
+            break;
+        }
+    }
+    os_unfair_lock_unlock(&g_lk);
+    return got;
+}
+static int ab_cmpf(const void *a, const void *b) {
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y;
+}
+static int ab_cmpd(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+static double ab_median(double *v, int n) {   // sorts v
+    if (n <= 0) return 0;
+    qsort(v, (size_t)n, sizeof *v, ab_cmpd);
+    return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
+static void ab_counters_now(uint64_t c[9]) {
+    memset(c, 0, 9 * sizeof c[0]);
+    if (ab_counters) ab_counters(c);
+}
+
+static void ab_win_begin(double now, double settle, double measure) {
+    ab_window *w = &g_ab.w;
+    w->t0 = now; w->m_t0 = 0; w->settle = settle; w->measure = measure;
+    w->first_frame = 0; w->ends = 0; w->n = 0;
+    w->sum = 0; w->excl_sum = 0; w->excl_n = 0;
+    w->hb = ab_hangs ? ab_hangs() : 0;
+}
+// Called every guest frame; f = a final frame not fed before (0 = none this time). 1 when the measurement is over.
+static int ab_win_tick(double now, uint32_t frame, uint32_t f, double uni, double ex, ab_result *r) {
+    ab_window *w = &g_ab.w;
+    if (!w->m_t0) {
+        if (now - w->t0 < w->settle) return 0;
+        // `frame` is the one just opened: everything it commits runs under the window's settings.
+        w->m_t0 = now;
+        w->first_frame = frame;
+        ab_counters_now(w->c0);
+        w->h0 = ab_hangs ? ab_hangs() : 0;
+        w->tr0 = atomic_load(&g_ab_trims);
+        return 0;
+    }
+    w->ends++;
+    if (f && f >= w->first_frame && w->n < kAbMaxFrames) {
+        w->ms[w->n++] = (float)uni;
+        w->sum += uni;
+        if (ex >= 0) { w->excl_sum += ex; w->excl_n++; }
+    }
+    if (now - w->m_t0 < w->measure) return 0;
+    memset(r, 0, sizeof *r);
+    double secs = now - w->m_t0;
+    r->n = w->n;
+    r->ends = w->ends;
+    r->fps = secs > 0 ? w->ends / secs : 0;
+    r->valid = w->n >= 8;
+    if (w->n) {
+        float tmp[kAbMaxFrames];
+        memcpy(tmp, w->ms, w->n * sizeof tmp[0]);
+        qsort(tmp, w->n, sizeof tmp[0], ab_cmpf);
+        r->med = w->n % 2 ? tmp[w->n / 2] : 0.5 * ((double)tmp[w->n / 2 - 1] + tmp[w->n / 2]);
+        r->mean = w->sum / w->n;
+    }
+    r->excl = w->excl_n ? w->excl_sum / w->excl_n : -1;
+    uint64_t c1[9];
+    ab_counters_now(c1);
+    for (int k = 0; k < 9; k++) r->dc[k] = c1[k] - w->c0[k];
+    r->hangs = (ab_hangs ? ab_hangs() : 0) - w->h0;
+    r->trims = atomic_load(&g_ab_trims) - w->tr0;
+    return 1;
+}
+
+static void ab_finish(double now);
+static void ab_census_begin(double now) {
+    g_ab.state = kAbCensus;
+    ab_apply(0);
+    ab_set_knock(0);
+    (void)ab_census(1);
+    g_ab.phase_t0 = now;
+    ab_hud("TEST 1/3: midiendo shaders · no te muevas");
+    fprintf(stderr, "[abtest] census: 3 s of pipeline counts (mask 0)\n");
+}
+static void ab_opt_window_begin(double now) {
+    int s = g_ab.step, r = s / kAbCfgs, cfg = (r + s % kAbCfgs) % kAbCfgs;
+    ab_apply(k_ab_mask[cfg]);
+    ab_win_begin(now, 0.6, 2.0);
+    ab_hud("TEST 2/3: optimizaciones %d/%d · no te muevas", s + 1, kAbRounds * kAbCfgs);
+}
+static void ab_knock_window_begin(double now) {
+    int c = g_ab.steps[g_ab.step];
+    ab_set_knock(c >= 0 ? g_ab.cand[c].key : 0);
+    ab_win_begin(now, 0.4, 1.4);
+    int shown = c >= 0 ? c + 1 : (g_ab.knock_done + 1 < g_ab.nc ? g_ab.knock_done + 1 : g_ab.nc);
+    ab_hud("TEST 3/3: quitando shader %d/%d (puede verse raro) · no te muevas", shown, g_ab.nc);
+}
+static void ab_knock_begin(double now) {
+    g_ab.state = kAbKnock;
+    ab_apply(0);   // legacy: each shader's share of the frame as the engine is without the optimisations
+    g_ab.nsteps = 0; g_ab.nbase = 0; g_ab.knock_done = 0; g_ab.step = 0;
+    if (!g_ab.nc) {
+        if (!g_ab.census_frames) fprintf(stderr, "[abtest] census saw 0 real frames: knockout skipped\n");
+        else fprintf(stderr, "[abtest] no pipeline in >= 80 %% of the %llu census frames: knockout skipped\n",
+                     (unsigned long long)g_ab.census_frames);
+        ab_finish(now);
+        return;
+    }
+    g_ab.steps[g_ab.nsteps++] = -1;
+    for (int i = 0; i < g_ab.nc && g_ab.nsteps < kAbStepsMax - 1; i++) {
+        g_ab.steps[g_ab.nsteps++] = i;
+        if ((i + 1) % 5 == 0 || i + 1 == g_ab.nc) g_ab.steps[g_ab.nsteps++] = -1;
+    }
+    fprintf(stderr, "[abtest] knockout: %d candidates, %d windows (mask 0)\n", g_ab.nc, g_ab.nsteps);
+    ab_knock_window_begin(now);
+}
+// The step in hand, from its beginning (after a pause).
+static void ab_step_begin(double now) {
+    if (g_ab.state == kAbCensus) ab_census_begin(now);
+    else if (g_ab.state == kAbOpts) ab_opt_window_begin(now);
+    else if (g_ab.state == kAbKnock) {
+        ab_apply(0);
+        ab_knock_window_begin(now);
+    }
+}
+static void ab_pause(void) {
+    g_ab.paused = 1;
+    ab_set_knock(0);
+    ab_apply(0);
+    if (g_ab.state == kAbCensus) (void)ab_census(0);
+    fprintf(stderr, "[abtest] a load started: step discarded, the test resumes 3 s after the scene is shown\n");
+    ab_hud("TEST en pausa (cargando)");
+}
+
+static void ab_census_tick(double now) {
+    if (now - g_ab.phase_t0 < 3.0) return;
+    // Heap (once, kept): 4096 entries are ~250 KB, too much for static storage that every run would carry.
+    static uint64_t *keys, *fr, *dr;
+    static uint8_t *cp, *taken;
+    static char (*lab)[48];
+    if (!keys) {
+        keys = calloc(kAbCensusMax, sizeof *keys); fr = calloc(kAbCensusMax, sizeof *fr); dr = calloc(kAbCensusMax, sizeof *dr);
+        cp = calloc(kAbCensusMax, 1); taken = calloc(kAbCensusMax, 1);
+        lab = calloc(kAbCensusMax, sizeof *lab);
+    }
+    uint64_t frames = ab_census(0);
+    int n = 0;
+    if (keys && fr && dr && cp && taken && lab) n = ab_census_get(keys, fr, dr, cp, lab, kAbCensusMax);
+    else fprintf(stderr, "[abtest] census: no memory for the pipeline list\n");
+    if (n < 0) n = 0;
+    if (n > kAbCensusMax) n = kAbCensusMax;
+    if (taken) memset(taken, 0, kAbCensusMax);
+    g_ab.nc = 0;
+    g_ab.census_frames = frames;
+    // The 20 non-compute pipelines with the most draws, then the 6 compute ones, among those in >= 80 % of the frames.
+    for (int pass = 0; pass < 2; pass++) {
+        int want = pass == 0 ? 20 : 6;
+        for (int k = 0; k < want && g_ab.nc < kAbCandMax; k++) {
+            int best = -1;
+            for (int i = 0; i < n; i++) {
+                if (taken[i] || (cp[i] != 0) != (pass == 1)) continue;
+                if (!frames || fr[i] * 5 < frames * 4) continue;
+                if (best < 0 || dr[i] > dr[best]) best = i;
+            }
+            if (best < 0) break;
+            taken[best] = 1;
+            int c = g_ab.nc++;
+            g_ab.cand[c].key = keys[best];
+            g_ab.cand[c].compute = cp[best] != 0;
+            g_ab.cand[c].frames = fr[best];
+            g_ab.cand[c].draws = dr[best];
+            lab[best][47] = 0;
+            snprintf(g_ab.cand[c].label, sizeof g_ab.cand[c].label, "%s", lab[best][0] ? lab[best] : "-");
+        }
+    }
+    fprintf(stderr, "[abtest] census: %llu real frames, %d pipelines, %d candidates\n", (unsigned long long)frames, n, g_ab.nc);
+    if (!frames) fprintf(stderr, "[abtest] census saw 0 real frames: no candidates\n");
+    else if (!g_ab.nc) fprintf(stderr, "[abtest] census: no pipeline in >= 80 %% of the %llu frames\n", (unsigned long long)frames);
+    for (int i = 0; i < g_ab.nc; i++)
+        fprintf(stderr, "[abtest] candidate %d key=%016llx compute=%d frames=%llu/%llu draws/frame=%.1f label=%s\n", i,
+                (unsigned long long)g_ab.cand[i].key, g_ab.cand[i].compute, (unsigned long long)g_ab.cand[i].frames,
+                (unsigned long long)frames, frames ? (double)g_ab.cand[i].draws / (double)frames : 0.0, g_ab.cand[i].label);
+    g_ab.state = kAbOpts;
+    g_ab.step = 0;
+    fprintf(stderr, "[abtest] optimisations: %d rounds x %d masks, 0.6 s settle + 2.0 s measured each\n", kAbRounds, kAbCfgs);
+    ab_opt_window_begin(now);
+}
+
+static void ab_opts_tick(double now, uint32_t frame, uint32_t f, double uni, double ex) {
+    ab_result res;
+    if (!ab_win_tick(now, frame, f, uni, ex, &res)) return;
+    int s = g_ab.step, r = s / kAbCfgs, cfg = (r + s % kAbCfgs) % kAbCfgs;
+    g_ab.opt[r][cfg] = res;
+    const uint64_t *d = res.dc;
+    fprintf(stderr, "[abtest] window r=%d cfg=%s mask=%u frames=%u union med %.2f mean %.2f excl %.2f fps %.1f prodcb %llu/%llu "
+            "fencewaits/cb %.1f clears %llu/%llu trims %u indirect calls %llu encoded %llu real %llu hangs %u%s\n",
+            r, k_ab_cfg[cfg], k_ab_mask[cfg], res.n, res.med, res.mean, res.excl, res.fps, (unsigned long long)d[1],
+            (unsigned long long)d[0], d[0] ? (double)d[2] / (double)d[0] : 0.0, (unsigned long long)d[4],
+            (unsigned long long)d[3], res.trims, (unsigned long long)d[6], (unsigned long long)d[7],
+            (unsigned long long)d[8], res.hangs, res.valid ? "" : " (too few frames: not used)");
+    if (++g_ab.step < kAbRounds * kAbCfgs) { ab_opt_window_begin(now); return; }
+    ab_knock_begin(now);
+}
+
+// Candidates of group g (between baselines g and g + 1): savings against the baselines' median interpolated linearly
+// at each candidate's place in the sequence.
+static void ab_knock_report_group(int g) {
+    if (g < 0 || g + 1 >= kAbBaseMax) return;
+    int i0 = g * 5, i1 = i0 + 5 < g_ab.nc ? i0 + 5 : g_ab.nc, gs = i1 - i0;
+    const ab_result *b0 = &g_ab.base[g], *b1 = &g_ab.base[g + 1];
+    for (int i = i0; i < i1; i++) {
+        const ab_result *k = &g_ab.knock[i];
+        double base = b0->med + (b1->med - b0->med) * (double)(i - i0 + 1) / (double)(gs + 1);
+        int ok = b0->valid && b1->valid && k->valid;
+        g_ab.save[i] = ok ? base - k->med : 0;
+        g_ab.save_ok[i] = ok;
+        fprintf(stderr, "[abtest] knock %d key=%016llx %s union med %.2f saving %.2f ms (%.0f %% of frame) knocked draws/frame %.1f "
+                "hangs %u%s\n", i, (unsigned long long)g_ab.cand[i].key, g_ab.cand[i].label, k->med, g_ab.save[i],
+                ok && base > 0 ? 100.0 * g_ab.save[i] / base : 0.0, k->ends ? (double)k->dc[5] / (double)k->ends : 0.0,
+                k->hangs, ok ? "" : " (a window had too few frames: not used)");
+    }
+}
+static void ab_knock_tick(double now, uint32_t frame, uint32_t f, double uni, double ex) {
+    // A GPU hang anywhere in the knockout (settle included): leaving a shader out can starve what reads its output.
+    // Stop at once, back to legacy, and go to the verdict with what was measured.
+    int c = g_ab.steps[g_ab.step];
+    uint32_t hangs_now = ab_hangs ? ab_hangs() : 0;
+    if (hangs_now != g_ab.w.hb) {
+        ab_set_knock(0);
+        ab_apply(0);
+        fprintf(stderr, "[abtest] knockout aborted: GPU hang with key %016llx (%s), %u new hang(s); on to the verdict\n",
+                c >= 0 ? (unsigned long long)g_ab.cand[c].key : 0ull, c >= 0 ? g_ab.cand[c].label : "baseline: nothing knocked out",
+                hangs_now - g_ab.w.hb);
+        ab_finish(now);
+        return;
+    }
+    ab_result res;
+    if (!ab_win_tick(now, frame, f, uni, ex, &res)) return;
+    if (c >= 0) {
+        g_ab.knock[c] = res;
+        g_ab.knock_done++;
+    } else {
+        if (g_ab.nbase < kAbBaseMax) g_ab.base[g_ab.nbase] = res;
+        g_ab.nbase++;
+        fprintf(stderr, "[abtest] knock baseline %d union med %.2f mean %.2f frames %u hangs %u%s\n", g_ab.nbase - 1, res.med,
+                res.mean, res.n, res.hangs, res.valid ? "" : " (too few frames)");
+        if (g_ab.nbase >= 2) ab_knock_report_group(g_ab.nbase - 2);
+    }
+    if (++g_ab.step < g_ab.nsteps) { ab_knock_window_begin(now); return; }
+    ab_set_knock(0);
+    ab_finish(now);
+}
+
+static void ab_finish(double now) {
+    // Noise: a robust sigma of one window's median from the pairwise differences between rounds of the same config,
+    // |x_i - x_j| / sqrt 2 (no self-differences: those are zero), median over every pair of every config (up to 15);
+    // noise = max(0.30 ms, 1.5 x sigma). SAVES / WORSE also need every valid round to agree on the sign.
+    double pd[kAbCfgs * kAbRounds * (kAbRounds - 1) / 2];
+    int npd = 0;
+    for (int c = 0; c < kAbCfgs; c++)
+        for (int i = 0; i < kAbRounds; i++)
+            for (int j = i + 1; j < kAbRounds; j++)
+                if (g_ab.opt[i][c].valid && g_ab.opt[j][c].valid)
+                    pd[npd++] = fabs(g_ab.opt[i][c].med - g_ab.opt[j][c].med) / sqrt(2.0);
+    double sigma = npd ? ab_median(pd, npd) : 0;
+    double noise = 1.5 * sigma;
+    if (noise < 0.30) noise = 0.30;
+    unsigned final_mask = 0;
+    fprintf(stderr, "[abtest] VERDICT noise %.2f ms (sigma %.3f ms from %d round pairs); SAVES = gain > %.2f ms and > 0.25 ms "
+            "with every round > 0; WORSE = gain < -%.2f ms with every round < 0\n", noise, sigma, npd, 2 * noise, 2 * noise);
+    for (int b = 0; b < 3; b++) {
+        double g[kAbRounds], gc[kAbRounds];
+        int ng = 0;
+        for (int r = 0; r < kAbRounds; r++)
+            if (g_ab.opt[r][1].valid && g_ab.opt[r][2 + b].valid) g[ng++] = g_ab.opt[r][2 + b].med - g_ab.opt[r][1].med;
+        memcpy(gc, g, sizeof gc);
+        double gain = ng ? ab_median(gc, ng) : 0;
+        int allpos = ng > 0, allneg = ng > 0;
+        for (int k = 0; k < ng; k++) { if (!(g[k] > 0)) allpos = 0; if (!(g[k] < 0)) allneg = 0; }
+        uint64_t acted = 0;
+        unsigned hang_on = 0, hang_off = 0;
+        for (int r = 0; r < kAbRounds; r++)
+            for (int c = 0; c < kAbCfgs; c++) {
+                const ab_result *x = &g_ab.opt[r][c];
+                if ((k_ab_mask[c] >> b) & 1u) {
+                    acted += b == 0 ? x->dc[1] : b == 1 ? x->dc[4] : x->trims;
+                    hang_on += x->hangs;
+                } else hang_off += x->hangs;
+            }
+        const char *cls;
+        // BREAKS: some window with the bit on hung and no window with it off did (= the bit was on in every window that hung).
+        if (hang_on > 0 && hang_off == 0) cls = "BREAKS";
+        else if (!acted) cls = "INACTIVE";
+        else if (!ng) cls = "UNMEASURED";
+        else if (gain > 2 * noise && gain > 0.25 && allpos) { cls = "SAVES"; final_mask |= 1u << b; }
+        else if (gain < -2 * noise && allneg) cls = "WORSE";
+        else cls = "NO EFFECT";
+        char per[96];
+        int u = 0;
+        per[0] = 0;
+        for (int k = 0; k < ng && u < (int)sizeof per - 12; k++) u += snprintf(per + u, sizeof per - u, " %.2f", g[k]);
+        fprintf(stderr, "[abtest] VERDICT %s: %s, gain %.2f ms (per round:%s); acted %llu (%s); hangs with it %u, without %u\n",
+                k_ab_bit[b], cls, gain, ng ? per : " none", (unsigned long long)acted,
+                b == 0 ? "command buffers with producer waits" : b == 1 ? "depth clears skipped" : "eye copies trimmed",
+                hang_on, hang_off);
+    }
+    {
+        double t[kAbRounds], off[kAbRounds], all[kAbRounds];
+        int nt = 0, allpos = 1, allneg = 1;
+        char per[96];
+        int u = 0;
+        per[0] = 0;
+        for (int r = 0; r < kAbRounds; r++)
+            if (g_ab.opt[r][0].valid && g_ab.opt[r][1].valid) {
+                off[nt] = g_ab.opt[r][0].med; all[nt] = g_ab.opt[r][1].med;
+                t[nt] = off[nt] - all[nt];
+                if (!(t[nt] > 0)) allpos = 0;
+                if (!(t[nt] < 0)) allneg = 0;
+                if (u < (int)sizeof per - 12) u += snprintf(per + u, sizeof per - u, " %.2f", t[nt]);
+                nt++;
+            }
+        double gain = ab_median(t, nt), mo = ab_median(off, nt), ma = ab_median(all, nt);
+        fprintf(stderr, "[abtest] VERDICT total ALL vs OFF: %s %.2f ms (per round:%s; union median OFF %.2f, ALL %.2f, %d rounds)\n",
+                !nt ? "UNMEASURED" : gain > 2 * noise && gain > 0.25 && allpos ? "SAVES"
+                    : gain < -2 * noise && allneg ? "WORSE" : "NO EFFECT",
+                gain, nt ? per : " none", mo, ma, nt);
+    }
+    {   // Knockout: the 10 largest savings.
+        double bsum = 0;
+        int bn = 0;
+        for (int i = 0; i < g_ab.nbase && i < kAbBaseMax; i++) if (g_ab.base[i].valid) { bsum += g_ab.base[i].med; bn++; }
+        double bavg = bn ? bsum / bn : 0;
+        int idx[kAbCandMax], ni = 0;
+        for (int i = 0; i < g_ab.nc; i++) if (g_ab.save_ok[i]) idx[ni++] = i;
+        for (int i = 0; i < ni; i++)
+            for (int j = i + 1; j < ni; j++)
+                if (g_ab.save[idx[j]] > g_ab.save[idx[i]]) { int tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp; }
+        fprintf(stderr, "[abtest] VERDICT knockout (mask 0, baseline union median %.2f ms): %d of %d candidates measured\n",
+                bavg, ni, g_ab.nc);
+        for (int k = 0; k < ni && k < 10; k++) {
+            int i = idx[k];
+            fprintf(stderr, "[abtest] VERDICT knockout #%d: key=%016llx %s compute=%d saves %.2f ms (%.0f %% of frame), %.1f draws/frame\n",
+                    k + 1, (unsigned long long)g_ab.cand[i].key, g_ab.cand[i].label, g_ab.cand[i].compute, g_ab.save[i],
+                    bavg > 0 ? 100.0 * g_ab.save[i] / bavg : 0.0,
+                    g_ab.census_frames ? (double)g_ab.cand[i].draws / (double)g_ab.census_frames : 0.0);
+        }
+    }
+    {   // Indirect-count draws over every optimisation window.
+        uint64_t calls = 0, enc = 0, real = 0, ends = 0;
+        for (int r = 0; r < kAbRounds; r++)
+            for (int c = 0; c < kAbCfgs; c++) {
+                calls += g_ab.opt[r][c].dc[6]; enc += g_ab.opt[r][c].dc[7]; real += g_ab.opt[r][c].dc[8];
+                ends += g_ab.opt[r][c].ends;
+            }
+        if (!calls || !ends)
+            fprintf(stderr, "[abtest] VERDICT indirect-count: no indirect-count draws in the measured frames\n");
+        else
+            fprintf(stderr, "[abtest] VERDICT indirect-count: %.1f calls, %.1f Metal draws encoded, %.1f asked for by the GPU "
+                    "counters per frame: indirect-count over-encoding %.0f %%\n", (double)calls / ends, (double)enc / ends,
+                    (double)real / ends, real ? 100.0 * ((double)enc - (double)real) / (double)real : 0.0);
+    }
+    ab_apply(final_mask);
+    fprintf(stderr, "[abtest] final mask %u:%s%s%s%s (kept for the session); the test took %.0f s\n", final_mask,
+            final_mask & 1u ? " producer-waits" : "", final_mask & 2u ? " clear-skip" : "", final_mask & 4u ? " eye-trim" : "",
+            final_mask ? "" : " none (legacy)", g_ab.t_start ? now - g_ab.t_start : 0.0);
+    g_ab.state = kAbDone;
+    ab_hud("TEST TERMINADO ✓ ya puedes salir y mandar los logs");
+    ab_hud_expire(now);
+}
+static void ab_fail(double now, const char *why) {
+    g_ab.state = kAbFailed;
+    fprintf(stderr, "[abtest] test not run: %s\n", why);
+    ab_hud("TEST no disponible (mira el log)");
+    ab_hud_expire(now);
+}
+
+// Game thread, every guest frame (kl_gpu_time_frame_end): `frame` is the frame just opened; timing = 0 while no
+// command buffer is timed (the -commit hook is not installed: KL_GPU_TIME=0, or no guest queue watched yet).
+static void ab_tick(uint32_t frame, int timing) {
+    if (!ab_env() || g_ab.state == kAbDone || g_ab.state == kAbFailed) return;
+    double now = CACurrentMediaTime();
+    if (!g_ab.t_first) g_ab.t_first = now;
+    if (!timing) {
+        // Nothing can be measured without GPU timing: give it 40 s (the guest's queue is watched at its first submit).
+        if (now - g_ab.t_first >= 40.0) {
+            const char *e = getenv("KL_GPU_TIME");
+            ab_fail(now, e && *e == '0' ? "GPU timing is off (KL_GPU_TIME=0)"
+                                        : "no GPU timing 40 s after the first frame (the guest's Metal queue was never watched)");
+        } else if (g_ab.state == kAbWait) {
+            double left = g_ab.t_first + 25.0 - now;
+            ab_hud("TEST: empieza en %d s · quédate quieto mirando al frente", left > 0 ? (int)ceil(left) : 0);
+        }
+        return;
+    }
+    unsigned loads = atomic_load(&g_ab_loads), shows = atomic_load(&g_ab_shows);
+    if (shows != g_ab.seen_shows) { g_ab.seen_shows = shows; g_ab.resume_at = now + 3.0; }
+    if (loads != g_ab.seen_loads) {
+        g_ab.seen_loads = loads;
+        if (ab_active() && !g_ab.paused) ab_pause();
+    }
+    int loading = atomic_load(&g_ab_loading);
+    // The newest final frame, fed once.
+    double uni = 0, ex = -1;
+    uint32_t f = ab_frame_metrics(&uni, &ex);
+    if (f && f > g_ab.last_fed) g_ab.last_fed = f;
+    else f = 0;
+    if (g_ab.state == kAbWait) {
+        double start = g_ab.t_first + 25.0;
+        if (g_ab.resume_at > start) start = g_ab.resume_at;
+        if (loading) { ab_hud("TEST en pausa (cargando)"); return; }
+        if (now < start || (g_prof > 0 && g_prof_from != UINT32_MAX)) {
+            int left = now < start ? (int)ceil(start - now) : 0;
+            ab_hud("TEST: empieza en %d s · quédate quieto mirando al frente", left);
+            return;
+        }
+        if (!ab_resolve()) {
+            ab_fail(now, "VPVulkan lacks patch 0038's switches (see the line above)");
+            return;
+        }
+        g_ab.t_start = now;
+        fprintf(stderr, "[abtest] starting %.1f s after the first frame\n", now - g_ab.t_first);
+        ab_census_begin(now);
+        return;
+    }
+    if (g_ab.paused) {
+        if (loading || now < g_ab.resume_at) { ab_hud("TEST en pausa (cargando)"); return; }
+        g_ab.paused = 0;
+        fprintf(stderr, "[abtest] resumed: the step is measured again from its start\n");
+        ab_step_begin(now);
+        return;
+    }
+    if (g_ab.state == kAbCensus) ab_census_tick(now);
+    else if (g_ab.state == kAbOpts) ab_opts_tick(now, frame, f, uni, ex);
+    else if (g_ab.state == kAbKnock) ab_knock_tick(now, frame, f, uni, ex);
+}
+
 unsigned kl_gpu_time_frame(void) { return g_commit ? g_frame : 0; }
 void kl_gpu_time_watch(void *mtl_queue) { watch(mtl_queue, 0); }
 void kl_gpu_time_watch_compositor(void *mtl_queue) { watch(mtl_queue, 1); }
@@ -1811,11 +2460,12 @@ void kl_gpu_time_frame_end(void) {
     uint32_t frame = g_frame;
     int on = g_commit != NULL;
     os_unfair_lock_unlock(&g_lk);
-    if (!on) return;
+    if (!on) { ab_tick(frame, 0); return; }   // KL_ABTEST: fails after 40 s without GPU timing instead of waiting forever
     if (g_prof > 0) {
         prof_report(frame);   // closes the active window once its frames are final
-        prof_tick(frame);     // opens the next due one
+        if (!ab_active()) prof_tick(frame);   // opens the next due one (not while the A/B test measures)
     }
+    ab_tick(frame, 1);        // KL_ABTEST: the automatic A/B test's state machine
     // Every few seconds: the finished frames' GPU time.
     static unsigned last_f, n;
     static double sum, csum, worst, since;

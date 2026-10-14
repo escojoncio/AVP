@@ -157,6 +157,13 @@ struct AVPSettingsView: View {
             Toggle(AVPL("Ojos al compositor sin copia", "Eyes to the compositor without a copy"), isOn: $s.eyeDirect)
             Toggle(AVPL("Occlusion culling medido (consultas de GPU)", "Measured occlusion culling (GPU queries)"), isOn: $s.occlusionQueries)
             Toggle(AVPL("Arranque anticipado del frame (CPU en paralelo con la GPU)", "Running start (CPU in parallel with the GPU)"), isOn: $s.runningStart)
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(AVPL("Test automático de rendimiento", "Automatic performance test"), isOn: $s.abTest)
+                Text(AVPL("Unos 2 minutos tras cargar, quieto en el menú; el HUD avisa cuando termina. Solo deja activo lo que mejora.",
+                          "About 2 minutes after loading, standing still in the menu; the HUD says when it is done. Only what helps stays on."))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
             Picker(AVPL("Frecuencia que se le dice al juego", "Refresh rate told to the game"), selection: $s.reportedHz) {
                 Text(AVPL("Automática (ritmo real)", "Automatic (the real pace)")).tag(AVPSettings.ReportedHz.measured)
                 Text(AVPL("Fija 50 Hz", "Fixed 50 Hz")).tag(AVPSettings.ReportedHz.fixed50)

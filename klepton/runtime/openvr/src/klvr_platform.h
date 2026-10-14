@@ -145,6 +145,10 @@ uint64_t klvr_plat_eye_image(int stage, int eye, uint32_t w, uint32_t h, int srg
 // copy into klvr_plat_eye_image's: 1 when done (no copy needed this submit), 0 when the platform cannot.
 int      klvr_plat_eye_publish_guest(int stage, int eye, uint64_t vk_image, int layer, uint32_t w, uint32_t h);
 void     klvr_plat_eye_unpublish_guest(int stage, int eye);   // this submit copies: the platform image is sampled again
+// Eye-copy trim (AVP's A/B test bit 2, or KL_EYE_TRIM=1): with foveation the useful picture of a w x h eye image is
+// only the rate map's physical area at its top-left, which is all the compositor reads. 1 with *tw x *th = the area
+// to copy (physical + a 2-texel bilinear margin, within w x h; the copy is then counted), 0 = copy everything.
+int      klvr_plat_eye_trim(uint32_t w, uint32_t h, uint32_t *tw, uint32_t *th);
 // The game's depth for one eye of a stage (KL_CP_DEPTH): an R32_SFLOAT VkImage the compositor samples, a
 // staging VkBuffer for the depth-aspect copy (host-visible; *mapped for a readback, may be NULL), and the depth
 // mapping the game rendered with (OpenVR row-major: clip.z = m22*z + m23, clip.w = -z). 0 / no-op if the

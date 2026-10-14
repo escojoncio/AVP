@@ -2760,8 +2760,10 @@ final class KleptonCompositor {
         // eye textures and the drawable are copied out (FrameCapture below).
         let guestLive = completeStage >= 0 && kl_ovrp_eye_layer_live() != 0
         if guestLive { capGuestFrames += 1 }
+        let capScheduledOK = FrameCapture.maxFrame <= 0 || capGuestFrames <= FrameCapture.maxFrame
         let capNow = guestLive && FrameCapture.enabled
-            && (FrameCapture.frames.contains(capGuestFrames) || capGuestFrames == overlayCapFrame || FrameCapture.takeManual())
+            && ((capScheduledOK && (FrameCapture.frames.contains(capGuestFrames) || capGuestFrames == overlayCapFrame))
+                || FrameCapture.takeManual())
         hudCount(rendered: rendered, haveRendered: haveRendered)
         loadingTick(originFromHead: originFromHead)
         for (di, drawable) in drawables.enumerated() {
@@ -2962,9 +2964,23 @@ final class KleptonCompositor {
     private var hudLastSerial: UInt64 = 0
     private var hudLine = "…"
     private var hudDepth: MTLDepthStencilState?
+    /// AVP's automatic A/B test (KL_ABTEST=1, kl_gpu_time.m kl_abtest_hud): its line, drawn under the FPS line in
+    /// yellow, and the HUD is shown for it even with «Mostrar FPS» off. nil when the test is off.
+    private var hudTestLine: String?
+    private var hudTestBuf = [CChar](repeating: 0, count: 256)
+    private var hudFpsShown = false   // whether the texture in hand carries the FPS line
 
     private func hudCount(rendered: kl_ovrp_render_pose, haveRendered: Bool) {
-        guard Self.fpsHudEnabled else { return }
+        // The test's line, every present (a lock and a copy): a new step shows at once, not at the next 0.5 s refresh.
+        // kl_abtest_hud says 0 when the test is off and 60 s after it ended.
+        let test: String? = kl_abtest_hud(&hudTestBuf, Int32(hudTestBuf.count)) != 0 ? String(cString: hudTestBuf) : nil
+        let fps = Self.fpsHudEnabled
+        guard fps || test != nil else {
+            if hudTestLine != nil { hudTestLine = nil; hudTex = nil }
+            return
+        }
+        var rebuild = test != hudTestLine || fps != hudFpsShown || hudTex == nil
+        hudTestLine = test
         hudPresents += 1
         if haveRendered, UInt64(rendered.serial) != hudLastSerial {
             hudLastSerial = UInt64(rendered.serial)
@@ -2978,12 +2994,19 @@ final class KleptonCompositor {
             hudLine = String(format: "Juego %.0f fps  Comp %.0f/s  %@  VPKTAA %@",
                              game, comp, res, !taaOut.isEmpty ? "on" : Self.reconOn ? "periferia" : "off")
             hudGuestFrames = 0; hudPresents = 0; hudWindowStart = Date()
-            hudTex = makeHudTexture(hudLine) ?? hudTex
+            rebuild = rebuild || fps   // the FPS figures changed
+        }
+        if rebuild {
+            hudFpsShown = fps
+            hudTex = makeHudTexture(fps ? hudLine : nil, test: test) ?? hudTex
         }
     }
 
-    private func makeHudTexture(_ text: String) -> MTLTexture? {
-        let w = 1024, h = 80
+    /// 1024x80 for one line (the FPS line, green, or the A/B test's alone, yellow); 1024x130 for both, the test's under
+    /// the FPS line. drawFpsHud sizes the quad from the texture's aspect.
+    private func makeHudTexture(_ text: String?, test: String? = nil) -> MTLTexture? {
+        guard text != nil || test != nil else { return nil }
+        let w = 1024, h = text != nil && test != nil ? 130 : 80
         guard let cs = CGColorSpace(name: CGColorSpace.sRGB),
               let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
                                   space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
@@ -2993,9 +3016,22 @@ final class KleptonCompositor {
         let attrs: [NSAttributedString.Key: Any] = [
             NSAttributedString.Key(kCTFontAttributeName as String): font,
             NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(red: 0.3, green: 1, blue: 0.4, alpha: 1)]
-        let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attrs))
-        ctx.textPosition = CGPoint(x: 16, y: 26)
-        CTLineDraw(line, ctx)
+        // CoreGraphics' origin is the bottom-left: the FPS line stays on top, the test's line goes below it.
+        if let text {
+            let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attrs))
+            ctx.textPosition = CGPoint(x: 16, y: h - 54)
+            CTLineDraw(line, ctx)
+        }
+        if let test {
+            // 22 pt: the longest test line (~66 characters) fits the 1024 px at Menlo's 0.6 em advance.
+            let small = CTFontCreateWithName("Menlo-Bold" as CFString, 22, nil)
+            let tattrs: [NSAttributedString.Key: Any] = [
+                NSAttributedString.Key(kCTFontAttributeName as String): small,
+                NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(red: 1, green: 0.85, blue: 0.2, alpha: 1)]
+            let tline = CTLineCreateWithAttributedString(NSAttributedString(string: test, attributes: tattrs))
+            ctx.textPosition = CGPoint(x: 16, y: text == nil ? 30 : 22)
+            CTLineDraw(tline, ctx)
+        }
         guard let data = ctx.data else { return nil }
         let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm_srgb, width: w, height: h,
                                                          mipmapped: false)
@@ -3008,14 +3044,15 @@ final class KleptonCompositor {
 
     private func drawFpsHud(_ enc: MTLRenderCommandEncoder, viewIndices: [Int],
                             drawable: LayerRenderer.Drawable, originFromHead: simd_float4x4) {
-        guard Self.fpsHudEnabled, let tex = hudTex, let pipe = overlayPipeline, let sampler else { return }
+        guard Self.fpsHudEnabled || hudTestLine != nil, let tex = hudTex, let pipe = overlayPipeline, let sampler else { return }
         var ov = kl_ovrp_overlay()
         ov.layer_id = -99
         ov.shape = 0
         ov.tex_w = Int32(tex.width); ov.tex_h = Int32(tex.height)
-        // Head-locked, 1 m ahead and a little below the line of sight; identity orientation.
+        // Head-locked, 1 m ahead and a little below the line of sight; identity orientation. 0.42 m wide, the height
+        // from the texture's aspect (1024x80: the old 0.033 m; taller with the A/B test's second line).
         ov.pose = (0, 0, 0, 1, 0, -0.22, -1.0)
-        ov.size = (0.42, 0.033)
+        ov.size = (0.42, 0.42 * Float(tex.height) / Float(max(1, tex.width)))
         ov.head_locked = 1
         ov.origin_top_left = 1
         var uniforms: [kl_overlay_uniforms] = []
@@ -6179,6 +6216,9 @@ final class LoadingVideoPlayer {
 // logs and returns; nothing here can stop a frame from presenting.
 enum FrameCapture {
     static let enabled: Bool = (getenv("KL_CAPTURE").map { String(cString: $0) } ?? "0") == "1"
+    /// KL_CAPTURE_MAX_FRAME=<n> (> 0): the scheduled and overlay captures only up to guest frame n (each stalls the
+    /// composite ~250 ms; AVP's A/B test sets 120 so none lands in its measurements). L3 + R3 still captures.
+    static let maxFrame: Int = getenv("KL_CAPTURE_MAX_FRAME").flatMap { Int(String(cString: $0)) } ?? 0
     // 2 and 30: the first guest frames (the full-view pink flash at immersive open).
     static let frames: Set<Int> = [2, 30, 120, 600, 1200, 2400, 3600]   // 2400/3600: in game (1200 fell on a fade)
     static let maxWidth = 1024
