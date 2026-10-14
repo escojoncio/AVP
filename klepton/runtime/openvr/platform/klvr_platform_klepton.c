@@ -656,6 +656,11 @@ void klvr_plat_controller(int hand, klvr_controller *out) {
     out->stick[1] = sy;
 }
 
+int klvr_plat_finger_curls(int hand, float curl[5]) {
+    if (host()) return 0;
+    return kl_ovrp_finger_curls(hand, curl);
+}
+
 void klvr_plat_haptic(int hand, float amplitude, float frequency, float seconds) {
     (void)frequency;
     if (host()) return;   // kl_ovrp's seam is amplitude and duration; see kl_ovrp.h

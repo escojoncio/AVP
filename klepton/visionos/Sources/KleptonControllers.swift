@@ -1655,6 +1655,68 @@ final class KleptonControllers {
         if fresh { NSLog("%@", msg) }
     }
 
+    // MARK: - Finger curls (AVP)
+
+    /// Finger curls as hand tracking sees them, 0 straight .. 1 fully bent (thumb, index, middle, ring,
+    /// pinky), published to kl_ovrp for the OpenVR shim's hand skeleton: the game animates the player's
+    /// fingers from the real hand, the way Valve's Index controllers do, even while a Sense controller
+    /// gives the pose and the buttons. Each finger's curl is the sum of its joint bend angles
+    /// (metacarpal→knuckle→intermediate base→intermediate tip→tip) against the open and closed sums.
+    /// nil when the skeleton or any joint of a finger is not tracked (the shim then keeps the buttons).
+    private func fingerCurls(_ anchor: HandAnchor) -> [Float]? {
+        guard let sk = anchor.handSkeleton else { return nil }
+        func pos(_ j: HandSkeleton.JointName) -> SIMD3<Float>? {
+            let joint = sk.joint(j)
+            guard joint.isTracked else { return nil }
+            let c = joint.anchorFromJointTransform.columns.3
+            return SIMD3<Float>(c.x, c.y, c.z)
+        }
+        // The bend summed along a chain of joints, in degrees.
+        func bend(_ chain: [HandSkeleton.JointName]) -> Float? {
+            var pts: [SIMD3<Float>] = []
+            for j in chain { guard let p = pos(j) else { return nil }; pts.append(p) }
+            var total: Float = 0
+            for i in 1..<(pts.count - 1) {
+                let a = simd_normalize(pts[i] - pts[i - 1]), b = simd_normalize(pts[i + 1] - pts[i])
+                let d = max(-1, min(1, simd_dot(a, b)))
+                total += acos(d) * 180 / .pi
+            }
+            return total
+        }
+        func curl(_ chain: [HandSkeleton.JointName], open: Float, closed: Float) -> Float? {
+            guard let b = bend(chain), b.isFinite else { return nil }
+            return max(0, min(1, (b - open) / (closed - open)))
+        }
+        guard let thumb = curl([.thumbKnuckle, .thumbIntermediateBase, .thumbIntermediateTip, .thumbTip], open: 15, closed: 95),
+              let index = curl([.indexFingerMetacarpal, .indexFingerKnuckle, .indexFingerIntermediateBase, .indexFingerIntermediateTip, .indexFingerTip], open: 20, closed: 210),
+              let middle = curl([.middleFingerMetacarpal, .middleFingerKnuckle, .middleFingerIntermediateBase, .middleFingerIntermediateTip, .middleFingerTip], open: 20, closed: 210),
+              let ring = curl([.ringFingerMetacarpal, .ringFingerKnuckle, .ringFingerIntermediateBase, .ringFingerIntermediateTip, .ringFingerTip], open: 20, closed: 210),
+              let pinky = curl([.littleFingerMetacarpal, .littleFingerKnuckle, .littleFingerIntermediateBase, .littleFingerIntermediateTip, .littleFingerTip], open: 20, closed: 210)
+        else { return nil }
+        return [thumb, index, middle, ring, pinky]
+    }
+
+    /// Hands seen (with a usable finger skeleton) per hand while a Sense controller gave the pose, and
+    /// update() calls with a controller: logged every 30 s so a run shows whether visionOS tracks the
+    /// fingers of a hand holding a controller at all.
+    private var fingerFrames: [Int] = [0, 0], fingerTracked: [Int] = [0, 0]
+    private var fingerReportAt: TimeInterval = 0
+
+    private func publishFingers(_ anchor: HandAnchor?, hand: Int, withSense: Bool, at t: TimeInterval) {
+        if withSense { fingerFrames[hand] += 1 }
+        if let anchor, let c = fingerCurls(anchor) {
+            if withSense { fingerTracked[hand] += 1 }
+            c.withUnsafeBufferPointer { kl_ovrp_set_finger_curls(Int32(hand), $0.baseAddress) }
+        }
+        if hand == 1 && t - fingerReportAt >= 30 {
+            fingerReportAt = t
+            if fingerFrames[0] + fingerFrames[1] > 0 {
+                NSLog("[input] fingers with a Sense controller in hand: left tracked %d/%d, right %d/%d",
+                      fingerTracked[0], fingerFrames[0], fingerTracked[1], fingerFrames[1])
+            }
+        }
+    }
+
     // MARK: - The seam
 
     /// The index trigger, from a pinch.
@@ -1698,6 +1760,10 @@ final class KleptonControllers {
     }
 
     /// The distance that reads as a fully released trigger. KL_PINCH_OPEN.
+    /// KL_HANDS_POSE=0 (AVP «Dedos reales»): hand tracking feeds the fingers only. A tracked hand never stands in
+    /// for a missing Sense controller (grip pose + pinch trigger), so a controller that loses tracking for a moment
+    /// cannot snap to the hand's pose or fire phantom trigger presses from fingers wrapped around its grip.
+    private static let handPose: Bool = klEnvOn("KL_HANDS_POSE", default: true)
     private static let pinchOpen: Float = envMetres("KL_PINCH_OPEN", 0.05)
     /// ...and the one that reads as fully pressed. KL_PINCH_CLOSED. Kept below
     /// `pinchOpen` whatever the environment says, because the two are divided.
@@ -1882,10 +1948,11 @@ final class KleptonControllers {
             lock.unlock()
 
             let accPose = sensePose(hand: hand, at: presentationTime)
+            publishFingers(hand == 0 ? leftHand : rightHand, hand: hand, withSense: accPose != nil, at: presentationTime)
             if let accPose {
                 st.position = accPose.0; st.orientation = accPose.1
                 st.linearVelocity = accPose.2; st.angularVelocity = accPose.3
-            } else if let anchor = (hand == 0 ? leftHand : rightHand) {
+            } else if Self.handPose, let anchor = (hand == 0 ? leftHand : rightHand) {
                 let (p, q) = gripPose(anchor, hand: hand)
                 st.position = p; st.orientation = q
                 // pollButtons() has already cleared this hand's bits (no Sense

@@ -3483,6 +3483,39 @@ void kl_ovrp_set_hand_motion(int hand, float px, float py, float pz,
     kl_ovrp_ctrl_trace("published", hand, e, pp);
 }
 
+// Finger curls from the frontend's hand tracking (AVP). Written by the compositor thread, read by
+// the guest's input thread: one word per float, plus a timestamp the reader checks for freshness.
+static int32_t g_curl[2][5];     // float bits
+static int64_t g_curl_at[2];     // double bits, CLOCK_UPTIME_RAW seconds
+static int     g_curl_seen[2];
+void kl_ovrp_set_finger_curls(int hand, const float curl[5]) {
+    if ((unsigned)hand > 1 || !curl) return;
+    for (int i = 0; i < 5; i++) {
+        float c = curl[i] < 0 ? 0 : curl[i] > 1 ? 1 : curl[i];
+        int32_t bits; memcpy(&bits, &c, sizeof bits);
+        __atomic_store_n(&g_curl[hand][i], bits, __ATOMIC_RELAXED);
+    }
+    double now = klovrp_mono_now();
+    int64_t nbits; memcpy(&nbits, &now, sizeof nbits);
+    __atomic_store_n(&g_curl_at[hand], nbits, __ATOMIC_RELEASE);
+    if (!g_curl_seen[hand]) {
+        g_curl_seen[hand] = 1;
+        fprintf(stderr, "  [input] hand %d: finger curls from hand tracking (thumb %.2f index %.2f middle %.2f ring %.2f pinky %.2f)\n",
+                hand, curl[0], curl[1], curl[2], curl[3], curl[4]);
+    }
+}
+int kl_ovrp_finger_curls(int hand, float out[5]) {
+    if ((unsigned)hand > 1 || !out) return 0;
+    int64_t nbits = __atomic_load_n(&g_curl_at[hand], __ATOMIC_ACQUIRE);
+    double at; memcpy(&at, &nbits, sizeof at);
+    if (at <= 0 || klovrp_mono_now() - at > 0.3) return 0;
+    for (int i = 0; i < 5; i++) {
+        int32_t bits = __atomic_load_n(&g_curl[hand][i], __ATOMIC_RELAXED);
+        memcpy(&out[i], &bits, sizeof bits);
+    }
+    return 1;
+}
+
     // ...and the pose-only form, which is what the macOS viewer publishes. It
 // differentiates rather than passing six zeros to the call above — zeros are the
 // claim that a moving controller is stationary (see klovrp_pose.motion_valid).

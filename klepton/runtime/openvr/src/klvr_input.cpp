@@ -529,6 +529,16 @@ void curls_from(const klvr_controller &c, float curl[5]) {
     curl[2] = curl[3] = curl[4] = g;
 }
 
+// The fingers the game animates: the headset's hand tracking when it sees the hand (what Index
+// controllers' finger sensing gives), the buttons otherwise. A pressed trigger / grip / button still
+// closes its finger at least as much as the buttons say, so a press never reads as an open hand.
+void curls_for(int hand, const klvr_controller &c, float curl[5]) {
+    curls_from(c, curl);
+    float tracked[5];
+    if (!klvr_plat_finger_curls(hand, tracked)) return;
+    for (int i = 0; i < 5; i++) curl[i] = std::max(curl[i], tracked[i]);
+}
+
 } // namespace
 
 void input_frame_begin(const Frame &) {}
@@ -933,7 +943,7 @@ vr::EVRInputError IVRInput__GetSkeletalBoneData(void *, vr::VRActionHandle_t h, 
     klvr_plat_controller(hand, &c);
     if (!c.connected) return vr::VRInputError_NoData;
     float curl[5];
-    curls_from(c, curl);
+    curls_for(hand, c, curl);
     vr::VRBoneTransform_t xf[kBoneCount];
     skel_pose(hand, curl, range, xf);
     to_space(space, xf);
@@ -950,7 +960,7 @@ vr::EVRInputError IVRInput__GetSkeletalSummaryData(void *, vr::VRActionHandle_t 
     klvr_controller c{};
     klvr_plat_controller(hand, &c);
     memset(out, 0, sizeof *out);
-    curls_from(c, out->flFingerCurl);
+    curls_for(hand, c, out->flFingerCurl);
     for (int i = 0; i < 4; i++) out->flFingerSplay[i] = 0.2f;
     return vr::VRInputError_None;
 }

@@ -45,6 +45,7 @@ void klvr_plat_hand(int hand, double t, klvr_tracked *out) {
 }
 
 void klvr_plat_controller(int hand, klvr_controller *out) { *out = klvr_null.ctl[hand & 1]; }
+int  klvr_plat_finger_curls(int hand, float curl[5]) { (void)hand; (void)curl; return 0; }
 
 void klvr_plat_haptic(int hand, float amplitude, float frequency, float seconds) {
     klvr_null.haptic_count[hand & 1]++;

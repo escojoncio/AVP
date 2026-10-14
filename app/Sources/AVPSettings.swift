@@ -53,6 +53,13 @@ final class AVPSettings: ObservableObject {
     @Published var gpuPassProfiling: Bool { didSet { save() } }
     @Published var movement: Movement { didSet { save() } }
     @Published var cloudSync: Bool { didSet { save() } }
+    /// Build 33: the player's fingers follow the headset's hand tracking (KL_HANDS=1, kl_ovrp_set_finger_curls →
+    /// the OpenVR skeleton), as Valve's Index controllers animate them; off = fingers from the buttons only and no
+    /// hand-tracking permission asked.
+    @Published var handFingers: Bool { didSet { save() } }
+    /// Build 33 test switch: VPKEngine vertex amplification (VPVK_AMPLIFY=1, one tiling for both eyes). Known broken
+    /// in B27/B28 (right eye shrunk, GPU fault in the overlay pass): only for a diagnostic run with captures.
+    @Published var amplifyTest: Bool { didSet { save() } }
 
     // Fixed since build 32 (they used to be settings; every validated value is now the only value):
     /// 12 command buffers in flight (build 24 orders them; 3 was the build-23 A/B test).
@@ -92,6 +99,8 @@ final class AVPSettings: ObservableObject {
         gpuPassProfiling = d.object(forKey: "avp.gpuPasses2") as? Bool ?? false
         movement = Movement(rawValue: d.object(forKey: "avp.movement") as? Int ?? 3) ?? .continuousHand
         cloudSync = d.object(forKey: "avp.cloudSync") as? Bool ?? true
+        handFingers = d.object(forKey: "avp.handFingers") as? Bool ?? true
+        amplifyTest = d.object(forKey: "avp.amplifyTest") as? Bool ?? false
         loading = false
     }
 
@@ -115,6 +124,8 @@ final class AVPSettings: ObservableObject {
         d.set(gpuPassProfiling, forKey: "avp.gpuPasses2")
         d.set(movement.rawValue, forKey: "avp.movement")
         d.set(cloudSync, forKey: "avp.cloudSync")
+        d.set(handFingers, forKey: "avp.handFingers")
+        d.set(amplifyTest, forKey: "avp.amplifyTest")
     }
 
     func resetToDefaults() {
@@ -128,7 +139,7 @@ final class AVPSettings: ObservableObject {
         vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
         anisotropy = fresh.anisotropy; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling
-        movement = fresh.movement; cloudSync = fresh.cloudSync
+        movement = fresh.movement; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplifyTest = fresh.amplifyTest
         AVPLog.log("Ajustes: valores por defecto")
     }
 
@@ -307,7 +318,10 @@ final class AVPSettings: ObservableObject {
             ("KL_CP_QUALITY", "0.40"),
             ("MVK_CONFIG_USE_MTLHEAP", "0"),
             ("KL_GUEST_BIGALLOC_MMAP", "1048576"),
-            ("KL_HANDS", "0"),
+            // Build 33: hand tracking on for the fingers (KleptonControllers.publishFingers); the Sense controllers
+            // keep the pose and the buttons.
+            ("KL_HANDS", handFingers ? "1" : "0"),
+            ("KL_HANDS_POSE", "0"),   // fingers only: a tracked hand never stands in for a Sense controller
             ("KL_MEM_TOTAL_MB", "16384"),
             ("KL_ALYX_NEWPLAYER_ARGS", "+hlvr_movetype_default \(movement.rawValue)"),
             ("KL_VK_FOZ_REPLAY", "\(p.pipelines.path):\(klfz.path)"),
@@ -328,12 +342,12 @@ final class AVPSettings: ObservableObject {
             ("KL_CP_RECON_SHARP", String(format: "%.2f", vpktaaSharpness)),
             ("VPVK_TEXTURE_CAP", String(textureCap)),
             ("KL_FPS_HUD", showFps ? "1" : "0"),
-            ("KL_CAPTURE", diagCaptures ? "1" : "0"),
+            ("KL_CAPTURE", (diagCaptures || amplifyTest) ? "1" : "0"),
             ("VP_FRAMES_IN_FLIGHT", String(Self.gpuQueueDepth)),
             ("KL_CP_SKIP_SAME", Self.composeNewOnly ? "1" : "0"),
             // Build 29: vertex amplification OFF (logs 20/2_6: the right eye was rasterized shrunk into a corner and the
-            // overlay pass faulted the GPU). Kept off whatever the stored setting says until it is fixed in VPKEngine.
-            ("VPVK_AMPLIFY", "0"),
+            // overlay pass faulted the GPU). Build 33: back as a diagnostic test switch (captures forced on with it).
+            ("VPVK_AMPLIFY", amplifyTest ? "1" : "0"),
             // Build 31: native half fetch back on, alone (B29 turned it off only because it shipped with amplification;
             // the translator's conversion is exact). Logs 22: the scene pass is vertex-bound (vtx 11 ms).
             ("VPVK_FETCH_NATIVE", "1"),
@@ -378,7 +392,7 @@ final class AVPSettings: ObservableObject {
         // Captures (eye pictures as PNG at guest frames 120/600/1200) and a per-pass dump of one in-game frame: always on
         // while VPKEngine's picture is being validated. Core frame 6000 is ~35 s after the first picture (frame 540 in
         // build 19, ~150 core frames per second); 600 fell inside the loading screen.
-        if diagCaptures, let logs = AVPFolder.shared.logs {
+        if diagCaptures || amplifyTest, let logs = AVPFolder.shared.logs {
             env += [("KL_CAPTURE_DIR", logs.path), ("VP_DUMP_FRAME", "6000"), ("VP_DUMP_DIR", logs.path)]
         }
         // GPU time per render pass ([passes] in the boot log, kl_gpu_time.m KL_GPU_PASSES), exclusive time grouped by
@@ -425,7 +439,8 @@ final class AVPSettings: ObservableObject {
                    + "\(Int(wideDegrees))°, periferia \(Int((periphery * 100).rounded())) %), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % "
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), FPS \(showFps), capturas \(diagCaptures), "
-                   + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao)")
+                   + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
+                   + "dedos por manos \(handFingers), amplificación (prueba) \(amplifyTest)")
         return env
     }
 

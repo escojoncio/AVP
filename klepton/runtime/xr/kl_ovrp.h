@@ -160,6 +160,12 @@ void kl_ovrp_host_recenter(void);
 void kl_ovrp_set_controller_input(int hand, uint32_t buttons, uint32_t touches,
                                   float index_trigger, float hand_trigger,
                                   float stick_x, float stick_y);
+// AVP: the fingers as the headset's hand tracking sees them, 0 = straight .. 1 = fully curled
+// (thumb, index, middle, ring, pinky), published once per frame while that hand is tracked. The
+// OpenVR shim's skeleton (klvr_plat_finger_curls) animates the game's hands with them, the way
+// Valve's Index controllers do; a hand not published for 0.3 s falls back to the buttons.
+void kl_ovrp_set_finger_curls(int hand, const float curl[5]);
+int  kl_ovrp_finger_curls(int hand, float out[5]);   // 1 when fresh
 
 // ---------------------------------------------------------------------------
 // Haptics: the one seam that runs OUT of the guest
