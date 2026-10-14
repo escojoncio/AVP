@@ -463,8 +463,8 @@ struct AVPPausedView: View {
                         Label(AVPL("Salir del juego", "Quit the game"), systemImage: "xmark.circle")
                     }
                     .buttonStyle(AVPPillButtonStyle(prominent: false))
-                    Text(AVPL("Al volver se aplican: forma del foveado (preset, zona nítida, periferia, transición), VPKTAA (intensidad y nitidez) y contador de FPS. Activar o desactivar el foveado, motor, resolución, texturas, anisotrópico e idioma se aplican al reiniciar el juego.",
-                              "Applied on return: foveation shape (preset, sharp zone, periphery, transition), VPKTAA (strength and sharpness) and the FPS counter. Turning foveation on or off, engine, resolution, textures, anisotropy and language apply on the next game start."))
+                    Text(AVPL("Al volver se aplican: calidad de los bordes del foveado, suavizado VPKTAA (intensidad y nitidez) y contador de FPS. Foveado sí/no, zona nítida, resolución, texturas, anisotrópico e idioma se aplican al reiniciar el juego.",
+                              "Applied on return: foveation edge quality, VPKTAA smoothing (strength and sharpness) and the FPS counter. Foveation on/off, sharp zone, resolution, textures, anisotropy and language apply on the next game start."))
                         .font(.caption).foregroundStyle(.tertiary)
                     Spacer()
                     AVPControllerPills(controllers: model.senseControllers)

@@ -21,11 +21,9 @@ struct AVPSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                resolution
-                textures
-                antialiasing
+                picture
                 foveationSection
-                display
+                textures
                 gameSection
                 diagnostics
                 certificateSection
@@ -45,30 +43,56 @@ struct AVPSettingsView: View {
         }
     }
 
-    private var resolution: some View {
+    // Build 32: one screen anyone can read. What a run showed to be the only sane value is no longer a setting
+    // (AVPSettings: gpuQueueDepth, composeNewOnly, guestHz, roundSharpZone, msaaOnTile; dynamic resolution, the
+    // texture pool, the M2/M5/custom foveation presets and the MoltenVK engine are gone).
+
+    private var picture: some View {
         Section {
             let eye = s.eyeSize
-            Stepper(AVPL("Resolución: \(Int(s.renderPercent)) % de la nativa (\(eye.width)×\(eye.height) por ojo)",
-                         "Resolution: \(Int(s.renderPercent)) % of native (\(eye.width)×\(eye.height) per eye)"),
+            Stepper(AVPL("Resolución: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) por ojo)",
+                         "Resolution: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) per eye)"),
                     value: $s.renderPercent, in: 50...130, step: 5)
-            Toggle(AVPL("Resolución dinámica", "Dynamic resolution"), isOn: $s.dynamicResolution)
-            if s.dynamicResolution {
-                Stepper(AVPL("Mínimo: \(pct(s.dynamicMin))", "Minimum: \(pct(s.dynamicMin))"), value: $s.dynamicMin, in: 0.5...1.0, step: 0.05)
-                Stepper(AVPL("Máximo: \(pct(s.dynamicMax))", "Maximum: \(pct(s.dynamicMax))"), value: $s.dynamicMax, in: 0.6...1.2, step: 0.05)
+            Toggle(AVPL("Mostrar FPS", "Show FPS"), isOn: $s.showFps)
+        } header: {
+            Text(AVPL("Imagen", "Picture"))
+        } footer: {
+            Text(AVPL("100 % = lo que pide el Vision Pro (3072×2464 por ojo). Menos resolución = más fluidez. El juego va a 50 fps cuando la GPU llega y a 33 cuando no; el visor siempre a 100 Hz. Al arrancar el juego.",
+                      "100 % = what Vision Pro asks for (3072×2464 per eye). Lower resolution = smoother. The game runs at 50 fps when the GPU keeps up and 33 when it does not; the headset always at 100 Hz. At game start."))
+        }
+    }
+
+    private var foveationSection: some View {
+        Section {
+            Toggle(AVPL("Foveado (centro nítido, bordes a menos resolución)", "Foveation (sharp centre, lower-resolution edges)"),
+                   isOn: $s.foveationOn)
+            if s.foveationOn {
+                Stepper(AVPL("Zona nítida: \(Int(s.wideDegrees))°", "Sharp zone: \(Int(s.wideDegrees))°"),
+                        value: $s.wideDegrees, in: 30...70, step: 5)
+                Stepper(AVPL("Calidad de los bordes: \(pct(s.periphery))", "Edge quality: \(pct(s.periphery))"),
+                        value: $s.periphery, in: AVPSettings.peripheryRange, step: 0.05)
+                Toggle(AVPL("Suavizar los bordes (VPKTAA)", "Smooth the edges (VPKTAA)"), isOn: $s.vpktaa)
+                if s.vpktaa {
+                    Stepper(AVPL("Intensidad: \(Int(s.vpktaaPercent)) %", "Strength: \(Int(s.vpktaaPercent)) %"),
+                            value: $s.vpktaaPercent, in: 0...100, step: 5)
+                    Stepper(AVPL("Nitidez: \(pct(s.vpktaaSharpness))", "Sharpness: \(pct(s.vpktaaSharpness))"),
+                            value: $s.vpktaaSharpness, in: 0...1, step: 0.05)
+                }
             }
         } header: {
-            Text(AVPL("Resolución", "Resolution"))
+            Text(AVPL("Foveado", "Foveation"))
         } footer: {
-            Text(AVPL("Nativa = lo que pide el Vision Pro (3072×2464 por ojo). 90 % es la configuración probada. Con resolución dinámica el juego baja la escala cuando no llega a tiempo.",
-                      "Native = what Vision Pro asks for (3072×2464 per eye). 90 % is the tested setting. With dynamic resolution the game lowers the scale when it runs late."))
+            Text(s.foveationOn
+                 ? AVPL("Zona nítida redonda (como en P.T.) a resolución completa, 10° por debajo de la mirada; fuera de ella los bordes se dibujan a la calidad elegida (10 % = máximo rendimiento; 65 % para un M5). La zona nítida y el foveado sí/no se aplican al arrancar; la calidad de los bordes y el suavizado, en vivo desde la pausa. El juego siempre usa MSAA 4x.",
+                        "Round sharp zone (as in P.T.) at full resolution, 10° below the gaze; outside it the edges are drawn at the chosen quality (10 % = most performance; 65 % for an M5). The sharp zone and foveation on/off apply at game start; edge quality and smoothing live from the pause menu. The game always uses 4x MSAA.")
+                 : AVPL("Sin foveado toda la imagen se dibuja a resolución completa: mucho más lento. Al arrancar el juego.",
+                        "Without foveation the whole picture is drawn at full resolution: much slower. At game start."))
         }
     }
 
     private var textures: some View {
-        Section(AVPL("Texturas", "Textures")) {
-            Stepper(AVPL("Memoria de texturas: \(s.texturePoolMB) MB", "Texture memory: \(s.texturePoolMB) MB"),
-                    value: $s.texturePoolMB, in: 1536...2816, step: 128)
-            Picker(AVPL("Tamaño máximo", "Maximum size"), selection: $s.textureCap) {
+        Section {
+            Picker(AVPL("Tamaño máximo de textura", "Maximum texture size"), selection: $s.textureCap) {
                 Text("1024").tag(1024)
                 Text("2048").tag(2048)
                 Text("4096").tag(4096)
@@ -78,78 +102,14 @@ struct AVPSettingsView: View {
                 Text("Off").tag(0); Text("x2").tag(2); Text("x4").tag(4); Text("x8").tag(8); Text("x16").tag(16)
             }
             .pickerStyle(.segmented)
-            if s.textureCap == 4096 {
-                Text(AVPL("4096 necesita más memoria de la que tiene el visor (~3,3 GB): puede haber texturas que aparecen tarde.",
-                          "4096 needs more memory than the headset has (~3.3 GB): textures may pop in late."))
-                    .font(.caption).foregroundStyle(.orange)
-            }
             Toggle(AVPL("Oclusión ambiental (SSAO)", "Ambient occlusion (SSAO)"), isOn: $s.ssao)
-        }
-    }
-
-    private var antialiasing: some View {
-        Section {
-            Toggle("VPKTAA", isOn: $s.vpktaa)
-            if s.vpktaa {
-                Stepper(AVPL("Intensidad: \(Int(s.vpktaaPercent)) %", "Strength: \(Int(s.vpktaaPercent)) %"),
-                        value: $s.vpktaaPercent, in: 0...100, step: 5)
-                Stepper(AVPL("Nitidez: \(pct(s.vpktaaSharpness))", "Sharpness: \(pct(s.vpktaaSharpness))"),
-                        value: $s.vpktaaSharpness, in: 0...1, step: 0.05)
-            }
         } header: {
-            Text(AVPL("Antialiasing", "Antialiasing"))
+            Text(AVPL("Texturas y efectos", "Textures and effects"))
         } footer: {
-            Text(s.foveation == .off
-                 ? AVPL("El juego usa MSAA 4x. VPKTAA solo actúa en la periferia foveada: con el foveado apagado no hace nada.",
-                        "The game uses 4x MSAA. VPKTAA only works on the foveated periphery: with foveation off it does nothing.")
-                 : AVPL("El juego usa MSAA 4x. VPKTAA suaviza solo la periferia foveada (los bloques del foveado); el centro queda intacto. Se aplica en vivo.",
-                        "The game uses 4x MSAA. VPKTAA smooths only the foveated periphery (the foveation blocks); the centre is untouched. Applied live."))
-        }
-    }
-
-    private var foveationSection: some View {
-        Section(AVPL("Foveado", "Foveation")) {
-            Picker(AVPL("Foveado", "Foveation"), selection: $s.foveation) {
-                Text(AVPL("Apagado", "Off")).tag(AVPSettings.Foveation.off)
-                Text("M2").tag(AVPSettings.Foveation.m2)
-                if AVPSettings.isM5 { Text("M5").tag(AVPSettings.Foveation.m5) }
-                Text(AVPL("Personalizado", "Custom")).tag(AVPSettings.Foveation.custom)
-            }
-            .pickerStyle(.segmented)
-            if s.foveation == .m2 || s.foveation == .m5 {
-                Stepper(AVPL("Calidad de la periferia: \(pct(s.presetPeriphery))", "Periphery quality: \(pct(s.presetPeriphery))"),
-                        value: Binding(get: { s.presetPeriphery }, set: { s.periphery = $0 }),
-                        in: AVPSettings.presetPeripheryRange, step: 0.05)
-                Stepper(AVPL("Zona nítida: \(Int(s.wideDegrees))°", "Sharp zone: \(Int(s.wideDegrees))°"),
-                        value: $s.wideDegrees, in: 30...70, step: 5)
-                Toggle(AVPL("Zona nítida redonda (como P.T.)", "Round sharp zone (like P.T.)"), isOn: $s.roundSharpZone)
-                Text(AVPL("Zona nítida redonda (como en P.T.) al 100 %, 10° por debajo del eje de mirada (60° es lo probado en P.T.; menos grados = más rendimiento; al arrancar el juego). La periferia va del 10 % (máximo rendimiento) al 65 % (para un M5) y se aplica en vivo. VPKTAA suaviza la periferia.",
-                          "Round sharp zone (as in P.T.) at 100 %, 10° below the straight-ahead axis (60° is what was tested in P.T.; fewer degrees = more performance; at game start). The periphery goes from 10 % (most performance) to 65 % (for an M5) and is applied live. VPKTAA smooths the periphery."))
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            if s.foveation == .custom {
-                Stepper(AVPL("Zona nítida: \(pct(s.sharpZone))", "Sharp zone: \(pct(s.sharpZone))"), value: $s.sharpZone, in: 0.05...0.6, step: 0.01)
-                Stepper(AVPL("Periferia: \(pct(s.periphery))", "Periphery: \(pct(s.periphery))"), value: $s.periphery, in: 0.1...1, step: 0.05)
-                Stepper(AVPL("Transición: \(pct(s.transition))", "Transition: \(pct(s.transition))"), value: $s.transition, in: 0.02...0.5, step: 0.02)
-            }
-        }
-    }
-
-    private var display: some View {
-        Section(AVPL("Pantalla", "Display")) {
-            Picker(AVPL("Frecuencia", "Refresh rate"), selection: $s.refreshHz) {
-                Text("90 Hz").tag(90)
-                Text("100 Hz").tag(100)
-            }
-            .pickerStyle(.segmented)
-            Toggle(AVPL("El juego dibuja a la mitad (\(s.refreshHz / 2) fps, más estable)", "Game renders at half rate (\(s.refreshHz / 2) fps, steadier)"),
-                   isOn: $s.halfRate)
-            Toggle(AVPL("Mostrar FPS", "Show FPS"), isOn: $s.showFps)
-            Toggle(AVPL("Componer solo imágenes nuevas (más rendimiento)", "Compose only new pictures (more performance)"),
-                   isOn: $s.composeNewOnly)
-            Text(AVPL("Si el juego no ha dibujado nada nuevo, visionOS reproyecta la última imagen en vez de recomponerla: deja más GPU al juego. Se aplica en vivo.",
-                      "When the game has drawn nothing new, visionOS reprojects the last picture instead of composing it again: more GPU for the game. Applied live."))
-                .font(.caption).foregroundStyle(.secondary)
+            Text(s.textureCap == 4096
+                 ? AVPL("4096 necesita más memoria de la que tiene el visor (~3,3 GB): puede haber texturas que aparecen tarde. 2048 es lo probado. Al arrancar el juego.",
+                        "4096 needs more memory than the headset has (~3.3 GB): textures may pop in late. 2048 is the tested value. At game start.")
+                 : AVPL("2048 es lo probado. Al arrancar el juego.", "2048 is the tested value. At game start."))
         }
     }
 
@@ -173,31 +133,9 @@ struct AVPSettingsView: View {
 
     private var diagnostics: some View {
         Section {
-            Picker(AVPL("Motor gráfico", "Graphics engine"), selection: $s.engine) {
-                Text("VPKEngine").tag(AVPSettings.Engine.vpkengine)
-                Text(AVPL("MoltenVK (diagnóstico)", "MoltenVK (diagnostic)")).tag(AVPSettings.Engine.moltenvk)
-            }
-            Group {   // keeps the section's direct children under SwiftUI's 10
-                Toggle(AVPL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $s.diagCaptures)
-                Toggle(AVPL("Medir GPU por pase (diagnóstico)", "Per-pass GPU timing (diagnostic)"), isOn: $s.gpuPassProfiling)
-                Toggle(AVPL("Orden de GPU por recursos (menos esperas)", "GPU ordering by resources (fewer waits)"), isOn: $s.trackedOrder)
-                Toggle(AVPL("MSAA resuelto en tile (menos ancho de banda)", "MSAA resolved on tile (less bandwidth)"), isOn: $s.msaaOnTile)
-            }
-            Text(AVPL("MSAA en tile: al arrancar el juego. Si la escena sale negra o corrupta, apágalo.",
-                      "MSAA on tile: at game start. If the scene comes out black or corrupt, turn it off."))
-                .font(.footnote).foregroundStyle(.secondary)
-            Text(AVPL("Orden por recursos: experimental, al arrancar el juego. Si ves geometría que explota, apágalo.",
-                      "Ordering by resources: experimental, at game start. If geometry explodes, turn it off."))
-                .font(.footnote).foregroundStyle(.secondary)
-            Picker(AVPL("Trabajo en cola para la GPU", "Work queued for the GPU"), selection: $s.gpuQueueDepth) {
-                Text(AVPL("12 (rápido)", "12 (fast)")).tag(12)
-                Text(AVPL("3 (prueba lenta; al arrancar el juego)", "3 (slow test; at game start)")).tag(3)
-            }
-            Text(AVPL("Con capturas activas, pulsa a la vez los dos sticks (L3 + R3) cuando veas un fallo: se guarda esa imagen "
-                      + "y los dos fotogramas siguientes pase a pase en Logs Alyx.",
-                      "With captures on, press both sticks (L3 + R3) together when you see a glitch: that picture and the frame "
-                      + "the next two frames pass by pass are saved in Logs Alyx."))
-                .font(.footnote).foregroundStyle(.secondary)
+            Toggle(AVPL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $s.diagCaptures)
+            Toggle(AVPL("Medir el tiempo de GPU por pase", "Per-pass GPU timing"), isOn: $s.gpuPassProfiling)
+            Toggle(AVPL("Orden de GPU por recursos", "GPU ordering by resources"), isOn: $s.trackedOrder)
             Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
                    role: .destructive) { confirmQuarantine = true }
                 .disabled(quarantined == 0)
@@ -215,12 +153,12 @@ struct AVPSettingsView: View {
                               "VPKEngine draws them again at the next launch. One that hangs the GPU again goes back into quarantine."))
                 }
                 .onAppear { quarantined = AVPPipelineCache.quarantineCount() }
-            Button(AVPL("Restablecer ajustes", "Reset settings"), role: .destructive) { s.resetToDefaults() }
+            Button(AVPL("Restablecer todos los ajustes", "Reset all settings"), role: .destructive) { s.resetToDefaults() }
         } header: {
-            Text(AVPL("Diagnóstico", "Diagnostics"))
+            Text(AVPL("Diagnóstico (solo si te lo piden)", "Diagnostics (only when asked)"))
         } footer: {
-            Text(AVPL("Todo se aplica al lanzar el juego, por encima de lo que diga el juego o Steam Cloud.",
-                      "Everything is applied when the game launches, over whatever the game or Steam Cloud says."))
+            Text(AVPL("Déjalo como está salvo que se te pida para un registro. Capturas: imágenes de los ojos y un volcado pase a pase en Logs Alyx; con ellas activas, L3 + R3 a la vez guarda el fallo que estés viendo. Medir GPU: escribe los tiempos en el registro, cuesta algo de rendimiento. Orden por recursos: menos esperas en la GPU; si ves geometría que explota, apágalo. Todo al arrancar el juego.",
+                      "Leave it as it is unless asked for a log. Captures: eye pictures and a pass-by-pass dump in Logs Alyx; with them on, L3 + R3 together saves the glitch you are seeing. GPU timing: writes the timings to the log, costs some performance. Ordering by resources: fewer GPU waits; if geometry explodes, turn it off. All at game start."))
         }
     }
 

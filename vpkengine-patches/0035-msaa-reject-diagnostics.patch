@@ -1,0 +1,149 @@
+From 53ab9c95f1d9c9e9c615d5cfac6af75390c1b7ba Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Wed, 14 Oct 2026 11:11:24 +0000
+Subject: [PATCH] Core: gpu.msaa rejected logs why an MSAA attachment stayed in
+ memory; VP_FRAME_DETAIL
+
+- frame_compiler: CompiledFrame::msaaRejects records every MSAA StoreAndResolve attachment the
+  resolve-on-tile option (0034) could not keep on tile, with the verdict and everything it was
+  decided on (dims, layers vs the pass's layerCount, mips, type, persistent/transient, load, which
+  encoders attach/read/use it, multi/sampled/elsewhere/badFetch).
+- device: the first 12 of a run, then those of one frame in every VP_FRAME_DETAIL (cap 120), logged as
+  gpu.msaa rejected ... why=<TileVerdict> ...
+- device: VP_FRAME_DETAIL=N logs gpu.enc (tile=/mem=) every N-th frame (setDetailEvery had no env).
+- Why: Logs 23 (AVP build 31): tile_local=0 tile_rejected=2 in every frame, the scene still
+  att=c0:CR:Persistent,d:CR:Persistent store_mb=58.4, and nothing in the log said which verdict.
+- tests: tile (the sampled-samples case checks the record).
+---
+ gpu/core/include/vpgpu/core/device.h         |  1 +
+ gpu/core/include/vpgpu/core/frame_compiler.h | 17 +++++++++++++
+ gpu/core/src/device.cpp                      | 25 ++++++++++++++++++++
+ gpu/core/src/frame_compiler.cpp              | 11 +++++++++
+ gpu/core/tests/core_tests.cpp                |  3 +++
+ 5 files changed, 57 insertions(+)
+
+diff --git a/gpu/core/include/vpgpu/core/device.h b/gpu/core/include/vpgpu/core/device.h
+index 8e0eaad..2a1d8d1 100644
+--- a/gpu/core/include/vpgpu/core/device.h
++++ b/gpu/core/include/vpgpu/core/device.h
+@@ -63,6 +63,7 @@ class Device {
+   PipelineCache pipelines_;
+   LogSink log_;
+   uint64_t frame_ = 0, detailEvery_ = 0;
++  uint32_t msaaRejectLogs_ = 0;  // gpu.msaa rejected lines written (capped)
+   uint64_t passEvery_ = 0, passNext_ = 0;
+   // Hold a frame (block the submit) while pipelines it draws with are still compiling, up to this
+   // many ms (env VP_HOLD_MS, default 1500; 0 = draw what is ready, the old behaviour). A held
+diff --git a/gpu/core/include/vpgpu/core/frame_compiler.h b/gpu/core/include/vpgpu/core/frame_compiler.h
+index 349abe5..c7a8c89 100644
+--- a/gpu/core/include/vpgpu/core/frame_compiler.h
++++ b/gpu/core/include/vpgpu/core/frame_compiler.h
+@@ -116,9 +116,26 @@ struct DrawRef {
+   auto operator<=>(const DrawRef&) const = default;
+ };
+ 
++// An MSAA attachment stored and resolved that CompileOptions::msaaResolveOnTile could not keep on
++// tile: why, and what the frame compiler saw of it (Device logs the first few as gpu.msaa).
++struct MsaaReject {
++  uint32_t encoder = 0;
++  uint8_t slot = 0;             // colour index, or kMaxColorAttachments for depth
++  TileVerdict why = TileVerdict::None;
++  TextureId texture;
++  uint32_t width = 0, height = 0;
++  uint16_t layers = 0, mips = 0, samples = 0, layerCount = 0, layer = 0;
++  uint8_t type = 0;             // TextureType
++  bool persistent = false, transient = false;
++  int firstRead = -1, lastUse = -1, attachedIn = -1;
++  bool multi = false, sampled = false, elsewhere = false, badFetch = false;
++  LoadAction load = LoadAction::DontCare;
++};
++
+ struct CompiledFrame {
+   std::vector<Encoder> encoders;
+   std::vector<Barrier> barriers;  // sorted by (encoder, item)
++  std::vector<MsaaReject> msaaRejects;  // MSAA attachments the resolve-on-tile option could not keep on tile
+   // Draws the backend must not execute: a pixel-local read that no colour attachment of their
+   // encoder serves (the shader would read garbage from [[color(n)]]). Sorted, unique.
+   std::vector<DrawRef> badDraws;
+diff --git a/gpu/core/src/device.cpp b/gpu/core/src/device.cpp
+index 198c9e3..9d2dfb1 100644
+--- a/gpu/core/src/device.cpp
++++ b/gpu/core/src/device.cpp
+@@ -21,6 +21,12 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
+   // memory every frame) instead of resolving from tile.
+   if (const char* e = std::getenv("VP_MSAA_TILE"); e && *e == '0') compileOptions_.msaaResolveOnTile = false;
+   log_(std::string("gpu.msaa resolve_on_tile=") + (compileOptions_.msaaResolveOnTile ? "1" : "0 (VP_MSAA_TILE=0)"));
++  // VP_FRAME_DETAIL=N: every N-th frame logs one gpu.enc line per encoder (attachments on tile, and why the
++  // others are not: mem=c0:SampledRead).
++  if (const char* e = std::getenv("VP_FRAME_DETAIL"); e && *e) {
++    detailEvery_ = std::strtoull(e, nullptr, 10);
++    if (detailEvery_) log_("gpu.detail armed every=" + std::to_string(detailEvery_));
++  }
+ }
+ 
+ BufferId Device::createBuffer(BufferDesc d) {
+@@ -121,6 +127,25 @@ FrameReport Device::submit(const Frame& frame) {
+   }
+   if (detailEvery_ && index % detailEvery_ == 0)
+     for (const std::string& line : formatEncoders(index, frame, compiled)) log_(line);
++  // MSAA attachments the resolve-on-tile option could not keep on tile: the first few of the run and then
++  // one frame in every VP_FRAME_DETAIL (the first rejects fall in the menu; the scene's matter), with
++  // everything the verdict was decided on (so a log says why, not just tile_rejected=N).
++  const bool detailFrame = detailEvery_ && index % detailEvery_ == 0;
++  for (const MsaaReject& r : compiled.msaaRejects) {
++    if (msaaRejectLogs_ >= 120 || (msaaRejectLogs_ >= 12 && !detailFrame)) break;
++    ++msaaRejectLogs_;
++    const std::string slot = r.slot == kDepthSlot ? "d" : "c" + std::to_string(r.slot);
++    char buf[320];
++    std::snprintf(buf, sizeof buf,
++                  "gpu.msaa rejected f=%llu enc=%u slot=%s why=%s tex=%u %ux%ux%u s%u mips=%u type=%u layer_count=%u layer=%u "
++                  "persistent=%d transient=%d load=%d attached_in=%d first_read=%d last_use=%d multi=%d sampled=%d "
++                  "elsewhere=%d bad_fetch=%d",
++                  (unsigned long long)index, r.encoder, slot.c_str(),
++                  toString(r.why), r.texture.index, r.width, r.height, r.layers, r.samples, r.mips, r.type, r.layerCount,
++                  r.layer, r.persistent ? 1 : 0, r.transient ? 1 : 0, int(r.load), r.attachedIn, r.firstRead, r.lastUse,
++                  r.multi ? 1 : 0, r.sampled ? 1 : 0, r.elsewhere ? 1 : 0, r.badFetch ? 1 : 0);
++    log_(buf);
++  }
+ 
+   // Per-pass timing (diagnostic): describe the encoders of the first frame with render work after
+   // each `passEvery_` boundary (VPVulkan alternates render frames with trivial compute submits).
+diff --git a/gpu/core/src/frame_compiler.cpp b/gpu/core/src/frame_compiler.cpp
+index 134ea03..0b4b787 100644
+--- a/gpu/core/src/frame_compiler.cpp
++++ b/gpu/core/src/frame_compiler.cpp
+@@ -609,6 +609,17 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
+         return;
+       }
+       if (v != TileVerdict::None && rejected.insert(k).second) ++out.stats.tileRejected;
++      if (msaaResolve && out.msaaRejects.size() < 8) {
++        MsaaReject r;
++        r.encoder = e, r.slot = uint8_t(slot), r.why = v, r.texture = a.texture;
++        r.width = d->width, r.height = d->height, r.layers = d->layers, r.mips = d->mips, r.samples = d->samples;
++        r.layerCount = enc.pass.layerCount, r.layer = a.layer, r.type = uint8_t(d->type);
++        r.persistent = d->persistent, r.transient = d->transient;
++        r.firstRead = u.firstRead, r.lastUse = u.last, r.attachedIn = u.encoder;
++        r.multi = u.multi, r.sampled = u.sampled, r.elsewhere = u.elsewhere, r.badFetch = u.badFetch;
++        r.load = a.load;
++        out.msaaRejects.push_back(r);
++      }
+       // Discarding contents something later in the frame reads would lose them (the classic broken
+       // G-buffer): store them anyway.
+       if (u.last > static_cast<int>(e) && (a.store == StoreAction::DontCare || a.store == StoreAction::Resolve)) {
+diff --git a/gpu/core/tests/core_tests.cpp b/gpu/core/tests/core_tests.cpp
+index acba13c..d4df6ff 100644
+--- a/gpu/core/tests/core_tests.cpp
++++ b/gpu/core/tests/core_tests.cpp
+@@ -617,6 +617,9 @@ void testTile() {
+       CHECK_EQ(cf.stats.tileLocal, 1u);  // depth only
+       CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::StoreAndResolve);
+       CHECK(cf.encoders[0].tile[0] == TileVerdict::SampledRead);
++      CHECK_EQ(cf.msaaRejects.size(), 1u);  // the colour, with why it stayed in memory
++      CHECK(cf.msaaRejects[0].why == TileVerdict::SampledRead && cf.msaaRejects[0].slot == 0 && cf.msaaRejects[0].sampled);
++      CHECK_EQ(cf.msaaRejects[0].samples, 4u);
+     }
+     {  // the samples read in a frame (submit) that does not render them: counted as a stale read
+       Frame f;
+-- 
+2.43.0
+
