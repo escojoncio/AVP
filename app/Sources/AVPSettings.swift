@@ -101,6 +101,10 @@ final class AVPSettings: ObservableObject {
         var env: String { self == .fixed50 ? "50" : self == .fixed90 ? "90" : "0" }
     }
     @Published var reportedHz: ReportedHz { didSet { save() } }
+    /// Build 45 (Logs_Alyx_34/2_12): the guest is released `lead` ms before its refresh so it builds the next frame on
+    /// the CPU while the GPU finishes the current one (SteamVR's running start). Off = the B44 pacing, where the GPU
+    /// idled ~5 ms at the start of every frame whatever the resolution (KL_GUEST_PACE_LEAD_MS).
+    @Published var runningStart: Bool { didSet { save() } }
 
     // Fixed since build 32 (they used to be settings; every validated value is now the only value):
     /// 12 command buffers in flight (build 24 orders them; 3 was the build-23 A/B test).
@@ -148,6 +152,7 @@ final class AVPSettings: ObservableObject {
         heightOffsetCm = d.object(forKey: "avp.heightCm") as? Double ?? 0
         occlusionQueries = d.object(forKey: "avp.occlusion") as? Bool ?? true
         reportedHz = ReportedHz(rawValue: d.object(forKey: "avp.reportHz") as? Int ?? 0) ?? .measured
+        runningStart = d.object(forKey: "avp.runStart") as? Bool ?? true
         subtitleSize = SubtitleSize(rawValue: d.object(forKey: "avp.subSize") as? Int ?? 0) ?? .small
         subtitleFoveation = d.object(forKey: "avp.subFov") as? Bool ?? true
         loading = false
@@ -181,6 +186,7 @@ final class AVPSettings: ObservableObject {
         d.set(heightOffsetCm, forKey: "avp.heightCm")
         d.set(occlusionQueries, forKey: "avp.occlusion")
         d.set(reportedHz.rawValue, forKey: "avp.reportHz")
+        d.set(runningStart, forKey: "avp.runStart")
         d.set(subtitleSize.rawValue, forKey: "avp.subSize")
         d.set(subtitleFoveation, forKey: "avp.subFov")
     }
@@ -199,6 +205,7 @@ final class AVPSettings: ObservableObject {
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
         postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; occlusionQueries = fresh.occlusionQueries
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
+        reportedHz = fresh.reportedHz; runningStart = fresh.runningStart
         AVPLog.log("Ajustes: valores por defecto")
     }
 
@@ -373,6 +380,7 @@ final class AVPSettings: ObservableObject {
             ("KLVR_EYE_SIZE", "\(eye.width),\(eye.height)"),
             ("KL_DISPLAY_HZ", String(Self.guestHz)),
             ("KL_GUEST_PACE_HZ", String(Self.guestHz / 2)),
+            ("KL_GUEST_PACE_LEAD_MS", runningStart ? "6" : "0"),
             // Klepton's encoder merging is MoltenVK's (MSAA scene chunks). VPKEngine merges same-target passes in its
             // own frame compiler, and now that its queue is watched those hooks would hold its encoders open across
             // its fences: off.
@@ -510,7 +518,7 @@ final class AVPSettings: ObservableObject {
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
-                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries), Hz al juego \(reportedHz)")
+                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart)")
         return env
     }
 
