@@ -130,6 +130,9 @@ void     klvr_plat_scene_fade(int to_grid);
 // governor holds a slower frame rate, so auto-fidelity budgets for that frame
 // (its vr_target_fps stays 60) and climbs back to top quality.
 float    klvr_plat_gpu_report_scale(void);
+// Build 44: the frame rates the pace governor plans with. *base = the full pace (panel / N), *current = the pace the
+// game is held at right now (the base, or the slower fallback). Returns 0 when there is no governor (a host run).
+int      klvr_plat_pace_hz(float *base, float *current);
 // Megabytes this process may still allocate before the system ends it (os_proc_available_memory), or -1 when
 // the platform cannot tell. KLVR_RAISE_MEM_TEST_MB stands in for it on a Mac test.
 int      klvr_plat_mem_free_mb(void);

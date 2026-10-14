@@ -60,6 +60,7 @@ int klvr_plat_gpu_ms_exclusive(void) { return 0; }
 void klvr_plat_frame_closed(void) {}
 void klvr_plat_scene_fade(int to_grid) { (void)to_grid; }
 float klvr_plat_gpu_report_scale(void) { return 1.0f; }
+int klvr_plat_pace_hz(float *base, float *current) { if (base) *base = 0; if (current) *current = 0; return 0; }
 int klvr_plat_mem_free_mb(void) { const char *e = getenv("KLVR_RAISE_MEM_TEST_MB"); return e && *e ? atoi(e) : -1; }
 void klvr_plat_async_frames(void) { klvr_null.async_frames = 1; }
 int klvr_plat_stage_count(void) { return klvr_null.stage_count; }

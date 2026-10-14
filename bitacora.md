@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0035).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B43).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B44).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -404,12 +404,30 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
    (`avp.reportHz` → `KLVR_REPORT_HZ_FIXED`, reinicio del juego). A/B directo de la cámara lenta.
 4. Revisión adversarial: 1 hallazgo corregido (la sonda movía la histéresis de `klvr_game_hz`).
 
-## Siguiente (al llegar el log de B43)
-1. KLTIME vs hora de consola: cociente juego/real a 50 fps estables. Si < 0,9: ver qué columna de `[openvr] clock`
-   coincide y corregir lo que se le reporta (Hz y/o `m_nNumFramePresents`); probar el resultado de las fijas 50/90.
-2. Si el reloj es correcto (≈1,0): el síntoma es latencia/cadencia, no tiempo → medir latencia de pose de mandos y
-   valorar síntesis del refresco intermedio (flujo óptico) para que 50 se sienta como 100.
-3. Luego: pasar el tiempo de presentación predicho al shim (pose rendida = pose registrada).
+## Logs_Alyx_32 / 3_2 / 2_11 (B43) — RESUELTO el "50 que no se siente a 50"
+- KLTIME demuestra el modelo de tiempo de Alyx: `FrameTime()` (tick del servidor) = 1/Hz reportado **al cargar el
+  mapa** y no cambia después (siguió 1/33 tras decirle 50); `Time()` avanza 1/Hz **actual** por frame renderizado.
+- Fija 90 a 50 fps → juego al 55 % (cámara lenta). Fija 50 → tiempo real ("se notaba bien"); a 33 (fallback) → 66 %.
+  Medida (B42 y 31): el mapa cargó con el regulador en 33 → tick a 33 Hz toda la sesión con imagen a 50 (la peor
+  sensación: manos/movimiento a saltos de 30 ms aunque el tiempo fuera real).
+- Panel 100 Hz medido → base 50 / fallback 33 (`pace_plan`: a 90 Hz sería 45 sin fallback). Pendiente mirar por qué
+  P.T./VisionQuestPro obtienen 90 Hz del sistema y AVP 100 (tipo de capa / formato de color): 45→90 costaría menos GPU.
+
+## B44 — cambios
+1. `klvr_game_hz` (`klvr_compositor.cpp`): Hz reportado = ritmo ACTUAL del regulador (`klvr_plat_pace_hz`: base 50 o
+   fallback 33, nuevo en `klvr_platform.h`/`_klepton.c`/`_null.c`), salvo mientras carga → base. Carga = grid de Source 2
+   mostrado (`g_grid_shown`, FadeGrid in/out; confiado 5 s de frames estables como máximo) o sin WaitGetPoses 0,5 s
+   (`g_last_wait_at`), con 1 s de retención tras reanudar. Log `[openvr] display frequency told to the game: X Hz (...)`
+   en cada cambio. Sin regulador (`KLVR_PACE_FALLBACK` no puesto: Mac) → medida suavizada como antes. Fijas 50/90 quedan
+   como prueba (`KLVR_REPORT_HZ_FIXED`). Ajuste renombrado «Automática (ritmo real)».
+2. Revisión adversarial: 3 hallazgos corregidos (ruta sin regulador inalcanzable, oscilación por tirones > 100 ms en
+   fallback, grid que nunca se apaga).
+
+## Siguiente (al llegar el log de B44)
+1. KLTIME: `ft=0.02000` en todos los mapas y `t` a 5 s/5 s reales también en tramos de fallback (allí Alyx debe
+   loguear `Refresh Rate: 33` y volver a 50). Contar cambios `told to the game`: deben coincidir con los del regulador.
+2. Sensación del usuario a 50 con tick 50: si sigue "lenta", pasar a latencia de pose de mandos y síntesis del refresco.
+3. Pasar el tiempo de presentación predicho al shim (pose rendida = pose registrada).
 
 ## Siguiente (al llegar el log de B41) — sustituido por lo anterior
 1. Confirmar sin parpadeo ni tirones con la copia de ojos (B40). Si siguieran: comparar con B36b (no los tenía).

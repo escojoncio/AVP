@@ -204,11 +204,24 @@ float klvr_plat_gpu_report_scale(void) {
     float s = (fb > 0 ? fb : base) / 60.0f;
     return s < 0.5f ? 0.5f : s > 1.0f ? 1.0f : s;
 }
+static int g_governor_on = -1;   // KLVR_PACE_FALLBACK, read by pace_governor on its first call
+int klvr_plat_pace_hz(float *base, float *current) {
+    // Only with the governor running: without it nothing holds the game at a plan rate, and the shim's
+    // measured rate (the behaviour before build 44) is the honest answer.
+    if (__atomic_load_n(&g_governor_on, __ATOMIC_RELAXED) != 1) return 0;
+    float b, fb;
+    pace_plan(&b, &fb);
+    if (!(b > 0)) return 0;
+    if (base) *base = b;
+    if (current) *current = (__atomic_load_n(&g_pace_extra, __ATOMIC_RELAXED) && fb > 0) ? fb : b;
+    return 1;
+}
 static void pace_governor(void) {
-    static int on = -1;
+    int on = __atomic_load_n(&g_governor_on, __ATOMIC_RELAXED);
     if (on < 0) {
         const char *e = getenv("KLVR_PACE_FALLBACK");
         on = e && *e == '1';
+        __atomic_store_n(&g_governor_on, on, __ATOMIC_RELAXED);
         if (on) fprintf(stderr, "  [openvr] pace governor: top quality at the slowest allowed pace, 60 when it fits\n");
     }
     if (!on) return;
