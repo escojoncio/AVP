@@ -83,7 +83,8 @@ final class AVPSettings: ObservableObject {
     /// the picture intact; the foveated passes' own version (KL_VRR_PHYS) broke the picture in build 29 and stays off.
     @Published var postPhysical: Bool { didSet { save() } }
     /// Build 37: the compositor samples the game's own eye image (KLVR_EYE_DIRECT=1, klvr_vk_submit.cpp) instead of
-    /// a copy of each eye into a platform image: 2 x 14.6 MB and ~0.6 ms of GPU per frame saved. Off = the copy.
+    /// a copy of each eye into a platform image. Build 40: OFF and refused by kl_vulkan when the game submits one
+    /// image for every stage (Alyx does: Logs_Alyx_28/29 flickered and juddered with it on). Kept for a game that cycles.
     @Published var eyeDirect: Bool { didSet { save() } }
     /// Build 38: player height offset in cm (negative = Alyx lower: for sitting down, or a floor origin that came out
     /// too low under the player). KLVR_HEIGHT_OFFSET, every tracked pose the game sees; live.
@@ -135,7 +136,7 @@ final class AVPSettings: ObservableObject {
         handFingers = d.object(forKey: "avp.handFingers") as? Bool ?? true
         amplify = d.object(forKey: "avp.amplify") as? Bool ?? true
         postPhysical = d.object(forKey: "avp.postPhys") as? Bool ?? false
-        eyeDirect = d.object(forKey: "avp.eyeDirect") as? Bool ?? true
+        eyeDirect = d.object(forKey: "avp.eyeDirect2") as? Bool ?? false   // build 40: OFF (Alyx renders into one image)
         heightOffsetCm = d.object(forKey: "avp.heightCm") as? Double ?? 0
         occlusionQueries = d.object(forKey: "avp.occlusion") as? Bool ?? true
         subtitleSize = SubtitleSize(rawValue: d.object(forKey: "avp.subSize") as? Int ?? 0) ?? .small
@@ -167,7 +168,7 @@ final class AVPSettings: ObservableObject {
         d.set(handFingers, forKey: "avp.handFingers")
         d.set(amplify, forKey: "avp.amplify")
         d.set(postPhysical, forKey: "avp.postPhys")
-        d.set(eyeDirect, forKey: "avp.eyeDirect")
+        d.set(eyeDirect, forKey: "avp.eyeDirect2")
         d.set(heightOffsetCm, forKey: "avp.heightCm")
         d.set(occlusionQueries, forKey: "avp.occlusion")
         d.set(subtitleSize.rawValue, forKey: "avp.subSize")
