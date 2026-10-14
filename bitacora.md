@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0035).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B35).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B36).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -239,16 +239,51 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
 3. Notificaciones en inmersivo: sin API en visionOS; solución = Modo de concentración con activación automática al
    abrir la app (Ajustes → Concentración → programar por app). Documentado al usuario, no en la app.
 
-## Pendiente de build (en main, sin IPA aún)
-- Doble ventana del launcher (también en StrikersVision): `KleptonApp.swift` → `Window(id:)` en vez de
-  `WindowGroup(id:)` para el launcher y "kbentry". `openWindow(id:)` sobre un WindowGroup crea otra instancia cada vez
-  (pausa + espacio perdido + fase .active podían abrir 2); sobre un `Window` trae la existente al frente.
+## Logs_Alyx 2_10 (B35) — medido
+- Subtítulos ROTOS (ojo izq. desplazado/doblado, dcho. cizallado): en `capture-3600-eyetex0/1` el subtítulo está
+  dibujado en coordenadas LÓGICAS (hasta x=747 de 1024, fuera del área física 1352x1308 = 64 %x76 % de la textura).
+  El juego lo dibuja en un pase propio tras el post: vista sRGB del ojo (`RGBA8sRGB 2112x1728x2 s1 att=c0:LS draws=1`,
+  frag 0,1 ms), SIN depth (`cc_vr_depth_test=0`); el hook solo foveaba MSAA y 1x CON depth → quad sin mapa sobre
+  imagen comprimida, y el compositor la desenrolla con el mapa. Convars sí aplicados (KLPERF `cc_vr_vertical_offset=6
+  cc_vr_font_size=2`); altura real ≈ 30–47 % desde arriba (justo sobre el centro, que está al 54 %).
+- Regulador: 50 → 33 a los 2 s de juego y nunca vuelve. Causa: `klvr_plat_gpu_ms` = UNIÓN de spans
+  `GPUStartTime→GPUEndTime` de los command buffers; en juego incluye esperas a buffers anteriores y turnos del
+  compositor: `[passes]` W5 unión 34 ms vs ocupado 17,4; W14 26 vs 13,5. Ocupado real escena 2: 13,5–16 ms (W7/W8/
+  W10/W14: cabían 50 fps) y 20–24 en zona densa (W11–W13). GPU ociosa dentro del span 29 ms/frame a 33 fps.
+- Pendiente de entender: command buffer del juego con 1 dispatch de compute a 100/s exactos (por refresco), 0,3–0,6 ms
+  excl (`gpu.excl type=1c9d9e5ec8c45b50`, `vk.submit ... dispatches=1`): 3–6 % de la GPU.
+- Blits ~1 ms/frame (x11, join/copias). Amplificación OK (vtx 2–7 ms). `gpu.excl busy_ms_per_s` 620–810 a 33 fps.
 
-## Siguiente (al llegar el log de B35)
-1. Regulador: contar cambios 50 ↔ 33 y tardíos en la base en escena 2; ajustar umbrales si hace falta.
-2. Subtítulos: confirmar altura/tamaño (AVPFORCE/KLPERF `cc_vr_vertical_offset=6`); afinar valores.
-3. Compositor: medir tiempo EXCLUSIVO (sample buffers en el pase de composición) y recortar `kl_reproject`
-   (vista ancha a la resolución de la periferia).
+## B36 — cambios
+1. Subtítulos: `kl_gpu_time.m` hook de foveado: también fovea pases de ojo 1x, 2 capas, formato sRGB, loadAction Load,
+   sin depth (`srgb1x`; log `[vrr] foveating a 1x layered pass without depth on the sRGB eye view (subtitles)`).
+   `KL_VRR_SRGB_1X=0` = comportamiento anterior (A/B). Los pases de post texel a texel usan la vista UNORM (f70).
+2. Tiempo de GPU EXCLUSIVO para el regulador:
+   - VPKEngine `0036`: en el completed handler, los timestamps de etapa de cada encoder (siempre muestreados) se
+     colocan en una línea de tiempo global y el exclusivo del command buffer se guarda en un anillo de 64 por puntero;
+     export `vpgpu_metal2_cb_busy_ms(cb, &ms)` (1 conocido / 0 nada muestreado / -1 no está; consume la entrada) y
+     `vpgpu_metal2_cb_busy_stats`. Independiente de `VP_EXCL_TIMING`.
+   - `kl_gpu_time.m`: `on_complete` recibe el command buffer; rol 0 → lookup en VPVulkan (dlsym vía
+     `dlopen(KL_MVK_DYLIB, RTLD_NOLOAD)` al primer commit del juego); rol 1 (compositor) → sample buffer propio
+     (`cx_*`: 4 timestamps por render encoder en el hook `kl_rce`, anillo 1024, línea de tiempo propia, calibración
+     ticks→ns como VPVulkan sin timebase + comprobación contra el span del buffer). `kl_gpu_time_frame_ms` devuelve el
+     exclusivo cuando TODOS los buffers del rol en el frame se contabilizaron, si no la unión; `kl_gpu_time_frame_exclusive()`
+     (bits rol 0/1, thread-local). Línea `[gputime]` cada 5 s amplía: `exclusive buffers game N (missed M), compositor
+     N (missed M); VPVulkan accounted N (unsampled N); compositor samples N resolved N bad N`. `KL_GPU_TIME_EXCL=0` = unión.
+   - Regulador (`klvr_platform_klepton.c`): con exclusivo, "tardío" = trabajo de GPU > presupuesto del frame (20 ms);
+     deja la base tras 2 s con media > 95 % o > 25 % tardíos; vuelve tras 3 s con media < 88 % y ≤ 5 % tardíos. Con
+     unión (sin VPVulkan) umbrales B35. Log cada 60 s `pace governor: at the base/fallback, GPU x ms (exclusive|union)`.
+   - Esperado: 50 fps en zonas con ocupado ≤ ~15 ms (+ compositor), 33 en densas. Si en el log sale `missed` > 0 en
+     el juego de forma sistemática, el orden de completed handlers no es el supuesto (VPVulkan antes que klepton):
+     entonces se queda en unión y hay que pasar el exclusivo por otra vía (acumulador global en vez de anillo).
+3. Launcher: `Window(id:)` para launcher y "kbentry" (ya en main desde B35, primera IPA con ello).
+
+## Siguiente (al llegar el log de B36)
+1. Confirmar `[vrr] ... (subtitles)` y subtítulos correctos en ambos ojos; afinar `cc_vr_vertical_offset` si la altura
+   no convence (6 ≈ justo sobre el centro).
+2. `[gputime]`: `missed 0` en juego y compositor, `calibrated ~1.0 ns per GPU tick`, sin `sample dropped`; regulador
+   `(exclusive)`; contar cambios 50↔33 y % de tiempo a 50.
+3. Compute de 100/s en la cola del juego (0,3–0,6 ms): identificar (¿klvr? ¿juego?) y quitar/limitar.
 4. Post foveado (tonemap + bloom al área física, con limpieza del área exterior): ~1,5 ms, riesgo medio.
 5. Streaming de texturas (`vkCopyMemoryToImageEXT` espera la GPU por región) → staging asíncrono.
 6. Hidden area mesh: comprobar que klvr devuelve malla para la lente del Vision Pro.

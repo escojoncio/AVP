@@ -28,6 +28,7 @@
 #include <string.h>
 #include <time.h>
 #include <mach/mach_time.h>
+#include <dlfcn.h>
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -47,6 +48,13 @@ typedef struct {
     uint32_t committed, completed;
     double busy[2];          // seconds of union GPU time so far, per role
     double last_end[2];      // end of the latest interval already counted, per role
+    // Build 36: EXCLUSIVE GPU time (seconds) of the frame's buffers, per role, from the encoders' stage-boundary
+    // timestamps (VPVulkan's for the guest, our own for the compositor): the union above holds every wait on an
+    // earlier buffer and the time the other queue had the GPU, which in play read twice the work (Logs_Alyx 2_10:
+    // union 34 ms against 17 ms busy) and kept the pace governor at the fallback. A frame with every buffer
+    // accounted this way reports the exclusive figure; one with a miss keeps the union (excl_miss > 0).
+    double excl[2];
+    uint32_t excl_n[2], excl_miss[2];
 } slot;
 
 static os_unfair_lock g_lk = OS_UNFAIR_LOCK_INIT;
@@ -63,7 +71,52 @@ static slot *slot_of(uint32_t f) {
     return s;
 }
 
-static void on_complete(uint32_t f, int role, double start, double end) {
+// ---- Exclusive GPU time per command buffer (build 36) --------------------------------------------------------------
+// The guest's: VPVulkan samples stage-boundary timestamps on every encoder it makes and, in its own completed handler
+// (added before ours: it adds it at submit, we add ours inside -commit), places them on one timeline and keeps each
+// buffer's exclusive ms in a ring (vpgpu_metal2_cb_busy_ms, consumed by the lookup). Resolved by name: a build
+// without it (MoltenVK) keeps the union. KL_GPU_TIME_EXCL=0 keeps the union too (A/B).
+static int (*g_vp_busy)(const void *, double *);
+static void (*g_vp_busy_stats)(uint64_t *, uint64_t *);
+static int g_excl_on = -1;
+static unsigned g_excl_hits[2], g_excl_misses[2];   // buffers accounted / not (per role), for the 5 s report
+static void excl_init(void) {
+    if (g_excl_on >= 0) return;
+    const char *e = getenv("KL_GPU_TIME_EXCL");
+    g_excl_on = !(e && *e == '0');
+    fprintf(stderr, "[gputime] exclusive GPU time per frame: %s\n",
+            g_excl_on ? "on (the compositor's from our sample buffers; the guest's once its driver's queue is seen)"
+                      : "off (KL_GPU_TIME_EXCL=0): span unions");
+}
+// The guest's driver is loaded after the compositor's queue is first watched, so its export is looked up at the first
+// commit on the guest's queue, not at init.
+static void excl_vp_resolve(void) {
+    static int tried;
+    if (tried || g_excl_on <= 0) return;
+    tried = 1;
+    // The driver was dlopen'ed RTLD_LOCAL (kl_vulkan.c): RTLD_NOLOAD on its path finds the loaded image.
+    const char *path = getenv("KL_MVK_DYLIB");
+    void *h = path && *path ? dlopen(path, RTLD_NOW | RTLD_NOLOAD) : NULL;
+    g_vp_busy = (int (*)(const void *, double *))dlsym(h ? h : RTLD_DEFAULT, "vpgpu_metal2_cb_busy_ms");
+    g_vp_busy_stats = (void (*)(uint64_t *, uint64_t *))dlsym(h ? h : RTLD_DEFAULT, "vpgpu_metal2_cb_busy_stats");
+    fprintf(stderr, "[gputime] the guest's exclusive GPU time: %s\n",
+            g_vp_busy ? "from VPVulkan's encoder timestamps (vpgpu_metal2_cb_busy_ms)" : "unavailable (no vpgpu_metal2_cb_busy_ms: the union stands)");
+}
+static double cx_resolve(void *cb, double span_ms);   // the compositor's buffers (below): exclusive ms, or -1
+
+static void on_complete(uint32_t f, int role, double start, double end, void *cb) {
+    double excl = -1;
+    if (g_excl_on > 0 && cb) {
+        if (role == 0 && g_vp_busy) {
+            double ms = 0;
+            int r = g_vp_busy(cb, &ms);
+            if (r == 1) excl = ms / 1e3;
+            else if (r == 0) excl = 0;   // completed with nothing sampled: an empty buffer
+        } else if (role == 1) {
+            double ms = cx_resolve(cb, (end - start) * 1e3);
+            if (ms >= 0) excl = ms / 1e3;
+        }
+    }
     os_unfair_lock_lock(&g_lk);
     slot *s = &g_slots[f % kRing];
     if (s->frame == f) {
@@ -72,6 +125,8 @@ static void on_complete(uint32_t f, int role, double start, double end) {
             if (end > from) s->busy[role] += end - from;
             if (end > s->last_end[role]) s->last_end[role] = end;
         }
+        if (excl >= 0) { s->excl[role] += excl; s->excl_n[role]++; g_excl_hits[role]++; }
+        else { s->excl_miss[role]++; if (g_excl_on > 0 && (role == 1 || g_vp_busy)) g_excl_misses[role]++; }
         s->completed++;
     }
     os_unfair_lock_unlock(&g_lk);
@@ -152,8 +207,10 @@ static void kl_commit(id self, SEL sel) {
     if (role >= 0) slot_of(f)->committed++;
     os_unfair_lock_unlock(&g_lk);
     if (role >= 0) {
+        excl_init();
+        if (role == 0) excl_vp_resolve();
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-            on_complete(f, role, done.GPUStartTime, done.GPUEndTime);
+            on_complete(f, role, done.GPUStartTime, done.GPUEndTime, (__bridge void *)done);
         }];
     }
     ((void (*)(id, SEL))g_commit)(self, sel);
@@ -1189,6 +1246,160 @@ static int g_merge_vis = -1;
 static void *g_vis_tex0, *g_vis_buf;
 static unsigned g_vis_given, g_vis_seen;
 
+// ---- The compositor's exclusive GPU time (build 36) ---------------------------------------------------------------
+// Every render encoder on the compositor's queue (role 1: the composite, the eye prep's FXAA/sharpen passes, the
+// panel clear) gets four stage-boundary timestamps in a sample buffer of our own, at the first free attachment index.
+// When its command buffer completes, the encoders are placed on one timeline and the buffer's exclusive time is what
+// they add past the latest end seen (the same rule as VPVulkan's and [passes]'), so a composite that ran alongside
+// the game's encoders is not charged the game's time. Its blit encoders (eye mips, captures) are not timed: a
+// compositor buffer without render encoders counts as 0. GPU ticks are calibrated against the CPU clock every 20 s.
+enum { kCxSamples = 1024, kCxCbs = 32, kCxPerCb = 24 };
+static id<MTLCounterSampleBuffer> g_cx_buf;
+static int g_cx_failed;                      // no sample buffer / no stage sampling: compositor stays on the union
+static unsigned g_cx_next;                   // next free sample index (a ring: 256 encoders in flight at most)
+static struct { void *cb; uint32_t idx[kCxPerCb]; int n, tainted; } g_cx_cbs[kCxCbs];   // tainted: an encoder went untimed
+static uint64_t g_cx_last_end;               // GPU ticks: the latest encoder end placed on the timeline
+static MTLTimestamp g_cx_cpu0, g_cx_gpu0;    // calibration: ticks -> ns
+static double g_cx_ns_per_tick, g_cx_cal_at;
+static unsigned g_cx_attached, g_cx_resolved, g_cx_bad;
+static os_unfair_lock g_cx_lk = OS_UNFAIR_LOCK_INIT;
+
+// The calibration pair: taken at creation, then the ratio from a second pair at least 1 s later, redone every 20 s.
+static void cx_calibrate(id<MTLDevice> dev) {
+    double now = CACurrentMediaTime();
+    MTLTimestamp cpu, gpu;
+    if (!g_cx_cal_at) { [dev sampleTimestamps:&g_cx_cpu0 gpuTimestamp:&g_cx_gpu0]; g_cx_cal_at = now; return; }
+    if (now - g_cx_cal_at < (g_cx_ns_per_tick > 0 ? 20.0 : 1.0)) return;
+    [dev sampleTimestamps:&cpu gpuTimestamp:&gpu];
+    // The CPU side is taken as ns, as VPVulkan's calibrate() does (its gpu.excl figures agree with [passes]); the
+    // [passes] window applies the mach timebase and then has to fall back to raw ns by a range check. cx_resolve
+    // checks the result against the buffer's own GPU span and drops the sample when the scale is off.
+    double cpu_ns = (double)(cpu - g_cx_cpu0);
+    if (gpu > g_cx_gpu0 && cpu_ns > 0) {
+        double r = cpu_ns / (double)(gpu - g_cx_gpu0);
+        if (g_cx_ns_per_tick <= 0)
+            fprintf(stderr, "[gputime] compositor timestamps calibrated: %.4f ns per GPU tick\n", r);
+        g_cx_ns_per_tick = r;
+    }
+    g_cx_cpu0 = cpu; g_cx_gpu0 = gpu; g_cx_cal_at = now;
+}
+// Attach our samples to a compositor render pass about to open; returns the attachment index used (or -1) and the
+// first of its 4 sample indices.
+static int cx_attach(id<MTLCommandBuffer> cb, MTLRenderPassDescriptor *d, unsigned *i0) {
+    if (g_cx_failed || g_excl_on <= 0) return -1;
+    int slot = 0;
+    while (slot < kProfSampleSlots && d.sampleBufferAttachments[slot].sampleBuffer) slot++;
+    os_unfair_lock_lock(&g_cx_lk);
+    if (!g_cx_buf) {
+        id<MTLDevice> dev = cb.device;
+        id<MTLCounterSet> ts = nil;
+        for (id<MTLCounterSet> c in dev.counterSets) if ([c.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = c;
+        if (!ts || ![dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+            g_cx_failed = 1;
+            fprintf(stderr, "[gputime] no stage-boundary timestamps: the compositor's GPU time stays the union\n");
+        } else {
+            MTLCounterSampleBufferDescriptor *bd = [MTLCounterSampleBufferDescriptor new];
+            bd.counterSet = ts; bd.storageMode = MTLStorageModeShared; bd.sampleCount = kCxSamples;
+            NSError *err = nil;
+            g_cx_buf = [dev newCounterSampleBufferWithDescriptor:bd error:&err];
+            if (!g_cx_buf) {
+                g_cx_failed = 1;
+                fprintf(stderr, "[gputime] no counter sample buffer for the compositor: %s\n", err.localizedDescription.UTF8String ?: "?");
+            } else cx_calibrate(dev);
+        }
+        if (g_cx_failed) { os_unfair_lock_unlock(&g_cx_lk); return -1; }
+    }
+    void *key = (__bridge void *)cb;
+    int e = -1, free_e = -1;
+    for (int i = 0; i < kCxCbs; i++) {
+        if (g_cx_cbs[i].cb == key) { e = i; break; }
+        if (!g_cx_cbs[i].cb && free_e < 0) free_e = i;
+    }
+    if (e < 0) {
+        if (free_e < 0) { os_unfair_lock_unlock(&g_cx_lk); return -1; }   // 32 compositor buffers in flight: never
+        e = free_e; g_cx_cbs[e].cb = key; g_cx_cbs[e].n = 0; g_cx_cbs[e].tainted = 0;
+    }
+    // An encoder this buffer cannot have timed (no free attachment index, 24 already): the buffer's figure would
+    // be an under-count presented as exclusive, so it is marked and reported as a miss (the union stands in).
+    if (slot == kProfSampleSlots || g_cx_cbs[e].n == kCxPerCb) { g_cx_cbs[e].tainted = 1; os_unfair_lock_unlock(&g_cx_lk); return -1; }
+    *i0 = g_cx_next;
+    g_cx_next = (g_cx_next + 4) % kCxSamples;
+    g_cx_cbs[e].idx[g_cx_cbs[e].n++] = *i0;
+    g_cx_attached++;
+    os_unfair_lock_unlock(&g_cx_lk);
+    MTLRenderPassSampleBufferAttachmentDescriptor *a = d.sampleBufferAttachments[slot];
+    a.sampleBuffer = g_cx_buf;
+    a.startOfVertexSampleIndex = *i0;
+    a.endOfVertexSampleIndex = *i0 + 1;
+    a.startOfFragmentSampleIndex = *i0 + 2;
+    a.endOfFragmentSampleIndex = *i0 + 3;
+    return slot;
+}
+// Metal would not open the encoder with our attachment: drop it (and the feature for the session) and let the caller retry.
+static void cx_detach(MTLRenderPassDescriptor *d, int slot, unsigned i0) {
+    d.sampleBufferAttachments[slot].sampleBuffer = nil;
+    os_unfair_lock_lock(&g_cx_lk);
+    for (int i = 0; i < kCxCbs; i++)
+        for (int j = 0; j < g_cx_cbs[i].n; j++)
+            if (g_cx_cbs[i].idx[j] == i0) { g_cx_cbs[i].idx[j] = g_cx_cbs[i].idx[--g_cx_cbs[i].n]; }
+    if (!g_cx_failed) {
+        g_cx_failed = 1;
+        fprintf(stderr, "[gputime] Metal refused a compositor encoder with our sample buffer: compositor GPU time stays the union\n");
+    }
+    os_unfair_lock_unlock(&g_cx_lk);
+}
+// Completed compositor buffer: its encoders' exclusive ms on the timeline; 0 for a buffer we timed nothing in,
+// -1 when a sample came back broken or the ticks are not calibrated yet (the union stands in).
+static double cx_resolve(void *cb, double span_ms) {
+    if (g_cx_failed) return -1;    // the union stands in for the whole session
+    if (!g_cx_buf) return 0;       // no render pass of the compositor's has opened yet: nothing to time
+    uint32_t idx[kCxPerCb];
+    int n = 0, tainted = 0;
+    os_unfair_lock_lock(&g_cx_lk);
+    for (int i = 0; i < kCxCbs; i++)
+        if (g_cx_cbs[i].cb == cb) {
+            n = g_cx_cbs[i].n; tainted = g_cx_cbs[i].tainted;
+            memcpy(idx, g_cx_cbs[i].idx, n * sizeof idx[0]);
+            g_cx_cbs[i].cb = NULL; g_cx_cbs[i].n = 0; g_cx_cbs[i].tainted = 0;
+            break;
+        }
+    os_unfair_lock_unlock(&g_cx_lk);
+    if (tainted) return -1;
+    if (!n) return 0;
+    double ms = 0;
+    os_unfair_lock_lock(&g_cx_lk);
+    cx_calibrate(g_cx_buf.device);
+    int ok = g_cx_ns_per_tick > 0;
+    for (int j = 0; j < n && ok; j++) {
+        MTLCounterResultTimestamp r[4];
+        @autoreleasepool {   // a completion handler's thread: the resolved NSData must not outlive this
+            NSData *part = [g_cx_buf resolveCounterRange:NSMakeRange(idx[j], 4)];
+            if (!part || part.length < sizeof r) { ok = 0; break; }
+            memcpy(r, part.bytes, sizeof r);
+        }
+        uint64_t v0 = r[0].timestamp, v1 = r[1].timestamp, f0 = r[2].timestamp, f1 = r[3].timestamp;
+        uint64_t start = v0 != MTLCounterErrorValue ? v0 : 0, end = f1 != MTLCounterErrorValue ? f1 : 0;
+        if (f0 != MTLCounterErrorValue && f0 && (!start || f0 < start)) start = f0;   // no vertex work
+        if (!end && v1 != MTLCounterErrorValue) end = v1;
+        if (!start || !end || end < start) { ok = 0; break; }
+        uint64_t from = start > g_cx_last_end ? start : g_cx_last_end;
+        if (end > from) ms += (double)(end - from) * g_cx_ns_per_tick / 1e6;
+        if (end > g_cx_last_end) g_cx_last_end = end;
+    }
+    // The scale check: a buffer's exclusive time cannot exceed its own GPU span by more than the overlap between
+    // its encoders allows (a little); far past it, the tick unit is wrong and the figure is dropped.
+    if (ok && span_ms > 0 && ms > 1.5 * span_ms + 0.5) {
+        static int said;
+        if (said++ < 3)
+            fprintf(stderr, "[gputime] compositor exclusive %.2f ms exceeds the buffer's span %.2f ms: tick scale %.4f looks wrong, sample dropped\n",
+                    ms, span_ms, g_cx_ns_per_tick);
+        ok = 0;
+    }
+    if (ok) g_cx_resolved++; else g_cx_bad++;
+    os_unfair_lock_unlock(&g_cx_lk);
+    return ok ? ms : -1;
+}
+
 static id kl_rce(id self, SEL sel, MTLRenderPassDescriptor *d) {
     if (g_merge > 0 && d) {
         if (g_merge_vis < 0) { const char *e = getenv("KL_VK_MERGE_VIS"); g_merge_vis = e && *e == '1';
@@ -1285,14 +1496,32 @@ static id kl_rce(id self, SEL sel, MTLRenderPassDescriptor *d) {
             int scene1x = dt && dt.width >= 1024 && d.renderTargetArrayLength == 2 &&   // two eyes, not a cascade
                           (dt.textureType == MTLTextureType2DArray || dt.textureType == MTLTextureType2DMultisampleArray) &&
                           (!ct || ct.pixelFormat != MTLPixelFormatRG16Float);
-            if (t && (t.sampleCount >= 4 || scene1x) && t.width >= 1024) {
-                static int said1x;
+            // Build 36: the VR subtitles (cc_vr_*) are one quad in a pass of their own after the post chain: the eye
+            // image's sRGB view, two layers, 1x, loaded, and NO depth attachment (cc_vr_depth_test 0). Left out, the
+            // quad was drawn in screen space over the foveated layout, which the compositor then unwarped (Logs_Alyx 2_10:
+            // left eye past the physical area, cut and doubled; right eye sheared). The texel-for-texel post passes
+            // (tonemap, bloom composite) write the UNORM view (fmt 70) or HDR formats; nothing draws 3D into the sRGB
+            // view without depth but this. KL_VRR_SRGB_1X=0 restores the old behaviour (A/B).
+            static int srgb1x_on = -1;
+            if (srgb1x_on < 0) { const char *e = getenv("KL_VRR_SRGB_1X"); srgb1x_on = !(e && *e == '0'); }
+            int srgb1x = srgb1x_on > 0 && !dt && ct && ct.sampleCount == 1 && ct.width >= 1024 && d.renderTargetArrayLength == 2 &&
+                         (ct.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB || ct.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB) &&
+                         d.colorAttachments[0].loadAction == MTLLoadActionLoad;
+            if (t && (t.sampleCount >= 4 || scene1x || srgb1x) && t.width >= 1024) {
+                static int said1x, saidSrgb;
                 if (scene1x && t.sampleCount < 4 && said1x < 4) {
                     said1x++;
                     fprintf(stderr, "[vrr] foveating a 1x layered pass with depth (overlays after the resolve): colour fmt %lu, "
                             "depth fmt %lu, %lux%lu x%lu, load %lu\n", ct ? (unsigned long)ct.pixelFormat : 0ul,
                             (unsigned long)dt.pixelFormat, (unsigned long)t.width, (unsigned long)t.height,
                             (unsigned long)d.renderTargetArrayLength, (unsigned long)d.colorAttachments[0].loadAction);
+                }
+                if (srgb1x && saidSrgb < 4) {
+                    saidSrgb++;
+                    fprintf(stderr, "[vrr] foveating a 1x layered pass without depth on the sRGB eye view (subtitles): "
+                            "colour fmt %lu, %lux%lu x%lu, store %lu (frame %u)\n", (unsigned long)ct.pixelFormat,
+                            (unsigned long)t.width, (unsigned long)t.height, (unsigned long)d.renderTargetArrayLength,
+                            (unsigned long)d.colorAttachments[0].storeAction, f);
                 }
                 NSUInteger layers = d.renderTargetArrayLength > 1 ? d.renderTargetArrayLength : 1;
                 NSUInteger w = d.renderTargetWidth ? d.renderTargetWidth : t.width;
@@ -1374,11 +1603,22 @@ static id kl_rce(id self, SEL sel, MTLRenderPassDescriptor *d) {
             }
         }
     }
+    // The compositor's passes (role 1): our timestamps for its exclusive GPU time (build 36).
+    int cx_slot = -1;
+    unsigned cx_i0 = 0;
+    if (d && g_excl_on > 0 && !g_cx_failed) {
+        int role; (void)prof_frame_of((id<MTLCommandBuffer>)self, &role);
+        if (role == 1) cx_slot = cx_attach((id<MTLCommandBuffer>)self, d, &cx_i0);
+    }
     ml_guard(d);
     id enc = ((id (*)(id, SEL, MTLRenderPassDescriptor *))g_rce)(self, sel, d);
     if (!enc && prof_slot >= 0) {   // no encoder with our sample buffer attached: drop it, and profiling, and retry
         d.sampleBufferAttachments[prof_slot].sampleBuffer = nil;
         prof_refused(prof_k, "render");
+        enc = ((id (*)(id, SEL, MTLRenderPassDescriptor *))g_rce)(self, sel, d);
+    }
+    if (!enc && cx_slot >= 0) {
+        cx_detach(d, cx_slot, cx_i0);
         enc = ((id (*)(id, SEL, MTLRenderPassDescriptor *))g_rce)(self, sel, d);
     }
     if (g_snap_at && !g_snap_done && enc && d) {
@@ -1477,7 +1717,8 @@ static void vrr_install(Class c) {
     }
     const char *e = getenv("KL_VRR_SPIKE");
     g_vrr_mode = !e || !*e ? 0 : !strncmp(e, "census", 6) ? 1 : !strncmp(e, "inject", 6) ? 2 : 0;
-    if (!g_vrr_mode && !g_prof && !g_merge && !g_snap_at && !g_vrr_on) return;
+    excl_init();   // the compositor's passes get our timestamps through the render-encoder hook below
+    if (!g_vrr_mode && !g_prof && !g_merge && !g_snap_at && !g_vrr_on && g_excl_on <= 0) return;
     if (!g_vrr_mode) { hook(c, @selector(renderCommandEncoderWithDescriptor:), (IMP)kl_rce, &g_rce); return; }
     if (g_vrr_mode == 2 && e[6] == ':') g_vrr_q = (float)atof(e + 7);
     const char *at = getenv("KL_VRR_SPIKE_AT");
@@ -1557,8 +1798,18 @@ void kl_gpu_time_frame_end(void) {
             time_t t = time(NULL);
             struct tm lt;
             localtime_r(&t, &lt);
+            unsigned h0, h1, m0, m1;
+            os_unfair_lock_lock(&g_lk);
+            h0 = g_excl_hits[0]; h1 = g_excl_hits[1]; m0 = g_excl_misses[0]; m1 = g_excl_misses[1];
+            g_excl_hits[0] = g_excl_hits[1] = g_excl_misses[0] = g_excl_misses[1] = 0;
+            os_unfair_lock_unlock(&g_lk);
+            uint64_t vcbs = 0, vuns = 0;
+            if (g_vp_busy_stats) g_vp_busy_stats(&vcbs, &vuns);
             fprintf(stderr, "[gputime] %02d:%02d:%02d GPU time per frame: game avg %.2f / worst %.2f ms, compositor avg "
-                    "%.2f ms, over %u frames\n", lt.tm_hour, lt.tm_min, lt.tm_sec, sum / n, worst, csum / n, n);
+                    "%.2f ms, over %u frames; exclusive buffers game %u (missed %u), compositor %u (missed %u); "
+                    "VPVulkan accounted %llu (unsampled %llu); compositor samples %u resolved %u bad %u\n",
+                    lt.tm_hour, lt.tm_min, lt.tm_sec, sum / n, worst, csum / n, n, h0, m0, h1, m1,
+                    (unsigned long long)vcbs, (unsigned long long)vuns, g_cx_attached, g_cx_resolved, g_cx_bad);
         }
         sum = csum = worst = 0; n = 0; since = now;
     }
@@ -1568,6 +1819,8 @@ void kl_gpu_time_frame_end(void) {
 // frame at least `frames_ago` closed frames back (0 = the frame closed most
 // recently, or the one before it while its buffers are still in flight).
 // Returns 0 with *frame = 0 when nothing is known.
+static __thread int g_excl_last;   // per thread: bit 0 = the guest figure this thread last got was exclusive, bit 1 = the compositor's
+int kl_gpu_time_frame_exclusive(void) { return g_excl_last; }
 float kl_gpu_time_frame_ms(unsigned frames_ago, float *compositor, unsigned *frame) {
     float ms = 0, cms = 0;
     unsigned got = 0;
@@ -1577,7 +1830,12 @@ float kl_gpu_time_frame_ms(unsigned frames_ago, float *compositor, unsigned *fra
         slot *s = &g_slots[f % kRing];
         if (s->frame != f) break;
         if (s->committed && s->completed == s->committed) {
-            ms = (float)(s->busy[0] * 1e3); cms = (float)(s->busy[1] * 1e3); got = f; break;
+            // Build 36: the exclusive figure when every buffer of the role was accounted, else the union.
+            int ex0 = s->excl_n[0] && !s->excl_miss[0], ex1 = s->excl_n[1] && !s->excl_miss[1];
+            ms = (float)((ex0 ? s->excl[0] : s->busy[0]) * 1e3);
+            cms = (float)((ex1 ? s->excl[1] : s->busy[1]) * 1e3);
+            g_excl_last = (ex0 ? 1 : 0) | (ex1 ? 2 : 0);
+            got = f; break;
         }
     }
     os_unfair_lock_unlock(&g_lk);

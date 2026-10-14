@@ -119,6 +119,8 @@ int      klvr_plat_presents(void);
 // frames_ago 0 is the newest frame whose GPU work has all completed. It feeds
 // Compositor_FrameTiming's GPU fields, which auto-fidelity reads.
 float    klvr_plat_gpu_ms(uint32_t frames_ago, float *compositor);
+// Whether that figure was the exclusive GPU time (bit 0: the guest's, bit 1: the compositor's) or a span union.
+int      klvr_plat_gpu_ms_exclusive(void);
 // The game has submitted both eyes: GPU work it issues from now on is the next frame's.
 void     klvr_plat_frame_closed(void);
 // The game asked for the grid (IVRCompositor::FadeGrid): to_grid = 1 fades it in (Source 2 does before a level
