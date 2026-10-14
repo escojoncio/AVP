@@ -178,6 +178,22 @@ typedef struct {
     // Texels per drawable pixel the sharp centre has (the render size over the native eye size): the thresholds
     // above are relative to it, so a lowered render resolution never pulls the centre into the reconstruction.
     float         recon_ref;
+    // ---- round sharp zone (P.T.'s inset circle; KleptonCompositor roundFovea) ----------------------------------
+    // A Metal rate map is separable, so the full-rate zone of the wide foveation map is the RECTANGLE holding the
+    // circle the user asked for. 1 = composite it round, as PTVisionPro does: inside a circle of radius
+    // `fov_radius` (a tangent, tan(degrees / 2)) around the point `fov_lift` (a tangent, up positive) on this
+    // eye's forward axis, measured in the guest's tangent plane (a true circle on the display), the eye picture
+    // as it is; outside it the "wide view" bound at fragment texture(4) — the same picture box-filtered once per
+    // guest frame to the periphery's density, slice `fov_slice` — with P.T.'s soft edge (the sharp picture faded
+    // out with a smoothstep over the outer `fov_fade` of the radius). kl_reproject_build leaves it off. Scalars
+    // for the layout reason the chroma block gives; the pad keeps the size a 16-byte multiple (288), which is what
+    // the MSL struct rounds to as an array element.
+    uint32_t      fov_on;
+    float         fov_lift;
+    float         fov_radius;
+    float         fov_fade;
+    uint32_t      fov_slice;
+    float         fov_pad[3];
 } kl_reproject_uniforms;
 
 // The blit's uniforms — buffer(0) of its FRAGMENT stage. It carried a bare

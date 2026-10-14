@@ -353,6 +353,13 @@ final class KleptonCompositor {
     private var depthDummy: MTLTexture?
     private var loggedGameDepth = false
     private var loggedRecon = false
+    /// Round sharp zone (roundFovea): the wide view's pipeline (kl_wide_v/kl_wide_f, rgba16F), its 2-slice texture
+    /// (one per eye) and what each slice was last built from, so it is built once per guest picture rather than per
+    /// composite.
+    private var widePipeline: MTLRenderPipelineState?
+    private var wideTex: MTLTexture?
+    private var wideKey: [String] = ["", ""]
+    private var loggedRound = ""
     /// Red, green, blue — one second each, off the wall clock. Deliberately
     /// full-intensity primaries: whatever tone mapping or colour management sits
     /// between the drawable and the display, these stay obviously themselves.
@@ -388,19 +395,27 @@ final class KleptonCompositor {
     // AVP build 26 — compose only new pictures (KL_CP_SKIP_SAME=1, app setting «Componer solo imágenes nuevas»).
     // Log 18: this loop re-composited the SAME guest picture at every panel refresh (100 Hz) while the game
     // made 20-33 fps: ~3 ms of GPU per composite, 7-19 ms per game frame taken from a GPU the game already
-    // fills (game 23-27 ms), which is what dropped it to 16-23 fps. With nothing new from the guest the frame
-    // is abandoned before any drawable is asked for (the bail paths' shape): visionOS keeps showing the last
-    // drawable, reprojected to the head by its own compositor, as for any app under the panel rate. The pose is
-    // still published every refresh (above the check), so the guest's pacing does not change. At most
-    // `skipMax` in a row (3: never under a quarter of the panel rate), so fades and a held guest still move.
+    // fills (game 23-27 ms), which is what dropped it to 16-23 fps. With nothing new from the guest the refresh
+    // is left to visionOS: it keeps showing the last drawable, reprojected to the head by its own compositor, as
+    // for any app under the panel rate. Build 27: WITHOUT querying a frame (skipRefreshIfSame; build 26 queried
+    // and abandoned one, and the next queryNextFrame aborted). The pose is still published once per refresh, so
+    // the guest's pacing does not change. At most `skipMax` in a row (3: never under a quarter of the panel
+    // rate), so fades and a held guest still move.
     nonisolated(unsafe) static var skipSameEnabled: Bool = (getenv("KL_CP_SKIP_SAME").map { String(cString: $0) } ?? "0") == "1"
     private static let skipMax: Int = {
-        if let e = getenv("KL_CP_SKIP_MAX"), let n = Int(String(cString: e)) { return max(1, min(5, n)) }
+        // Hard cap 3: never more than three refreshes in a row without a composite, whatever the environment says.
+        if let e = getenv("KL_CP_SKIP_MAX"), let n = Int(String(cString: e)) { return max(1, min(3, n)) }
         return 3
     }()
     private var lastPresentedPicture: UInt64 = 0   // pictureId of the last composite that showed a guest picture
     private var skippedInARow = 0                  // refreshes abandoned since the last composite
     private var skippedTotal = 0                   // for the liveness line
+    // Build 27: a skipped refresh queries NO frame (skipRefreshIfSame). Its instants come from the last frame that
+    // was queried (predictTiming) plus k display periods, and a refresh whose picture changed during the wait is
+    // handed to the normal path with its pose still owed to the guest.
+    private var lastRealInput: LayerRenderer.Clock.Instant?
+    private var lastRealPresentation: LayerRenderer.Clock.Instant?
+    private var owedRefresh: (input: LayerRenderer.Clock.Instant, presentation: LayerRenderer.Clock.Instant)?
     private static func pictureId(_ stage: Int, _ serial: UInt64) -> UInt64 {
         (UInt64(stage + 1) << 48) ^ serial
     }
@@ -990,6 +1005,13 @@ final class KleptonCompositor {
             amplification = device.supportsVertexAmplificationCount(2) ? 2 : 1
             desc.maxVertexAmplificationCount = amplification
             pipeline = try device.makeRenderPipelineState(descriptor: desc)
+            // The round sharp zone's wide view (kl_wide_f): its own small target, no depth, one slice per pass.
+            let wdesc = MTLRenderPipelineDescriptor()
+            wdesc.vertexFunction   = lib.makeFunction(name: "kl_wide_v")
+            wdesc.fragmentFunction = lib.makeFunction(name: "kl_wide_f")
+            wdesc.colorAttachments[0].pixelFormat = .rgba16Float
+            widePipeline = try? device.makeRenderPipelineState(descriptor: wdesc)
+            NSLog("[cp] wide-view pipeline (round sharp zone): " + (widePipeline == nil ? "FAILED — the composite stays rectangular" : "ready"))
             if Self.gameDepth {
                 // Same pass, the fragment that also writes [[depth(any)]]. Linked here so a failure says so once and
                 // the composite simply keeps the quad's depth.
@@ -2252,7 +2274,92 @@ final class KleptonCompositor {
         return out + (bad ? "  <-- the guest and the composite are on DIFFERENT textures" : "")
     }
 
+    /// Whether this refresh may be left to visionOS (skipSameEnabled): the setting, a guest picture already shown,
+    /// no loading panel or video of ours on screen, and under the `skipMax` cap.
+    private func skipAllowed() -> Bool {
+        Self.skipSameEnabled && !syncGuest && loggedFirstPicture && (loadingDone || !Self.loadingEnabled)
+            && kl_loadingvideo_active() == 0 && loadingVideo == nil
+            && lastPresentedPicture != 0 && skippedInARow < Self.skipMax
+    }
+
+    /// The guest's newest complete picture is the one the last composite showed.
+    private func pictureUnchanged() -> Bool {
+        let cs = Int(kl_ovrp_last_complete_stage())
+        guard cs >= 0 else { return false }
+        var r = kl_ovrp_render_pose()
+        let have = withUnsafeMutablePointer(to: &r) { kl_ovrp_stage_render_pose(Int32(cs), $0) != 0 }
+        return have && r.complete != 0 && Self.pictureId(cs, UInt64(r.serial)) == lastPresentedPicture
+    }
+
+    /// A refresh with nothing new to show, WITHOUT a Compositor Services frame (skipSameEnabled, build 27).
+    ///
+    /// Returns true when this refresh was handled here (the guest got its pose, nothing was queried); false sends
+    /// the caller down the normal path, which queries the next frame.
+    ///
+    /// Build 26 queried the frame, ran startUpdate/endUpdate, waited, published and then abandoned it: the NEXT
+    /// queryNextFrame aborted the process (SIGABRT "BUG IN CLIENT" in cp_layer_renderer.queryNextFrame, log 19) —
+    /// a frame that was queried and updated must be submitted. So a skipped refresh never touches the layer at all,
+    /// which is exactly what an app rendering under the panel rate does (visionOS shows and reprojects the last
+    /// drawable). Chosen over LayerRenderer.minimumFrameRepeatCount (applyFrameRepeat): that one repeats EVERY frame
+    /// a fixed number of times whether the guest has a new picture or not, it slows the frame cadence this loop's
+    /// publishes ride on (the guest pacer and the OpenVR shim's pace plan measure the panel rate from them,
+    /// kl_app.c guest_pace_wait / kl_guest_display_rate), and changing it mid-session is a Compositor Services path
+    /// nothing here has run.
+    ///
+    /// The guest still gets ONE pose per panel refresh, at the refresh's own input time: this refresh's instants are
+    /// the last real frame's (predictTiming) plus k display periods. If the guest finishes a picture during the wait,
+    /// the refresh is handed to the normal path with its publish owed (`owedRefresh`), so the picture goes out now
+    /// and the guest's count stays one per refresh either way.
+    private func skipRefreshIfSame() -> Bool {
+        guard skipAllowed(), displayPeriod > 0, let in0 = lastRealInput, let pr0 = lastRealPresentation,
+              pictureUnchanged() else { return false }
+        let k = Double(skippedInARow + 1)
+        let input = in0.advanced(by: .seconds(displayPeriod * k))
+        let presentation = pr0.advanced(by: .seconds(displayPeriod * k))
+        let clock = LayerRenderer.Clock()
+        // A base older than a period (a pause, a long hitch): the virtual refresh would be in the past. Resync on a
+        // real frame instead.
+        if input.advanced(by: .seconds(displayPeriod)) < clock.now { return false }
+        if clock.now < input { clock.wait(until: input) }
+        if !pictureUnchanged() {
+            owedRefresh = (input: input, presentation: presentation)
+            return false
+        }
+        updatePoses(at: LayerRenderer.Clock.Instant.epoch.duration(to: presentation).timeInterval)
+        kl_app_guest_publish()
+        skippedInARow += 1
+        skippedTotal += 1
+        return true
+    }
+
     private func renderFrame() -> Int {
+        // Compose only new pictures: a refresh with the same guest picture is left to visionOS before anything is
+        // queried (see skipRefreshIfSame for why it must be before).
+        owedRefresh = nil
+        if skipRefreshIfSame() { return 0 }
+
+        // Everything that can fail on OUR side is settled BEFORE the frame is queried: from queryNextFrame on, the
+        // frame must be submitted with a presented drawable (log 19: a queried, updated and abandoned frame aborts
+        // the next queryNextFrame). A missing pipeline is not one of these: encodeViews presents a cleared drawable
+        // without it.
+        cmdLock.lock()
+        let refused = queueRefused
+        queueRefused = false
+        cmdLock.unlock()
+        if refused, queueRebuilds < 64, let dev = queue?.device, let q = dev.makeCommandQueue() {
+            queueRebuilds += 1
+            if let old = queue { retiredQueues.append(old) }
+            q.label = "klepton.compositor.r\(queueRebuilds)"
+            queue = q
+            kl_gpu_time_watch_compositor(Unmanaged.passUnretained(q).toOpaque())
+            NSLog("[cp] queue replaced after a GPU error on the old one (n=\(queueRebuilds))")
+        }
+        guard let cmd = queue?.makeCommandBuffer() else {
+            bailNoPipeline += 1
+            Thread.sleep(forTimeInterval: 0.005)   // nothing was queried: do not spin
+            return 0
+        }
+
         guard let frame = layerRenderer.queryNextFrame() else { bailNoFrame += 1; return 0 }
         frame.startUpdate()
         frame.endUpdate()
@@ -2262,8 +2369,22 @@ final class KleptonCompositor {
         // pacing that replaces a free-running pump.
         let timing = frame.predictTiming()
         if let timing {
+            // A refresh skipRefreshIfSame left owed (the picture changed during its wait) and this frame is for a
+            // LATER refresh (its input time over half a period after the owed one): the owed refresh's pose goes to
+            // the guest now, so it still gets exactly one publish per panel refresh.
+            if let owed = owedRefresh, owed.input.duration(to: timing.optimalInputTime) > .seconds(displayPeriod * 0.5) {
+                if !syncGuest {
+                    updatePoses(at: LayerRenderer.Clock.Instant.epoch.duration(to: owed.presentation).timeInterval)
+                    kl_app_guest_publish()
+                }
+                skippedInARow += 1
+                skippedTotal += 1
+            }
+            lastRealInput = timing.optimalInputTime
+            lastRealPresentation = timing.presentationTime
             LayerRenderer.Clock().wait(until: timing.optimalInputTime)
         }
+        owedRefresh = nil
         // NOT `defer { frame.endSubmission() }`. Compositor Services treats
         // ending a submission that never presented a drawable as a client bug
         // and aborts the process:
@@ -2284,9 +2405,11 @@ final class KleptonCompositor {
         //     -> wait(optimalInputTime) -> queryDrawable -> startSubmission
         //     -> encode -> encodePresent -> commit -> endSubmission
         //
-        // startSubmission must NOT be called before queryDrawable: the two
-        // bail paths below would then abandon a submission they had already
-        // started, which Compositor Services aborts on.
+        // startSubmission must NOT be called before queryDrawable: the
+        // no-drawable bail below would then abandon a submission it had already
+        // started, which Compositor Services aborts on. (Build 27: that bail is
+        // the only one left after queryNextFrame; log 19 showed that even a
+        // queried-and-updated frame abandoned by US aborts the next query.)
 
         // Poses first, then the frame that uses them.
         if let timing {
@@ -2320,26 +2443,6 @@ final class KleptonCompositor {
             }
         }
 
-        // Nothing new from the guest since the last composite: abandon this refresh (see skipSameEnabled).
-        // Only once a guest picture has been shown and the loading panel is gone, and never more than
-        // skipMax refreshes in a row.
-        // Not while the loading video plays either: that skybox is ours and moves every refresh while the guest's
-        // serial stands still.
-        if Self.skipSameEnabled && !syncGuest && loggedFirstPicture && (loadingDone || !Self.loadingEnabled)
-            && kl_loadingvideo_active() == 0 && loadingVideo == nil
-            && lastPresentedPicture != 0 && skippedInARow < Self.skipMax {
-            let cs = Int(kl_ovrp_last_complete_stage())
-            if cs >= 0 {
-                var r = kl_ovrp_render_pose()
-                let have = withUnsafeMutablePointer(to: &r) { kl_ovrp_stage_render_pose(Int32(cs), $0) != 0 }
-                if have && r.complete != 0 && Self.pictureId(cs, UInt64(r.serial)) == lastPresentedPicture {
-                    skippedInARow += 1
-                    skippedTotal += 1
-                    return 0
-                }
-            }
-        }
-
         // ALL of them, not just the first. visionOS 26 hands out more than one
         // drawable while the render quality is moving between two resolutions —
         // the system crossfades them so the change is not visible — and a loop
@@ -2349,25 +2452,11 @@ final class KleptonCompositor {
         // queryDrawable() is deprecated in 26 in favour of this for the same
         // reason, and ALVR loops over the array likewise.
         let drawables = frame.queryDrawables()
+        // The one abandon left after queryNextFrame, and it is the SYSTEM's: no drawable to present into. Every
+        // failure of ours (queue, command buffer) was settled before the frame was queried.
         guard !drawables.isEmpty else { bailNoDrawable += 1; return 0 }
-        cmdLock.lock()
-        let refused = queueRefused
-        queueRefused = false
-        cmdLock.unlock()
-        if refused, queueRebuilds < 64, let dev = queue?.device, let q = dev.makeCommandQueue() {
-            queueRebuilds += 1
-            if let old = queue { retiredQueues.append(old) }
-            q.label = "klepton.compositor.r\(queueRebuilds)"
-            queue = q
-            kl_gpu_time_watch_compositor(Unmanaged.passUnretained(q).toOpaque())
-            NSLog("[cp] queue replaced after a GPU error on the old one (n=\(queueRebuilds))")
-        }
-        guard let cmd = queue?.makeCommandBuffer(), pipeline != nil, sampler != nil else {
-            bailNoPipeline += 1
-            return 0
-        }
-        // Everything above may abandon the frame; from here it will be
-        // presented, so the submission can be opened.
+        // From here the frame WILL be presented (a missing pipeline presents a cleared drawable: encodeViews), so
+        // the submission can be opened; endSubmission is reached on every path below, after encodePresent.
         frame.startSubmission()
         let main = drawables[0]
 
@@ -2811,11 +2900,31 @@ final class KleptonCompositor {
               let w = e.split(separator: ",").first.flatMap({ Float($0) }), w > 0 else { return 1 }
         return max(0.25, min(2, w / 3072))
     }()
+    /// Round sharp zone (build 27; kl_reproject.h `fov_on`): with the wide foveation map (the M2/M5 presets:
+    /// KL_VRR=1, KL_VRR_MAP=wide) the composite shows the full-rate picture inside P.T.'s circle (`roundDegrees`
+    /// across, 10 degrees below each eye's forward axis, as kl_gpu_time.m vrr_fov_map centres its rectangle) and the
+    /// wide view (the picture at the periphery's density, `roundEdge`) outside it. Set per launch and live by
+    /// AVPSettings; `roundDegrees` must be the map's (KL_VRR_WIDE_DEG, read once when the map is built), so the live
+    /// path never changes it. KL_CP_ROUND=0 turns it off (A/B).
+    private static func envStr(_ name: String) -> String? { getenv(name).map { String(cString: $0) } }
+    nonisolated(unsafe) static var roundFovea: Bool = (envStr("KL_CP_ROUND") ?? "1") != "0"
+        && envStr("KL_VRR") == "1" && envStr("KL_VRR_MAP") == "wide"
+    nonisolated(unsafe) static var roundDegrees: Float =
+        max(30, min(70, envStr("KL_VRR_WIDE_DEG").flatMap { Float($0) } ?? 60))
+    nonisolated(unsafe) static var roundEdge: Float =
+        max(0.05, min(1, envStr("KL_VRR_EDGE").flatMap { Float($0) } ?? 0.10))
+    /// `degrees` nil keeps the launch value (the map's sharp zone is not a live setting).
+    static func setRoundFovea(on: Bool, degrees: Float?, edge: Float) {
+        roundFovea = on && (envStr("KL_CP_ROUND") ?? "1") != "0"
+        if let degrees { roundDegrees = max(30, min(70, degrees)) }
+        roundEdge = max(0.05, min(1, edge))
+        NSLog("[cp] round sharp zone \(roundFovea ? "on" : "off"): \(Int(roundDegrees)) deg, periphery \(Int(roundEdge * 100)) %")
+    }
     static func setPeripheryRecon(on: Bool, percent: Float, sharpness: Float) {
         reconOn = on
         reconStrength = max(0, min(1, percent / 100))
         reconSharp = max(0, min(1, sharpness))
-        NSLog("[cp] periphery reconstruction \(on ? "on" : "off"): \(Int(percent)) %, sharpness \(sharpness)")
+        NSLog("%@", "[cp] periphery reconstruction \(on ? "on" : "off"): \(Int(percent)) %, sharpness \(sharpness)")
     }
     private var hudTex: MTLTexture?
     private var hudWindowStart = Date()
@@ -3354,7 +3463,7 @@ final class KleptonCompositor {
                 u.recon_ref = Self.reconRef
                 if !loggedRecon {
                     loggedRecon = true
-                    NSLog("[cp] periphery reconstruction active: \(Int(Self.reconStrength * 100)) %, sharpness \(Self.reconSharp) "
+                    NSLog("%@", "[cp] periphery reconstruction active: \(Int(Self.reconStrength * 100)) %, sharpness \(Self.reconSharp) "
                           + "(magnified eye texels only: none at >= 0.75 x the centre's \(Self.reconRef) texels/pixel, full at <= 0.45 x)")
                 }
             }
@@ -3621,6 +3730,40 @@ final class KleptonCompositor {
                     uniforms[n].grid_eye = 1
                 }
             }
+            // Round sharp zone (roundFovea, kl_reproject.h `fov_on`): P.T.'s circle over the wide view. Only on an eye
+            // Klepton foveated with its map (vrrGrid: the wide map's rectangle is what this rounds), in the real eye
+            // pass (no probe rung, no temporal VPKTAA output, whose picture is not the foveated one).
+            var wideBound: MTLTexture? = nil
+            if Self.roundFovea, vrrGrid, probePipeline == nil, taaOut.isEmpty, let gridBuf {
+                wideBound = buildWideView(viewIndices: viewIndices, uniforms: uniforms, bind0: bind0, bind1: bind1,
+                                          grid: gridBuf, gridVerts: gridVerts, stage: stage,
+                                          rendered: rendered, haveRendered: haveRendered)
+                if wideBound != nil {
+                    // The circle's centre 10 degrees below each eye's forward axis, as kl_gpu_time.m vrr_fov_map
+                    // centres the map's full-rate rectangle (tan 10 = 0.1763); its radius the launcher's sharp zone,
+                    // tan(degrees / 2), the rectangle's half side. Tangents up positive, like the quad's.
+                    let lift: Float = -0.1763
+                    let wanted = tanf(Self.roundDegrees * 0.5 * .pi / 180)
+                    for n in uniforms.indices where uniforms[n].visible != 0 {
+                        let t = uniforms[n].tangents     // left, right, up, down: what the guest rendered with
+                        // P.T.'s clamp (VrPlay::PrepareInsets): the circle stays inside the eye's own field.
+                        let radius = min(wanted, 0.98 * min(t.x, t.y), 0.98 * (t.z - lift), 0.98 * (lift + t.w))
+                        uniforms[n].fov_on = 1
+                        uniforms[n].fov_lift = lift
+                        uniforms[n].fov_radius = max(radius, 0.02)
+                        uniforms[n].fov_fade = 0.15      // P.T.: the fade, as a fraction of the circle's radius
+                        uniforms[n].fov_slice = UInt32(viewIndices[n])
+                    }
+                }
+            }
+            if let wt = wideTex {
+                let say = wideBound == nil ? "off" : "on: \(Int(Self.roundDegrees)) deg circle, wide view "
+                    + "\(wt.width)x\(wt.height) (\(Int(Self.roundEdge * 100)) % of \(bind0.width)x\(bind0.height))"
+                if say != loggedRound {
+                    loggedRound = say
+                    NSLog("%@", "[cp] round sharp zone " + say)
+                }
+            }
             // KL_CP_DEPTH: each view's copy of the game's depth for this stage (fragment textures 2 and 3, by the
             // view's amplification index, like the eye textures) and the mapping it was rendered with.
             var depthTex: [MTLTexture?] = [nil, nil]
@@ -3645,6 +3788,9 @@ final class KleptonCompositor {
             if let depthState { enc.setDepthStencilState(depthState) }
             enc.setFragmentTexture(bind0, index: 0)
             enc.setFragmentTexture(bind1, index: 1)
+            // The wide view (round sharp zone). Something of the declared type is bound even when it is off: the
+            // shader only reads it for a view with fov_on, but every argument a pipeline declares gets a texture.
+            enc.setFragmentTexture(wideBound ?? bind0, index: 4)
             if useDepth {
                 enc.setFragmentTexture(depthTex[0] ?? depthTex[1] ?? depthDummy, index: 2)
                 enc.setFragmentTexture(depthTex[1] ?? depthTex[0] ?? depthDummy, index: 3)
@@ -3674,6 +3820,85 @@ final class KleptonCompositor {
         // its menu correctly, which is an instrument contradicting the display.
         if visible > 0 { return visible }
         return panels > 0 ? viewIndices.count : 0
+    }
+
+    /// The round sharp zone's wide view: each visible eye's picture box-filtered to the periphery's density
+    /// (kl_wide_f) into one slice of `wideTex`, slice = the view's eye. Rebuilt only when what it was built from
+    /// changes (the guest picture, the texture, the grid, the size), so a composite of a picture already seen costs
+    /// nothing here. Encoded in a command buffer of its own, committed now: the composite's `cmd` is committed later
+    /// on the same queue, so this runs first, and Metal orders the composite's read of `wideTex` after these writes.
+    /// GL guests: it waits on the same guest fence as the composite (`taaWait`). Returns the texture, or nil when
+    /// it cannot be had (the composite then stays rectangular for this frame).
+    private func buildWideView(viewIndices: [Int], uniforms: [kl_reproject_uniforms],
+                               bind0: MTLTexture, bind1: MTLTexture, grid: MTLBuffer, gridVerts: Int,
+                               stage: Int, rendered: kl_ovrp_render_pose, haveRendered: Bool) -> MTLTexture? {
+        guard let pipe = widePipeline, let samp = sampler, let q = queue, gridVerts > 0 else { return nil }
+        // The periphery's density (the map's edge rate), at most half the eye's: the M5 presets go to 65 %, where
+        // the wide view would be most of an eye texture for a blur nobody sees.
+        let dens = max(0.05, min(0.5, Self.roundEdge))
+        let ww = max(16, Int((Float(bind0.width) * dens).rounded()))
+        let wh = max(16, Int((Float(bind0.height) * dens).rounded()))
+        // Bilinear taps per axis over a wide texel's footprint (1 / dens eye texels at full rate), each covering
+        // about two texels: 4 at 10 %, 2 at 25 %, 1 from 50 %.
+        let taps = UInt32(max(1, min(4, Int((0.5 / dens).rounded(.up)))))
+        if wideTex == nil || wideTex!.width != ww || wideTex!.height != wh {
+            let d = MTLTextureDescriptor()
+            d.textureType = .type2DArray
+            d.pixelFormat = .rgba16Float
+            d.width = ww
+            d.height = wh
+            d.arrayLength = 2
+            d.usage = [.renderTarget, .shaderRead]
+            d.storageMode = .private
+            wideTex = device.makeTexture(descriptor: d)
+            wideTex?.label = "klepton wide view"
+            wideKey = ["", ""]
+            if wideTex == nil { NSLog("[cp] the wide view (\(ww)x\(wh)x2) could not be allocated"); return nil }
+        }
+        guard let wt = wideTex else { return nil }
+        // What the guest picture is; with no frame record nothing identifies it, so it is rebuilt every time.
+        let picture = haveRendered ? String(Self.pictureId(stage, UInt64(rendered.serial))) : "?\(cmdCommitted)"
+        var wcmd: MTLCommandBuffer? = nil
+        for (n, vi) in viewIndices.enumerated() where vi >= 0 && vi < 2 && n < uniforms.count {
+            let u = uniforms[n]
+            guard u.visible != 0 else { continue }
+            let src = n == 0 ? bind0 : bind1
+            let key = "\(picture)|\(ObjectIdentifier(src).hashValue)|\(u.slice)|\(u.flip_y)|\(u.grid_eye)|"
+                + "\(ObjectIdentifier(grid).hashValue)|\(taps)"
+            if key == wideKey[vi] { continue }
+            if wcmd == nil {
+                wcmd = q.makeCommandBuffer()
+                wcmd?.label = "klepton wide view"
+                if let w = taaWait { wcmd?.encodeWaitForEvent(w.0, value: w.1) }
+            }
+            guard let c = wcmd else { return nil }
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = wt
+            pass.colorAttachments[0].slice = vi
+            pass.colorAttachments[0].loadAction = .dontCare   // the grid covers the whole target
+            pass.colorAttachments[0].storeAction = .store
+            guard let e = c.makeRenderCommandEncoder(descriptor: pass) else {
+                // Whatever was encoded still runs; nothing counts as built, so the next composite tries again.
+                wideKey = ["", ""]
+                c.commit()
+                return nil
+            }
+            e.label = "klepton wide view eye \(vi)"
+            let p: [UInt32] = [u.slice, u.flip_y, u.grid_eye, taps]   // KLWide in kl_reproject.c
+            e.setRenderPipelineState(pipe)
+            p.withUnsafeBytes { b in
+                e.setVertexBytes(b.baseAddress!, length: b.count, index: 0)
+                e.setFragmentBytes(b.baseAddress!, length: b.count, index: 0)
+            }
+            e.setVertexBuffer(grid, offset: 0, index: 1)
+            e.setFragmentTexture(src, index: 0)
+            e.setFragmentSamplerState(samp, index: 0)
+            e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: gridVerts)
+            e.endEncoding()
+            wideKey[vi] = key
+        }
+        wcmd?.commit()
+        return wt
     }
 
     /// The guest's PROJECTION layers, each as its own quad with its own frustum,
@@ -3770,6 +3995,7 @@ final class KleptonCompositor {
             enc.setRenderPipelineState(pipeline)
             enc.setFragmentTexture(bind0, index: 0)
             enc.setFragmentTexture(bind1, index: 1)
+            enc.setFragmentTexture(bind0, index: 4)   // the wide view's slot: unused here (fov_on 0), still bound
             enc.setFragmentSamplerState(sampler, index: 0)
             uniforms.withUnsafeBytes { buf in
                 enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
@@ -5335,7 +5561,8 @@ final class KleptonCompositor {
                 // KL_HZ_SETTLE=0 so the gate has a one-launch A/B.
                 break
             }
-            guard layerRenderer.state == .running,
+            // The command buffer first: nothing that can fail on our side may come after the frame is queried.
+            guard layerRenderer.state == .running, let pcmd = queue?.makeCommandBuffer(),
                   let frame = layerRenderer.queryNextFrame() else { break }
             frame.startUpdate()
             frame.endUpdate()
@@ -5405,7 +5632,8 @@ final class KleptonCompositor {
             }
             // Every drawable the frame carries, not just the one measured from:
             // a frame that leaves one unpresented is a frame half-written.
-            for d in all { clearAndPresent(d) }
+            for d in all { clearAndPresent(d, cmd: pcmd) }
+            pcmd.commit()
             // Only after a drawable was actually presented: ending a
             // submission on the no-drawable path is an abort.
             frame.endSubmission()
@@ -5483,8 +5711,9 @@ final class KleptonCompositor {
     /// A drawable with nothing in it. The priming frames are shown to the user,
     /// so they have to be *something*; an unwritten drawable is whatever was in
     /// that texture last.
-    private func clearAndPresent(_ drawable: LayerRenderer.Drawable) {
-        guard let cmd = queue?.makeCommandBuffer() else { return }
+    /// `cmd` is made by the caller BEFORE the frame is queried (build 27): a drawable that cannot be presented after
+    /// startSubmission would end the submission unpresented, which Compositor Services aborts on.
+    private func clearAndPresent(_ drawable: LayerRenderer.Drawable, cmd: MTLCommandBuffer) {
         for view in drawable.views {
             let map = view.textureMap
             let pass = MTLRenderPassDescriptor()
@@ -5496,7 +5725,6 @@ final class KleptonCompositor {
             cmd.makeRenderCommandEncoder(descriptor: pass)?.endEncoding()
         }
         drawable.encodePresent(commandBuffer: cmd)
-        cmd.commit()
     }
 
     /// The measurement that says whether any of this is doing anything.

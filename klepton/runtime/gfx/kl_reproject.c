@@ -200,6 +200,12 @@ static const char kl_msl_reproject[] =
 "    float    reconStrength;\n"
 "    float    reconSharp;\n"
 "    float    reconRef;   // the centre's texels per pixel; thresholds are relative to it\n"
+"    uint     fovOn;      // round sharp zone (kl_reproject.h): P.T.'s inset circle\n"
+"    float    fovLift;    // the circle's centre, a tangent above the forward axis (negative = below)\n"
+"    float    fovRadius;  // its radius, a tangent\n"
+"    float    fovFade;    // the soft edge, a fraction of the radius\n"
+"    uint     fovSlice;   // the wide view's slice for this eye (texture(4))\n"
+"    float    fovPad[3];\n"
 "};\n"
 "\n"
 // The sRGB EOTF, piecewise as the spec has it rather than a 2.2 power. The
@@ -252,7 +258,10 @@ static const char kl_msl_reproject[] =
 // along its ray), and the game's depth mapping. Flat for the reason `slice` is.
 "              float3 qpos; float qdepth [[flat]]; float4 zrow [[flat]];\n"
 "              float4 wrow [[flat]]; float2 dmap [[flat]]; uint depthOn [[flat]];\n"
-"              uint reconOn [[flat]]; float3 reconK [[flat]]; };\n"
+"              uint reconOn [[flat]]; float3 reconK [[flat]];\n"
+// The round sharp zone: this pixel's point in the guest's tangent plane (x right, y up; linear on the quad, so the
+// interpolation is exact), its place in the wide view (top-down rows), and the circle (lift, radius, fade, slice).
+"              float2 ftan; float2 wuv; uint fovOn [[flat]]; float4 fovP [[flat]]; };\n"
 "\n"
 // One place, so a rung of the probe ladder cannot disagree with the real pass
 // about which eye it is looking at — which is the failure this whole file keeps
@@ -332,15 +341,60 @@ static const char kl_msl_reproject[] =
 "\n"
 // The eye sample the composite takes: the plain one, or the reconstruction where it applies. `mag` is measured
 // HERE, outside the per-texture branch, so the derivatives are taken in uniform control flow.
-"static float4 kl_eye_sample_main(texture2d_array<float> t0, texture2d_array<float> t1, sampler samp,\n"
-"                                 float2 uv, uint slice, uint srgbDecode, uint src, uint reconOn, float3 k)\n"
+// `fw` is fwidth(uv), taken by the caller in uniform control flow (the round path below samples in a branch).
+"static float4 kl_eye_sample_fw(texture2d_array<float> t0, texture2d_array<float> t1, sampler samp,\n"
+"                               float2 uv, uint slice, uint srgbDecode, uint src, uint reconOn, float3 k, float2 fw)\n"
 "{\n"
-"    float2 dt = fwidth(uv) * (src == 0u ? float2(float(t0.get_width()), float(t0.get_height()))\n"
-"                                        : float2(float(t1.get_width()), float(t1.get_height())));\n"
+"    float2 dt = fw * (src == 0u ? float2(float(t0.get_width()), float(t0.get_height()))\n"
+"                                : float2(float(t1.get_width()), float(t1.get_height())));\n"
 "    float mag = max(dt.x, dt.y);\n"
 "    if (reconOn == 0u || mag >= 0.75 * k.z) return kl_eye_sample2(t0, t1, samp, uv, slice, srgbDecode, src);\n"
 "    float4 r = src == 0u ? kl_eye_recon(t0, samp, uv, slice, mag, k) : kl_eye_recon(t1, samp, uv, slice, mag, k);\n"
 "    return float4(srgbDecode != 0u ? kl_srgb_to_linear(max(r.rgb, 0.0)) : r.rgb, r.a);\n"
+"}\n"
+"\n"
+"static float4 kl_eye_sample_main(texture2d_array<float> t0, texture2d_array<float> t1, sampler samp,\n"
+"                                 float2 uv, uint slice, uint srgbDecode, uint src, uint reconOn, float3 k)\n"
+"{\n"
+"    return kl_eye_sample_fw(t0, t1, samp, uv, slice, srgbDecode, src, reconOn, k, fwidth(uv));\n"
+"}\n"
+"\n"
+// ---- the round sharp zone (KleptonCompositor roundFovea) -------------------------------------------------------
+//
+// PTVisionPro's composition, which the user tested and wants: the eye's sharp centre is an inset CIRCLE over a
+// low-density wide view of the whole field. Its maths, copied from xr_host_visionos.mm inset_fragment and
+// VrPlay::PrepareInsets: r = distance from the circle's centre in the tangent plane over the radius (the radius
+// tan(degrees / 2), the centre `lift` on the vertical through the forward axis), and the sharp picture's weight
+// a = 1 - smoothstep(1 - fade, 1, r) with fade 0.15 of the radius. Here the rate map's full-rate RECTANGLE holds that
+// circle (a rate map is separable), so its corners, and the bands beside the rectangle that are full rate along one
+// axis, would otherwise show detail the periphery does not have: outside the circle every pixel comes from the wide
+// view instead (texture(4): the eye picture box-filtered to the periphery's density once per guest frame,
+// kl_wide_f), sampled the way the real periphery is (kl_eye_recon when VPKTAA is on). The big eye texture is only
+// read where a > 0, and there with ONE bilinear tap: inside the circle the eye is at full rate, and the drawable's
+// own dense centre used to pull it under kl_eye_recon's threshold (eye texels per drawable pixel ~0.64 against
+// 0.75 x recon_ref 0.91 at 2784 wide), i.e. 15 taps for a ~15 % blend nobody asked for, on the drawable's most
+// pixel-dense region. P.T. draws its inset unfiltered. Derivatives first, in uniform control flow.
+"static float4 kl_eye_sample_round(texture2d_array<float> t0, texture2d_array<float> t1,\n"
+"                                  texture2d_array<float> wide, sampler samp, float2 uv, uint slice,\n"
+"                                  uint srgbDecode, uint src, uint reconOn, float3 k,\n"
+"                                  float2 ftan, float2 wuv, uint fovOn, float4 fovP)\n"
+"{\n"
+"    float2 fw = fwidth(uv);\n"
+"    float2 fww = fwidth(wuv);\n"
+"    if (fovOn == 0u) return kl_eye_sample_fw(t0, t1, samp, uv, slice, srgbDecode, src, reconOn, k, fw);\n"
+"    float r = length(ftan - float2(0.0, fovP.x)) / max(fovP.y, 1.0e-4);\n"
+"    float f = max(fovP.z, 1.0e-3);\n"
+"    float a = 1.0 - smoothstep(1.0 - f, 1.0, r);\n"
+"    float4 sharp = float4(0.0), outer = float4(0.0);\n"
+"    if (a > 0.0) sharp = kl_eye_sample2(t0, t1, samp, uv, slice, srgbDecode, src);\n"
+"    if (a < 1.0) {\n"
+"        uint ws = uint(fovP.w + 0.5);\n"
+"        float2 dw = fww * float2(float(wide.get_width()), float(wide.get_height()));\n"
+"        float4 w = reconOn != 0u ? kl_eye_recon(wide, samp, wuv, ws, max(dw.x, dw.y), k)\n"
+"                                 : wide.sample(samp, wuv, ws, level(0.0));\n"
+"        outer = float4(srgbDecode != 0u ? kl_srgb_to_linear(max(w.rgb, 0.0)) : w.rgb, w.a);\n"
+"    }\n"
+"    return mix(outer, sharp, a);\n"
 "}\n"
 "\n"
 // ---- the chroma key -------------------------------------------------------
@@ -478,6 +532,10 @@ static const char kl_msl_reproject[] =
 "    o.depthOn = u.depthOn;\n"
 "    o.reconOn = u.reconOn;\n"
 "    o.reconK = float3(u.reconStrength, u.reconSharp, max(u.reconRef, 0.25));\n"
+"    o.ftan = float2(mix(-u.tangents.x, u.tangents.y, c.x), mix(-u.tangents.w, u.tangents.z, c.y));\n"
+"    o.wuv = float2(c.x, 1.0 - c.y);   // the wide view's rows run top-down (kl_wide_v)\n"
+"    o.fovOn = u.fovOn;\n"
+"    o.fovP = float4(u.fovLift, u.fovRadius, u.fovFade, float(u.fovSlice));\n"
 "    // Same mapping as the plain blit below, and for the same reason. Derived\n"
 "    // in the viewer against a frame known to be the right way up — do not\n"
 "    // re-derive it from first principles about GL's origin, because ANGLE's\n"
@@ -517,10 +575,12 @@ static const char kl_msl_reproject[] =
 "                                         texture2d_array<float> tex1 [[texture(1)]],\n"
 "                                         texture2d<float> dep0 [[texture(2)]],\n"
 "                                         texture2d<float> dep1 [[texture(3)]],\n"
+"                                         texture2d_array<float> wide [[texture(4)]],\n"
 "                                         sampler samp [[sampler(0)]])\n"
 "{\n"
 "    KLDepthOut o;\n"
-"    float4 c = kl_eye_sample_main(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src, in.reconOn, in.reconK);\n"
+"    float4 c = kl_eye_sample_round(tex, tex1, wide, samp, in.uv, in.slice, in.srgb, in.src, in.reconOn, in.reconK,\n"
+"                                   in.ftan, in.wuv, in.fovOn, in.fovP);\n"
 "    if (in.fadeOn != 0u) c.rgb = c.rgb * in.fadeS + in.fadeO;\n"
 "    o.color = kl_chroma_apply(c, in.chromaOn, in.chromaKey, in.chromaRange);\n"
 "    float3 p = in.qpos;\n"
@@ -539,15 +599,65 @@ static const char kl_msl_reproject[] =
 "fragment float4 kl_reproject_f(VOut in [[stage_in]],\n"
 "                               texture2d_array<float> tex [[texture(0)]],\n"
 "                               texture2d_array<float> tex1 [[texture(1)]],\n"
+"                               texture2d_array<float> wide [[texture(4)]],\n"
 "                               sampler samp [[sampler(0)]])\n"
 "{\n"
-"    float4 c = kl_eye_sample_main(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src, in.reconOn, in.reconK);\n"
+"    float4 c = kl_eye_sample_round(tex, tex1, wide, samp, in.uv, in.slice, in.srgb, in.src, in.reconOn, in.reconK,\n"
+"                                   in.ftan, in.wuv, in.fovOn, in.fovP);\n"
 "    if (in.fadeOn != 0u) c.rgb = c.rgb * in.fadeS + in.fadeO;\n"
 // The matte is applied HERE and in no probe below. A rung of the probe ladder
 // exists to answer "is the picture arriving", and one that could also be
 // keyed out would answer that question with the matte's opinion — which is the
 // failure mode this ladder was built to end.
 "    return kl_chroma_apply(c, in.chromaOn, in.chromaKey, in.chromaRange);\n"
+"}\n"
+"\n"
+// ---- the wide view (round sharp zone, KleptonCompositor buildWideView) ----------------------------------------
+//
+// The eye picture at the PERIPHERY's density, one slice per eye, built once per guest frame into a small rgba16F
+// array (the eye texture's size x the periphery rate, e.g. 211x173 at 10 %). Same grid and same unwarp as the
+// composite (so texel (x, y) is the quad's point (x, 1 - y), the eye's flip applied), drawn straight into the
+// target. Each texel is a box filter over its own footprint in the eye texture: `taps` x `taps` bilinear samples
+// spread over the footprint the derivatives give (one wide texel = 1 / rate eye texels where the eye is at full
+// rate: the rectangle's corners and the bands beside it; about one where it is already at the periphery's rate).
+// Prefiltered rather than point-sampled, so the corners do not alias more than the real periphery.
+"struct KLWide { uint slice; uint flipY; uint gridEye; uint taps; };\n"
+"struct KLWideOut { float4 pos [[position]]; float2 uv; };\n"
+"vertex KLWideOut kl_wide_v(uint vid [[vertex_id]],\n"
+"                           constant KLWide &u [[buffer(0)]],\n"
+"                           constant float2 *grid [[buffer(1)]])\n"
+"{\n"
+"    uint nx = uint(grid[0].x), ny = uint(grid[0].y);\n"
+"    uint base = 1u + u.gridEye * (nx + 1u) * (ny + 1u);\n"
+"    uint cell = vid / 6u, k = vid % 6u;\n"
+"    uint2 g = uint2(cell % nx, cell / nx);\n"
+"    g.x += (k == 1u || k == 3u || k == 4u) ? 1u : 0u;\n"
+"    g.y += (k == 2u || k == 4u || k == 5u) ? 1u : 0u;\n"
+"    float2 c = float2(g) / float2(float(nx), float(ny));\n"
+"    KLWideOut o;\n"
+"    o.pos = float4(c * 2.0 - 1.0, 0.0, 1.0);   // c.y = 1 (up) is the target's top row\n"
+"    float2 uv = grid[base + g.y * (nx + 1u) + g.x];\n"
+"    if (u.flipY != 0u) uv.y = 1.0 - uv.y;\n"
+"    o.uv = uv;\n"
+"    return o;\n"
+"}\n"
+"\n"
+"fragment float4 kl_wide_f(KLWideOut in [[stage_in]],\n"
+"                          texture2d_array<float> tex [[texture(0)]],\n"
+"                          sampler samp [[sampler(0)]],\n"
+"                          constant KLWide &u [[buffer(0)]])\n"
+"{\n"
+"    float2 dx = dfdx(in.uv), dy = dfdy(in.uv);\n"
+"    uint n = clamp(u.taps, 1u, 4u);\n"
+"    float inv = 1.0 / float(n);\n"
+"    float4 acc = float4(0.0);\n"
+"    for (uint j = 0u; j < n; j++) {\n"
+"        for (uint i = 0u; i < n; i++) {\n"
+"            float2 o = (float2(float(i), float(j)) + 0.5) * inv - 0.5;\n"
+"            acc += tex.sample(samp, in.uv + dx * o.x + dy * o.y, u.slice, level(0.0));\n"
+"        }\n"
+"    }\n"
+"    return acc * (inv * inv);\n"
 "}\n"
 "\n"
 // The probe ladder (KL_CP_PROBE). Same library, same vertex function, so each
@@ -592,6 +702,8 @@ static const char kl_msl_reproject[] =
 "    o.qpos = float3(0.0); o.qdepth = 1.0; o.zrow = float4(0.0); o.wrow = float4(0.0, 0.0, 0.0, 1.0);\n"
 "    o.dmap = float2(0.0); o.depthOn = 0u;\n"
 "    o.fadeOn = 0u; o.fadeS = float3(1.0); o.fadeO = float3(0.0);\n"
+"    o.reconOn = 0u; o.reconK = float3(0.0, 0.0, 1.0);\n"
+"    o.ftan = float2(0.0); o.wuv = float2(0.0); o.fovOn = 0u; o.fovP = float4(0.0, 1.0, 0.15, 0.0);\n"
 "    return o;\n"
 "}\n"
 "\n"
@@ -965,6 +1077,12 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     u.recon_on = 0;                       // KL_CP_RECON: the compositor turns it on per view
     u.recon_strength = u.recon_sharp = 0.0f;
     u.recon_ref = 1.0f;
+    u.fov_on = 0;                         // round sharp zone: the compositor turns it on per view
+    u.fov_lift = 0.0f;
+    u.fov_radius = 1.0f;
+    u.fov_fade = 0.15f;
+    u.fov_slice = 0;
+    u.fov_pad[0] = u.fov_pad[1] = u.fov_pad[2] = 0.0f;
     // Which grid block this eye reads. `eye` and `slice` are not the same
     // number and neither could stand in for this one: an Array-layout guest has
     // slice == eye, a Stereo-layout one has two textures and slice 0 for both,

@@ -252,32 +252,91 @@ static id<MTLRasterizationRateMap> vrr_map(id<MTLDevice> dev, NSUInteger w, NSUI
     return map;
 }
 
-// ---- Per-pass GPU time (KL_GPU_PASSES=<first frame>; a Mac/diagnostic tool) --
-// For KL_GPU_PASSES_N frames (default 60) from frame KL_GPU_PASSES, every render,
-// compute and blit encoder on the guest's queue gets Metal stage-boundary
-// timestamps (a counter sample buffer on its pass descriptor). Afterwards the
-// passes are grouped by what they draw into (the census signature: attachment
-// sizes, formats, samples, load/store actions) and listed by GPU ms per frame.
-// Encoders overlap on the GPU, so the rows can add up to more than the frame.
+// ---- Per-pass GPU time (KL_GPU_PASSES; diagnostics) ---------------------------
+// Windows of KL_GPU_PASSES_N guest frames (default 24) in which every render, compute and blit encoder on the
+// guest's queue gets Metal stage-boundary timestamps in a counter sample buffer of our own. It is attached at the
+// first FREE sampleBufferAttachments index: VPKEngine samples every encoder at index 0 for its own timings (its
+// timestamp queries), which build 26 overwrote on render passes; Metal has 4 per pass. Compute and blit encoders
+// are timed whether made with a descriptor (VPKEngine) or without (MoltenVK).
+// KL_GPU_PASSES lists the windows, comma separated:
+//   <n>    from guest frame n
+//   t<s>   s seconds after the first guest frame (wall time)
+//   g<s>   s seconds after EVERY scene start: the game fading the grid out (IVRCompositor::FadeGrid at the end of
+//          the start-up and of each level load; kl_gpu_time_scene, from the OpenVR shim). Fading back to the grid
+//          (a load starting) drops that scene's windows that have not started.
+// Build 26's windows were only t75..t330 after the first frame: a run that quit at 70 s or crashed gave nothing.
+// Windows run one at a time, in time order. Each report ([passes] lines): busy (sum of exclusive encoder times),
+// span (first encoder start to last end) and the GPU idle inside it (waits on fences/events, late submits), the
+// [gputime] union of the same frames, time per kind (MSAA scene, eye 1x, depth-only, 2D UI targets, other, compute,
+// blit) and the top passes by what they draw into. The first window of each scene (4 at most) also lists one frame's
+// encoders in order. Encoders overlap on the GPU, so exclusive time is what each adds past everything before it.
 enum { kProfPerBuf = 4096, kProfBufs = 8, kProfSamples = kProfPerBuf * kProfBufs };   // Metal: 32 KB per buffer
+enum { kKindMsaa, kKindEye1x, kKindDepth, kKindUi, kKindOther, kKindCompute, kKindBlit, kKinds };
+static const char *const k_prof_kind[kKinds] = { "scene-msaa", "eye-1x", "depth-only", "ui-2d", "other-rt", "compute", "blit" };
+enum { kProfSampleSlots = 4 };                    // MTLMax{Render,Compute,Blit}PassSampleBuffers
 static int g_prof = -1;
-static uint32_t g_prof_from, g_prof_n = 60;
+static uint32_t g_prof_n = 24;
+static volatile uint32_t g_prof_from = UINT32_MAX; // the active window's first guest frame; UINT32_MAX = none
 static id<MTLCounterSampleBuffer> g_prof_buf, g_prof_bufs[kProfBufs];
-static unsigned g_prof_used;                       // sample pairs handed out
-static struct { uint32_t frame; char sig[200]; } *g_prof_meta;
+static unsigned g_prof_used;                       // sample pairs handed out in the active window
+static unsigned g_prof_noslot;                     // encoders left untimed: all 4 sample attachments taken
+static struct { uint32_t frame; uint8_t kind; char sig[200]; } *g_prof_meta;
 static MTLTimestamp g_prof_cpu0, g_prof_gpu0;
-static int g_prof_done;
-// KL_GPU_PASSES may list several windows, "4000,t300,t337": a plain number is a guest frame, tN is N seconds after the
-// first guest frame (for a scene reached at a known time, e.g. on the headset). Each window reports on its own.
-enum { kProfWins = 8 };
-static double g_prof_at[kProfWins];               // seconds after the first frame, or -1 for a frame number
-static uint32_t g_prof_fr[kProfWins];
-static int g_prof_nwin, g_prof_win;
-static double g_prof_t0;                          // the first guest frame (CACurrentMediaTime)
+static os_unfair_lock g_prof_lk = OS_UNFAIR_LOCK_INIT;   // window queue, activation, pair allocation
+enum { kProfReqs = 64, kProfSpecs = 16 };
+typedef struct { double at; uint32_t frame; int scene; char tag[24]; } prof_req;   // at < 0: by frame number
+static prof_req g_prof_q[kProfReqs];
+static int g_prof_nq;
+static double g_prof_spec_t[kProfSpecs], g_prof_spec_g[kProfSpecs];
+static int g_prof_nt, g_prof_ng;
+static int g_prof_scene;                           // scene starts seen (grid fade-outs)
+static double g_prof_t0;                           // the first guest frame (CACurrentMediaTime)
+static int g_prof_win;                             // windows started
+static char g_prof_tag[24];                        // the active window's name
+static int g_prof_cur_scene, g_prof_cur_loading, g_prof_orders, g_prof_order_scene = -2;
+static double g_prof_cur_at;                       // seconds after the first frame it started
+static double g_prof_union;                        // [gputime] union of the window's frames (ms) and their count
+static unsigned g_prof_union_n;
+
+static void prof_push_locked(double at, uint32_t frame, int scene, const char *tag) {
+    if (g_prof_nq >= kProfReqs) return;
+    prof_req *r = &g_prof_q[g_prof_nq++];
+    r->at = at; r->frame = frame; r->scene = scene;
+    snprintf(r->tag, sizeof r->tag, "%s", tag);
+}
+
+// The OpenVR shim: the game faded the grid in (to_grid = 1, a level load starting) or out (0, a scene shown).
+void kl_gpu_time_scene(int to_grid) {
+    if (g_prof <= 0) return;
+    double now = CACurrentMediaTime();
+    int scene = 0, dropped = 0;
+    static int last = -1;
+    os_unfair_lock_lock(&g_prof_lk);
+    if (to_grid) {
+        int j = 0;
+        for (int i = 0; i < g_prof_nq; i++) { if (g_prof_q[i].scene >= 1) dropped++; else g_prof_q[j++] = g_prof_q[i]; }
+        g_prof_nq = j;
+        if (g_prof_from != UINT32_MAX) g_prof_cur_loading = 1;
+    } else {
+        scene = ++g_prof_scene;
+        for (int i = 0; i < g_prof_ng; i++) {
+            char tag[24];
+            snprintf(tag, sizeof tag, "scene%d+%gs", scene, g_prof_spec_g[i]);
+            prof_push_locked(now + g_prof_spec_g[i], 0, scene, tag);
+        }
+    }
+    os_unfair_lock_unlock(&g_prof_lk);
+    if (last != to_grid || !to_grid) {
+        last = to_grid;
+        if (to_grid) fprintf(stderr, "[passes] grid shown (loading): %d pending scene window(s) dropped\n", dropped);
+        else fprintf(stderr, "[passes] scene %d shown at %.1f s: %d window(s) queued\n", scene,
+                     g_prof_t0 ? now - g_prof_t0 : 0.0, g_prof_ng);
+    }
+}
 
 static void prof_sig_render(MTLRenderPassDescriptor *d, char *out, size_t n) {
-    int u = snprintf(out, n, "R %lux%lu L%lu", (unsigned long)d.renderTargetWidth, (unsigned long)d.renderTargetHeight,
-                     (unsigned long)d.renderTargetArrayLength);
+    int u = snprintf(out, n, "R %lux%lu L%lu%s", (unsigned long)d.renderTargetWidth, (unsigned long)d.renderTargetHeight,
+                     (unsigned long)d.renderTargetArrayLength, d.rasterizationRateMap ? " vrr" : "");
     for (int i = 0; i < 8 && u < (int)n - 40; i++) {
         MTLRenderPassColorAttachmentDescriptor *a = d.colorAttachments[i];
         if (!a.texture) continue;
@@ -292,40 +351,101 @@ static void prof_sig_render(MTLRenderPassDescriptor *d, char *out, size_t n) {
                  (unsigned long)z.pixelFormat, (unsigned long)z.sampleCount, (unsigned long)d.depthAttachment.loadAction,
                  (unsigned long)d.depthAttachment.storeAction, d.depthAttachment.resolveTexture ? "+r" : "");
 }
+// What a render pass is, for the per-kind totals: anything multisampled is the scene; an eye-sized layered (or
+// 2D-array) target at 1x is eye post/overlay work; no colour is a depth-only pass (shadows); an 8-bit colour target
+// that is not an eye image is 2D UI (Panorama panels, their blur/box-shadow scratch); the rest (bloom chain, fog,
+// HDR intermediates) is "other".
+static int prof_kind_render(MTLRenderPassDescriptor *d) {
+    id<MTLTexture> c0 = nil;
+    int msaa = 0;
+    for (int i = 0; i < 8; i++) {
+        id<MTLTexture> t = d.colorAttachments[i].texture;
+        if (!t) continue;
+        if (!c0) c0 = t;
+        if (t.sampleCount > 1) msaa = 1;
+    }
+    id<MTLTexture> z = d.depthAttachment.texture ? d.depthAttachment.texture : d.stencilAttachment.texture;
+    if (z && z.sampleCount > 1) msaa = 1;
+    if (msaa) return kKindMsaa;
+    id<MTLTexture> t = c0 ? c0 : z;
+    if (t && t.width >= 1024 && (d.renderTargetArrayLength >= 2 ||
+                                 (t.textureType == MTLTextureType2DArray && t.arrayLength >= 2))) return kKindEye1x;
+    if (!c0) return kKindDepth;
+    switch (c0.pixelFormat) {
+    case MTLPixelFormatBGRA8Unorm_sRGB: case MTLPixelFormatRGBA8Unorm_sRGB:
+    case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatRGBA8Unorm: return kKindUi;
+    default: return kKindOther;
+    }
+}
 
+// Is guest frame f inside the active window (a cheap check before the locked one)?
+static int prof_in(uint32_t f) {
+    uint32_t from = g_prof_from;
+    return g_prof > 0 && from != UINT32_MAX && f >= from && f - from < g_prof_n;
+}
 // A sample pair for an encoder in guest frame f, or -1 (not profiling it).
-static int prof_pair(id<MTLCommandBuffer> cb, uint32_t f) {
-    if (g_prof <= 0 || g_prof_done || f < g_prof_from || f >= g_prof_from + g_prof_n) return -1;
-    if (!g_prof_buf) {
+// two = 1: also reserve pair k + 1 (a render pass's stages pair) under the same lock, so the two are adjacent even
+// with encoders made on several threads; it starts as '!' (ignored) until the caller fills it.
+static int prof_pair(id<MTLCommandBuffer> cb, uint32_t f, int kind, int two) {
+    if (!prof_in(f)) return -1;
+    int k = -1;
+    os_unfair_lock_lock(&g_prof_lk);
+    if (prof_in(f) && !g_prof_buf) {
         id<MTLDevice> dev = cb.device;
-        if (![dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
-            fprintf(stderr, "[passes] no stage-boundary counter sampling on this GPU\n"); g_prof = 0; return -1;
-        }
         id<MTLCounterSet> ts = nil;
         for (id<MTLCounterSet> c in dev.counterSets) if ([c.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = c;
-        MTLCounterSampleBufferDescriptor *bd = [MTLCounterSampleBufferDescriptor new];
-        bd.counterSet = ts; bd.storageMode = MTLStorageModeShared; bd.sampleCount = kProfPerBuf;
-        for (int i = 0; i < kProfBufs; i++) {
-            NSError *err = nil;
-            g_prof_bufs[i] = [dev newCounterSampleBufferWithDescriptor:bd error:&err];
-            if (!g_prof_bufs[i]) { fprintf(stderr, "[passes] no counter sample buffer: %s\n", err.localizedDescription.UTF8String); g_prof = 0; return -1; }
+        if (!ts || ![dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+            fprintf(stderr, "[passes] no stage-boundary timestamp sampling on this GPU: per-pass times off\n");
+            g_prof = 0;
+        } else {
+            MTLCounterSampleBufferDescriptor *bd = [MTLCounterSampleBufferDescriptor new];
+            bd.counterSet = ts; bd.storageMode = MTLStorageModeShared; bd.sampleCount = kProfPerBuf;
+            for (int i = 0; i < kProfBufs && g_prof > 0; i++) {
+                NSError *err = nil;
+                g_prof_bufs[i] = [dev newCounterSampleBufferWithDescriptor:bd error:&err];
+                if (!g_prof_bufs[i]) {
+                    fprintf(stderr, "[passes] no counter sample buffer: %s\n", err.localizedDescription.UTF8String);
+                    g_prof = 0;
+                }
+            }
+            g_prof_meta = g_prof > 0 ? calloc(kProfSamples / 2, sizeof *g_prof_meta) : NULL;
+            if (!g_prof_meta) g_prof = 0;
+            if (g_prof > 0) {
+                g_prof_buf = g_prof_bufs[0];
+                [dev sampleTimestamps:&g_prof_cpu0 gpuTimestamp:&g_prof_gpu0];
+            }
         }
-        g_prof_buf = g_prof_bufs[0];
-        g_prof_meta = calloc(kProfSamples / 2, sizeof *g_prof_meta);
-        [dev sampleTimestamps:&g_prof_cpu0 gpuTimestamp:&g_prof_gpu0];
-        fprintf(stderr, "[passes] profiling guest frames %u..%u\n", g_prof_from, g_prof_from + g_prof_n - 1);
     }
-    if (g_prof_used >= kProfSamples / 2) return -1;
-    int k = (int)g_prof_used++;
-    g_prof_meta[k].frame = f;
+    if (prof_in(f) && g_prof_buf && g_prof_used + (two ? 2u : 1u) <= kProfSamples / 2) {
+        k = (int)g_prof_used;
+        g_prof_used += two ? 2 : 1;
+        g_prof_meta[k].frame = f;
+        g_prof_meta[k].kind = (uint8_t)kind;
+        g_prof_meta[k].sig[0] = 0;
+        if (two) { g_prof_meta[k + 1].frame = f; g_prof_meta[k + 1].kind = kKindOther; g_prof_meta[k + 1].sig[0] = '!'; }
+    }
+    os_unfair_lock_unlock(&g_prof_lk);
     return k;
 }
 // Pair k lives in buffer k / (kProfPerBuf / 2), at samples 2 * (k % (kProfPerBuf / 2)) and the one after.
 static id<MTLCounterSampleBuffer> prof_buf(int k) { return g_prof_bufs[k / (kProfPerBuf / 2)]; }
 static NSUInteger prof_idx(int k) { return 2 * (NSUInteger)(k % (kProfPerBuf / 2)); }
+// Metal did not make an encoder with our sample buffer at a second attachment index (MTLMax*PassSampleBuffers says 4
+// are allowed; this is the fail-safe): the encoder is made again without it and per-pass timing stops for the session.
+static volatile int g_prof_refused;
+static void prof_refused(int k, const char *what) {
+    if (k >= 0) g_prof_meta[k].sig[0] = '!';
+    if (!g_prof_refused) {
+        g_prof_refused = 1;
+        fprintf(stderr, "[passes] Metal refused a %s encoder with our sample buffer at a free attachment index: "
+                "per-pass times OFF for this session\n", what);
+    }
+}
 
 static id (*g_cce)(id, SEL, MTLDispatchType);    // -computeCommandEncoderWithDispatchType:
 static id (*g_bce)(id, SEL);                     // -blitCommandEncoder
+static id (*g_cced)(id, SEL, MTLComputePassDescriptor *);   // -computeCommandEncoderWithDescriptor:
+static id (*g_bced)(id, SEL, MTLBlitPassDescriptor *);      // -blitCommandEncoderWithDescriptor:
 static uint32_t prof_frame_of(id<MTLCommandBuffer> cb, int *role) {
     void *q = (__bridge void *)[cb commandQueue];
     os_unfair_lock_lock(&g_lk);
@@ -334,39 +454,124 @@ static uint32_t prof_frame_of(id<MTLCommandBuffer> cb, int *role) {
     os_unfair_lock_unlock(&g_lk);
     return f;
 }
-static id kl_cce(id self, SEL sel, MTLDispatchType dt) {
+// The descriptor variants carry the timestamps (VPKEngine makes every compute and blit encoder this way, with its
+// own samples at index 0); the plain ones (MoltenVK) are turned into descriptor calls while a window is open.
+// Re-entrancy guard: Metal's own encoder methods may call each other (e.g. the plain variant through the descriptor
+// one); inside one of our hooks every nested hook goes straight to the original, so no encoder is timed twice.
+static __thread int g_in_enc_hook;
+static id kl_cced(id self, SEL sel, MTLComputePassDescriptor *d) {
+    if (g_in_enc_hook || g_prof <= 0 || !d || g_prof_refused) return g_cced(self, sel, d);
     int role; uint32_t f = prof_frame_of((id<MTLCommandBuffer>)self, &role);
-    int k = role == 0 ? prof_pair((id<MTLCommandBuffer>)self, f) : -1;
-    if (k < 0) return g_cce(self, sel, dt);
-    snprintf(g_prof_meta[k].sig, sizeof g_prof_meta[k].sig, "C compute");
+    if (role != 0 || !prof_in(f)) return g_cced(self, sel, d);
+    int slot = 0;
+    while (slot < kProfSampleSlots && d.sampleBufferAttachments[slot].sampleBuffer) slot++;
+    if (slot == kProfSampleSlots) { g_prof_noslot++; return g_cced(self, sel, d); }
+    int k = prof_pair((id<MTLCommandBuffer>)self, f, kKindCompute, 0);
+    if (k < 0) return g_cced(self, sel, d);
+    snprintf(g_prof_meta[k].sig, sizeof g_prof_meta[k].sig, "C compute%s",
+             d.dispatchType == MTLDispatchTypeConcurrent ? " concurrent" : "");
+    d.sampleBufferAttachments[slot].sampleBuffer = prof_buf(k);
+    d.sampleBufferAttachments[slot].startOfEncoderSampleIndex = prof_idx(k);
+    d.sampleBufferAttachments[slot].endOfEncoderSampleIndex = prof_idx(k) + 1;
+    g_in_enc_hook = 1;
+    id enc = g_cced(self, sel, d);
+    if (!enc) { d.sampleBufferAttachments[slot].sampleBuffer = nil; prof_refused(k, "compute"); enc = g_cced(self, sel, d); }
+    g_in_enc_hook = 0;
+    return enc;
+}
+static id kl_bced(id self, SEL sel, MTLBlitPassDescriptor *d) {
+    if (g_in_enc_hook || g_prof <= 0 || !d || g_prof_refused) return g_bced(self, sel, d);
+    int role; uint32_t f = prof_frame_of((id<MTLCommandBuffer>)self, &role);
+    if (role != 0 || !prof_in(f)) return g_bced(self, sel, d);
+    int slot = 0;
+    while (slot < kProfSampleSlots && d.sampleBufferAttachments[slot].sampleBuffer) slot++;
+    if (slot == kProfSampleSlots) { g_prof_noslot++; return g_bced(self, sel, d); }
+    int k = prof_pair((id<MTLCommandBuffer>)self, f, kKindBlit, 0);
+    if (k < 0) return g_bced(self, sel, d);
+    snprintf(g_prof_meta[k].sig, sizeof g_prof_meta[k].sig, "B blit");
+    d.sampleBufferAttachments[slot].sampleBuffer = prof_buf(k);
+    d.sampleBufferAttachments[slot].startOfEncoderSampleIndex = prof_idx(k);
+    d.sampleBufferAttachments[slot].endOfEncoderSampleIndex = prof_idx(k) + 1;
+    g_in_enc_hook = 1;
+    id enc = g_bced(self, sel, d);
+    if (!enc) { d.sampleBufferAttachments[slot].sampleBuffer = nil; prof_refused(k, "blit"); enc = g_bced(self, sel, d); }
+    g_in_enc_hook = 0;
+    return enc;
+}
+static id kl_cce(id self, SEL sel, MTLDispatchType dt) {
+    int role = -1; uint32_t f = 0;
+    if (!g_in_enc_hook) f = prof_frame_of((id<MTLCommandBuffer>)self, &role);
+    if (g_in_enc_hook || role != 0 || !prof_in(f) || !g_cced || g_prof_refused) {
+        int was = g_in_enc_hook;
+        g_in_enc_hook = 1;
+        id enc = g_cce(self, sel, dt);
+        g_in_enc_hook = was;
+        return enc;
+    }
     MTLComputePassDescriptor *d = [MTLComputePassDescriptor computePassDescriptor];
     d.dispatchType = dt;
-    d.sampleBufferAttachments[0].sampleBuffer = prof_buf(k);
-    d.sampleBufferAttachments[0].startOfEncoderSampleIndex = prof_idx(k);
-    d.sampleBufferAttachments[0].endOfEncoderSampleIndex = prof_idx(k) + 1;
-    return [(id<MTLCommandBuffer>)self computeCommandEncoderWithDescriptor:d];
+    return kl_cced(self, @selector(computeCommandEncoderWithDescriptor:), d);   // our descriptor hook, called directly
 }
 static id kl_bce(id self, SEL sel) {
-    int role; uint32_t f = prof_frame_of((id<MTLCommandBuffer>)self, &role);
-    int k = role == 0 ? prof_pair((id<MTLCommandBuffer>)self, f) : -1;
-    if (k < 0) return g_bce(self, sel);
-    snprintf(g_prof_meta[k].sig, sizeof g_prof_meta[k].sig, "B blit");
-    MTLBlitPassDescriptor *d = [MTLBlitPassDescriptor blitPassDescriptor];
-    d.sampleBufferAttachments[0].sampleBuffer = prof_buf(k);
-    d.sampleBufferAttachments[0].startOfEncoderSampleIndex = prof_idx(k);
-    d.sampleBufferAttachments[0].endOfEncoderSampleIndex = prof_idx(k) + 1;
-    return [(id<MTLCommandBuffer>)self blitCommandEncoderWithDescriptor:d];
+    int role = -1; uint32_t f = 0;
+    if (!g_in_enc_hook) f = prof_frame_of((id<MTLCommandBuffer>)self, &role);
+    if (g_in_enc_hook || role != 0 || !prof_in(f) || !g_bced || g_prof_refused) {
+        int was = g_in_enc_hook;
+        g_in_enc_hook = 1;
+        id enc = g_bce(self, sel);
+        g_in_enc_hook = was;
+        return enc;
+    }
+    return kl_bced(self, @selector(blitCommandEncoderWithDescriptor:), [MTLBlitPassDescriptor blitPassDescriptor]);
 }
 
-// After the window's frames are final: resolve, group, print.
-static void prof_report(void) {
-    if (g_prof <= 0 || g_prof_done || !g_prof_buf || g_prof_from == UINT32_MAX || g_frame < g_prof_from + g_prof_n + 8) return;   // 8: VPKEngine keeps 12 command buffers (~2 frames) in flight
-    g_prof_done = 1;
-    unsigned pairs = g_prof_used;
+// Game thread, at every frame end: start the next due window when none is open.
+static void prof_tick(uint32_t frame) {
+    double now = CACurrentMediaTime();
+    os_unfair_lock_lock(&g_prof_lk);
+    if (!g_prof_t0) {
+        g_prof_t0 = now;
+        for (int i = 0; i < g_prof_nt; i++) {
+            char tag[24];
+            snprintf(tag, sizeof tag, "t%g", g_prof_spec_t[i]);
+            prof_push_locked(now + g_prof_spec_t[i], 0, -1, tag);
+        }
+    }
+    int best = -1;
+    if (g_prof_from == UINT32_MAX)
+        for (int i = 0; i < g_prof_nq; i++) {
+            const prof_req *r = &g_prof_q[i];
+            int due = r->at < 0 ? r->frame <= frame + 1 : r->at <= now;
+            if (due && (best < 0 || (r->at >= 0 && (g_prof_q[best].at < 0 || r->at < g_prof_q[best].at)))) best = i;
+        }
+    if (best >= 0) {
+        prof_req r = g_prof_q[best];
+        g_prof_q[best] = g_prof_q[--g_prof_nq];
+        snprintf(g_prof_tag, sizeof g_prof_tag, "%s", r.tag);
+        g_prof_cur_scene = r.scene;
+        g_prof_cur_loading = 0;
+        g_prof_cur_at = now - g_prof_t0;
+        g_prof_union = 0; g_prof_union_n = 0;
+        g_prof_used = 0; g_prof_noslot = 0;
+        g_prof_win++;
+        g_prof_from = frame + 1;
+    }
+    os_unfair_lock_unlock(&g_prof_lk);
+    if (best >= 0) {
+        time_t tt = time(NULL);
+        struct tm lt;
+        localtime_r(&tt, &lt);
+        fprintf(stderr, "[passes] W%d %s at %02d:%02d:%02d (%.1f s after the first frame): profiling guest frames %u..%u\n",
+                g_prof_win, g_prof_tag, lt.tm_hour, lt.tm_min, lt.tm_sec, g_prof_cur_at, frame + 1, frame + g_prof_n);
+    }
+}
+
+// Resolve, group and print one finished window (pairs > 0, sample buffers made).
+static void prof_print(uint32_t from, unsigned pairs, const char *tag) {
     // Resolve every buffer that was handed pairs into one array, pair k at [2k], [2k+1].
     MTLCounterResultTimestamp *r = calloc(2 * (size_t)pairs + 2, sizeof *r);
-    NSData *data = r ? [NSData dataWithBytesNoCopy:r length:(2 * (size_t)pairs + 2) * sizeof *r freeWhenDone:YES] : nil;
-    for (unsigned k0 = 0; r && k0 < pairs; k0 += kProfPerBuf / 2) {
+    if (!r) return;
+    for (unsigned k0 = 0; k0 < pairs; k0 += kProfPerBuf / 2) {
         unsigned nk = pairs - k0 < kProfPerBuf / 2 ? pairs - k0 : kProfPerBuf / 2;
         NSData *part = [prof_buf((int)k0) resolveCounterRange:NSMakeRange(0, 2 * nk)];
         if (part) memcpy(r + 2 * k0, part.bytes, part.length < 2 * nk * sizeof *r ? part.length : 2 * nk * sizeof *r);
@@ -376,38 +581,28 @@ static void prof_report(void) {
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
     double cpu_ns = (double)(cpu1 - g_prof_cpu0) * tb.numer / tb.denom;
     double ns_per_tick = gpu1 > g_prof_gpu0 && cpu_ns > 0 ? cpu_ns / (double)(gpu1 - g_prof_gpu0) : 1.0;
-    // Exclusive time: stage-boundary spans include waiting behind earlier passes, so each pass is
-    // credited only with how far it pushes the frame's end past everything encoded before it
-    // (the passes of a frame, in encoding order). The sum is the frame's busy time.
+#define PROF_OK(k) (r[2 * (k)].timestamp != MTLCounterErrorValue && r[2 * (k) + 1].timestamp != MTLCounterErrorValue && \
+                    r[2 * (k)].timestamp && r[2 * (k) + 1].timestamp >= r[2 * (k)].timestamp)
+    // Pass 1: exclusive time per encoder (how far it pushes its frame's end past everything encoded before it, in
+    // encoding order), per-frame span and busy, per-signature rows and per-kind totals.
     enum { kMax = 256 };
-    static struct { char sig[200]; double t; unsigned n; } row[kMax];
-    int rows = 0; unsigned bad = 0;
-    double total = 0;
-    uint32_t cur = UINT32_MAX; uint64_t hi = 0;
-    // One frame in encoding order (the window's second frame): what each encoder draws into, its span
-    // and its exclusive time, to see what sits between the scene passes.
-    {
-        uint32_t fd = g_prof_from + 1; uint64_t h2 = 0, f0 = 0; int idx = 0;
-        for (unsigned k = 0; k < pairs && data; k++) {
-            if (g_prof_meta[k].frame != fd) continue;
-            uint64_t a = r[2 * k].timestamp, b = r[2 * k + 1].timestamp;
-            if (a == MTLCounterErrorValue || b == MTLCounterErrorValue || !a || b < a) {
-                fprintf(stderr, "[passes] f%u #%02d  (no timestamps)  %s\n", fd, idx++, g_prof_meta[k].sig); continue;
-            }
-            if (!f0) f0 = a;
-            uint64_t from = a > h2 ? a : h2;
-            fprintf(stderr, "[passes] f%u #%02d at %7.3f span %6.3f excl %6.3f ms  %s\n", fd, idx++, (a - f0) / 1e6,
-                    (b - a) / 1e6, b > from ? (b - from) / 1e6 : 0.0, g_prof_meta[k].sig);
-            if (b > h2) h2 = b;
+    static struct { char sig[200]; double t, vtx, frg; unsigned n; uint8_t kind; } row[kMax];
+    int rows = 0;
+    unsigned bad = 0, nf = 0, encs = 0;
+    double total = 0, span_sum = 0, kt[kKinds] = { 0 }, kv[kKinds] = { 0 }, kf[kKinds] = { 0 };
+    unsigned kn[kKinds] = { 0 };
+    uint32_t cur = UINT32_MAX;
+    uint64_t hi = 0, lo = 0;
+    for (unsigned k = 0; k <= pairs; k++) {
+        // '~': a render pass's stages pair (read with it below); '!': a pair handed out but not attached.
+        if (k < pairs && (g_prof_meta[k].sig[0] == '~' || g_prof_meta[k].sig[0] == '!')) continue;
+        if (k == pairs || g_prof_meta[k].frame != cur) {   // a frame ends: its span
+            if (cur != UINT32_MAX && hi > lo) { span_sum += (double)(hi - lo); nf++; }
+            if (k == pairs) break;
+            cur = g_prof_meta[k].frame; hi = 0; lo = 0;
         }
-    }
-    static double vtx[kMax], frg[kMax];
-    memset(vtx, 0, sizeof vtx); memset(frg, 0, sizeof frg);
-    for (unsigned k = 0; k < pairs && data; k++) {
+        if (!PROF_OK(k)) { bad++; continue; }
         uint64_t a = r[2 * k].timestamp, b = r[2 * k + 1].timestamp;
-        if (g_prof_meta[k].sig[0] == '~') continue;
-        if (g_prof_meta[k].frame != cur) { cur = g_prof_meta[k].frame; hi = 0; }
-        if (a == MTLCounterErrorValue || b == MTLCounterErrorValue || !a || b < a) { bad++; continue; }
         // the stages pair right after a render pass: vertex end, fragment start
         double vs = 0, fs = 0;
         if (k + 1 < pairs && g_prof_meta[k + 1].sig[0] == '~') {
@@ -415,51 +610,90 @@ static void prof_report(void) {
             if (ve != MTLCounterErrorValue && ve >= a && ve) vs = (double)(ve - a);
             if (fb != MTLCounterErrorValue && fb && b >= fb) fs = (double)(b - fb);
         }
-        uint64_t from = a > hi ? a : hi;
-        double t = b > from ? (double)(b - from) : 0;
+        if (!lo || a < lo) lo = a;
+        uint64_t from_t = a > hi ? a : hi;
+        double t = b > from_t ? (double)(b - from_t) : 0;
         if (b > hi) hi = b;
-        total += t;
+        total += t; encs++;
+        int kd = g_prof_meta[k].kind < kKinds ? g_prof_meta[k].kind : kKindOther;
+        kt[kd] += t; kv[kd] += vs; kf[kd] += fs; kn[kd]++;
         int j = 0;
         while (j < rows && strcmp(row[j].sig, g_prof_meta[k].sig)) j++;
-        if (j == rows) { if (rows == kMax) continue; strcpy(row[rows].sig, g_prof_meta[k].sig); row[rows].t = 0; row[rows].n = 0; rows++; }
-        row[j].t += t; row[j].n++;
-        vtx[j] += vs; frg[j] += fs;
-    }
-    // Frames that actually got encoders (the sample buffers can run out before the window ends: a game frame of
-    // ~150 render passes takes 300 pairs): averages are over those, not over the window's length.
-    unsigned nf = 0;
-    {
-        static unsigned char seen[1024];
-        memset(seen, 0, sizeof seen);
-        for (unsigned k = 0; k < pairs; k++) {
-            if (g_prof_meta[k].sig[0] == '~') continue;
-            uint32_t d = g_prof_meta[k].frame - g_prof_from;
-            if (d < sizeof seen && !seen[d]) { seen[d] = 1; nf++; }
+        if (j == rows) {
+            if (rows == kMax) continue;
+            snprintf(row[rows].sig, sizeof row[rows].sig, "%s", g_prof_meta[k].sig);
+            row[rows].t = row[rows].vtx = row[rows].frg = 0; row[rows].n = 0; row[rows].kind = (uint8_t)kd; rows++;
         }
+        row[j].t += t; row[j].n++; row[j].vtx += vs; row[j].frg += fs;
     }
     if (!nf) nf = 1;
     // Units: Apple GPUs report these counters in ns, although sampleTimestamps' GPU clock ticks at
-    // 24 MHz; take whichever puts the frame's busy time in a sane range (0.2..40 ms).
+    // 24 MHz; take whichever puts the frame's busy time in a sane range (0.2..60 ms).
     double per_frame = total / nf, scale = 1e-6;          // raw ns -> ms
-    if (per_frame * scale < 0.2 || per_frame * scale > 40) scale = ns_per_tick * 1e-6;
-    for (int i = 0; i < rows; i++) for (int j = i + 1; j < rows; j++)
-        if (row[j].t > row[i].t) {
-            __typeof__(row[0]) tmp = row[i]; row[i] = row[j]; row[j] = tmp;
-            double x = vtx[i]; vtx[i] = vtx[j]; vtx[j] = x; x = frg[i]; frg[i] = frg[j]; frg[j] = x;
-        }
-    fprintf(stderr, "[passes] %u encoders over %u of %u frames (%u without timestamps): %.2f GPU ms per frame busy "
-            "(units: %s); exclusive time by what they draw into:\n", pairs, nf, g_prof_n, bad, per_frame * scale,
-            scale == 1e-6 ? "ns" : "GPU ticks");
-    for (int i = 0; i < rows; i++)
-        fprintf(stderr, "[passes] %6.3f ms/frame %5.1f%%  x%-5.1f vtx %6.3f frag %6.3f  %s\n", row[i].t * scale / nf,
-                total > 0 ? 100.0 * row[i].t / total : 0, (double)row[i].n / nf, vtx[i] * scale / nf,
-                frg[i] * scale / nf, row[i].sig);
-    if (++g_prof_win < g_prof_nwin) {             // the next window reuses the sample buffers
-        g_prof_used = 0;
-        g_prof_from = g_prof_at[g_prof_win] >= 0 ? UINT32_MAX : g_prof_fr[g_prof_win];
-        g_prof_done = 0;
-        if (g_prof_from != UINT32_MAX) fprintf(stderr, "[passes] profiling guest frames %u..%u\n", g_prof_from, g_prof_from + g_prof_n - 1);
+    if (per_frame * scale < 0.2 || per_frame * scale > 60) scale = ns_per_tick * 1e-6;
+    double busy = per_frame * scale, span = span_sum / nf * scale;
+    fprintf(stderr, "[passes] W%d %s%s: %u frames, %.1f encoders/frame (%u without timestamps, %u untimed: no free sample "
+            "slot); busy %.2f ms/frame, span %.2f ms, GPU idle inside the span %.2f ms; [gputime] union %.2f ms (%u frames); "
+            "units %s\n", g_prof_win, tag, g_prof_cur_loading ? " (a load began during it)" : "", nf, (double)encs / nf,
+            bad, g_prof_noslot, busy, span, span > busy ? span - busy : 0.0,
+            g_prof_union_n ? g_prof_union / g_prof_union_n : 0.0, g_prof_union_n, scale == 1e-6 ? "ns" : "GPU ticks");
+    {
+        char line[600];
+        int u = snprintf(line, sizeof line, "[passes] W%d by kind (ms/frame, encoders/frame, vtx/frag):", g_prof_win);
+        for (int i = 0; i < kKinds && u < (int)sizeof line - 64; i++)
+            if (kn[i]) u += snprintf(line + u, sizeof line - u, " %s %.2f x%.1f (%.2f/%.2f) |", k_prof_kind[i],
+                                     kt[i] * scale / nf, (double)kn[i] / nf, kv[i] * scale / nf, kf[i] * scale / nf);
+        fprintf(stderr, "%s\n", line);
     }
+    // Top passes by exclusive time.
+    for (int i = 0; i < rows; i++) for (int j = i + 1; j < rows; j++)
+        if (row[j].t > row[i].t) { __typeof__(row[0]) tmp = row[i]; row[i] = row[j]; row[j] = tmp; }
+    for (int i = 0; i < rows && i < 16; i++)
+        fprintf(stderr, "[passes] W%d %6.3f ms/frame %5.1f%%  x%-5.1f vtx %6.3f frag %6.3f  %-10s %s\n", g_prof_win,
+                row[i].t * scale / nf, total > 0 ? 100.0 * row[i].t / total : 0, (double)row[i].n / nf,
+                row[i].vtx * scale / nf, row[i].frg * scale / nf, k_prof_kind[row[i].kind], row[i].sig);
+    if (rows > 16) {
+        double rest = 0; for (int i = 16; i < rows; i++) rest += row[i].t;
+        fprintf(stderr, "[passes] W%d %6.3f ms/frame in %d more signatures\n", g_prof_win, rest * scale / nf, rows - 16);
+    }
+    // One frame in encoding order (the window's second): its first window per scene, 4 scenes at most.
+    if (g_prof_orders < 4 && g_prof_cur_scene != g_prof_order_scene) {
+        g_prof_orders++; g_prof_order_scene = g_prof_cur_scene;
+        uint32_t fd = from + 1; uint64_t h2 = 0, f0 = 0; int idx = 0;
+        for (unsigned k = 0; k < pairs; k++) {
+            if (g_prof_meta[k].frame != fd || g_prof_meta[k].sig[0] == '~' || g_prof_meta[k].sig[0] == '!') continue;
+            if (!PROF_OK(k)) { fprintf(stderr, "[passes] W%d f%u #%03d (no timestamps) %s\n", g_prof_win, fd, idx++, g_prof_meta[k].sig); continue; }
+            uint64_t a = r[2 * k].timestamp, b = r[2 * k + 1].timestamp;
+            if (!f0) f0 = a;
+            uint64_t from_t = a > h2 ? a : h2;
+            fprintf(stderr, "[passes] W%d f%u #%03d at %7.3f span %6.3f excl %6.3f ms  %s\n", g_prof_win, fd, idx++,
+                    (double)(a - f0) * scale, (double)(b - a) * scale, b > from_t ? (double)(b - from_t) * scale : 0.0,
+                    g_prof_meta[k].sig);
+            if (b > h2) h2 = b;
+        }
+    }
+#undef PROF_OK
+    free(r);
+}
+
+// After the active window's frames are final: print it (in an autorelease pool: the resolved counters are
+// autoreleased and the game thread has none) and close it, so the next window can start.
+static void prof_report(uint32_t frame) {
+    uint32_t from = g_prof_from;
+    // 12: VPKEngine keeps up to 12 command buffers (several frames) in flight; their samples must have landed.
+    if (g_prof <= 0 || from == UINT32_MAX || frame < from + g_prof_n + 12) return;
+    os_unfair_lock_lock(&g_prof_lk);
+    unsigned pairs = g_prof_used;
+    os_unfair_lock_unlock(&g_prof_lk);
+    if (!pairs || !g_prof_buf)
+        fprintf(stderr, "[passes] W%d %s: no encoder timed (%u left without a free sample slot)\n", g_prof_win, g_prof_tag,
+                g_prof_noslot);
+    else
+        @autoreleasepool { prof_print(from, pairs, g_prof_tag); }
+    os_unfair_lock_lock(&g_prof_lk);
+    g_prof_used = 0;
+    g_prof_from = UINT32_MAX;
+    os_unfair_lock_unlock(&g_prof_lk);
 }
 
 
@@ -821,8 +1055,10 @@ void kl_vrr_set(int mode, float inner, float outer, float edge) {   // mode: 0 c
     g_vrr_live_soft = mode >= 0 && mode <= 2 ? mode : 0;
     kl_vrr_reload();
 }
+static void vrr_forget_full(void);
 void kl_vrr_reload(void) {
     for (int i = 0; i < 8; i++) g_vrr_maps[i].map = NULL, g_vrr_maps[i].w = g_vrr_maps[i].h = 0;
+    vrr_forget_full();   // KL_VRR_PHYS: a new physical size; every texture gets one full-area pass again
     fprintf(stderr, "[vrr] settings changed: maps rebuilt on the next frame\n");
 }
 void *kl_vrr_map_for(int w, int h) {
@@ -840,6 +1076,108 @@ void *kl_vrr_grid_ctx(int eye, void *map, float tex_h) {
     g_vrr_ctx[eye].scr_h = (float)m.screenSize.height;
     g_vrr_ctx[eye].tex_h = tex_h;
     return &g_vrr_ctx[eye];
+}
+
+// ---- Render area of the foveated passes (KL_VRR_PHYS=1; KL_VRR_PHYS_POST=1) -------------------------------------
+// With a rasterization rate map Metal rasterizes into the map's PHYSICAL size (top-left of the attachments) while
+// viewports and scissors stay in screen (logical) coordinates: Apple's own model, where the drawable textures are the
+// physical size (CompositorServices' drawables and views' viewports, "Rendering with a rasterization rate map").
+// The render target size is in physical pixels: VPKEngine sets it to the game's render area (the full eye size,
+// 2784x2208 at 90 %), so every tile of that area was still cleared, loaded, stored and resolved although only the
+// physical part (1536x1428 with the M2 map: 36 %) is ever drawn or read back (the compositor unwarps that part only).
+// KL_VRR_PHYS=1 constrains the render target of every foveated pass (MSAA scene, 1x overlays with depth) to the
+// map's physical size: the MSAA resolve, the depth resolve and the overlay pass's loads and stores shrink to it.
+// Viewports, scissors and the map are untouched (logical, as before). Outside the physical part the textures are then
+// no longer written every frame, but the unfoveated post passes (bloom, exposure) still read the whole texture: what
+// lies there must stay what it is today (the clear colour, resolved), not whatever the memory held at allocation
+// (VPKEngine gives each Vulkan image its own Metal texture, no aliasing, but Metal does not zero new textures). So the
+// FIRST foveated pass that touches a texture keeps the full area (its clear and resolve fill the outside once) and
+// only later passes on known textures are constrained (vrr_textures_known: a weak set, so a texture the game frees
+// and re-creates, e.g. at a fidelity change, gets its full pass again).
+// KL_VRR_PHYS_POST=1 (A/B, off by default) does the same for the unfoveated eye-sized layered 1x passes without depth
+// (fullscreen post: tonemap and the like), which carry the physical layout texel for texel: there the viewport and
+// scissor are larger than the render target WITHOUT a rate map, which Metal's validation calls an error (the GPU
+// clips to the render target), hence opt-in until a run shows the picture intact.
+static int g_vrr_phys = -1, g_vrr_phys_post = -1;
+static void vrr_phys_env(void) {
+    if (g_vrr_phys >= 0) return;
+    const char *e = getenv("KL_VRR_PHYS");
+    g_vrr_phys = e && *e == '1';
+    e = getenv("KL_VRR_PHYS_POST");
+    g_vrr_phys_post = e && *e == '1';
+    fprintf(stderr, "[vrr] render area of foveated passes = the map's physical size: %s; unfoveated eye post passes: %s\n",
+            g_vrr_phys ? "on (KL_VRR_PHYS)" : "off", g_vrr_phys_post ? "on (KL_VRR_PHYS_POST)" : "off");
+}
+// The largest physical size over the map's layers (the eyes' maps differ: their axes are off-centre on opposite sides).
+static MTLSize vrr_phys_size(id<MTLRasterizationRateMap> m) {
+    MTLSize p = [m physicalSizeForLayer:0];
+    for (NSUInteger l = 1; l < m.layerCount && l < 2; l++) {
+        MTLSize q = [m physicalSizeForLayer:l];
+        if (q.width > p.width) p.width = q.width;
+        if (q.height > p.height) p.height = q.height;
+    }
+    return p;
+}
+// 1 when every texture the pass writes or loads (attachments and resolve targets; a view counts as its parent;
+// memoryless ones hold nothing) has had one full-area foveated pass already; otherwise records them and returns 0.
+static NSHashTable *g_vrr_full_done;   // weak: entries vanish when the game frees the texture
+static os_unfair_lock g_vrr_full_lk = OS_UNFAIR_LOCK_INIT;
+static unsigned g_vrr_full_passes;
+static int vrr_textures_known(MTLRenderPassDescriptor *d) {
+    id<MTLTexture> ts[20];
+    int n = 0;
+    for (int i = 0; i < 8; i++) { ts[n++] = d.colorAttachments[i].texture; ts[n++] = d.colorAttachments[i].resolveTexture; }
+    ts[n++] = d.depthAttachment.texture; ts[n++] = d.depthAttachment.resolveTexture;
+    ts[n++] = d.stencilAttachment.texture; ts[n++] = d.stencilAttachment.resolveTexture;
+    int known = 1;
+    os_unfair_lock_lock(&g_vrr_full_lk);
+    // alloc/init: owned (libklepton builds this file without ARC, where weakObjectsHashTable would be autoreleased)
+    if (!g_vrr_full_done) g_vrr_full_done = [[NSHashTable alloc] initWithOptions:NSPointerFunctionsWeakMemory capacity:16];
+    for (int i = 0; i < n; i++) {
+        id<MTLTexture> t = ts[i];
+        if (!t || t.storageMode == MTLStorageModeMemoryless) continue;
+        if (t.parentTexture) t = t.parentTexture;
+        if (![g_vrr_full_done containsObject:t]) { known = 0; [g_vrr_full_done addObject:t]; }
+    }
+    if (!known) g_vrr_full_passes++;
+    os_unfair_lock_unlock(&g_vrr_full_lk);
+    return known;
+}
+static void vrr_forget_full(void) {
+    os_unfair_lock_lock(&g_vrr_full_lk);
+    [g_vrr_full_done removeAllObjects];
+    os_unfair_lock_unlock(&g_vrr_full_lk);
+}
+// Constrain the pass's render target (screen size w x h) to the map's physical size; only ever shrinks it.
+static void vrr_constrain(MTLRenderPassDescriptor *d, id<MTLRasterizationRateMap> m, NSUInteger w, NSUInteger h, int post) {
+    // KL_VK_MERGE (MoltenVK diagnostics) compares render target sizes to merge resumed chunks: leave them alone.
+    if (g_merge > 0) return;
+    MTLSize p = vrr_phys_size(m);
+    if (!p.width || !p.height || p.width > w || p.height > h || (p.width == w && p.height == h)) return;
+    if (!vrr_textures_known(d)) {   // its first pass: full area, so the outside holds what it always did
+        if (g_vrr_full_passes <= 8 || g_vrr_full_passes % 100 == 0)
+            fprintf(stderr, "[vrr] full-area first pass on new texture(s) (%u so far), physical area from the next one\n",
+                    g_vrr_full_passes);
+        return;
+    }
+    d.renderTargetWidth = p.width;
+    d.renderTargetHeight = p.height;
+    static int said[2];
+    if (said[post] < 3) {
+        said[post]++;
+        id<MTLTexture> t = d.colorAttachments[0].texture ? d.colorAttachments[0].texture : d.depthAttachment.texture;
+        fprintf(stderr, "[vrr] %s pass (fmt %lu x%lu, %lu layer(s)): render area %lux%lu -> %lux%lu (%.0f%% of the tiles)\n",
+                post ? "unfoveated post" : "foveated", t ? (unsigned long)t.pixelFormat : 0ul,
+                t ? (unsigned long)t.sampleCount : 0ul, (unsigned long)d.renderTargetArrayLength, (unsigned long)w,
+                (unsigned long)h, (unsigned long)p.width, (unsigned long)p.height, 100.0 * p.width * p.height / ((double)w * h));
+    }
+}
+// The foveated map already built for this screen size (the scene pass builds it earlier in the frame), or nil.
+static id<MTLRasterizationRateMap> vrr_map_cached(NSUInteger w, NSUInteger h, NSUInteger layers) {
+    for (int i = 0; i < 8; i++)
+        if (g_vrr_maps[i].map && g_vrr_maps[i].w == w && g_vrr_maps[i].h == h && g_vrr_maps[i].layers == layers)
+            return (__bridge id<MTLRasterizationRateMap>)g_vrr_maps[i].map;
+    return nil;
 }
 
 // KL_VK_MERGE_VIS=1 (with KL_VK_MERGE): the scene's first chunk issues no occlusion queries and so gets no
@@ -962,6 +1300,8 @@ static id kl_rce(id self, SEL sel, MTLRenderPassDescriptor *d) {
                 id<MTLRasterizationRateMap> map = vrr_fov_map(cb.device, w, h, layers);
                 if (map) {
                     d.rasterizationRateMap = map;
+                    vrr_phys_env();
+                    if (g_vrr_phys > 0) vrr_constrain(d, map, w, h, 0);
                     static void *published;
                     if ((__bridge void *)map != published) {   // the compositor unwarps the eye image with it
                         published = (__bridge void *)map;
@@ -973,12 +1313,21 @@ static id kl_rce(id self, SEL sel, MTLRenderPassDescriptor *d) {
                 }
             } else if (t && t.width >= 1024 && d.renderTargetArrayLength > 1) {
                 // Measurement: eye-sized layered passes left unfoveated (expected: the fullscreen post passes only).
+                NSUInteger w = d.renderTargetWidth ? d.renderTargetWidth : t.width;
+                NSUInteger h = d.renderTargetHeight ? d.renderTargetHeight : t.height;
                 static int saidNot;
                 if (saidNot < 6) {
                     saidNot++;
-                    fprintf(stderr, "[vrr] eye-sized layered pass NOT foveated: colour fmt %lu x%lu samples, depth %s, load %lu\n",
-                            ct ? (unsigned long)ct.pixelFormat : 0ul, (unsigned long)t.sampleCount, dt ? "yes" : "no",
-                            (unsigned long)d.colorAttachments[0].loadAction);
+                    fprintf(stderr, "[vrr] eye-sized layered pass NOT foveated: colour fmt %lu x%lu samples, depth %s, load %lu, "
+                            "store %lu, area %lux%lu x%lu (frame %u)\n", ct ? (unsigned long)ct.pixelFormat : 0ul,
+                            (unsigned long)t.sampleCount, dt ? "yes" : "no", (unsigned long)d.colorAttachments[0].loadAction,
+                            (unsigned long)d.colorAttachments[0].storeAction, (unsigned long)w, (unsigned long)h,
+                            (unsigned long)d.renderTargetArrayLength, f);
+                }
+                vrr_phys_env();
+                if (g_vrr_phys_post > 0 && t.sampleCount == 1 && !dt && d.renderTargetArrayLength == 2) {
+                    id<MTLRasterizationRateMap> m = vrr_map_cached(w, h, 2);
+                    if (m) vrr_constrain(d, m, w, h, 1);
                 }
             }
         }
@@ -999,24 +1348,39 @@ static id kl_rce(id self, SEL sel, MTLRenderPassDescriptor *d) {
             }
         }
     }
-    if (g_prof > 0 && d) {
+    int prof_slot = -1, prof_k = -1;   // our sample attachment on this pass, if any (undone if Metal refuses it)
+    if (g_prof > 0 && d && !g_prof_refused) {
         int role; uint32_t f = prof_frame_of((id<MTLCommandBuffer>)self, &role);
-        int k = role == 0 ? prof_pair((id<MTLCommandBuffer>)self, f) : -1;
-        // A second pair, in the same sample buffer, for the vertex stage's end and the fragment stage's start.
-        int k2 = k >= 0 ? prof_pair((id<MTLCommandBuffer>)self, f) : -1;
-        if (k >= 0 && k2 >= 0 && prof_buf(k2) != prof_buf(k)) k2 = -1;
-        if (k >= 0) {
-            prof_sig_render(d, g_prof_meta[k].sig, sizeof g_prof_meta[k].sig);
-            d.sampleBufferAttachments[0].sampleBuffer = prof_buf(k);
-            d.sampleBufferAttachments[0].startOfVertexSampleIndex = prof_idx(k);
-            d.sampleBufferAttachments[0].endOfVertexSampleIndex = k2 >= 0 ? prof_idx(k2) : MTLCounterDontSample;
-            d.sampleBufferAttachments[0].startOfFragmentSampleIndex = k2 >= 0 ? prof_idx(k2) + 1 : MTLCounterDontSample;
-            d.sampleBufferAttachments[0].endOfFragmentSampleIndex = prof_idx(k) + 1;
-            if (k2 >= 0) snprintf(g_prof_meta[k2].sig, sizeof g_prof_meta[k2].sig, "~stages of %d", k);
+        if (role == 0 && prof_in(f)) {
+            // Our samples go to the first free attachment: VPKEngine's own (index 0) stay intact.
+            int slot = 0;
+            while (slot < kProfSampleSlots && d.sampleBufferAttachments[slot].sampleBuffer) slot++;
+            if (slot == kProfSampleSlots) g_prof_noslot++;
+            // Two adjacent pairs: k for the pass, k + 1 for the vertex stage's end and the fragment stage's start
+            // (used only when both sit in the same sample buffer).
+            int k = slot < kProfSampleSlots ? prof_pair((id<MTLCommandBuffer>)self, f, prof_kind_render(d), 1) : -1;
+            int k2 = k >= 0 && prof_buf(k + 1) == prof_buf(k) ? k + 1 : -1;
+            if (k >= 0) {
+                // After the foveation hook above: the signature shows the rate map ("vrr") and the render area used.
+                prof_sig_render(d, g_prof_meta[k].sig, sizeof g_prof_meta[k].sig);
+                MTLRenderPassSampleBufferAttachmentDescriptor *a = d.sampleBufferAttachments[slot];
+                a.sampleBuffer = prof_buf(k);
+                a.startOfVertexSampleIndex = prof_idx(k);
+                a.endOfVertexSampleIndex = k2 >= 0 ? prof_idx(k2) : MTLCounterDontSample;
+                a.startOfFragmentSampleIndex = k2 >= 0 ? prof_idx(k2) + 1 : MTLCounterDontSample;
+                a.endOfFragmentSampleIndex = prof_idx(k) + 1;
+                if (k2 >= 0) snprintf(g_prof_meta[k2].sig, sizeof g_prof_meta[k2].sig, "~stages of %d", k);
+                prof_slot = slot; prof_k = k;
+            }
         }
     }
     ml_guard(d);
     id enc = ((id (*)(id, SEL, MTLRenderPassDescriptor *))g_rce)(self, sel, d);
+    if (!enc && prof_slot >= 0) {   // no encoder with our sample buffer attached: drop it, and profiling, and retry
+        d.sampleBufferAttachments[prof_slot].sampleBuffer = nil;
+        prof_refused(prof_k, "render");
+        enc = ((id (*)(id, SEL, MTLRenderPassDescriptor *))g_rce)(self, sel, d);
+    }
     if (g_snap_at && !g_snap_done && enc && d) {
         int role; uint32_t f = prof_frame_of((id<MTLCommandBuffer>)self, &role);
         if (role == 0) snap_note((id<MTLCommandBuffer>)self, d, f);
@@ -1086,17 +1450,30 @@ static void vrr_install(Class c) {
     const char *pp = getenv("KL_GPU_PASSES");
     g_prof = pp && *pp ? 1 : 0;
     if (g_prof) {
-        for (const char *q = pp; *q && g_prof_nwin < kProfWins; ) {
-            if (*q == 't') { g_prof_at[g_prof_nwin] = atof(q + 1); g_prof_fr[g_prof_nwin] = 0; }
-            else { g_prof_at[g_prof_nwin] = -1; g_prof_fr[g_prof_nwin] = (uint32_t)atoi(q); }
-            g_prof_nwin++;
-            q = strchr(q, ','); if (!q) break; q++;
-        }
-        g_prof_from = g_prof_nwin && g_prof_at[0] >= 0 ? UINT32_MAX : g_prof_fr[0];
         const char *pn = getenv("KL_GPU_PASSES_N");
         if (pn && atoi(pn) > 0) g_prof_n = (uint32_t)atoi(pn);
+        int nf = 0;
+        os_unfair_lock_lock(&g_prof_lk);
+        for (const char *q = pp; q && *q; ) {
+            while (*q == ' ') q++;
+            if (*q == 't' && g_prof_nt < kProfSpecs) g_prof_spec_t[g_prof_nt++] = atof(q + 1);
+            else if (*q == 'g' && g_prof_ng < kProfSpecs) g_prof_spec_g[g_prof_ng++] = atof(q + 1);
+            else if (*q >= '0' && *q <= '9') {
+                char tag[24];
+                snprintf(tag, sizeof tag, "f%d", atoi(q));
+                prof_push_locked(-1, (uint32_t)atoi(q), -1, tag);
+                nf++;
+            }
+            q = strchr(q, ',');
+            if (q) q++;
+        }
+        os_unfair_lock_unlock(&g_prof_lk);
         hook(c, @selector(computeCommandEncoderWithDispatchType:), (IMP)kl_cce, (IMP *)&g_cce);
         hook(c, @selector(blitCommandEncoder), (IMP)kl_bce, (IMP *)&g_bce);
+        hook(c, @selector(computeCommandEncoderWithDescriptor:), (IMP)kl_cced, (IMP *)&g_cced);
+        hook(c, @selector(blitCommandEncoderWithDescriptor:), (IMP)kl_bced, (IMP *)&g_bced);
+        fprintf(stderr, "[passes] per-pass GPU times (KL_GPU_PASSES=%s): %d window(s) after every scene start, %d after the "
+                "first frame, %d at frame numbers; %u frames each\n", pp, g_prof_ng, g_prof_nt, nf, g_prof_n);
     }
     const char *e = getenv("KL_VRR_SPIKE");
     g_vrr_mode = !e || !*e ? 0 : !strncmp(e, "census", 6) ? 1 : !strncmp(e, "inject", 6) ? 2 : 0;
@@ -1152,26 +1529,24 @@ void kl_gpu_time_frame_end(void) {
     os_unfair_lock_lock(&g_lk);
     g_frame++;
     slot_of(g_frame);
+    uint32_t frame = g_frame;
     int on = g_commit != NULL;
     os_unfair_lock_unlock(&g_lk);
     if (!on) return;
     if (g_prof > 0) {
-        double now = CACurrentMediaTime();
-        if (!g_prof_t0) g_prof_t0 = now;
-        if (!g_prof_done && g_prof_from == UINT32_MAX && g_prof_win < g_prof_nwin && now - g_prof_t0 >= g_prof_at[g_prof_win]) {
-            g_prof_from = g_frame + 1;
-            fprintf(stderr, "[passes] window %d at %.1f s after the first guest frame: profiling guest frames %u..%u\n",
-                    g_prof_win + 1, now - g_prof_t0, g_prof_from, g_prof_from + g_prof_n - 1);
-        }
+        prof_report(frame);   // closes the active window once its frames are final
+        prof_tick(frame);     // opens the next due one
     }
-    if (g_prof > 0 && !g_prof_done) prof_report();
     // Every few seconds: the finished frames' GPU time.
     static unsigned last_f, n;
     static double sum, csum, worst, since;
     unsigned f;
     float comp;
     float ms = kl_gpu_time_frame_ms(0, &comp, &f);
-    if (f && f != last_f) { last_f = f; sum += ms; csum += comp; n++; if (ms > worst) worst = ms; }
+    if (f && f != last_f) {
+        last_f = f; sum += ms; csum += comp; n++; if (ms > worst) worst = ms;
+        if (prof_in(f)) { g_prof_union += ms; g_prof_union_n++; }   // the profiled window's own [gputime]
+    }
     // KL_GPU_TIME_LOG: the report interval in seconds (default 5).
     static double every;
     if (!every) { const char *e = getenv("KL_GPU_TIME_LOG"); every = e && atof(e) > 0 ? atof(e) : 5.0; }

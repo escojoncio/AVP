@@ -780,9 +780,16 @@ vr::HmdColor_t IVRCompositor__GetCurrentFadeColor(void *, bool) {
 }
 void IVRCompositor__FadeGrid(void *, float seconds, bool fade_in) {
     const float a[4] = { fade_in ? 1.0f : 0.0f, 0, 0, 0 };
-    std::lock_guard<std::mutex> l(g_mu);
-    g_fade_grid.start(klvr_plat_now(), a, seconds);
+    {
+        std::lock_guard<std::mutex> l(g_mu);
+        g_fade_grid.start(klvr_plat_now(), a, seconds);
+    }
     logf("FadeGrid(%.2f s, %s)", seconds, fade_in ? "in" : "out");
+    // Only a change of state reaches the platform (Source 2 fades in a dozen times per load): outside g_mu, the
+    // platform may log or take its own locks.
+    static std::atomic<int> s_last_fade{-1};
+    const int now_fade = fade_in ? 1 : 0;
+    if (s_last_fade.exchange(now_fade) != now_fade) klvr_plat_scene_fade(now_fade);
 }
 float IVRCompositor__GetCurrentGridAlpha(void *) {
     float a[4];

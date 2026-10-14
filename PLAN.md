@@ -82,11 +82,15 @@ pieces; VisionQuestPro is not touched.
    command buffer must be ordered after the previous command buffer (Vulkan barriers cover all
    earlier submissions); 12 command buffers in flight stays the default.
 
-8. Compositor cost (build 26): the compositor only composes when the game has a new picture; otherwise visionOS
+8. Compositor cost (build 26, fixed in 27 — a queried frame must always be presented): the compositor only composes when the game has a new picture; otherwise visionOS
    reprojects the last drawable (it used to re-composite the same picture at every 100 Hz refresh, 7-19 ms of GPU
    per game frame). Setting "Compose only new pictures", on by default.
 9. Next performance step decided from per-pass GPU times measured in play (build 26, `KL_GPU_PASSES`): post passes
    at the foveated size, MSAA 2x, shadows, or P.T.-style views (inset + wide view) in VPKEngine.
+
+10. Build 27: round sharp zone like P.T. composed in the compositor (circle over the rate map's rectangle, outside at the
+    periphery's quality); VPKEngine 0031 vertex amplification + dependency-tracked command-buffer ordering + exclusive
+    per-encoder GPU timing; foveated passes' render area = the rate map's physical size.
 
 **Diagnostic switch (hidden, temporary): MoltenVK.** Only to isolate CPU/OpenVR/signing bugs from
 VPKEngine bugs while the gaps are closed. Not a play mode; removed once VPKEngine boots Alyx.

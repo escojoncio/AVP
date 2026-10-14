@@ -56,6 +56,7 @@ void klvr_plat_haptic(int hand, float amplitude, float frequency, float seconds)
 int klvr_plat_presents(void) { return !klvr_null.no_display; }
 float klvr_plat_gpu_ms(uint32_t frames_ago, float *compositor) { (void)frames_ago; if (compositor) *compositor = 0; return 0; }
 void klvr_plat_frame_closed(void) {}
+void klvr_plat_scene_fade(int to_grid) { (void)to_grid; }
 float klvr_plat_gpu_report_scale(void) { return 1.0f; }
 int klvr_plat_mem_free_mb(void) { const char *e = getenv("KLVR_RAISE_MEM_TEST_MB"); return e && *e ? atoi(e) : -1; }
 void klvr_plat_async_frames(void) { klvr_null.async_frames = 1; }
