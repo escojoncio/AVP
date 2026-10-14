@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0035).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B36).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B37).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -298,7 +298,26 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
 3. Compositor: la vista ancha YA se construye a la densidad de la periferia (`buildWideView`, dens = edge, taps 4):
    nada que recortar ahí; medir primero con `cx` (B36).
 
-## Siguiente (al llegar el log de B36)
+## Logs_Alyx_3 (B36b) — medido
+- B36b arranca: el crash al tocar el icono era `Window(id:)` (no usar en AVP). Subtítulos: foveado correcto
+  (`[vrr] ... (subtitles)`), pero letra 2 demasiado grande → B37 letra 1.
+- Medida exclusiva FUNCIONA: `missed 0` en juego y compositor toda la sesión, calibración 1,0000 ns/tick, `bad 99`
+  solo los frames antes de calibrar. Regulador `(exclusive)`.
+- Cifras REALES por frame (33 fps, juego): juego 14–18 ms (picos 22–26), **compositor 4,5–5,9 ms exclusivos** (luego
+  2,8–3,6 en otra zona) → total 18–23 ms: 50 fps no cabe casi nunca; el regulador sube a 50 en zonas ligeras
+  (11–16 ms) y cae a los 2 s (32/50 tardíos). El compositor es ~25 % del presupuesto: objetivo principal.
+- El compositor compone 1 vez por frame del juego (34/s, `skipped(same picture)` el resto) → ~5 ms POR COMPOSICIÓN.
+  Sospechosos: reconstrucción de periferia (`KL_CP_RECON=1`, multi-tap) y el muestreo redondo; B37 saca
+  `[gputime] compositor passes (exclusive ms per pass, passes/s)` cada 30 s con la firma de cada pase para repartirlo.
+
+## Siguiente (al llegar el log de B37)
+1. Repartir los ~5 ms del compositor por pase y recortar el mayor (recon / composite): candidatos: recon a menos
+   taps, componer la periferia a menor resolución, o `KL_CP_QUALITY` (hoy 0,40).
+2. Confirmar `[vk] ... samples the guest's image ... directly` y que la imagen es correcta; `gpu.excl` tipo 1c9d…
+   debe bajar de 3 a 1 CB/frame.
+3. Probar el ajuste «Post-procesado solo en el área foveada»; si limpio → ON por defecto.
+
+## Siguiente (al llegar el log de B36) — hecho en B37 salvo lo indicado
 1. Confirmar `[vrr] ... (subtitles)` y subtítulos correctos en ambos ojos; afinar `cc_vr_vertical_offset` si la altura
    no convence (6 ≈ justo sobre el centro).
 2. `[gputime]`: `missed 0` en juego y compositor, `calibrated ~1.0 ns per GPU tick`, sin `sample dropped`; regulador
