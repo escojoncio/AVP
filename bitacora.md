@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0035).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B33).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B34).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -180,17 +180,45 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
    Ajuste «Dedos reales» (`avp.handFingers`, ON) = `KL_HANDS=1` (pide permiso de manos). Log cada 30 s:
    `[input] fingers with a Sense controller in hand: left tracked N/M, right N/M` → dice si visionOS da manos con el
    mando sujeto (VisionQuestPro observó que NO en versiones anteriores).
-2. Ajuste «Prueba: amplificación de vértices» (`avp.amplifyTest`, OFF) = `VPVK_AMPLIFY=1` + capturas forzadas. Para una
-   partida corta de diagnóstico: PNG de ojos + `gpu.hunt` del fallo del pase overlay (`wm4294967280` = variante con
-   write mask c0=0).
+2. Ajuste de prueba de amplificación de vértices (sustituido en B34, ver abajo).
 
-## Siguiente (al llegar el log de B33)
-1. Dedos: contador `fingers with a Sense controller in hand`; si 0/M, visionOS no da manos con el mando → la función
-   solo sirve sin mandos (dejar el ajuste, documentarlo).
-2. Amplificación (vtx 11 → ~6 ms; la única vía a 50 fps estables): con las capturas de la prueba, localizar el bug.
-   Pistas: viewMappings vs capa del rate map por `[[viewport_array_index]]` (`0027`); VS que escriben
-   Layer/ClipDistance siguen instanciados (`SpirvInterface::amplified=false`): mezcla en el mismo pase; kernel de
-   fix-up de draws indirectos (`kOwnerFixBase`) multiplicando ×2 también los amplificados.
+## Logs_Alyx_26 / 2_8 / 2_9 (B33) — medido
+- Dedos reales: `[input] fingers with a Sense controller in hand: left tracked 0/N, right 0/N` toda la partida →
+  visionOS NO da manos trackeadas con el Sense sujeto. La función solo actúa con las manos libres (pie del ajuste).
+- Amplificación de vértices (`VPVK_AMPLIFY=1`): CORRECTA. Capturas 1200/2400/3600: los dos ojos bien, foveado centrado
+  donde toca en cada ojo (ojo 0 nítido al 63 %, ojo 1 al 37 %); 0 cuelgues, 0 `gpu.hunt`, 0 `metal_faulted`. Escena
+  MSAA: `vtx_ms` 8–12 → **~4 ms** (668 draws, excl 10 ms frente a 13–18). Lo que B29 vio roto no se reproduce
+  (los fallos de entonces venían de `KL_VRR_PHYS=1`).
+- Los 20 fps del final del test 2 NO son la amplificación: **el compositor midió el panel a 50 Hz al arrancar**
+  (`display rate SETTLED at 50.005 Hz`: los 120 fotogramas de cebado se mostraron 2 refrescos cada uno y pasaron por
+  "cadencia estable"; la sesión 26 midió 100). Con 50 latcheado: refrescos saltados a 20 ms, pacer `1/1 of 50 Hz` →
+  `1/2 of 57.3` → `1/1 of 40.8 Hz` (dividía la tasa de publicación de la última ventana, que baja cuando el juego va
+  tarde), plan del regulador "base 50, sin fallback" (50/2 = 25 < 32): sin escalón de 33; en zonas densas el juego
+  cae a la mitad (compositor: 20 imágenes nuevas/s con el juego a 40). Más tarde en la sesión hubo huecos de 10 ms
+  (`display rate 100 Hz (min gap 10.00 ms)`): el panel era de 100 Hz.
+- Mapa blanco/vacío al cargar la partida en la sesión 26: sin consola del juego de esa sesión (`console.log` se
+  sobrescribe). Pendiente: si vuelve a pasar, zip inmediato con `console.log`.
+
+## B34 — cambios
+1. `KleptonCompositor.swift`: el panel nunca va más rápido de lo que es. (a) Latch de arranque: una tasa asentada
+   < 55 Hz es una retención ×2/×3 de 120/100/96/90 (`unheldPanelPeriod`; 55–85 se deja: un 60 Hz real existe) → se
+   latchea la canónica, log `display rate X Hz is a HELD cadence ... latching Y Hz`. (b) En sesión: `cadenceMinDirect`
+   (hueco mínimo SOLO entre presentaciones sin refresco saltado entre medias) → si 3 ventanas seguidas coinciden en
+   una canónica > 6 % más rápida que la latcheada: `PANEL RATE RE-LATCHED a -> b Hz`; nunca hacia abajo (una
+   cadencia más lenta son retenciones, no un panel más lento; una demotion real a 60 Hz en sesión no se propaga:
+   aceptado). (c) `kl_guest_set_panel_hz(hz)` al compositor → `kl_app.c`.
+2. `kl_app.c` `guest_pace_wait`: divide la tasa canónica del panel (`g_panel_hz`), no la de publicación de la ventana
+   (que solo se usa de respaldo antes del latch y se loguea cada 60 s: `poses published at X Hz (panel Y Hz)`).
+   `g_disp_rate` = panel → el plan del regulador (`pace_plan`, pico) ve 100 desde el principio.
+3. Amplificación de vértices ON por defecto: clave nueva `avp.amplify` (`AVPSettings.amplify`), toggle «Amplificación
+   de vértices» en Diagnóstico (apagar = instanciado, B32); sin capturas forzadas. La firma de cuarentena cambia
+   (VPVK_AMPLIFY=1) → la cuarentena anterior se descarta sola.
+4. Pie de «Dedos reales»: solo con las manos libres (con Sense en la mano el visor no trackea esa mano).
+
+## Siguiente (al llegar el log de B34)
+1. Comprobar en el log: `display N Hz measured` = 100 (o la línea HELD/RE-LATCHED), `[guest] panel rate 100.0 Hz`,
+   `pace governor: 1/2 of 100 → 50` y `1/3 → 33` en zonas densas, y `with a picture` ≈ fps del juego (no la mitad).
+2. Con amplificación por defecto: ritmo real (tramos a 50 y mínimo en zonas densas), `vtx` en `[passes]`.
 3. Streaming de texturas (`vkCopyMemoryToImageEXT` espera la GPU por región) → staging asíncrono.
 4. Compositor 3,3 ms por imagen nueva: perfilar `kl_reproject` por etapa.
 5. Hidden area mesh: comprobar que klvr devuelve malla para la lente del Vision Pro.

@@ -1373,6 +1373,19 @@ float kl_guest_pace_fps(void) { return g_pace_fps; }
 static _Atomic float g_disp_rate;
 float kl_guest_display_rate(void);
 float kl_guest_display_rate(void) { return g_disp_rate; }
+// The panel's rate as the compositor latched it (canonical: 90/96/100/120), set at boot and re-latched upward if a
+// faster cadence shows up later (build 34). The pacer divides THIS, not the publish rate of the last window: that
+// rate falls whenever the guest runs late (held drawables), which made the pacer follow the fall (Logs_Alyx_2_8:
+// "1/1 of 40.8 Hz", half the frames never shown).
+static _Atomic float g_panel_hz;
+void kl_guest_set_panel_hz(float hz) {
+    if (hz > 20) {
+        g_panel_hz = hz;
+        g_disp_rate = hz;
+        printf("[guest] panel rate %.1f Hz (from the compositor)\n", (double)hz);
+        fflush(stdout);
+    }
+}
 
 // Pause (the launcher over the game, or the space lost to the Home/PS button): the guest's frame loop is
 // held at its next frame boundary until resumed. Its simulation, input and rendering stop with it.
@@ -1423,9 +1436,21 @@ static void guest_pace_wait(void) {
         }
         if (!win_t0) { win_t0 = t; win_p0 = p; }
         else if (t - win_t0 >= 1.0) {
-            double rate = (double)(p - win_p0) / (t - win_t0);
+            double published = (double)(p - win_p0) / (t - win_t0);
+            // The panel rate the compositor latched; the publish rate only before it has one (it only ever reads
+            // LOW: a late guest holds drawables and loses publishes, and pacing off it followed the loss).
+            float panel = g_panel_hz;
+            double rate = panel > 20 ? (double)panel : published;
             last_rate = rate;
-            if (rate > 20) g_disp_rate = (float)rate;
+            if (!(panel > 20) && published > 20) g_disp_rate = (float)published;
+            {
+                static double said_pub;   // once a minute: what really arrived, against the panel
+                if (panel > 20 && (t - said_pub >= 60.0 || !said_pub)) {
+                    said_pub = t;
+                    printf("[guest] poses published at %.1f Hz over the last second (panel %.1f Hz)\n", published, rate);
+                    fflush(stdout);
+                }
+            }
             // Up to 15 % over the target: 100 Hz panels pace 1/2 = 50 (not 1/3 = 33), 90 Hz 45, 120 Hz 40.
             unsigned want = (unsigned)ceil(rate / (pace_hz * 1.15) - 0.05);
             if (want < 1) want = 1;
