@@ -920,11 +920,35 @@ float klvr_game_hz(float panel) {
         bool grid = g_grid_shown.load() && (steady <= 0 || now - steady < 5.0);
         bool loading = stalled || now < hold_until.load() || grid;
         float h = (loading || !(cur > 0)) ? base : cur;
+        // Below the pace it is held at (an open area that does not fit even the fallback): the game's measured rate,
+        // whole Hz, at least 20, after 2 s under 90 % of the pace; back to the pace after 2 s at 97 % or more. Its
+        // clock then keeps real time at the cost of fluidity only. Held between to avoid flips.
+        // One state machine under one lock: Prop_DisplayFrequency may be read from more than one game thread.
+        static std::mutex below_mu;
+        static double under_since = 0, over_since = 0;
+        static float below = 0;   // the sub-pace value in force, 0 = none
+        double g = g_game_hz.load();
+        std::lock_guard<std::mutex> bl(below_mu);
+        if (!loading && g > 0 && h > 0) {
+            if (g < 0.9 * h) { over_since = 0; if (under_since <= 0) under_since = now; }
+            else if (g >= 0.97 * h) { under_since = 0; if (over_since <= 0) over_since = now; }
+            else { if (below <= 0) under_since = 0; else over_since = 0; }   // the dead band restarts the timer that would change state
+            if (below <= 0 && under_since > 0 && now - under_since >= 2.0) below = 1;
+            if (below > 0 && over_since > 0 && now - over_since >= 2.0) { below = 0; under_since = 0; }
+            if (below > 0) {
+                float m = (float)std::lround(g);
+                if (m < 20) m = 20;
+                if (m >= h) m = std::ceil(h) - 1;            // whole Hz, strictly below the pace (33.3 -> 33, 50 -> 49)
+                if (below <= 1 || std::fabs(m - below) > 1.0f) below = m;   // move the told value in 2 Hz steps
+                h = below;
+            }
+        } else { under_since = over_since = 0; below = 0; }
         if (h > panel) h = panel;
         float had = g_hz_held.exchange(h);
         if (had != h)
             fprintf(stderr, "  [openvr] display frequency told to the game: %.1f Hz (%s; base %.1f, pace %.1f)\n",
-                    (double)h, loading ? "loading or stalled: the base pace" : cur < base ? "the fallback pace" : "the base pace",
+                    (double)h, loading ? "loading or stalled: the base pace" : h < cur ? "below the pace: the measured rate"
+                               : cur < base ? "the fallback pace" : "the base pace",
                     (double)base, (double)cur);
         return h;
     }
