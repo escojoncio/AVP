@@ -50,6 +50,9 @@ final class AVPSettings: ObservableObject {
     @Published var refreshHz: Int { didSet { save() } }         // 90 | 100
     @Published var halfRate: Bool { didSet { save() } }         // the game renders every 2nd display frame
     @Published var showFps: Bool { didSet { save() } }
+    /// Build 26: the compositor composes only when the game has a new picture (KL_CP_SKIP_SAME); otherwise visionOS
+    /// reprojects the last one. Log 18: re-compositing the same picture at 100 Hz took 7-19 ms of GPU per game frame.
+    @Published var composeNewOnly: Bool { didSet { save() } }
     @Published var diagCaptures: Bool { didSet { save() } }
     /// Command buffers VPKEngine lets the game queue ahead of the GPU (VP_FRAMES_IN_FLIGHT): 12 overlaps CPU and
     /// GPU (faster); 3 is the A/B test (build 23: no vertex explosions with 3, at half the frame rate). Build 24
@@ -85,6 +88,7 @@ final class AVPSettings: ObservableObject {
         refreshHz = d.object(forKey: "avp.refreshHz") as? Int ?? 90
         halfRate = d.object(forKey: "avp.halfRate") as? Bool ?? true
         showFps = d.object(forKey: "avp.showFps") as? Bool ?? false
+        composeNewOnly = d.object(forKey: "avp.cpSkipSame") as? Bool ?? true
         diagCaptures = d.object(forKey: "avp.diagCaptures") as? Bool ?? false
         gpuQueueDepth = (d.object(forKey: "avp.gpuQueueDepth24") as? Int).map { $0 == 3 ? 3 : 12 } ?? 12
         movement = Movement(rawValue: d.object(forKey: "avp.movement") as? Int ?? 3) ?? .continuousHand
@@ -115,6 +119,7 @@ final class AVPSettings: ObservableObject {
         d.set(refreshHz, forKey: "avp.refreshHz")
         d.set(halfRate, forKey: "avp.halfRate")
         d.set(showFps, forKey: "avp.showFps")
+        d.set(composeNewOnly, forKey: "avp.cpSkipSame")
         d.set(diagCaptures, forKey: "avp.diagCaptures")
         d.set(gpuQueueDepth, forKey: "avp.gpuQueueDepth24")
         d.set(movement.rawValue, forKey: "avp.movement")
@@ -134,7 +139,7 @@ final class AVPSettings: ObservableObject {
         vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
         anisotropy = fresh.anisotropy; engine = fresh.engine
         systemLanguage = fresh.systemLanguage; refreshHz = fresh.refreshHz; halfRate = fresh.halfRate
-        showFps = fresh.showFps; diagCaptures = fresh.diagCaptures; gpuQueueDepth = fresh.gpuQueueDepth; movement = fresh.movement; cloudSync = fresh.cloudSync
+        showFps = fresh.showFps; composeNewOnly = fresh.composeNewOnly; diagCaptures = fresh.diagCaptures; gpuQueueDepth = fresh.gpuQueueDepth; movement = fresh.movement; cloudSync = fresh.cloudSync
         AVPLog.log("Ajustes: valores por defecto")
     }
 
@@ -303,6 +308,7 @@ final class AVPSettings: ObservableObject {
             ("KL_FPS_HUD", showFps ? "1" : "0"),
             ("KL_CAPTURE", (diagCaptures || engine == .vpkengine) ? "1" : "0"),
             ("VP_FRAMES_IN_FLIGHT", String(gpuQueueDepth)),
+            ("KL_CP_SKIP_SAME", composeNewOnly ? "1" : "0"),
         ]
         // VPKTAA inputs not usable yet (build 17 log): VPKEngine's motion vectors are all zero (its "eye frame"
         // restarts at every depth-clearing multiview pass, 4-7 per game frame, so no draw ever finds last frame's
@@ -336,6 +342,13 @@ final class AVPSettings: ObservableObject {
         if (diagCaptures || engine == .vpkengine), let logs = AVPFolder.shared.logs {
             env += [("KL_CAPTURE_DIR", logs.path), ("VP_DUMP_FRAME", "6000"), ("VP_DUMP_DIR", logs.path)]
         }
+        // Build 26: GPU time per render pass in play ([passes] in the boot log, kl_gpu_time.m KL_GPU_PASSES): 40 guest
+        // frames in each window, N seconds after the game's first frame (menu + level load is ~55 s), exclusive time
+        // grouped by what each pass draws into. Decides the next performance step (MSAA, shadows, post at the
+        // foveated size, quad views) from measurements instead of guesses.
+        if engine == .vpkengine {
+            env += [("KL_GPU_PASSES", "t75,t110,t150,t200,t260,t330"), ("KL_GPU_PASSES_N", "40")]
+        }
         if let driver = AVPLaunch.driverPath { env.append(("KL_MVK_DYLIB", driver)) }
         // VPKEngine's persistent pipeline caches (recipes + Metal binary archive) and whether a full prewarm already
         // filled them for this VPVulkan build and this pipeline list (then neither the launcher nor the game replays).
@@ -352,6 +365,7 @@ final class AVPSettings: ObservableObject {
         // app session (after Salir) must see this launch's values.
         KleptonCompositor.reconRef = max(0.25, min(2, Float(eye.width) / Float(Self.nativeEye.width)))
         KleptonCompositor.setPeripheryRecon(on: reconActive, percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
+        KleptonCompositor.skipSameEnabled = composeNewOnly
         var text = "# Written by AVP at every launch from the app's settings. Do not edit: the app rewrites it.\n"
         for (k, v) in env { text += "\(k)=\(v)\n" }
         try text.write(to: p.configDir.appendingPathComponent("alyx-env.txt"), atomically: true, encoding: .utf8)
@@ -363,7 +377,7 @@ final class AVPSettings: ObservableObject {
                    + "texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveation) (zona nítida \(Int(wideDegrees))°), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % "
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA), aniso x\(anisotropy), motor \(engine.rawValue), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), FPS \(showFps), capturas \(diagCaptures), "
-                   + "cola GPU \(gpuQueueDepth)")
+                   + "cola GPU \(gpuQueueDepth), componer solo imágenes nuevas \(composeNewOnly)")
         return env
     }
 
@@ -447,6 +461,7 @@ end, nil)
         // No setenv here: the compositor and the guest read the environment on other threads, and setenv
         // racing getenv is a crash. Each live setting goes straight to its owner.
         KleptonCompositor.fpsHudEnabled = showFps
+        KleptonCompositor.skipSameEnabled = composeNewOnly
         KleptonTAA.reloadSettings(percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
         KleptonCompositor.setPeripheryRecon(on: reconActive, percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
         switch foveation {
@@ -455,7 +470,7 @@ end, nil)
         case .custom: kl_vrr_set(0, Float(sharpZone), Float(min(0.95, sharpZone + transition)), Float(periphery))
         }
         applyToVPKEngine()
-        AVPLog.log("Ajustes en vivo: foveado \(foveation), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % nitidez \(vpktaaSharpness), FPS \(showFps)")
+        AVPLog.log("Ajustes en vivo: foveado \(foveation), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % nitidez \(vpktaaSharpness), FPS \(showFps), componer solo imágenes nuevas \(composeNewOnly)")
     }
 
     func applyToVPKEngine() {
