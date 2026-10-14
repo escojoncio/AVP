@@ -71,7 +71,7 @@ int kl_alyx_run(const char *game, const char *sysroot, int gargc, char **gargv) 
     if (!gcc || !cxx) { fprintf(stderr, "[alyx] C++ runtime: %s\n", kl_error()); return 1; }
     kl_glibc_set_cxx_images(cxx, gcc);
 
-    static char *args[72];
+    static char *args[200];   // build 29: was 72 (with kl_driver.c's 40 it cut the app's profile args)
     int n = 0;
     args[n++] = exe;
     // In VR, Alyx pauses after every map load (hlvr_pause_after_realmap,
@@ -90,7 +90,7 @@ int kl_alyx_run(const char *game, const char *sysroot, int gargc, char **gargv) 
     // it is built serially by default (the engine's own switch);
     // KL_ALYX_NET_PARALLEL=1 restores the parallel build.
     if (!kl_env_on("KL_ALYX_NET_PARALLEL", 0)) args[n++] = "-net_no_parallel_build";
-    for (int i = 0; i < gargc && n < 71; i++) args[n++] = gargv[i];
+    for (int i = 0; i < gargc && n < 199; i++) args[n++] = gargv[i];
     args[n] = NULL;
     kl_glibc_set_process(n, args, exe);
     if (chdir(game) != 0) perror("[alyx] chdir");

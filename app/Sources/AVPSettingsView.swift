@@ -122,6 +122,7 @@ struct AVPSettingsView: View {
                         in: AVPSettings.presetPeripheryRange, step: 0.05)
                 Stepper(AVPL("Zona nítida: \(Int(s.wideDegrees))°", "Sharp zone: \(Int(s.wideDegrees))°"),
                         value: $s.wideDegrees, in: 30...70, step: 5)
+                Toggle(AVPL("Zona nítida redonda (como P.T.)", "Round sharp zone (like P.T.)"), isOn: $s.roundSharpZone)
                 Text(AVPL("Zona nítida redonda (como en P.T.) al 100 %, 10° por debajo del eje de mirada (60° es lo probado en P.T.; menos grados = más rendimiento; al arrancar el juego). La periferia va del 10 % (máximo rendimiento) al 65 % (para un M5) y se aplica en vivo. VPKTAA suaviza la periferia.",
                           "Round sharp zone (as in P.T.) at 100 %, 10° below the straight-ahead axis (60° is what was tested in P.T.; fewer degrees = more performance; at game start). The periphery goes from 10 % (most performance) to 65 % (for an M5) and is applied live. VPKTAA smooths the periphery."))
                     .font(.caption).foregroundStyle(.secondary)
@@ -179,11 +180,10 @@ struct AVPSettingsView: View {
             Group {   // keeps the section's direct children under SwiftUI's 10
                 Toggle(AVPL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $s.diagCaptures)
                 Toggle(AVPL("Medir GPU por pase (diagnóstico)", "Per-pass GPU timing (diagnostic)"), isOn: $s.gpuPassProfiling)
-                Toggle(AVPL("Amplificación de vértices (multivista de Metal)", "Vertex amplification (Metal multiview)"), isOn: $s.vertexAmplification)
                 Toggle(AVPL("Orden de GPU por recursos (menos esperas)", "GPU ordering by resources (fewer waits)"), isOn: $s.trackedOrder)
             }
-            Text(AVPL("Rendimiento de VPKEngine, al arrancar el juego. Si ves la imagen rota o geometría que explota, apaga el que hayas cambiado. Cambiar la amplificación recompila los shaders una vez.",
-                      "VPKEngine performance, at game start. If the picture breaks or geometry explodes, turn off the one you changed. Changing amplification recompiles the shaders once."))
+            Text(AVPL("Orden por recursos: experimental, al arrancar el juego. Si ves geometría que explota, apágalo.",
+                      "Ordering by resources: experimental, at game start. If geometry explodes, turn it off."))
                 .font(.footnote).foregroundStyle(.secondary)
             Picker(AVPL("Trabajo en cola para la GPU", "Work queued for the GPU"), selection: $s.gpuQueueDepth) {
                 Text(AVPL("12 (rápido)", "12 (fast)")).tag(12)

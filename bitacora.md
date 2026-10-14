@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0030).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B28).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B29).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -78,13 +78,30 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
   `vr_foveated_inner/outer_scalar`, `vr_foveated_boundary`). FDM radial no es representable en Metal (rate maps
   separables); VPKEngine no anuncia FDM. Subview stencil es incompatible con nuestro rate map (doble warp).
 
-## Siguiente (al llegar el log de B27)
-1. Crash/arranque: `[cp] alive` iters/s ≈ panel, `skipped(same picture)` creciendo; `[cp] round sharp zone on`.
-2. `gpu.excl`: tipo con mayor share; en la escena `vtx_ms` vs `frag_ms` (¿limitada por vértices?), `store_mb`/`att=`.
-3. `[passes] W# sceneN…` + `by kind`; `[vrr] … render area 2784x2208 -> …` y `full-area first pass` estable.
-4. Con amplificación: `vk.translator mode=… amplify=1`, sin `gpu.err what=pipeline`; ambos ojos correctos.
-5. `[gputime]` vs 19-22 (70 %) / 22-27 (90 %). Si sigue limitado por vértices: LOD/geom (convars), sombras.
-6. Siguiente paso grande si hace falta: vistas tipo P.T. (inset + ancha) en VPKEngine (PLAN §5.1-9).
+## Logs_Alyx_20 / 2_6 (B27/B28) — regresiones y arreglo en B29
+- Idioma inglés: `kl_driver.c` `argv[40]` (n<39) cortaba `KL_ALYX_PROFILE_ARGS` tras las convars de efectos de B27 →
+  `-language spanish` fuera. B29: `argv[160]`, `extra[8192]`; `kl_alyx.c` `args[200]` (era 72).
+- Imagen rota (imagen dentro de imagen, bloques negros) + fallo de GPU en el pase overlay 1x: `KL_VRR_PHYS=1` (fuera del
+  área física queda un fotograma viejo que post y compositor mezclan). B29: `KL_VRR_PHYS=0`.
+- Ojo derecho encogido en una esquina / FOV roto + fallos `metal_faulted` en pipelines `wm4294967280`: `VPVK_AMPLIFY=1`
+  (0031). B29: forzado a 0 (toggle quitado de la UI; `vertexAmplification` sin uso). Pendiente: depurar viewMappings
+  vs capa/viewport del rate map en VPKEngine antes de reactivarlo.
+- `VP_CB_ORDER=2`: sin veredicto (2_6 colgó con él y amplify a la vez). B29: OFF por defecto (clave nueva
+  `avp.cbOrder2b`), toggle experimental.
+- Real: compositor 6-8 ms → 3,3 ms por frame con `skipRefreshIfSame` (sin crash). La bajada de GPU del juego en menú
+  (10-20 → 6-9 ms) NO es válida: el ojo derecho apenas se dibujaba.
+- `gpu.excl` (menú, 70 %, con amplify): escena MSAA ~1,0-1,3 ms excl; tonemap RGBA8 2112x1728x2 1,5-1,8 ms (29 MB
+  load+store); sombras D32F 4096² ~1 ms; bloom RG11B10F 2048x2048x2 ~1,1 ms; compute vk.comp29 ~0,8 ms. Falta medir
+  en juego (ninguna sesión llegó a jugar sin cuelgue).
+- Zona nítida redonda: ajuste «Zona nítida redonda (como P.T.)» (`avp.roundFov`, ON).
+- Regulador de ritmo (`klvr_platform_klepton.c` `pace_governor`): sube a la base (50) solo con 5 s seguidos de media
+  < 15 ms y 0 frames tardíos (> 18 ms); con picos de streaming no sube nunca → 33 fps aunque haya margen.
+
+## Siguiente (al llegar el log de B29)
+1. Confirmar imagen/idioma/FOV como B25 y sin `gpu.hang`.
+2. `gpu.excl` y `[passes]` EN JUEGO (a2_drainage): reparto de los ~20 ms del juego.
+3. Si cabe: relajar el regulador (permitir ≤3 % tardíos) para llegar a 45/50.
+4. Amplify: arreglar el ojo derecho en VPKEngine (viewMappings / `[[render_target_array_index]]` / viewport por vista).
 
 ## Pendiente menor
 - Ajustes en vivo que faltan: resolución/texturas (convars), anisotrópico; activar/desactivar foveado requiere reiniciar.

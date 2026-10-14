@@ -437,8 +437,10 @@ static void *linux_guest_thread(void *unused) {
     kl_thread_init();
     // Valve's launcher argv: VR, the engine console to the log, and the one
     // Vulkan feature MoltenVK lacks. KL_ALYX_ARGS appends (e.g. "+map a1_intro_world").
-    static char *argv[40];
-    static char extra[1024];
+    // Build 29: room for every argument. 40 slots cut the app's profile at 39 tokens and the effect convars of
+    // build 27 pushed "-language spanish" past it (the game started in English).
+    static char *argv[160];
+    static char extra[8192];
     int n = 0;
     argv[n++] = "-vr"; argv[n++] = "-console"; argv[n++] = "-condebug";
     argv[n++] = "-vulkan_disable_ext_dynamic_state_3";
@@ -448,7 +450,7 @@ static void *linux_guest_thread(void *unused) {
     const char *more = kl_env_str("KL_ALYX_ARGS", NULL);
     snprintf(extra, sizeof extra, "%s %s", prof ? prof : "", more ? more : "");
     char *save = NULL;
-    for (char *t = strtok_r(extra, " ", &save); t && n < 39; t = strtok_r(NULL, " ", &save)) argv[n++] = t;
+    for (char *t = strtok_r(extra, " ", &save); t && n < 159; t = strtok_r(NULL, " ", &save)) argv[n++] = t;
     argv[n] = NULL;
     g_linux_state = 1;
     g_linux_rc = g_linux_main(g_linux_game, g_libdir, n, argv);
