@@ -55,13 +55,14 @@ final class AVPSettings: ObservableObject {
     @Published var composeNewOnly: Bool { didSet { save() } }
     /// Ambient occlusion (r_ssao). On by default on every headset: fidelity is kept, performance comes from resolution.
     @Published var ssao: Bool { didSet { save() } }
-    /// Build 27 (VPKEngine 0031): multiview by Metal vertex amplification (VPVK_AMPLIFY + VPVK_FETCH_NATIVE) instead of
-    /// drawing every instance once per eye; the scene pass does not scale with resolution (logs 18/2_5), so its vertex
-    /// work is the suspect. Changing it retranslates the shaders once (longer first preparation).
+    /// Build 27 (VPKEngine 0031) vertex amplification: forced OFF since build 29 (right eye broken, GPU faults); the
+    /// stored value is kept but unused.
     @Published var vertexAmplification: Bool { didSet { save() } }
     /// Build 27 (VPKEngine 0031): command buffers wait only on the previous ones they really depend on (VP_CB_ORDER=2)
     /// instead of all of them (0029, VP_CB_ORDER=1). If vertex explosions come back, turn it off.
     @Published var trackedOrder: Bool { didSet { save() } }
+    /// Build 27: the sharp zone composed as P.T.'s circle (KleptonCompositor.setRoundFovea) over the wide map.
+    @Published var roundSharpZone: Bool { didSet { save() } }
     @Published var diagCaptures: Bool { didSet { save() } }
     /// Build 27: per-pass GPU timing windows (KL_GPU_PASSES, kl_gpu_time.m) with VPKEngine; off removes them.
     @Published var gpuPassProfiling: Bool { didSet { save() } }
@@ -102,7 +103,8 @@ final class AVPSettings: ObservableObject {
         composeNewOnly = d.object(forKey: "avp.cpSkipSame") as? Bool ?? true
         ssao = d.object(forKey: "avp.ssao") as? Bool ?? true
         vertexAmplification = d.object(forKey: "avp.vkAmplify") as? Bool ?? true
-        trackedOrder = d.object(forKey: "avp.cbOrder2") as? Bool ?? true
+        trackedOrder = d.object(forKey: "avp.cbOrder2b") as? Bool ?? false
+        roundSharpZone = d.object(forKey: "avp.roundFov") as? Bool ?? true
         diagCaptures = d.object(forKey: "avp.diagCaptures") as? Bool ?? false
         gpuPassProfiling = d.object(forKey: "avp.gpuPasses") as? Bool ?? true
         gpuQueueDepth = (d.object(forKey: "avp.gpuQueueDepth24") as? Int).map { $0 == 3 ? 3 : 12 } ?? 12
@@ -137,7 +139,8 @@ final class AVPSettings: ObservableObject {
         d.set(composeNewOnly, forKey: "avp.cpSkipSame")
         d.set(ssao, forKey: "avp.ssao")
         d.set(vertexAmplification, forKey: "avp.vkAmplify")
-        d.set(trackedOrder, forKey: "avp.cbOrder2")
+        d.set(trackedOrder, forKey: "avp.cbOrder2b")
+        d.set(roundSharpZone, forKey: "avp.roundFov")
         d.set(diagCaptures, forKey: "avp.diagCaptures")
         d.set(gpuPassProfiling, forKey: "avp.gpuPasses")
         d.set(gpuQueueDepth, forKey: "avp.gpuQueueDepth24")
@@ -159,7 +162,7 @@ final class AVPSettings: ObservableObject {
         anisotropy = fresh.anisotropy; engine = fresh.engine
         systemLanguage = fresh.systemLanguage; refreshHz = fresh.refreshHz; halfRate = fresh.halfRate
         showFps = fresh.showFps; composeNewOnly = fresh.composeNewOnly; ssao = fresh.ssao
-        vertexAmplification = fresh.vertexAmplification; trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling; gpuQueueDepth = fresh.gpuQueueDepth; movement = fresh.movement; cloudSync = fresh.cloudSync
+        vertexAmplification = fresh.vertexAmplification; trackedOrder = fresh.trackedOrder; roundSharpZone = fresh.roundSharpZone; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling; gpuQueueDepth = fresh.gpuQueueDepth; movement = fresh.movement; cloudSync = fresh.cloudSync
         AVPLog.log("Ajustes: valores por defecto")
     }
 
@@ -357,8 +360,10 @@ final class AVPSettings: ObservableObject {
             ("KL_CAPTURE", (diagCaptures || engine == .vpkengine) ? "1" : "0"),
             ("VP_FRAMES_IN_FLIGHT", String(gpuQueueDepth)),
             ("KL_CP_SKIP_SAME", composeNewOnly ? "1" : "0"),
-            ("VPVK_AMPLIFY", vertexAmplification ? "1" : "0"),
-            ("VPVK_FETCH_NATIVE", vertexAmplification ? "1" : "0"),
+            // Build 29: vertex amplification OFF (logs 20/2_6: the right eye was rasterized shrunk into a corner and the
+            // overlay pass faulted the GPU). Kept off whatever the stored setting says until it is fixed in VPKEngine.
+            ("VPVK_AMPLIFY", "0"),
+            ("VPVK_FETCH_NATIVE", "0"),
             ("VP_CB_ORDER", trackedOrder ? "2" : "1"),
             ("VP_EXCL_TIMING", "1"),
         ]
@@ -393,7 +398,10 @@ final class AVPSettings: ObservableObject {
         // though only the physical 36 % is drawn and shown. KL_VRR_PHYS_POST does the same for the unfoveated eye
         // post passes (tonemap...): an A/B switch, off until a run shows the picture intact with it.
         if foveationUsable && foveation != .off {
-            env += [("KL_VRR_PHYS", "1"), ("KL_VRR_PHYS_POST", "0")]
+            // Build 29: OFF. Logs 20/2_6: outside the physical area the eye textures kept a stale unfoveated frame that
+            // the post chain and the compositor mixed in (picture inside a picture, black blocks), and the foveated
+            // overlay pass faulted the GPU.
+            env += [("KL_VRR_PHYS", "0"), ("KL_VRR_PHYS_POST", "0")]
         }
         // Captures (eye pictures as PNG at guest frames 120/600/1200) and a per-pass dump of one in-game frame: always on
         // while VPKEngine's picture is being validated. Core frame 6000 is ~35 s after the first picture (frame 540 in
@@ -429,7 +437,7 @@ final class AVPSettings: ObservableObject {
         // Round sharp zone (P.T.'s circle) over the wide map: its degrees are the map's (KL_VRR_WIDE_DEG above, 60 when
         // the launch was not M2/M5, as kl_gpu_time.m defaults it).
         let wideMap = foveationUsable && (foveation == .m2 || foveation == .m5)
-        KleptonCompositor.setRoundFovea(on: wideMap, degrees: Float(wideMap ? wideDegrees.rounded() : 60),
+        KleptonCompositor.setRoundFovea(on: wideMap && roundSharpZone, degrees: Float(wideMap ? wideDegrees.rounded() : 60),
                                         edge: Float(presetPeriphery))
         var text = "# Written by AVP at every launch from the app's settings. Do not edit: the app rewrites it.\n"
         for (k, v) in env { text += "\(k)=\(v)\n" }
@@ -442,7 +450,7 @@ final class AVPSettings: ObservableObject {
                    + "texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveation) (zona nítida \(Int(wideDegrees))°), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % "
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA), aniso x\(anisotropy), motor \(engine.rawValue), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), FPS \(showFps), capturas \(diagCaptures), "
-                   + "cola GPU \(gpuQueueDepth), componer solo imágenes nuevas \(composeNewOnly), amplificación de vértices \(vertexAmplification), orden por recursos \(trackedOrder), SSAO \(ssao)")
+                   + "cola GPU \(gpuQueueDepth), componer solo imágenes nuevas \(composeNewOnly), amplificación de vértices off (forzada), orden por recursos \(trackedOrder), zona redonda \(roundSharpZone), SSAO \(ssao)")
         return env
     }
 
@@ -564,7 +572,7 @@ end, nil)
         }
         // The round sharp zone follows the map: on with the wide map, at its live periphery (degrees stay the launch's).
         if foveation != .off {
-            KleptonCompositor.setRoundFovea(on: foveation == .m2 || foveation == .m5, degrees: nil, edge: Float(presetPeriphery))
+            KleptonCompositor.setRoundFovea(on: (foveation == .m2 || foveation == .m5) && roundSharpZone, degrees: nil, edge: Float(presetPeriphery))
         }
         applyToVPKEngine()
         AVPLog.log("Ajustes en vivo: foveado \(foveation), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % nitidez \(vpktaaSharpness), FPS \(showFps), componer solo imágenes nuevas \(composeNewOnly)")
