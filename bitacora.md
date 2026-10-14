@@ -239,6 +239,11 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
 3. Notificaciones en inmersivo: sin API en visionOS; solución = Modo de concentración con activación automática al
    abrir la app (Ajustes → Concentración → programar por app). Documentado al usuario, no en la app.
 
+## Pendiente de build (en main, sin IPA aún)
+- Doble ventana del launcher (también en StrikersVision): `KleptonApp.swift` → `Window(id:)` en vez de
+  `WindowGroup(id:)` para el launcher y "kbentry". `openWindow(id:)` sobre un WindowGroup crea otra instancia cada vez
+  (pausa + espacio perdido + fase .active podían abrir 2); sobre un `Window` trae la existente al frente.
+
 ## Siguiente (al llegar el log de B35)
 1. Regulador: contar cambios 50 ↔ 33 y tardíos en la base en escena 2; ajustar umbrales si hace falta.
 2. Subtítulos: confirmar altura/tamaño (AVPFORCE/KLPERF `cc_vr_vertical_offset=6`); afinar valores.
