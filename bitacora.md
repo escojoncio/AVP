@@ -359,6 +359,10 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
 5. Streaming de texturas (`vkCopyMemoryToImageEXT` espera la GPU por región) → staging asíncrono.
 6. Hidden area mesh: comprobar que klvr devuelve malla para la lente del Vision Pro.
 
+## No tocar (decisión del usuario)
+- `vr_expand_cull_frustum` (2): bajarlo ahorraría algo en exteriores pero puede meter popping en el borde al girar;
+  descartado. Frustum culling es de CPU (Source 2) con las tangentes reales del visor (105x95°): no hay nada roto ahí.
+
 ## Pendiente menor
 - Ajustes en vivo que faltan: resolución/texturas (convars), anisotrópico, zona nítida; activar/desactivar foveado requiere reiniciar.
 - Botón PS no capturable (solo "Button Menu"); mitigado por la pausa. QR de Steam. Subir 0011–0030 al repo VPKEngine.
