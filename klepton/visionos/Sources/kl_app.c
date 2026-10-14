@@ -1290,6 +1290,7 @@ static struct {
     pthread_cond_t  cv;
     uint64_t        published;    // poses the compositor has offered
     uint64_t        consumed;     // poses the guest has started a frame for
+    double          pub_t;        // CLOCK_MONOTONIC seconds of the last publish (build 45: running start)
     unsigned        limit;        // KL_FRAMES, or 0 for "until stopped"
     // volatile because the Steam Link pump reads it WITHOUT the lock: that loop
     // is inside kl_slink and is handed a plain flag, which is the honest shape
@@ -1484,12 +1485,59 @@ static void guest_pace_wait(void) {
             said_eff = eff;
         }
     }
+    // Build 45, running start (KL_GUEST_PACE_LEAD_MS, SteamVR's "running start"): Logs_Alyx_34 / 2_12 showed the GPU
+    // idle ~5 ms at the start of every frame at 80 % AND at 50 %: the guest was released on the refresh its frame
+    // belongs to and only then spent its CPU time (~4-5 ms) building the frame, while the GPU waited. CPU and GPU ran
+    // in series (5 + 15 ms at 50 %: right at the 20 ms budget whatever the resolution). Released `lead` ms before
+    // that refresh instead, the guest builds frame N+1 while the GPU still finishes frame N. Same frame rate, the
+    // frame's GPU work queued back to back; poses are older by `lead` (the compositor's timewarp covers rotation).
+    static double lead_s = -1;
+    if (lead_s < 0) {
+        const char *e = getenv("KL_GUEST_PACE_LEAD_MS");
+        lead_s = e && *e ? atof(e) / 1000.0 : 0;
+        if (lead_s < 0) lead_s = 0;
+        if (lead_s > 0.012) lead_s = 0.012;
+        if (lead_s > 0) printf("[guest] running start: frames released %.1f ms before their refresh (KL_GUEST_PACE_LEAD_MS)\n", lead_s * 1000);
+    }
+    const double period = last_rate > 20 ? 1.0 / last_rate : 0;
+    // `owed`: the previous frame was released ahead of a refresh that had not been published yet; that publish is
+    // the previous frame's and must not count towards this one.
+    static int owed;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += 1;
     pthread_mutex_lock(&g_guest.mu);
-    while (!g_guest.stop && g_guest.published - g_guest.consumed < eff)
-        if (pthread_cond_timedwait(&g_guest.cv, &g_guest.mu, &ts) == ETIMEDOUT) break;
+#define KL_AVAIL() ((long long)(g_guest.published - g_guest.consumed) - owed)
+    int early_release = 0;
+    if (lead_s > 0 && period > 0 && lead_s < period) {
+        // One refresh short of the turn, then wait until `lead` before the refresh that completes it (or for that
+        // publish itself, whichever comes first).
+        const long long early = eff > 1 ? (long long)eff - 1 : 0;
+        while (!g_guest.stop && KL_AVAIL() < early)
+            if (pthread_cond_timedwait(&g_guest.cv, &g_guest.mu, &ts) == ETIMEDOUT) break;
+        if (!g_guest.stop && KL_AVAIL() < (long long)eff && g_guest.pub_t > 0) {
+            const double target = g_guest.pub_t + period - lead_s;
+            struct timespec mn;
+            clock_gettime(CLOCK_MONOTONIC, &mn);
+            const double wait = target - (mn.tv_sec + mn.tv_nsec * 1e-9);
+            if (wait > 0 && wait < period) {
+                struct timespec rt;
+                clock_gettime(CLOCK_REALTIME, &rt);
+                long long ns = (long long)rt.tv_nsec + (long long)(wait * 1e9);
+                rt.tv_sec += (time_t)(ns / 1000000000LL);
+                rt.tv_nsec = (long)(ns % 1000000000LL);
+                while (!g_guest.stop && KL_AVAIL() < (long long)eff)
+                    if (pthread_cond_timedwait(&g_guest.cv, &g_guest.mu, &rt) == ETIMEDOUT) break;
+            }
+            // Still short of the turn: released ahead of its refresh, which is then this frame's.
+            early_release = !g_guest.stop && KL_AVAIL() < (long long)eff && KL_AVAIL() >= early;
+        }
+    } else {
+        while (!g_guest.stop && KL_AVAIL() < (long long)eff)
+            if (pthread_cond_timedwait(&g_guest.cv, &g_guest.mu, &ts) == ETIMEDOUT) break;
+    }
+#undef KL_AVAIL
+    owed = early_release;
     // Coalesce, do not queue: everything published since the last frame is one
     // turn. A guest that is behind then skips frames — which reprojection covers
     // — rather than being owed a backlog it can never work off.
@@ -1641,8 +1689,11 @@ int kl_app_guest_start(void) {
 }
 
 void kl_app_guest_publish(void) {
+    struct timespec pt;
+    clock_gettime(CLOCK_MONOTONIC, &pt);
     pthread_mutex_lock(&g_guest.mu);
     g_guest.published++;
+    g_guest.pub_t = pt.tv_sec + pt.tv_nsec * 1e-9;
     pthread_cond_signal(&g_guest.cv);
     pthread_mutex_unlock(&g_guest.mu);
 }

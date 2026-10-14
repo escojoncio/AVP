@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0035).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B44).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B45).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -444,6 +444,41 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
   quads de clear sobre el área exacta (offset+extent) de cada pase posterior del frame que lo carga; lo no dibujado en
   el frame queda sin limpiar (si el juego muestreara una zona no dibujada vería sombras viejas → toggle A/B).
 - Pedido al usuario (sin build): «Medir el tiempo de GPU por pase» ON, menú 40 s a 50 % y 40 s a 75 % en el mismo sitio.
+
+## Logs_Alyx_34 (80 %) / 2_12 (50 %), menú con UI, perfilado ON — el coste fijo, medido
+- W4 (78 encoders/frame): span 25,3 → 18,5 ms, ocupado 21,6 → 13,4, **GPU parada 3,7 → 5,1 ms**.
+- CAUSA 1 (≈5 ms): en las dos resoluciones la GPU está parada de #003 (~0,8 ms) a #004 (~5,1–5,3 ms) en cada frame =
+  el juego se suelta en su refresco y solo entonces gasta ~4,5–5 ms de CPU construyendo el frame; CPU y GPU en serie
+  (`frame worker: GPU finish after handover` 15 ms; histograma 2:184 3:66 a 50 % con GPU 13,5+2). B45 lo arregla.
+- Resto fijo a 50 % (3 agentes, modelo 14,4 fijos + 4,2 escalables ≈ 18,6 medido):
+  * UI Panorama en serie al final del frame: ~12 blits intercalados 0,1–0,4 ms (≈1,8 ms; probablemente mips por
+    `vkCmdBlitImage` nivel a nivel, un encoder cada uno) + 37 pases ui-2d 1,25 ms + burbujas 0,5–0,7 ms.
+  * compute `vk.comp31` 1,37 ms (3 dispatches, niebla/binning): legítimo.
+  * vtx escena 2,4 ms + ~0,8 fijo del frag (frag escala 1,7x con 2,46x menos píxeles físicos).
+  * cadena de bloom: ~0,08 ms por encoder diminuto + espera de ~0,4 ms en E/8 (drenaje por `waitFrontier`).
+  * RGBA16F 2048x1024 0,3 ms; limpieza del atlas 4096² (oculta en el hueco; en el menú NADIE usa el atlas después).
+  * compositor 1,2 ms por composición + vista ancha 0,21 ms x2 (0,72 x2 a 80 %).
+- Sospechosos en VPKEngine (agente, sin verificar): (1) `vkCmdDraw*IndirectCount` codifica `maxDrawCount` draws de Metal
+  (metal_backend.mm ~3112, vulkan/commands.cpp:703) — registrar suma de maxDrawCount vs reales; (2) fix-up de indirectos
+  espera a todo el frontier + join (~2587); (3) `waitFrontier` espera a TODOS los fences sin ordenar, no solo a los
+  productores de la barrera (~2429); (4) encoder `vpgpu.join` por command buffer (~2759); (5) `vkCmdClearColorImage/
+  DepthStencil` = un pase por mip×capa (commands.cpp:394); `vkCmdClearAttachments` parte el pase y fuerza Store
+  (commands.cpp:304-446); (6) timestamps de etapa siempre activos (0036) y `VP_EXCL_TIMING` en todos los frames con
+  «Medir GPU» (las dos medidas lo tenían ON).
+
+## B45 — cambios
+1. Arranque anticipado (`kl_app.c` `guest_pace_wait`, `KL_GUEST_PACE_LEAD_MS`, ajuste «Arranque anticipado del frame»
+   `avp.runStart` ON = 6 ms): espera eff−1 publicaciones y suelta al juego 6 ms antes del refresco que completa su
+   turno; `owed` reserva esa publicación para el frame soltado (no cuenta para el siguiente). `g_guest.pub_t` = hora
+   de la última publicación. Revisión adversarial: sin fallos (cadencia panel/eff en todos los casos simulados);
+   arreglado `resetToDefaults` (reportedHz, runningStart).
+
+## Siguiente (al llegar el log de B45)
+1. Confirmar: «GPU idle inside the span» ~5 → ~0,5 ms, `render` sin crecer, histograma 2:≈250 a 50 %; A/B con el ajuste.
+2. B46 (VPKEngine, por orden): contador de draws indirectos codificados vs reales; blits de mips de Panorama en un
+   encoder; `waitFrontier` solo a productores; limpieza redundante del atlas (estado «limpia con v», saltar repetida);
+   timestamps solo en ventanas.
+3. App: copias de ojos recortadas al área física del mapa; vista ancha desde la recon.
 
 ## Siguiente (al llegar el log de B44)
 1. KLTIME: `ft=0.02000` en todos los mapas y `t` a 5 s/5 s reales también en tramos de fallback (allí Alyx debe
