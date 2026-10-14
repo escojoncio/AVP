@@ -274,13 +274,16 @@ static void pace_governor(void) {
     // fallback never saw headroom (13.5-16 ms busy, 33 fps). With the EXCLUSIVE time (kl_gpu_time build 36) the
     // thresholds mean what they say: leave the base after 2 s averaging over 95 % of the frame or with over 25 % of
     // the frames' GPU work past it; come back after 3 s under 88 % with at most 5 % such frames.
+    // Build 42 (Logs_Alyx_30): at the base with a quarter of the frames late the picture alternates 2 and 3
+    // refreshes, which reads as far fewer fps than either pace; it stayed 2 s each time. Now: out after ONE second
+    // with over 40 % late (or two over 25 % / 95 % average), back only after 5 s under 85 % with at most 5 % late.
     if (ne > nn / 2) {
         if (!g_pace_extra) {
             over = (avg > 0.95 * 1000.0 / base || nl > 0.25 * nn) ? over + 1 : 0;
-            if (over >= 2) want = 1;
+            if (over >= 2 || nl > 0.40 * nn) want = 1;
         } else {
-            good = (avg < 0.88 * 1000.0 / base && nl <= 0.05 * nn) ? good + 1 : 0;
-            if (good >= 3) want = 0;
+            good = (avg < 0.85 * 1000.0 / base && nl <= 0.05 * nn) ? good + 1 : 0;
+            if (good >= 5) want = 0;
         }
     } else if (!g_pace_extra) {                      // at the base: leave when it clearly does not fit
         over = (avg > 0.95 * 1000.0 / base || nl > 0.30 * nn) ? over + 1 : 0;

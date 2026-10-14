@@ -405,7 +405,7 @@ final class AVPSettings: ObservableObject {
             ("VPVK_AMPLIFY", amplify ? "1" : "0"),
             ("KLVR_EYE_DIRECT", eyeDirect ? "1" : "0"),
             ("KLVR_HEIGHT_OFFSET", String(format: "%.3f", heightOffsetCm / 100)),
-            ("KL_VRR_SRGB_1X", subtitleFoveation ? "1" : "0"),
+            ("KL_VRR_SRGB_1X", "1"),   // build 42: always (B41 log: the A/B toggle left off = the B35 subtitle bug again)
             ("VPVK_OCCLUSION", occlusionQueries ? "1" : "0"),
             // Build 31: native half fetch back on, alone (B29 turned it off only because it shipped with amplification;
             // the translator's conversion is exact). Logs 22: the scene pass is vertex-bound (vtx 11 ms).

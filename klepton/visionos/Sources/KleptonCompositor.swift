@@ -417,6 +417,8 @@ final class KleptonCompositor {
     }()
     private var lastPresentedPicture: UInt64 = 0   // pictureId of the last composite that showed a guest picture
     private var skippedInARow = 0                  // refreshes abandoned since the last composite
+    private var cadHist = [0, 0, 0, 0, 0, 0]       // build 42: composites by refreshes shown (index 1...5+)
+    private var cadCount = 0
     private var skippedTotal = 0                   // for the liveness line
     // Build 27: a skipped refresh queries NO frame (skipRefreshIfSame). Its instants come from the last frame that
     // was queried (predictTiming) plus k display periods, and a refresh whose picture changed during the wait is
@@ -2868,6 +2870,15 @@ final class KleptonCompositor {
                   + "enc=\(encoded) cmd=\(cmdCommitted)/\(dn)")
         }
         noteCadence(presentation: presentation, drawable: main, refreshes: skippedInARow + 1)
+        // Build 42: how many panel refreshes each composited picture stayed up (2 everywhere = an even 50 on 100 Hz,
+        // 3 = an even 33; a mix of 2 and 3 is the judder that reads as far fewer fps than the counter says).
+        cadHist[min(skippedInARow + 1, 5)] += 1
+        cadCount += 1
+        if cadCount >= 250 {
+            NSLog("[cp] refreshes per composited picture (last \(cadCount)): 1:\(cadHist[1]) 2:\(cadHist[2]) 3:\(cadHist[3]) 4:\(cadHist[4]) 5+:\(cadHist[5])")
+            cadHist = [0, 0, 0, 0, 0, 0]
+            cadCount = 0
+        }
         // What this composite showed, for the next refresh's skip check (0: no guest picture, never skipped against).
         lastPresentedPicture = encoded > 0 && haveRendered && completeStage >= 0
             ? Self.pictureId(completeStage, UInt64(rendered.serial)) : 0
