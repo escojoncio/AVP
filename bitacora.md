@@ -7,7 +7,7 @@ juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `v
 con `git format-patch` sobre ref+parches). Sin MetalFX, sin MoltenVK (solo referencia), sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B46**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B46b**, pendiente de compilar).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -67,7 +67,9 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
   de fence, clears saltados, draws indirect-count codificados vs reales leídos del kernel de fix-up, palabra 3).
   Test `producers` en `gpu/core/tests` (3000 frames aleatorios, 0 violaciones; detecta la mutación).
 - Klepton `kl_gpu_time.m` (`KL_ABTEST=1`, ajuste «Test automático de rendimiento», `avp.abTest`, off por defecto):
-  espera 25 s fuera de cargas → censo 3 s → 3 rondas × 5 máscaras (OFF, ALL, ALL−bit) 0,6 s + 2 s → knockout de 26
+  espera ≥ 25 s, fuera de cargas y hasta ver el MENÚ (frames reales con ≥ 50 encoders 5 s seguidos; el logo de Valve
+  tiene ~28, el menú ~80; `vpgpu_metal2_last_real_encoders`, 0 si no hay frame real en 500 ms; a los 180 s arranca
+  igualmente) → censo 3 s → 3 rondas × 5 máscaras (OFF, ALL, ALL−bit) 0,6 s + 2 s → knockout de 26
   pipelines (20 render + 6 compute, ≥ 80 % de frames) con línea base cada 5 → `[abtest] VERDICT` y aplica la máscara
   ganadora. Métrica: span UNIÓN del frame (busy[0]). Bit2 = recorte de la copia de ojos al área física del mapa
   (`klvr_plat_eye_trim`, `kl_vrr_phys_extent`, +2 texels; se desactiva solo si hay pases que leen el ojo entero).

@@ -1884,6 +1884,8 @@ static uint32_t (*ab_hangs)(void);
 static struct {
     int state, paused;
     double t_first, t_start, resume_at, phase_t0;
+    double menu_since;                        // wait: since when the real frames look like the menu (0 = not yet)
+    int menu_said, menu_low;                  // menu_low: consecutive frames under 50 encoders
     unsigned seen_loads, seen_shows;
     uint32_t last_fed;                        // the newest final frame already fed to a window
     ab_window w;
@@ -1917,7 +1919,7 @@ static int ab_env(void) {
         g_ab_env = e && *e == '1';
         if (g_ab_env) {
             g_ab.state = kAbWait;
-            ab_hud("TEST: empieza en %d s · quédate quieto mirando al frente", 25);
+            ab_hud("TEST: esperando al menú (tras el logo de Valve) · quédate quieto");
             fprintf(stderr, "[abtest] automatic A/B test on (KL_ABTEST=1): starts 25 s after the first frame, outside loads\n");
         }
     });
@@ -2408,7 +2410,7 @@ static void ab_tick(uint32_t frame, int timing) {
         return;
     }
     unsigned loads = atomic_load(&g_ab_loads), shows = atomic_load(&g_ab_shows);
-    if (shows != g_ab.seen_shows) { g_ab.seen_shows = shows; g_ab.resume_at = now + 3.0; }
+    if (shows != g_ab.seen_shows) { g_ab.seen_shows = shows; g_ab.resume_at = now + 3.0; g_ab.menu_since = 0; }
     if (loads != g_ab.seen_loads) {
         g_ab.seen_loads = loads;
         if (ab_active() && !g_ab.paused) ab_pause();
@@ -2422,11 +2424,44 @@ static void ab_tick(uint32_t frame, int timing) {
     if (g_ab.state == kAbWait) {
         double start = g_ab.t_first + 25.0;
         if (g_ab.resume_at > start) start = g_ab.resume_at;
-        if (loading) { ab_hud("TEST en pausa (cargando)"); return; }
+        if (loading) { g_ab.menu_since = 0; ab_hud("TEST en pausa (cargando)"); return; }
         if (now < start || (g_prof > 0 && g_prof_from != UINT32_MAX)) {
-            int left = now < start ? (int)ceil(start - now) : 0;
-            ab_hud("TEST: empieza en %d s · quédate quieto mirando al frente", left);
+            ab_hud("TEST: esperando al menú (tras el logo de Valve) · quédate quieto");
             return;
+        }
+        // Not during Valve's logo: Alyx shows it for ~15-25 s after the first picture with ~28 encoders a frame; the menu
+        // (Panorama UI over the scene) has ~80. Start once real frames have had 50+ encoders for 5 s straight (any
+        // level has that many too); after 180 s start anyway (logged).
+        static uint32_t (*last_enc)(void);
+        static int enc_tried;
+        if (!enc_tried) {
+            enc_tried = 1;
+            const char *path = getenv("KL_MVK_DYLIB");
+            void *h = path && *path ? dlopen(path, RTLD_NOW | RTLD_NOLOAD) : NULL;
+            last_enc = (uint32_t (*)(void))dlsym(h ? h : RTLD_DEFAULT, "vpgpu_metal2_last_real_encoders");
+            if (!last_enc) fprintf(stderr, "[abtest] no vpgpu_metal2_last_real_encoders: the menu is not waited for\n");
+        }
+        if (last_enc) {
+            const uint32_t enc = last_enc();
+            if (enc >= 50) {
+                g_ab.menu_low = 0;
+                if (!g_ab.menu_since) {
+                    g_ab.menu_since = now;
+                    fprintf(stderr, "[abtest] menu-like frames (%u encoders) %.1f s after the first frame\n", enc, now - g_ab.t_first);
+                }
+            } else if (++g_ab.menu_low >= 3) {   // one odd frame does not restart the 5 s
+                g_ab.menu_since = 0;
+            }
+            const int timed_out = now - g_ab.t_first >= 180.0;
+            if ((!g_ab.menu_since || now - g_ab.menu_since < 5.0) && !timed_out) {
+                if (!g_ab.menu_since) ab_hud("TEST: esperando al menú (tras el logo de Valve) · quédate quieto");
+                else ab_hud("TEST: empieza en %d s · quédate quieto mirando al frente", (int)ceil(g_ab.menu_since + 5.0 - now));
+                return;
+            }
+            if (timed_out && !g_ab.menu_said) {
+                g_ab.menu_said = 1;
+                fprintf(stderr, "[abtest] no menu-like frames (last %u encoders) 180 s after the first frame: starting anyway\n", enc);
+            }
         }
         if (!ab_resolve()) {
             ab_fail(now, "VPVulkan lacks patch 0038's switches (see the line above)");
