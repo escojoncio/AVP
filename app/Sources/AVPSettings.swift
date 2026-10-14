@@ -25,7 +25,9 @@ final class AVPSettings: ObservableObject {
     /// launch arguments + the Lua re-apply), so nothing compounds across maps or launches.
     enum SubtitlePlacement: Int, CaseIterable { case game = 0, higher = 1, eyeLevel = 2, high = 3
         var verticalOffset: String { self == .game ? "-6.5" : self == .higher ? "0" : self == .eyeLevel ? "6" : "12" }
-        var fontSize: String { self == .game ? "1" : "2" }
+        // Build 37: the game's medium size everywhere. Build 35's "large" (2) filled the view with a long line once
+        // the subtitle pass was foveated correctly (B36b); the panel is already close (30 units) and at eye height.
+        var fontSize: String { "1" }
     }
 
     /// Vision Pro's native per-eye render size (what visionOS asks for at 100 %).
