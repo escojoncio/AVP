@@ -370,6 +370,8 @@ void close_stage_locked() {
 } // namespace klvr
 
 using namespace klvr;
+namespace klvr { float klvr_game_hz_told(void); }
+
 namespace klvr { namespace impl {
 
 void IVRCompositor__SetTrackingSpace(void *, vr::ETrackingUniverseOrigin u) {
@@ -379,6 +381,36 @@ void IVRCompositor__SetTrackingSpace(void *, vr::ETrackingUniverseOrigin u) {
 vr::ETrackingUniverseOrigin IVRCompositor__GetTrackingSpace(void *) {
     std::lock_guard<std::mutex> l(g_mu);
     return g_space;
+}
+
+// Build 43 (Logs_Alyx_31): the shim's side of the game-clock question. Every 5 s of WALL time: frames the game ran,
+// the Hz it was told (and how often that number changed), and what its clock would read under the two models we know
+// of — one display period per frame (sum of 1/Hz) or the display period counted per vsync of the panel. The game's
+// own answer is the KLTIME line in its console (app-convars.lua); whichever column matches it is the model.
+static void clock_probe(double dt) {
+    static double wall, step_sum, pres_sum;
+    static unsigned frames, changes;
+    static float last_hz;
+    klvr_display d{};
+    klvr_plat_display(&d);
+    float panel = d.refresh_hz > 0 ? d.refresh_hz : 90.0f;
+    float hz = klvr::klvr_game_hz_told();   // read-only: what the game was last told
+    if (hz <= 0) hz = panel;                // not read yet: the game assumes the panel's rate
+    if (last_hz > 0 && hz != last_hz) changes++;
+    last_hz = hz;
+    wall += dt;
+    frames++;
+    if (hz > 0) {
+        step_sum += 1.0 / hz;                                   // one told period per frame
+        double v = std::lround(dt * panel); if (v < 1) v = 1;   // m_nNumFramePresents, as GetFrameTiming reports it
+        pres_sum += v / hz;                                     // one told period per present
+    }
+    if (wall < 5.0) return;
+    fprintf(stderr, "  [openvr] clock: wall %.2f s, %u frames (%.1f fps), told %.0f Hz (%u changes); game time if one "
+                    "period per frame = %.2f s (%.0f %%), if one period per present = %.2f s (%.0f %%)\n",
+            wall, frames, frames / wall, (double)hz, changes, step_sum, 100.0 * step_sum / wall,
+            pres_sum, 100.0 * pres_sum / wall);
+    wall = step_sum = pres_sum = 0; frames = changes = 0;
 }
 
 vr::EVRCompositorError IVRCompositor__WaitGetPoses(void *, vr::TrackedDevicePose_t *render, uint32_t nrender,
@@ -408,6 +440,7 @@ vr::EVRCompositorError IVRCompositor__WaitGetPoses(void *, vr::TrackedDevicePose
                 g_game_hz.store(cur > 0 ? cur + (hz - cur) * 0.1 : hz);
             }
             walk_update(dt);
+            clock_probe(dt);
         }
         last_wait = now_w;
     }
@@ -854,8 +887,14 @@ namespace klvr {
 // time), so reporting the panel's rate while rendering at 28 fps ran the game
 // at a quarter speed on Vision Pro. KLVR_REPORT_GAME_HZ=1 (default) reports
 // the game's smoothed frame rate instead, clamped to [20, panel].
+static std::atomic<float> g_hz_held{0};   // the whole-Hz value last reported (hysteresis state)
 float klvr_game_hz(float panel) {
     static bool on = env_on("KLVR_REPORT_GAME_HZ", true);
+    // Build 43: KLVR_REPORT_HZ_FIXED=<hz> reports one fixed number whatever the game's rate (the A/B for a game clock
+    // that runs slow at a steady 50 fps, Logs_Alyx_31): 0 or unset = the measured rate below.
+    static float fixed = -1;
+    if (fixed < 0) { const char *e = getenv("KLVR_REPORT_HZ_FIXED"); fixed = e && *e ? (float)atof(e) : 0; }
+    if (fixed > 0) return fixed > panel ? panel : fixed;
     double g = g_game_hz.load();
     if (!on || g <= 0) return panel;
     if (g > panel) g = panel;
@@ -864,13 +903,19 @@ float klvr_game_hz(float panel) {
     // re-derives its frame timing and logs "Converting display frequency" on
     // every change of this number, which the raw smoothed rate made ~44 times
     // a second (9,220 console lines in 3.5 min on the Mac).
-    static std::atomic<float> held{0};
-    float h = held.load();
+    float h = g_hz_held.load();
     if (h <= 0 || std::fabs(g - h) > 1.0) {
         h = (float)std::lround(g);
         if (h > panel) h = panel;
-        held.store(h);
+        g_hz_held.store(h);
     }
     return h;
+}
+// Build 43: the number the game was LAST told, with no side effect (the clock probe reads it every frame; calling
+// klvr_game_hz there would move the hysteresis above between the game's own reads). 0 before the first read.
+float klvr_game_hz_told(void) {
+    static float fixed = -1;
+    if (fixed < 0) { const char *e = getenv("KLVR_REPORT_HZ_FIXED"); fixed = e && *e ? (float)atof(e) : 0; }
+    return fixed > 0 ? fixed : g_hz_held.load();
 }
 }

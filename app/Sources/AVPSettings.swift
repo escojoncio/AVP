@@ -93,6 +93,13 @@ final class AVPSettings: ObservableObject {
     /// "always visible": Source 2 then skips what its occlusion test found hidden (r_occlusion_culling 1).
     /// Off = every query reads visible, the behaviour up to build 38 (VPVK_OCCLUSION).
     @Published var occlusionQueries: Bool { didSet { save() } }
+    /// Build 43 (Logs_Alyx_31): the refresh rate the OpenVR shim tells Alyx (Prop_DisplayFrequency). Alyx steps its
+    /// clock from this number; `measured` = the game's own smoothed frame rate (the default since the start), the fixed
+    /// values are the A/B for walking and hands running in slow motion at a steady 50 fps (KLVR_REPORT_HZ_FIXED).
+    enum ReportedHz: Int, CaseIterable { case measured = 0, fixed50 = 1, fixed90 = 2
+        var env: String { self == .fixed50 ? "50" : self == .fixed90 ? "90" : "0" }
+    }
+    @Published var reportedHz: ReportedHz { didSet { save() } }
 
     // Fixed since build 32 (they used to be settings; every validated value is now the only value):
     /// 12 command buffers in flight (build 24 orders them; 3 was the build-23 A/B test).
@@ -139,6 +146,7 @@ final class AVPSettings: ObservableObject {
         eyeDirect = d.object(forKey: "avp.eyeDirect2") as? Bool ?? false   // build 40: OFF (Alyx renders into one image)
         heightOffsetCm = d.object(forKey: "avp.heightCm") as? Double ?? 0
         occlusionQueries = d.object(forKey: "avp.occlusion") as? Bool ?? true
+        reportedHz = ReportedHz(rawValue: d.object(forKey: "avp.reportHz") as? Int ?? 0) ?? .measured
         subtitleSize = SubtitleSize(rawValue: d.object(forKey: "avp.subSize") as? Int ?? 0) ?? .small
         subtitleFoveation = d.object(forKey: "avp.subFov") as? Bool ?? true
         loading = false
@@ -171,6 +179,7 @@ final class AVPSettings: ObservableObject {
         d.set(eyeDirect, forKey: "avp.eyeDirect2")
         d.set(heightOffsetCm, forKey: "avp.heightCm")
         d.set(occlusionQueries, forKey: "avp.occlusion")
+        d.set(reportedHz.rawValue, forKey: "avp.reportHz")
         d.set(subtitleSize.rawValue, forKey: "avp.subSize")
         d.set(subtitleFoveation, forKey: "avp.subFov")
     }
@@ -407,6 +416,7 @@ final class AVPSettings: ObservableObject {
             ("KLVR_HEIGHT_OFFSET", String(format: "%.3f", heightOffsetCm / 100)),
             ("KL_VRR_SRGB_1X", "1"),   // build 42: always (B41 log: the A/B toggle left off = the B35 subtitle bug again)
             ("VPVK_OCCLUSION", occlusionQueries ? "1" : "0"),
+            ("KLVR_REPORT_HZ_FIXED", reportedHz.env),
             // Build 31: native half fetch back on, alone (B29 turned it off only because it shipped with amplification;
             // the translator's conversion is exact). Logs 22: the scene pass is vertex-bound (vtx 11 ms).
             ("VPVK_FETCH_NATIVE", "1"),
@@ -499,7 +509,7 @@ final class AVPSettings: ObservableObject {
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
-                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries)")
+                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries), Hz al juego \(reportedHz)")
         return env
     }
 

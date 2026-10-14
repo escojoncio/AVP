@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0035).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B42).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B43).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -381,10 +381,35 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
 - B42: regulador sale de la base en 1 s con > 40 % tardíos (o 2 s > 25 % / > 95 %), vuelve tras 5 s < 85 % y ≤ 5 %;
   log `[cp] refreshes per composited picture (last 250): 1:a 2:b 3:c 4:d 5+:e` (2 = 50 parejos, 3 = 33 parejos).
 
-## Siguiente (al llegar el log de B42)
-1. Histograma de refrescos: si la mezcla 2/3 persiste en la base, el umbral de "tardío" (trabajo > 20 ms) no
-   predice el refresco perdido: usar la cadencia real del compositor como señal del regulador.
-2. Composición 1,2–2 ms: medir dentro (pase sin muestreo de ojo / sin depth) antes de tocar nada.
+## Logs_Alyx_31 (B42) — medido
+- 50 fps REALES y parejos en el último minuto: `[openvr] frames: 50.0 fps` (wait 15,2/16,6), histograma `2:250` (cada
+  imagen 2 refrescos), juego 11,7–13,7 ms + compositor 3,2–3,9 ms exclusivos, 0 tardíos, regulador en la base. El HUD
+  cuenta seriales de imagen distintos: no mentía. Tramo malo solo en la carga/transición (20:50:04–20:50:36, 3–4
+  refrescos por imagen, 2 bajadas a 33).
+- Síntoma del usuario con eso: andar más lento de lo debido y manos "muy lentas" = TIEMPO DE SIMULACIÓN lento (manos
+  físicas de Alyx y locomoción nativa, no del shim: `KLVR_WALK` está OFF). Alyx vio `Refresh Rate: 50.00 Hz` todo el
+  tramo (re-derivado 3 veces por dips 48→52→50 de la media). Ningún cambio B39→B42 toca el tiempo del juego.
+- Pendiente (no es la causa de esto, `pose latch` peor 0,25°): `kl_ovrp_set_predicted_display_time` no se llama desde
+  el frontend → el juego predice a "ahora + 1/90" (`period()`), el registro guarda la pose latcheada; la
+  reproyección corrige un delta ≠ al rendido, proporcional a la velocidad de giro. Arreglar aparte (toca el reloj del shim).
+- `klepton-crash-vpkengine.log` del zip es de otra sesión (00:36): `BUG IN CLIENT` en `queryNextFrame`, ignorado.
+
+## B43 — cambios (medir el reloj del juego)
+1. `app-convars.lua`: think `kltime` cada 5 s de TIEMPO DE JUEGO → `KLTIME t=<Time()> ft=<FrameTime()> timescale=`.
+   La consola lleva hora real: una línea cada 5,0 s reales = tiempo real; cada 7 s = juego al 70 %.
+2. `klvr_compositor.cpp` `clock_probe` (desde WaitGetPoses, cada 5 s reales): `[openvr] clock: wall, frames, told Hz
+   (changes), game time if one period per frame = X s (%), if one period per present = Y s (%)`. Comparar con KLTIME
+   dice qué fórmula usa Alyx. Solo lectura (`klvr_game_hz_told`, estado de histéresis `g_hz_held`).
+3. Ajuste Diagnóstico «Frecuencia que se le dice al juego»: medida (defecto, = B42) / fija 50 / fija 90
+   (`avp.reportHz` → `KLVR_REPORT_HZ_FIXED`, reinicio del juego). A/B directo de la cámara lenta.
+4. Revisión adversarial: 1 hallazgo corregido (la sonda movía la histéresis de `klvr_game_hz`).
+
+## Siguiente (al llegar el log de B43)
+1. KLTIME vs hora de consola: cociente juego/real a 50 fps estables. Si < 0,9: ver qué columna de `[openvr] clock`
+   coincide y corregir lo que se le reporta (Hz y/o `m_nNumFramePresents`); probar el resultado de las fijas 50/90.
+2. Si el reloj es correcto (≈1,0): el síntoma es latencia/cadencia, no tiempo → medir latencia de pose de mandos y
+   valorar síntesis del refresco intermedio (flujo óptico) para que 50 se sienta como 100.
+3. Luego: pasar el tiempo de presentación predicho al shim (pose rendida = pose registrada).
 
 ## Siguiente (al llegar el log de B41) — sustituido por lo anterior
 1. Confirmar sin parpadeo ni tirones con la copia de ojos (B40). Si siguieran: comparar con B36b (no los tenía).
