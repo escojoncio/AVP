@@ -2,9 +2,9 @@
 
 Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en el visor: Steam oficial → descarga →
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
-juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0033).
+juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0034).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B30).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B31).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -97,31 +97,61 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
 - Regulador de ritmo (`klvr_platform_klepton.c` `pace_governor`): sube a la base (50) solo con 5 s seguidos de media
   < 15 ms y 0 frames tardíos (> 18 ms); con picos de streaming no sube nunca → 33 fps aunque haya margen.
 
-## Logs_Alyx_21 / 2_7 (B29) — escena negra y bajadas de fps
-- ESCENA NEGRA (solo HUD): no era B29. `vpcache/quarantine.txt` traía 9 pipelines de la sesión B28 con amplify
-  (page fault f=2754): el cazador bisecó con `verdict=clean` en TODOS los pasos (el cuelgue nunca se repitió) y aun
-  así condenó al primer candidato, `vk.comp17` (compute del binning de luces: tile grid 264x216 y color HDR a 0),
-  más 8 `metal_faulted` colaterales. B29 los cargaba y saltaba (4096 draws). Confirmado por el usuario: al
-  restablecer la cuarentena vuelve la imagen. Arreglo B30: (1) VPKEngine `0032`: el cazador, con un candidato,
-  lo vuelve a dibujar (`gpu.hunt confirm`); cuelgue en 12 frames que lo dibujen → `verdict=confirmed` y cuarentena;
-  12 frames limpios → `verdict=indeterminate`, nada se guarda. (2) App: `vpcache/quarantine.key` = build VPVulkan +
-  VPVK_AMPLIFY/FETCH_NATIVE/VP_CB_ORDER/KL_VRR/KL_VRR_PHYS/FORCE_1X/MOTION/FRAMES_IN_FLIGHT/msaa; firma distinta o
-  ausente → se borran `quarantine.txt` y `suspects.txt` (log "cuarentena de otra configuración del motor descartada").
-- BAJADAS DE FPS (mirar a un enemigo y atacar / mirar a una zona): GPU estable ~14 ms; el hilo de render del juego a
-  40-150 ms; `gpu.frame … cpu_ms` (= solo `compileFrame`) 35-40 ms en el command buffer de escena (`passes=14,
-  merged=12`) frente a 0,4 ms en el resto. Causa: `conflicts(acc, acc_[open_])` cuadrático (todos los bindings de
-  todos los draws del pase × todos los acumulados del encoder). Arreglo `0033`: accesos plegados por (recurso, rango,
-  write, pixelLocal, attachment) con stages OR-eados; listas por encoder indexadas por recurso y escrituras aparte
-  (una lectura solo se compara con escrituras). Sintético (14 pases × 300 draws × 14 bindings): 2667 → 5,2 ms; tests
-  de `gpu/core` (14) en verde en Linux. Esperado en Alyx: cpu_ms < 1 ms. Parte menor de las bajadas: streaming de
-  texturas (`vkCreateImage` 2048² en ráfagas); pendiente `vkCopyMemoryToImageEXT` por región.
+## B30 (Logs_Alyx_21 / 2_7) — resuelto
+- Escena negra = cuarentena heredada (el cazador condenaba sin reproducción; 9 pipelines, incl. el compute del binning
+  de luces). `0032`: el cazador confirma al sospechoso (`gpu.hunt confirm/confirmed/indeterminate`). App:
+  `vpcache/quarantine.key` (build VPVulkan + toggles del motor + VP_MSAA_TILE); firma distinta/ausente → cuarentena y
+  sospechosos borrados. Confirmado por el usuario.
+- Bajadas al mirar enemigos = `compileFrame` cuadrático (35-40 ms CPU). `0033`: accesos plegados + índice por recurso.
+  Logs 22: `cpu_ms` ≤ 2 ms siempre; hilo de render del juego 3-10 ms. Confirmado ("va mejor al ver al enemigo").
 
-## Siguiente (al llegar el log de B30)
-1. Log: línea "cuarentena … descartada" al arrancar; `gpu.frame … cpu_ms` del CB de escena en combate (meta < 1 ms);
-   `[openvr] frames` render ms en los mismos momentos (mirar enemigo/atacar). Si siguen picos sin cpu_ms: texturas
-   (`vkCreateImage` + `vkCopyMemoryToImageEXT` por región) → subida asíncrona / staging.
-2. Regulador de ritmo: con el CPU libre, permitir ≤3 % tardíos para subir a 45/50.
-3. Amplify: arreglar el ojo derecho en VPKEngine (viewMappings / `[[render_target_array_index]]` / viewport por vista).
+## Logs_Alyx_22 (B30) — reparto real de la GPU en juego (33 fps clavados)
+- `[openvr] frames`: wait 20-25 ms (el juego espera al regulador), render 3-10 ms. `gpu.time` p50 21 ms, p90 26 ms.
+- `[passes]` W5-W7/W11 (a2, en juego): escena MSAA **12,5-17 ms** = vtx 8-10 + frag 5,7-7,9; eye-1x 2,6-3,7 (x11);
+  blit 0,8-3; compute 1,2-1,5; other-rt 0,7-1; depth-only 0,4-1. `gpu.excl` fin de sesión (zona densa): 731-815
+  draws, excl 20-29 ms, **vtx 11 ms**, frag 11-19 ms, store 58 MB.
+- Regulador: 100 Hz → solo 50 o 33. Bajaba a 33 con 2/51 tardíos (3,9 %) y media 16 ms; subía 5 s después; ciclo.
+  Por eso "ni con foveado ni sin": ambos quedan entre 20 y 30 ms → 33.
+- Vértices = kernel de tiling de Apple (todos los vértices + binning de todos los triángulos, ×2 por multiview por
+  instancias: `vr_multiview_instancing=0` → el juego usa VK_KHR_multiview y el traductor lo instancia). No baja con
+  foveado ni resolución. Suelo duro hasta la amplificación.
+- Convars (KLPERF): `vr_depth_prepass=0` (correcto en TBDR), `vr_stencil_hidden_pixels=1`, `cl_enable_eye_occlusion=1`,
+  `vr_shadow_map_culling=1`. `r_occlusion_culling` no estaba en el volcado (B31 lo vuelca y lo fuerza a 1).
+  Convars de LOD/cull existentes en el binario ARM64 (strings): `sc_lod_distance_scale_override`, `sc_force_lod_level`,
+  `r_size_cull_threshold[_shadow]`, `r_worldlod`, `sc_perdrawculling`, `sc_bounds_group_cull`, `vr_expand_cull_frustum`,
+  `r_stereo_true_multiview`, `r_stereo_multiview_instancing`. DECISIÓN DEL USUARIO: nada de LOD/cull que altere lo
+  visible; solo optimización pura.
+- Attachments MSAA: `att=c0:CR:Persistent,d:CR:Persistent`, `st2+r`, `tile_local=0` en TODOS los frames: el juego
+  pide storeOp STORE + resolve; VPVulkan marca persistent todo lo no transient → Metal escribe las 4 muestras de color
+  y D32FS8 (2112x1728x2) a memoria cada frame (~230 MB) y el juego solo lee el resuelto (VK_KHR_depth_stencil_resolve,
+  `ld2` = clear al inicio).
+
+## B31 — cambios (sin coste de fidelidad)
+1. VPKEngine `0034`: MSAA con StoreAndResolve no leído en el submit → `Resolve` desde tile (sin store de muestras).
+   `CompileOptions::msaaResolveOnTile`, `VP_MSAA_TILE=0` lo apaga (log `gpu.msaa resolve_on_tile=`). Detección de
+   lectura en submit posterior: `msaa_stale=N` en `gpu.frame` (si aparece > 0 en juego, apagar y revisar). Ajuste
+   «MSAA resuelto en tile» (`avp.msaaOnTile`, ON). Solo ancho de banda: la textura persistent sigue asignada.
+2. `VPVK_FETCH_NATIVE=1` solo (exacto; B29 lo apagó por ir con amplify). Medir `vtx` en `[passes]`/`gpu.excl`.
+3. Regulador: deja la base tras 2 s seguidos > 92 % del presupuesto o > 10 % tardíos; vuelve tras 3 s < 80 % y
+   ≤ 2 % tardíos (antes: 1 s / 3 % y 5 s / 0).
+4. `r_occlusion_culling 1` forzado (AVPMISSING si no existe); KLPERF vuelca los convars de cull/LOD/multiview.
+
+## Siguiente (al llegar el log de B31)
+1. Comprobar: `msaa_stale` ausente; `tile_local=2` en el CB de escena; `gpu.excl` escena: `store_mb` y `excl_ms`;
+   `vtx_ms` con fetch nativo vs 11; imagen correcta (si no: ajuste «MSAA resuelto en tile» OFF). KLPERF:
+   `r_occlusion_culling`, `sc_perdrawculling`.
+2. AMPLIFICACIÓN DE VÉRTICES (la mayor ganancia posible: un tiling para los dos ojos). Bug conocido (B27/B28): ojo
+   derecho encogido en una esquina + page fault en el pase overlay 1x con `wm4294967280`. Pistas: viewMappings vs capa
+   del rate map elegida por `[[viewport_array_index]]` (regla de `0027`); los VS que escriben Layer/ClipDistance
+   siguen instanciados (`SpirvInterface::amplified=false`): mezcla de pases amplificados y no amplificados sobre el
+   mismo rate map. Objetivo vtx 11 → ~6 ms.
+3. Streaming de texturas: `vkCreateImage` 2048² en ráfagas + `vkCopyMemoryToImageEXT` que espera la GPU por región
+   (bitácora B18) → copias por staging asíncrono en un blit por frame. Blit 2-3 ms/frame x20 en W3/W4.
+4. Compositor 3,3 ms por imagen nueva (wide view + círculo + recon VPKTAA): perfilar `kl_reproject` por etapa.
+5. Hidden area mesh: `vr_stencil_hidden_pixels=1` solo ahorra si `GetHiddenAreaMesh` devuelve una malla; comprobar
+   que klvr la devuelve para la lente del Vision Pro (si no, fragmentos de la periferia invisible se pintan).
+6. Instrumentación: `KL_GPU_PASSES` + `VP_EXCL_TIMING` en cada encoder (28-120/frame) cuestan algo; dejarlos OFF
+   por defecto cuando el reparto esté claro (ajuste «Medir GPU por pase» ya existe).
 
 ## Pendiente menor
 - Ajustes en vivo que faltan: resolución/texturas (convars), anisotrópico; activar/desactivar foveado requiere reiniciar.

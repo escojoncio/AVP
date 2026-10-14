@@ -61,6 +61,8 @@ final class AVPSettings: ObservableObject {
     /// Build 27 (VPKEngine 0031): command buffers wait only on the previous ones they really depend on (VP_CB_ORDER=2)
     /// instead of all of them (0029, VP_CB_ORDER=1). If vertex explosions come back, turn it off.
     @Published var trackedOrder: Bool { didSet { save() } }
+    /// MSAA scene targets resolve from tile (no per-sample store). VPKEngine 0034, VP_MSAA_TILE.
+    @Published var msaaOnTile: Bool { didSet { save() } }
     /// Build 27: the sharp zone composed as P.T.'s circle (KleptonCompositor.setRoundFovea) over the wide map.
     @Published var roundSharpZone: Bool { didSet { save() } }
     @Published var diagCaptures: Bool { didSet { save() } }
@@ -104,6 +106,7 @@ final class AVPSettings: ObservableObject {
         ssao = d.object(forKey: "avp.ssao") as? Bool ?? true
         vertexAmplification = d.object(forKey: "avp.vkAmplify") as? Bool ?? true
         trackedOrder = d.object(forKey: "avp.cbOrder2b") as? Bool ?? false
+        msaaOnTile = d.object(forKey: "avp.msaaOnTile") as? Bool ?? true
         roundSharpZone = d.object(forKey: "avp.roundFov") as? Bool ?? true
         diagCaptures = d.object(forKey: "avp.diagCaptures") as? Bool ?? false
         gpuPassProfiling = d.object(forKey: "avp.gpuPasses") as? Bool ?? true
@@ -140,6 +143,7 @@ final class AVPSettings: ObservableObject {
         d.set(ssao, forKey: "avp.ssao")
         d.set(vertexAmplification, forKey: "avp.vkAmplify")
         d.set(trackedOrder, forKey: "avp.cbOrder2b")
+        d.set(msaaOnTile, forKey: "avp.msaaOnTile")
         d.set(roundSharpZone, forKey: "avp.roundFov")
         d.set(diagCaptures, forKey: "avp.diagCaptures")
         d.set(gpuPassProfiling, forKey: "avp.gpuPasses")
@@ -162,7 +166,7 @@ final class AVPSettings: ObservableObject {
         anisotropy = fresh.anisotropy; engine = fresh.engine
         systemLanguage = fresh.systemLanguage; refreshHz = fresh.refreshHz; halfRate = fresh.halfRate
         showFps = fresh.showFps; composeNewOnly = fresh.composeNewOnly; ssao = fresh.ssao
-        vertexAmplification = fresh.vertexAmplification; trackedOrder = fresh.trackedOrder; roundSharpZone = fresh.roundSharpZone; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling; gpuQueueDepth = fresh.gpuQueueDepth; movement = fresh.movement; cloudSync = fresh.cloudSync
+        vertexAmplification = fresh.vertexAmplification; trackedOrder = fresh.trackedOrder; msaaOnTile = fresh.msaaOnTile; roundSharpZone = fresh.roundSharpZone; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling; gpuQueueDepth = fresh.gpuQueueDepth; movement = fresh.movement; cloudSync = fresh.cloudSync
         AVPLog.log("Ajustes: valores por defecto")
     }
 
@@ -298,6 +302,9 @@ final class AVPSettings: ObservableObject {
             ("vr_single_light_fast_path_sun_cascade_0_texels_per_world", "3"),
             ("vr_single_light_fast_path_sun_cascade_1_texels_per_world", "0"),
             ("vr_shadow_map_culling", "1"),
+            // Build 31: software occlusion culling (occluded = never visible: no fidelity cost). Forced so a saved
+            // config cannot turn it off; AVPMISSING if this build lacks it.
+            ("r_occlusion_culling", "1"),
         ]
     }
     private func effect(_ name: String) -> String { effectsConvars.first(where: { $0.0 == name })?.1 ?? "0" }
@@ -363,7 +370,11 @@ final class AVPSettings: ObservableObject {
             // Build 29: vertex amplification OFF (logs 20/2_6: the right eye was rasterized shrunk into a corner and the
             // overlay pass faulted the GPU). Kept off whatever the stored setting says until it is fixed in VPKEngine.
             ("VPVK_AMPLIFY", "0"),
-            ("VPVK_FETCH_NATIVE", "0"),
+            // Build 31: native half fetch back on, alone (B29 turned it off only because it shipped with amplification;
+            // the translator's conversion is exact). Logs 22: the scene pass is vertex-bound (vtx 11 ms).
+            ("VPVK_FETCH_NATIVE", "1"),
+            // Build 31: MSAA scene targets resolve from tile instead of storing every sample (VPKEngine 0034).
+            ("VP_MSAA_TILE", msaaOnTile ? "1" : "0"),
             ("VP_CB_ORDER", trackedOrder ? "2" : "1"),
             ("VP_EXCL_TIMING", "1"),
         ]
@@ -424,7 +435,7 @@ final class AVPSettings: ObservableObject {
             // The engine configuration the hang quarantine is valid for (AVPPipelineCache: quarantine.key). The values
             // are read back from the env so the signature cannot drift from what VPKEngine actually gets.
             let sigKeys = ["VPVK_AMPLIFY", "VPVK_FETCH_NATIVE", "VP_CB_ORDER", "KL_VRR", "KL_VRR_PHYS", "VPVK_FORCE_1X",
-                           "VPVK_MOTION", "VP_FRAMES_IN_FLIGHT"]
+                           "VPVK_MOTION", "VP_FRAMES_IN_FLIGHT", "VP_MSAA_TILE"]
             let signature = sigKeys.map { k in "\(k)=\(env.last { $0.0 == k }?.1 ?? "-")" }.joined(separator: "|")
                 + "|msaa=\(gameMSAA)"
             let cache = AVPPipelineCache.configure(data: p.dataDir, pipelines: p.pipelines, engine: engine.rawValue,

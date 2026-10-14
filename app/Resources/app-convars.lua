@@ -46,7 +46,11 @@ ListenToGameEvent("player_activate", function()
         "r_light_flickering_enabled", "lb_shadow_texture_width_override", "lb_shadow_texture_height_override",
         "lb_enable_shadow_casting", "csm_max_num_cascades_override", "@panorama_max_fps", "@panorama_max_overlay_fps",
         "@panorama_experimental_fast_box_shadow", "@panorama_disable_box_shadow", "@panorama_disable_blur",
-        "vr_perf_mode_override2", "vr_fidelity_level", "vr_msaa" }) do
+        "vr_perf_mode_override2", "vr_fidelity_level", "vr_msaa",
+        -- build 31: culling and LOD state (read only; answers "is occlusion / per-draw culling on?")
+        "r_occlusion_culling", "sc_perdrawculling", "sc_bounds_group_cull", "sc_no_cull", "vr_expand_cull_frustum",
+        "r_size_cull_threshold", "r_size_cull_threshold_shadow", "r_worldlod", "sc_force_lod_level",
+        "sc_lod_distance_scale_override", "r_stereo_true_multiview", "r_stereo_multiview_instancing" }) do
       local ok, v = pcall(Convars.GetStr, Convars, k)
       out[#out + 1] = k .. "=" .. ((ok and v ~= nil) and tostring(v) or "nil")
       if #out == 12 then Msg("KLPERF " .. table.concat(out, " ") .. "\n"); out = {} end   -- short console lines

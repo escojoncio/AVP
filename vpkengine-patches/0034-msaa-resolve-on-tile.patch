@@ -1,0 +1,261 @@
+From 3123ff8850f248e2c5e19db780380c44a3587233 Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Wed, 14 Oct 2026 10:33:27 +0000
+Subject: [PATCH] Core: MSAA attachments stored and resolved keep only the
+ resolve (samples not stored)
+
+- frame_compiler/placeTiles: an MSAA attachment with StoreAndResolve that nothing
+  in the frame reads is a tile-local candidate whatever its persistent flag
+  (CompileOptions::msaaResolveOnTile, default on; Device: VP_MSAA_TILE=0 turns
+  it off, logged as gpu.msaa). Its store becomes Resolve: the samples are
+  resolved from tile and not written to memory. Samples read in the same frame
+  (a custom resolve) keep the store as before. Only bandwidth is saved: a
+  persistent texture is still allocated eagerly by metal2.
+- A VPKEngine frame is one vkQueueSubmit: samples read in a LATER submit would
+  be undefined. stats.msaaStaleReads (msaa_stale= in gpu.frame) counts MSAA
+  textures sampled, copied or loaded in a frame before (or without) being
+  rendered in it, so a run shows whether the client ever does that.
+- Why: Alyx asks storeOp STORE + resolve on its 2112x1728x2 4x colour and
+  D32FS8 scene targets, cleared every frame and only consumed through the
+  resolve (VK_KHR_depth_stencil_resolve): ~230 MB of sample stores per frame
+  for nothing (Logs 22: tile_local=0 in every frame, att=...:Persistent).
+- tests: tile (new MSAA cases incl. the stale-read counter; the old
+  "StoreAndResolve keeps the samples" expectation now holds with the option off).
+---
+ gpu/core/include/vpgpu/core/device.h         |  1 +
+ gpu/core/include/vpgpu/core/frame_compiler.h | 11 ++++
+ gpu/core/src/device.cpp                      |  6 +-
+ gpu/core/src/diagnostics.cpp                 |  1 +
+ gpu/core/src/frame_compiler.cpp              | 20 ++++--
+ gpu/core/tests/core_tests.cpp                | 64 +++++++++++++++++++-
+ 6 files changed, 96 insertions(+), 7 deletions(-)
+
+diff --git a/gpu/core/include/vpgpu/core/device.h b/gpu/core/include/vpgpu/core/device.h
+index f74abab..8e0eaad 100644
+--- a/gpu/core/include/vpgpu/core/device.h
++++ b/gpu/core/include/vpgpu/core/device.h
+@@ -69,6 +69,7 @@ class Device {
+   // frame is one the host compositor never sees half-drawn: it keeps reprojecting the last
+   // complete one, which in VR reads as a brief pause instead of corrupted geometry.
+   uint32_t holdMs_ = 1500;
++  CompileOptions compileOptions_;  // VP_MSAA_TILE
+   // After a hold that timed out (a cold shader cache: every frame brings pipelines still compiling, build 18
+   // held 1.5 s per frame = 0.7 fps), holds are cut to kHoldBackoffMs for a while: draws that are not ready
+   // are skipped instead of stalling the game thread frame after frame.
+diff --git a/gpu/core/include/vpgpu/core/frame_compiler.h b/gpu/core/include/vpgpu/core/frame_compiler.h
+index 282de1b..349abe5 100644
+--- a/gpu/core/include/vpgpu/core/frame_compiler.h
++++ b/gpu/core/include/vpgpu/core/frame_compiler.h
+@@ -105,6 +105,9 @@ struct CompileStats {
+   uint32_t badFetch = 0;       // pixel-local reads that cannot be served: their draws are skipped
+   uint64_t tileBytes = 0;      // memory the tile-local textures would have occupied
+   uint32_t storesKept = 0;     // DontCare stores turned into Store: a later encoder uses the texture
++  // MSAA textures read (sampled, copied, loaded) in this frame before any encoder rendered them in it:
++  // their contents come from an earlier submit, which msaaResolveOnTile may have left on tile.
++  uint32_t msaaStaleReads = 0;
+ };
+ 
+ // A draw by position: Frame::commands()[command] is a RenderPass, draws[draw] the draw.
+@@ -131,6 +134,14 @@ struct CompileOptions {
+   // tables, "maximum implicit image block size, per pixel, per sample, when using multiple color
+   // render targets", Apple4-Apple6 (Apple7+ allow 128; the visionOS M2 is Apple8).
+   uint32_t tileBytesPerPixel = 64;
++  // An MSAA attachment stored AND resolved (Vulkan storeOp STORE + a resolve attachment) that nothing
++  // in the frame reads keeps only its resolve: the samples are not written to memory every frame
++  // (only the store bandwidth is saved: a persistent texture is still allocated by the backend). The
++  // persistent flag (anything not transient, in Vulkan) is ignored for it: the resolve is the copy the
++  // client consumes, and a client that reads the samples in the same frame (= the same submit; a
++  // custom resolve) keeps the store. A read in a LATER submit would see undefined samples:
++  // CompiledFrame::stats.msaaStaleReads counts such reads (msaa_stale in the frame report).
++  bool msaaResolveOnTile = true;
+ };
+ 
+ class ResourceTable;
+diff --git a/gpu/core/src/device.cpp b/gpu/core/src/device.cpp
+index 5471922..198c9e3 100644
+--- a/gpu/core/src/device.cpp
++++ b/gpu/core/src/device.cpp
+@@ -17,6 +17,10 @@ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
+   }
+   if (const char* e = std::getenv("VP_HOLD_MS"); e && *e) holdMs_ = uint32_t(std::strtoul(e, nullptr, 10));
+   log_("gpu.hold armed max_ms=" + std::to_string(holdMs_));
++  // VP_MSAA_TILE=0: MSAA attachments that are stored and resolved keep their store (samples written to
++  // memory every frame) instead of resolving from tile.
++  if (const char* e = std::getenv("VP_MSAA_TILE"); e && *e == '0') compileOptions_.msaaResolveOnTile = false;
++  log_(std::string("gpu.msaa resolve_on_tile=") + (compileOptions_.msaaResolveOnTile ? "1" : "0 (VP_MSAA_TILE=0)"));
+ }
+ 
+ BufferId Device::createBuffer(BufferDesc d) {
+@@ -59,7 +63,7 @@ FrameReport Device::submit(const Frame& frame) {
+   const uint64_t index = frame_++;
+   const auto start = std::chrono::steady_clock::now();
+   std::unique_lock resLock(resMutex_);
+-  const CompiledFrame compiled = compileFrame(frame, &resources_);
++  const CompiledFrame compiled = compileFrame(frame, &resources_, compileOptions_);
+   resLock.unlock();
+   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+   if (holdMs_) {
+diff --git a/gpu/core/src/diagnostics.cpp b/gpu/core/src/diagnostics.cpp
+index 034c9c8..a339628 100644
+--- a/gpu/core/src/diagnostics.cpp
++++ b/gpu/core/src/diagnostics.cpp
+@@ -60,6 +60,7 @@ std::vector<std::string> formatReport(const FrameReport& r) {
+   kv(l, " tile_local=%u tile_rejected=%u saved_mb=%.1f", r.compile.tileLocal, r.compile.tileRejected,
+      double(r.compile.tileBytes) / (1024.0 * 1024.0));
+   if (r.compile.storesKept) kv(l, " stores_kept=%u", r.compile.storesKept);
++  if (r.compile.msaaStaleReads) kv(l, " msaa_stale=%u", r.compile.msaaStaleReads);
+   if (r.compile.badFetch) kv(l, " bad_fetch=%u", r.compile.badFetch);
+   kv(l, " cpu_ms=%.3f", r.cpuCompileMs);
+   if (r.gpu.frameMs > 0) kv(l, " gpu_ms=%.3f", r.gpu.frameMs);
+diff --git a/gpu/core/src/frame_compiler.cpp b/gpu/core/src/frame_compiler.cpp
+index f720835..134ea03 100644
+--- a/gpu/core/src/frame_compiler.cpp
++++ b/gpu/core/src/frame_compiler.cpp
+@@ -531,9 +531,10 @@ class BarrierPlacer {
+ 
+ // Phase 3: decide which attachments never need memory (see TileVerdict).
+ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std::vector<AccessList>& accesses,
+-                const ResourceTable& res) {
++                const ResourceTable& res, const CompileOptions& options) {
+   struct Use {
+     int encoder = -1, last = -1;  // render encoder holding it as attachment; last encoder using it
++    int firstRead = -1;           // first encoder that samples, copies or loads it (-1: none)
+     bool multi = false, pixelLocal = false, sampled = false, elsewhere = false, badFetch = false;
+   };
+   std::unordered_map<uint64_t, Use> uses;
+@@ -551,6 +552,7 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
+         else if (t.attachment) continue;  // membership comes from the encoder's pass below
+         else if (isCopy || t.access.write) u.elsewhere = true;
+         else u.sampled = true;
++        if (!t.access.pixelLocal && !t.access.write && u.firstRead < 0) u.firstRead = static_cast<int>(e);
+       }
+     }
+     if (enc.kind != Encoder::Kind::Render) continue;
+@@ -558,11 +560,19 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
+       if (!a.texture) return;
+       Use& u = uses[key(a.texture.index, a.texture.generation)];
+       u.multi = u.multi || (u.encoder >= 0 && u.encoder != static_cast<int>(e));
++      if (a.load == LoadAction::Load && u.encoder < 0 && u.firstRead < 0) u.firstRead = static_cast<int>(e);
+       u.encoder = static_cast<int>(e);
+       if (a.resolve) uses[key(a.resolve.index, a.resolve.generation)].elsewhere = true;  // resolved into memory
+     });
+   }
+ 
++  // MSAA textures whose contents this frame reads before (or without) rendering them: those came from
++  // an earlier submit (see CompileOptions::msaaResolveOnTile).
++  for (const auto& [k, u] : uses) {
++    if (u.firstRead < 0) continue;
++    const TextureDesc* d = res.get(TextureId{uint32_t(k & 0xffffffffu), uint32_t(k >> 32)});
++    if (d && d->samples > 1 && (u.encoder < 0 || u.firstRead < u.encoder)) ++out.stats.msaaStaleReads;
++  }
+   std::unordered_set<uint64_t> rejected;
+   for (uint32_t e = 0; e < out.encoders.size(); ++e) {
+     Encoder& enc = out.encoders[e];
+@@ -580,8 +590,10 @@ void placeTiles(CompiledFrame& out, const std::vector<Command>& cmds, const std:
+       // Only textures the client lets go of are candidates: not stored, or marked transient. An
+       // explicit Store may be presented, read back by the CPU or read next frame.
+       const bool resolves = a.store == StoreAction::Resolve || a.store == StoreAction::StoreAndResolve;
+-      if (a.store != StoreAction::DontCare && a.store != StoreAction::Resolve && !d->transient) v = TileVerdict::None;
+-      else if (d->persistent) v = TileVerdict::Persistent;
++      // MSAA samples stored and resolved: the resolve is what the client consumes (CompileOptions).
++      const bool msaaResolve = options.msaaResolveOnTile && d->samples > 1 && a.store == StoreAction::StoreAndResolve;
++      if (a.store != StoreAction::DontCare && a.store != StoreAction::Resolve && !d->transient && !msaaResolve) v = TileVerdict::None;
++      else if (d->persistent && !msaaResolve) v = TileVerdict::Persistent;
+       else if (u.elsewhere) v = TileVerdict::UsedElsewhere;
+       else if (u.badFetch) v = TileVerdict::BadFetch;
+       else if (u.sampled) v = TileVerdict::SampledRead;
+@@ -634,7 +646,7 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
+     else scheduler.copy(i, accesses[i]);
+   }
+   scheduler.finish();
+-  if (resources) placeTiles(out, cmds, accesses, *resources);
++  if (resources) placeTiles(out, cmds, accesses, *resources, options);
+ 
+   BarrierPlacer placer(out);
+   for (uint32_t e = 0; e < out.encoders.size(); ++e) {
+diff --git a/gpu/core/tests/core_tests.cpp b/gpu/core/tests/core_tests.cpp
+index bc92c2a..acba13c 100644
+--- a/gpu/core/tests/core_tests.cpp
++++ b/gpu/core/tests/core_tests.cpp
+@@ -585,6 +585,59 @@ struct Deferred {
+ };
+ 
+ void testTile() {
++  {  // MSAA colour + depth stored AND resolved, read by nothing in the frame: samples stay on tile, resolve kept
++    Scene s;
++    TextureDesc md;
++    md.format = Format::RGBA8Unorm; md.width = md.height = 256; md.samples = 4; md.usage = usage::colorTarget;
++    const TextureId mc = s.res.createTexture(md);
++    md.format = Format::D32Float; md.usage = usage::depthTarget;
++    const TextureId mdep = s.res.createTexture(md);
++    const TextureId rc = s.rt(), rd = s.depthRt();
++    auto msaa = [&]() {
++      auto d = Scene::pass(mc, mdep, LoadAction::Clear);
++      d.colors[0].store = StoreAction::StoreAndResolve; d.colors[0].resolve = rc;
++      d.depth.store = StoreAction::StoreAndResolve; d.depth.resolve = rd;
++      return d;
++    };
++    {
++      Frame f;
++      Scene::passWithDraw(f, msaa());
++      Scene::passWithDraw(f, Scene::pass(s.rt()), {Scene::sample(rc)});  // the resolve is what gets read
++      const CompiledFrame cf = compileFrame(f, &s.res);
++      CHECK_EQ(cf.stats.tileLocal, 2u);
++      CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::Resolve);
++      CHECK(cf.encoders[0].pass.depth.store == StoreAction::Resolve);
++      CHECK(cf.encoders[0].pass.colors[0].resolve == rc);
++    }
++    {  // the samples themselves read in the frame (a custom resolve): stored as asked
++      Frame f;
++      Scene::passWithDraw(f, msaa());
++      Scene::passWithDraw(f, Scene::pass(s.rt()), {Scene::sample(mc)});
++      const CompiledFrame cf = compileFrame(f, &s.res);
++      CHECK_EQ(cf.stats.tileLocal, 1u);  // depth only
++      CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::StoreAndResolve);
++      CHECK(cf.encoders[0].tile[0] == TileVerdict::SampledRead);
++    }
++    {  // the samples read in a frame (submit) that does not render them: counted as a stale read
++      Frame f;
++      Scene::passWithDraw(f, Scene::pass(s.rt()), {Scene::sample(mc)});
++      const CompiledFrame cf = compileFrame(f, &s.res);
++      CHECK_EQ(cf.stats.msaaStaleReads, 1u);
++      Frame g;  // rendered first, read after: not stale
++      Scene::passWithDraw(g, msaa());
++      Scene::passWithDraw(g, Scene::pass(s.rt()), {Scene::sample(mc)});
++      CHECK_EQ(compileFrame(g, &s.res).stats.msaaStaleReads, 0u);
++    }
++    {  // option off: persistent as before
++      CompileOptions o;
++      o.msaaResolveOnTile = false;
++      Frame f;
++      Scene::passWithDraw(f, msaa());
++      const CompiledFrame cf = compileFrame(f, &s.res, o);
++      CHECK_EQ(cf.stats.tileLocal, 0u);
++      CHECK(cf.encoders[0].pass.colors[0].store == StoreAction::StoreAndResolve);
++    }
++  }
+   {  // classic deferred: 1 encoder, 3 colour targets + depth on tile
+     Deferred g;
+     Frame f;
+@@ -803,9 +856,16 @@ void testTile() {
+     Scene::passWithDraw(f, p);
+     Scene::passWithDraw(f, Scene::pass(s.rt()), {Scene::sample(single)});
+     const CompiledFrame cf = compileFrame(f, &s.res);
+-    // StoreAndResolve keeps the samples: client asked for them, not a candidate.
+-    CHECK(cf.encoders[0].tile[0] == TileVerdict::None);
++    // StoreAndResolve with nothing reading the samples in the frame: the resolve is kept, the samples
++    // stay on tile (CompileOptions::msaaResolveOnTile, default on).
++    CHECK(cf.encoders[0].tileLocal(0) && cf.encoders[0].pass.colors[0].store == StoreAction::Resolve);
+     CHECK_EQ(hazards(cf, HazardKind::RAW), 1u);  // resolve target -> sampled
++    {
++      CompileOptions o;
++      o.msaaResolveOnTile = false;
++      const CompiledFrame co = compileFrame(f, &s.res, o);
++      CHECK(co.encoders[0].tile[0] == TileVerdict::None);  // off: the client asked for the samples
++    }
+     p.colors[0].store = StoreAction::Resolve;
+     Frame g2;
+     Scene::passWithDraw(g2, p);
+-- 
+2.43.0
+
