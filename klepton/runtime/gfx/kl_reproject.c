@@ -648,7 +648,12 @@ static const char kl_msl_reproject[] =
 "                          constant KLWide &u [[buffer(0)]])\n"
 "{\n"
 "    float2 dx = dfdx(in.uv), dy = dfdy(in.uv);\n"
-"    uint n = clamp(u.taps, 1u, 4u);\n"
+// Build 41: as many taps per axis as the texel's own footprint needs (each bilinear tap covers ~2 eye texels), up to
+// `taps`: 4 x 4 only in the full-rate rectangle's corners and bands, 1 where the eye is already at the periphery's
+// rate (most of the view), where 16 taps inside one texel averaged to that one bilinear sample anyway.
+"    float2 sz = float2(float(tex.get_width()), float(tex.get_height()));\n"
+"    float fp = max(length(dx * sz), length(dy * sz));\n"
+"    uint n = clamp(uint(ceil(fp * 0.5)), 1u, clamp(u.taps, 1u, 4u));\n"
 "    float inv = 1.0 / float(n);\n"
 "    float4 acc = float4(0.0);\n"
 "    for (uint j = 0u; j < n; j++) {\n"
@@ -658,6 +663,28 @@ static const char kl_msl_reproject[] =
 "        }\n"
 "    }\n"
 "    return acc * (inv * inv);\n"
+"}\n"
+"\n"
+// Build 41: the periphery reconstruction (kl_eye_recon) of the wide view, evaluated once per guest picture into a
+// texture 3x the wide view's size, instead of per drawable pixel in every composite (15 taps on ~70 % of two
+// 1856x1760 views: 1.3-2.4 ms a composite, Logs_Alyx_28/29). The composite reads it with one bilinear tap; at 3x the
+// smooth reconstruction is sampled densely enough that the bilinear between samples follows it. Same strength,
+// sharpness and reference as the composite's (mag 0 = full effect, as the periphery's ~0.11 already was).
+"struct KLWideRecon { uint slice; float strength; float sharp; float ref; };\n"
+"struct KLWideReconOut { float4 pos [[position]]; float2 uv; };\n"
+"vertex KLWideReconOut kl_widerecon_v(uint vid [[vertex_id]]) {\n"
+"    float2 p = float2((vid << 1) & 2, vid & 2);\n"
+"    KLWideReconOut o;\n"
+"    o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+"    o.uv = float2(p.x, 1.0 - p.y);   // row 0 on top, as the wide view (kl_wide_v)\n"
+"    return o;\n"
+"}\n"
+"fragment float4 kl_widerecon_f(KLWideReconOut in [[stage_in]],\n"
+"                               texture2d_array<float> wide [[texture(0)]],\n"
+"                               sampler samp [[sampler(0)]],\n"
+"                               constant KLWideRecon &u [[buffer(0)]])\n"
+"{\n"
+"    return kl_eye_recon(wide, samp, in.uv, u.slice, 0.0, float3(u.strength, u.sharp, max(u.ref, 0.25)));\n"
 "}\n"
 "\n"
 // The probe ladder (KL_CP_PROBE). Same library, same vertex function, so each

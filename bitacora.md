@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro. Todo en
 conversión ELF→Mach-O (`klepton_ld` en proceso) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** (repo `escojoncio/VPKEngine` = `vpkengine.ref` + `vpkengine-patches/` 0011–0035).
 MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Plan: `PLAN.md`. Historial completo:
-`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B40).
+`git log -p bitacora.md`. IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: B41).
 
 ## 100 % funcional en el visor
 - Steam (login + Guard, propiedad paquete 134870, descarga build 25487405, Cloud), .p12 como primer paso, firma on-device.
@@ -355,7 +355,22 @@ MoltenVK solo como referencia de diagnóstico. Sin MetalFX (no sirve en VR). Pla
   0,33–0,83 ms × 29–93/s (2 ojos por imagen)**: absurdo para 36k píxeles → sospechoso #1 del compositor (¿la malla
   `grid`/overdraw o los 16 taps bilineales sobre 2112x1728?). Compositor total 2,5–3,5 ms/frame.
 
-## Siguiente (al llegar el log de B40)
+## B41 — cambios
+1. Compositor, periferia (Logs_Alyx_28/29: composición 1,3–2,4 ms por pase, vista ancha 0,33–0,83 ms por ojo):
+   - `kl_wide_f`: taps por eje adaptativos por huella de la derivada (`n = clamp(ceil(fp*0.5), 1, taps)`): 4x4 solo
+     en el rectángulo a tasa completa; 1 donde el ojo ya está a la densidad de la periferia.
+   - `kl_widerecon_v/f` + `buildWideView`: la reconstrucción (`kl_eye_recon`, ~15 taps) se calcula UNA vez por imagen
+     del juego en `wideReconTex` (factor `min(3, 0.3/dens)`: 3x a 10 %, desactivado si < 2x), y la composición lee
+     con un tap (`recon_on = 0` en las vistas, textura 4 = la reconstruida). `KL_CP_WIDE_RECON=0` = por píxel.
+     Log `[cp] periphery reconstruction precomputed per picture: WxH x2 (Nx ...)`. Medir con `[gputime] compositor
+     passes`: esperado composición ≪ 1,3 ms y vista ancha < 0,3 ms.
+2. Ajustes → Cuenta y carpeta: «Importar caché de shaders (.foz)…» (`AVPSettingsView.importFoz`: comprueba la magia
+   Fossilize, copia a la raíz de AVP vía `.tmp` + replace, sin copiar si ya está ahí, fuera del hilo principal).
+   `importExtraFoz` normaliza la extensión a `.foz` (el replay compara exacto).
+3. Revisión adversarial: 4 hallazgos corregidos (factor por densidad, mismo fichero origen/destino, extensión en
+   mayúsculas, copia síncrona).
+
+## Siguiente (al llegar el log de B41)
 1. Confirmar sin parpadeo ni tirones con la copia de ojos (B40). Si siguieran: comparar con B36b (no los tenía).
 2. Vista ancha: medir por qué 0,6–0,8 ms por ojo (reducir taps a 2 con mips del ojo, o 1 muestra bilineal sobre
    un mip 1/4): −1 ms/frame del compositor.

@@ -422,7 +422,7 @@ enum AVPPrepare {
             guard size > 0 else { continue }
             let id = "\(name):\(size)/\(mtime)"
             ids.append(id)
-            let dstName = "user-" + name
+            let dstName = "user-" + (name as NSString).deletingPathExtension + ".foz"   // the replay matches ".foz" exactly
             keep.insert(dstName)
             let dst = klfz.appendingPathComponent(dstName)
             let idURL = klfz.appendingPathComponent(dstName + ".id")
