@@ -13,6 +13,8 @@ struct AVPSettingsView: View {
     @State private var password = ""
     @State private var result: String?
     @State private var pickingFolder = false
+    @State private var pickingFoz = false
+    @State private var fozResult: String?
     @State private var confirmQuarantine = false
     @State private var quarantined = AVPPipelineCache.quarantineCount()
 
@@ -219,6 +221,59 @@ struct AVPSettingsView: View {
                 .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { r in
                     if case .success(let url) = r { model.choose(url) }
                 }
+            // Build 41: a Fossilize pipeline database (e.g. the PC's steamapps/shadercache/546560/fozpipelinesv6/
+            // steamapp_pipeline_cache.foz) copied to the AVP folder's root, where the next preparation precompiles it
+            // (AVPPrepare.importExtraFoz).
+            Button(AVPL("Importar caché de shaders (.foz)…", "Import shader cache (.foz)…")) { pickingFoz = true }
+                .disabled(model.folderPath == nil)
+                .fileImporter(isPresented: $pickingFoz, allowedContentTypes: [.data, .item]) { r in
+                    guard case .success(let src) = r else { return }
+                    fozResult = AVPL("Copiando…", "Copying…")
+                    Task.detached {   // ~64 MB: off the main thread
+                        let msg = Self.importFoz(src)
+                        await MainActor.run { fozResult = msg }
+                    }
+                }
+            if let fozResult { Text(fozResult).font(.caption) }
+        }
+    }
+
+    /// Copies the chosen file to the AVP folder's root as <name>.foz. The file must be a Fossilize database (its
+    /// 16-byte magic); anything else is refused, so a wrong pick cannot reach the replay.
+    static func importFoz(_ src: URL) -> String {
+        let scoped = src.startAccessingSecurityScopedResource()
+        defer { if scoped { src.stopAccessingSecurityScopedResource() } }
+        guard let root = AVPFolder.shared.cache?.deletingLastPathComponent() else {
+            return AVPL("Elige antes la carpeta AVP.", "Choose the AVP folder first.")
+        }
+        guard let h = try? FileHandle(forReadingFrom: src), let head = try? h.read(upToCount: 12),
+              head.count == 12, head.dropFirst().starts(with: Array("FOSSILIZEDB".utf8)) else {
+            return AVPL("Ese fichero no es una caché de pipelines (.foz de Fossilize).",
+                        "That file is not a pipeline cache (Fossilize .foz).")
+        }
+        try? h.close()
+        var name = src.deletingPathExtension().lastPathComponent
+        if name.isEmpty { name = "shadercache" }
+        let dst = root.appendingPathComponent(name + ".foz")
+        let fm = FileManager.default
+        func real(_ u: URL) -> String { u.standardizedFileURL.resolvingSymlinksInPath().path }
+        if real(src) == real(dst) {   // already in place (picked from the AVP folder itself): nothing to copy
+            AVPLog.log("Ajustes: caché de shaders ya en la carpeta AVP: \(dst.lastPathComponent)")
+            return AVPL("Ya estaba en la carpeta AVP: se precompila en la próxima preparación.",
+                        "Already in the AVP folder: it is precompiled at the next preparation.")
+        }
+        do {
+            let tmp = root.appendingPathComponent(".import-" + name + ".tmp")   // not *.foz: never picked up half-copied
+            try? fm.removeItem(at: tmp)
+            try fm.copyItem(at: src, to: tmp)
+            if fm.fileExists(atPath: dst.path) { _ = try fm.replaceItemAt(dst, withItemAt: tmp) }
+            else { try fm.moveItem(at: tmp, to: dst) }
+            let mb = ((try? fm.attributesOfItem(atPath: dst.path)[.size] as? NSNumber)?.int64Value ?? 0) / 1_048_576
+            AVPLog.log("Ajustes: caché de shaders importada: \(dst.lastPathComponent) (\(mb) MB)")
+            return AVPL("Importada (\(mb) MB). Se precompila en la próxima preparación (una vez, unos minutos).",
+                        "Imported (\(mb) MB). It is precompiled at the next preparation (once, a few minutes).")
+        } catch {
+            return AVPL("No se pudo copiar: ", "Could not copy: ") + error.localizedDescription
         }
     }
 

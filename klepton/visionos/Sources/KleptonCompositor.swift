@@ -359,6 +359,14 @@ final class KleptonCompositor {
     private var widePipeline: MTLRenderPipelineState?
     private var wideTex: MTLTexture?
     private var wideKey: [String] = ["", ""]
+    /// Build 41: the wide view's periphery reconstruction, precomputed at 3x its size once per guest picture
+    /// (kl_widerecon_f) and read by the composite with one tap. KL_CP_WIDE_RECON=0 = per pixel in the composite.
+    nonisolated(unsafe) static var wideReconOn: Bool = (getenv("KL_CP_WIDE_RECON").map { String(cString: $0) } ?? "1") != "0"
+    private var wideReconPipeline: MTLRenderPipelineState?
+    private var wideReconTex: MTLTexture?
+    private var wideReconKey: [String] = ["", ""]
+    private var wideReconUsable = false
+    private var loggedWideRecon = false
     private var loggedRound = ""
     /// Red, green, blue — one second each, off the wall clock. Deliberately
     /// full-intensity primaries: whatever tone mapping or colour management sits
@@ -1017,6 +1025,12 @@ final class KleptonCompositor {
             wdesc.colorAttachments[0].pixelFormat = .rgba16Float
             widePipeline = try? device.makeRenderPipelineState(descriptor: wdesc)
             NSLog("[cp] wide-view pipeline (round sharp zone): " + (widePipeline == nil ? "FAILED — the composite stays rectangular" : "ready"))
+            let rdesc = MTLRenderPipelineDescriptor()
+            rdesc.vertexFunction   = lib.makeFunction(name: "kl_widerecon_v")
+            rdesc.fragmentFunction = lib.makeFunction(name: "kl_widerecon_f")
+            rdesc.colorAttachments[0].pixelFormat = .rgba16Float
+            wideReconPipeline = try? device.makeRenderPipelineState(descriptor: rdesc)
+            NSLog("[cp] wide-view reconstruction pipeline: " + (wideReconPipeline == nil ? "FAILED — reconstructed per pixel in the composite" : "ready"))
             if Self.gameDepth {
                 // Same pass, the fragment that also writes [[depth(any)]]. Linked here so a failure says so once and
                 // the composite simply keeps the quad's depth.
@@ -3743,6 +3757,11 @@ final class KleptonCompositor {
                 wideBound = buildWideView(viewIndices: viewIndices, uniforms: uniforms, bind0: bind0, bind1: bind1,
                                           grid: gridBuf, gridVerts: gridVerts, stage: stage,
                                           rendered: rendered, haveRendered: haveRendered)
+                if wideBound != nil, wideReconUsable, let rt = wideReconTex {
+                    // Build 41: the reconstruction is in the texture already: the composite takes one tap there.
+                    wideBound = rt
+                    for n in uniforms.indices where uniforms[n].visible != 0 { uniforms[n].recon_on = 0 }
+                }
                 if wideBound != nil {
                     // The circle's centre 10 degrees below each eye's forward axis, as kl_gpu_time.m vrr_fov_map
                     // centres the map's full-rate rectangle (tan 10 = 0.1763); its radius the launcher's sharp zone,
@@ -3901,6 +3920,70 @@ final class KleptonCompositor {
             e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: gridVerts)
             e.endEncoding()
             wideKey[vi] = key
+        }
+        // Build 41: the periphery reconstruction of each slice, once per wide view (kl_widerecon_f), when every visible
+        // view has it on; otherwise the composite keeps reconstructing (or not) per pixel as before.
+        wideReconUsable = false
+        if Self.wideReconOn, let rp = wideReconPipeline {
+            var allRecon = true
+            for (n, vi) in viewIndices.enumerated() where vi >= 0 && vi < 2 && n < uniforms.count && uniforms[n].visible != 0 {
+                if uniforms[n].recon_on == 0 { allRecon = false }
+            }
+            // 3x at the 10 % periphery; less as the periphery rate rises (an M5 preset at 50 % makes the wide view
+            // half the eye: 3x of that would cost more than reconstructing per drawable pixel). 1x = off.
+            let dens = max(0.05, min(0.5, Self.roundEdge))
+            let factor = max(1, min(3, Int(0.3 / dens)))
+            if factor < 2 { allRecon = false }
+            let rw = wt.width * factor, rh = wt.height * factor
+            if allRecon && (wideReconTex == nil || wideReconTex!.width != rw || wideReconTex!.height != rh) {
+                let d = MTLTextureDescriptor()
+                d.textureType = .type2DArray
+                d.pixelFormat = .rgba16Float
+                d.width = rw
+                d.height = rh
+                d.arrayLength = 2
+                d.usage = [.renderTarget, .shaderRead]
+                d.storageMode = .private
+                wideReconTex = device.makeTexture(descriptor: d)
+                wideReconTex?.label = "klepton wide view reconstructed"
+                wideReconKey = ["", ""]
+            }
+            if allRecon, let rt = wideReconTex {
+                var ok = true
+                for (n, vi) in viewIndices.enumerated() where vi >= 0 && vi < 2 && n < uniforms.count {
+                    let u = uniforms[n]
+                    guard u.visible != 0 else { continue }
+                    let key = wideKey[vi] + "|\(u.recon_strength)|\(u.recon_sharp)|\(u.recon_ref)"
+                    if wideKey[vi].isEmpty { ok = false; break }
+                    if key == wideReconKey[vi] { continue }
+                    if wcmd == nil {
+                        wcmd = q.makeCommandBuffer()
+                        wcmd?.label = "klepton wide view"
+                        if let w = taaWait { wcmd?.encodeWaitForEvent(w.0, value: w.1) }
+                    }
+                    guard let c = wcmd else { ok = false; break }
+                    let pass = MTLRenderPassDescriptor()
+                    pass.colorAttachments[0].texture = rt
+                    pass.colorAttachments[0].slice = vi
+                    pass.colorAttachments[0].loadAction = .dontCare   // the triangle covers the whole target
+                    pass.colorAttachments[0].storeAction = .store
+                    guard let e = c.makeRenderCommandEncoder(descriptor: pass) else { wideReconKey = ["", ""]; ok = false; break }
+                    e.label = "klepton wide view reconstruction eye \(vi)"
+                    var p = (UInt32(vi), u.recon_strength, u.recon_sharp, u.recon_ref)   // KLWideRecon in kl_reproject.c
+                    e.setRenderPipelineState(rp)
+                    withUnsafeBytes(of: &p) { e.setFragmentBytes($0.baseAddress!, length: $0.count, index: 0) }
+                    e.setFragmentTexture(wt, index: 0)
+                    e.setFragmentSamplerState(samp, index: 0)
+                    e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                    e.endEncoding()
+                    wideReconKey[vi] = key
+                }
+                wideReconUsable = ok
+                if ok && !loggedWideRecon {
+                    loggedWideRecon = true
+                    NSLog("[cp] periphery reconstruction precomputed per picture: \(rw)x\(rh) x2 (\(factor)x the wide view); the composite reads it with one tap")
+                }
+            }
         }
         wcmd?.commit()
         return wt
