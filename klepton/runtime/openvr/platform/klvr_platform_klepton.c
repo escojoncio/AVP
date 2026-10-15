@@ -268,7 +268,10 @@ static void pace_governor(void) {
     }
     double now = klvr_plat_now();
     if (!t0) t0 = now;
-    if (now - t0 < 1.0) return;
+    // Build 53 (Logs_Alyx_40): at the base, a burst of late frames used to wait for the 1 s window (and two of them)
+    // while the picture alternated 2 and 3 refreshes. Drop as soon as 0.3 s hold 10+ frames with over 40 % late.
+    int fast = !g_pace_extra && now - t0 >= 0.3 && n >= 10 && late > 0.40 * n;
+    if (!fast && now - t0 < 1.0) return;
     double avg = n ? sum / n : 0;
     int nl = late, nn = n, ne = nexcl;
     t0 = now; sum = 0; n = 0; late = 0; nexcl = 0;
@@ -292,7 +295,14 @@ static void pace_governor(void) {
     // Build 42 (Logs_Alyx_30): at the base with a quarter of the frames late the picture alternates 2 and 3
     // refreshes, which reads as far fewer fps than either pace; it stayed 2 s each time. Now: out after ONE second
     // with over 40 % late (or two over 25 % / 95 % average), back only after 5 s under 85 % with at most 5 % late.
-    if (ne > nn / 2) {
+    // Build 53: the way back needs 15 s in a row under 80 % of the base frame with at most 3 % late frames, so a
+    // quiet second between two heavy ones no longer flips 30 <-> 45.
+    if (fast) want = 1;
+    else if (g_pace_extra) {
+        double lim_ok = ne > nn / 2 ? 0.03 : 0.08;
+        good = (avg < 0.80 * 1000.0 / base && nl <= lim_ok * nn) ? good + 1 : 0;
+        if (good >= 15) want = 0;
+    } else if (ne > nn / 2) {
         if (!g_pace_extra) {
             over = (avg > 0.95 * 1000.0 / base || nl > 0.25 * nn) ? over + 1 : 0;
             if (over >= 2 || nl > 0.40 * nn) want = 1;

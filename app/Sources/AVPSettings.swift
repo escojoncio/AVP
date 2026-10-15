@@ -110,6 +110,13 @@ final class AVPSettings: ObservableObject {
     /// each heavy shader is left out once; what saves stays on for the session and everything goes to the log. While on,
     /// the compositor's diagnostic captures stop after guest frame 120 (each stalls ~250 ms).
     @Published var abTest: Bool { didSet { save() } }
+    /// Build 53: graphics engine for an A/B run. VPKEngine (VPVulkan) is the default; MoltenVK (bundled) is a test: none
+    /// of VPKEngine's patches apply (measured occlusion, amplification, constant tables, exclusive GPU time).
+    enum Engine: String, CaseIterable { case vpkengine, moltenvk }
+    @Published var engine: Engine { didSet { save() } }
+    /// Build 53: settings layout version. Older saved settings are wiped once so every validated value is the default
+    /// (the options left out of the menu keep their default for good).
+    static let schema = 53
 
     // Fixed since build 32 (they used to be settings; every validated value is now the only value):
     /// 12 command buffers in flight (build 24 orders them; 3 was the build-23 A/B test).
@@ -131,6 +138,13 @@ final class AVPSettings: ObservableObject {
 
     private init() {
         let d = UserDefaults.standard
+        if d.integer(forKey: "avp.schema") < Self.schema {
+            for k in d.dictionaryRepresentation().keys where k.hasPrefix("avp.") && k != "avp.folderBookmark"
+                && k != "avp.signatureVariant" {
+                d.removeObject(forKey: k)
+            }
+            d.set(Self.schema, forKey: "avp.schema")
+        }
         renderPercent = d.object(forKey: "avp.renderPercent") as? Double ?? 90
         textureCap = d.object(forKey: "avp.texCap") as? Int ?? 2048
         // Build 32: the M2/M5/custom picker (avp.fov2: 0 off, 1 M2, 2 M5, 3 custom) becomes one switch.
@@ -152,13 +166,14 @@ final class AVPSettings: ObservableObject {
         cloudSync = d.object(forKey: "avp.cloudSync") as? Bool ?? true
         handFingers = d.object(forKey: "avp.handFingers") as? Bool ?? true
         amplify = d.object(forKey: "avp.amplify") as? Bool ?? true
-        postPhysical = d.object(forKey: "avp.postPhys") as? Bool ?? false
+        postPhysical = d.object(forKey: "avp.postPhys") as? Bool ?? true   // B53: ON (B39-B52 runs: no visual fault)
         eyeDirect = d.object(forKey: "avp.eyeDirect2") as? Bool ?? false   // build 40: OFF (Alyx renders into one image)
         heightOffsetCm = d.object(forKey: "avp.heightCm") as? Double ?? 0
         occlusionQueries = d.object(forKey: "avp.occlusion") as? Bool ?? true
         reportedHz = ReportedHz(rawValue: d.object(forKey: "avp.reportHz") as? Int ?? 0) ?? .measured
         runningStart = d.object(forKey: "avp.runStart") as? Bool ?? true
         abTest = d.object(forKey: "avp.abTest") as? Bool ?? false
+        engine = Engine(rawValue: d.string(forKey: "avp.engine") ?? "") ?? .vpkengine
         subtitleSize = SubtitleSize(rawValue: d.object(forKey: "avp.subSize") as? Int ?? 0) ?? .small
         subtitleFoveation = d.object(forKey: "avp.subFov") as? Bool ?? true
         loading = false
@@ -194,6 +209,8 @@ final class AVPSettings: ObservableObject {
         d.set(reportedHz.rawValue, forKey: "avp.reportHz")
         d.set(runningStart, forKey: "avp.runStart")
         d.set(abTest, forKey: "avp.abTest")
+        d.set(engine.rawValue, forKey: "avp.engine")
+        d.set(Self.schema, forKey: "avp.schema")
         d.set(subtitleSize.rawValue, forKey: "avp.subSize")
         d.set(subtitleFoveation, forKey: "avp.subFov")
     }
@@ -212,7 +229,7 @@ final class AVPSettings: ObservableObject {
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
         postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; occlusionQueries = fresh.occlusionQueries
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
-        reportedHz = fresh.reportedHz; runningStart = fresh.runningStart; abTest = fresh.abTest
+        reportedHz = fresh.reportedHz; runningStart = fresh.runningStart; abTest = fresh.abTest; engine = fresh.engine
         AVPLog.log("Ajustes: valores por defecto")
     }
 
@@ -382,6 +399,8 @@ final class AVPSettings: ObservableObject {
         var args = forcedConvars().map { "+\($0.0) \($0.1)" }.joined(separator: " ")
         args += " +log_verbosity VR max -condebug -language \(lang.name)"
 
+        // B53: MoltenVK only when picked AND the launcher really fell back to it (no VPVulkan loaded).
+        let vpk = AVPLaunch.driverPath != nil
         var env: [(String, String)] = [
             ("KL_ALYX_PROFILE_ARGS", args),
             ("KLVR_EYE_SIZE", "\(eye.width),\(eye.height)"),
@@ -397,10 +416,10 @@ final class AVPSettings: ObservableObject {
             // Klepton's encoder merging is MoltenVK's (MSAA scene chunks). VPKEngine merges same-target passes in its
             // own frame compiler, and now that its queue is watched those hooks would hold its encoders open across
             // its fences: off.
-            ("KL_VK_MERGE", "0"),
-            ("KL_VK_MERGE_VIS", "0"),
+            ("KL_VK_MERGE", vpk ? "0" : "1"),
+            ("KL_VK_MERGE_VIS", vpk ? "0" : "1"),
             ("KLVR_PACE_FALLBACK", "1"),   // 50 fps on 100 Hz when the GPU fits, else 33.3
-            ("KL_LOG_TAG", "vpkengine"),
+            ("KL_LOG_TAG", vpk ? "vpkengine" : "moltenvk"),
             ("KL_CP_QUALITY", "0.40"),
             ("MVK_CONFIG_USE_MTLHEAP", "0"),
             ("KL_GUEST_BIGALLOC_MMAP", "1048576"),
@@ -417,7 +436,7 @@ final class AVPSettings: ObservableObject {
             ("KL_VK_DEVICE_INFO", "auto"),
             ("KL_VK_CENSUS", "1"),
             ("KL_VPKTAA", temporalTAA ? "1" : "0"),
-            ("KL_VK_CLEAR_NEW", "1"),   // VisionQuestPro's new-image clear: not in Glovebox's setup
+            ("KL_VK_CLEAR_NEW", vpk ? "1" : "0"),   // VisionQuestPro's new-image clear: not in Glovebox's setup
             ("KL_VPKTAA_PCT", String(format: "%.0f", vpktaaPercent)),
             ("KL_VPKTAA_SHARP", String(format: "%.2f", vpktaaSharpness)),
             ("VPVK_ANISO", String(anisotropy)),
@@ -503,7 +522,7 @@ final class AVPSettings: ObservableObject {
         if let driver = AVPLaunch.driverPath { env.append(("KL_MVK_DYLIB", driver)) }
         // VPKEngine's persistent pipeline caches (recipes + Metal binary archive) and whether a full prewarm already
         // filled them for this VPVulkan build and this pipeline list (then neither the launcher nor the game replays).
-        do {
+        if vpk {
             // The engine configuration the hang quarantine is valid for (AVPPipelineCache: quarantine.key). The values
             // are read back from the env so the signature cannot drift from what VPKEngine actually gets.
             let sigKeys = ["VPVK_AMPLIFY", "VPVK_FETCH_NATIVE", "VP_CB_ORDER", "KL_VRR", "KL_VRR_PHYS", "VPVK_FORCE_1X",
@@ -537,7 +556,7 @@ final class AVPSettings: ObservableObject {
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
-                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart), test A/B \(abTest)")
+                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart), test A/B \(abTest), motor \(engine.rawValue)")
         return env
     }
 

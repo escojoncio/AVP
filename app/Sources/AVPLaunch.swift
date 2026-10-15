@@ -22,6 +22,10 @@ enum AVPLaunch {
     static func selectDriver() {
         driverPath = nil
         unsetenv("KL_MVK_DYLIB")
+        if UserDefaults.standard.string(forKey: "avp.engine") == "moltenvk" {
+            AVPLog.log("Gráficos: MoltenVK (prueba elegida en Ajustes)")
+            return
+        }
         guard let path = vpvulkanPath else {
             AVPLog.log("Gráficos: esta build no trae VPVulkan; se usa MoltenVK")
             return
