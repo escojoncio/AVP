@@ -212,6 +212,15 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
     Hz al juego medido, post al área física **ON**.
 - Validar con log: líneas del regulador (sin bailes 45↔30), MSAA x2 con foveado correcto, MoltenVK arranca.
 
+## Logs_Alyx_42 (B53, MoltenVK) / 43 (B53, VPKEngine) — ambos 70 %, MSAA x2, preset custom
+- Regulador B53 OK: en ambos sube a 45 una vez, cae a 30 al primer tramo pesado, espera 30 s y no vuelve (la zona no
+  cabe: juego 16–23 ms + compositor 3–5 > 80 % de 22,2). Sin bailes 45↔30.
+- MoltenVK arranca y foveado aplicado (pase 1x en capas + MSAA x2); único error: D24S8 → D32S8 (avisado por MVK).
+- Comparación NO justa: 43 se jugó justo después de 42 (empezó en «fair», serious a 2 min 18 s, **critical** a 3,5 min
+  → juego 13–18 → 28–32 ms). 42 empezó nominal, serious a 2 min 47 s. MoltenVK da tiempo «union» (sobrestima);
+  antes del calor ambos rondan 13–20 ms. Para comparar: visor frío, misma zona, mismo tiempo.
+- Problema principal ahora: térmico (critical duplica el tiempo de GPU) y la zona no cabe en 45 ni a 70 %.
+
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su
    MSL/coste. Si indirect-count codificado ≫ real → `MTLIndirectCommandBuffer` / compactar en el fix-up.
