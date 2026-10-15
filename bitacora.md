@@ -157,11 +157,13 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
 ## Logs_Alyx_38 (B51, menú + nivel)
 - Menú: `refreshes per picture` 2:248–250 → baile del menú RESUELTO; `[gap]` idle CPU 0–0,3 ms.
 - Nivel: juego 25–30 ms + compositor 5–8 ms; `thermal fair` a los ~2,5 min (14:41:04) justo cuando el juego pasa de
-  21 a 28 ms y el compositor de 3,8 a 7 ms → estrangulamiento térmico del M2 con la GPU al 100 %. Memoria 6,8 GB.
+  21 a 28 ms y el compositor de 3,8 a 7 ms (coincidencia: «fair» NO baja la GPU, solo «serious»; ninguna sesión ha llegado a serious). El empeoramiento es
+  el nivel más pesado (juego 21→28–30 ms); el compositor por frame sube porque cada imagen se mantiene más refrescos.
+  Memoria 6,8 GB de 8,1 (vigilar streaming de texturas).
 - El regulador no podía bajar a 30 a 90 Hz (`pace_plan`: fallback solo si ≥ 32 fps) → alternancia 2/3 refrescos.
 - Sombras que «salen tarde» en el nivel: sospecha de las esperas a productores (0038 bit0).
 - B52: fallback a 90 Hz = 30 fps (umbral 29,5; klvr_platform_klepton.c `pace_plan`); `VPVK_RUNTIME_OPTS=0`.
-- Pendiente: con la GPU al 100 % el visor se calienta; sin bajar carga (resolución/MSAA) solo queda elegir entre 45
+- Pendiente: con la GPU al 100 %; sin bajar carga (resolución/MSAA) solo queda elegir entre 45
   con baile o 30 estable. Validar sombras con bit0 off.
 
 ## SIGUIENTES PASOS
