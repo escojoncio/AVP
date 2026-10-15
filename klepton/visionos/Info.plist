@@ -33,9 +33,10 @@
 		</dict>
 	</dict>
 
-	<!-- ARKit providers: world tracking (head pose), hand tracking, accessory tracking (Sense). -->
+	<!-- ARKit providers: world tracking (head pose), plane detection (the real floor, build 58), hand tracking,
+	     accessory tracking (Sense). Plane detection is what actually needs world sensing. -->
 	<key>NSWorldSensingUsageDescription</key>
-	<string>AVP reads the headset's pose so Half-Life: Alyx renders from your head position.</string>
+	<string>AVP finds your room's floor so Half-Life: Alyx places you at your real height, seated or standing.</string>
 	<key>NSHandsTrackingUsageDescription</key>
 	<string>AVP moves the player’s fingers with your real hands and can use them as controllers.</string>
 	<key>NSAccessoryTrackingUsageDescription</key>

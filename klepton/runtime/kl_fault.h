@@ -43,4 +43,9 @@ void kl_fault_print_frames(FILE *f, void *fp);
 // still goes to fd 2 either way.
 void kl_fault_set_crash_path(const char *path);
 
+// The guest's own console file (Source 2's -condebug console.log). On SIGABRT / SIGTRAP its last ~40
+// lines go into the report: an engine that aborts on purpose (Plat_FatalError, a failed assert) says
+// why there just before it dies. Read with open/pread/write only. NULL disables it.
+void kl_fault_set_console_path(const char *path);
+
 #endif

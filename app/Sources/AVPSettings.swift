@@ -98,6 +98,10 @@ final class AVPSettings: ObservableObject {
     /// Build 38: player height offset in cm (negative = Alyx lower: for sitting down, or a floor origin that came out
     /// too low under the player). KLVR_HEIGHT_OFFSET, every tracked pose the game sees; live.
     @Published var heightOffsetCm: Double { didSet { save() } }
+    /// Build 58 (user report): the height was wrong seated and standing because the game's floor was the immersive
+    /// space's origin, not the room's floor. ON = ARKit floor planes measure the real floor (KleptonFloor.swift) and the
+    /// game's height is head - floor; heightOffsetCm stays as a fine trim. KLVR_REAL_FLOOR at launch; live.
+    @Published var realFloor: Bool { didSet { save() } }
     /// Build 39: the game's occlusion queries measured (VPKEngine 0037, Metal visibility results) instead of
     /// "always visible": Source 2 then skips what its occlusion test found hidden (r_occlusion_culling 1).
     /// Off = every query reads visible, the behaviour up to build 38 (VPVK_OCCLUSION).
@@ -199,6 +203,7 @@ final class AVPSettings: ObservableObject {
         postPhysical = d.object(forKey: "avp.postPhys") as? Bool ?? true   // B53: ON (B39-B52 runs: no visual fault)
         eyeDirect = d.object(forKey: "avp.eyeDirect2") as? Bool ?? false   // build 40: OFF (Alyx renders into one image)
         heightOffsetCm = d.object(forKey: "avp.heightCm") as? Double ?? 0
+        realFloor = d.object(forKey: "avp.realFloor") as? Bool ?? true
         occlusionQueries = d.object(forKey: "avp.occlusion") as? Bool ?? true
         reportedHz = ReportedHz(rawValue: d.object(forKey: "avp.reportHz") as? Int ?? 0) ?? .measured
         runningStart = d.object(forKey: "avp.runStart") as? Bool ?? true
@@ -238,6 +243,7 @@ final class AVPSettings: ObservableObject {
         d.set(postPhysical, forKey: "avp.postPhys")
         d.set(eyeDirect, forKey: "avp.eyeDirect2")
         d.set(heightOffsetCm, forKey: "avp.heightCm")
+        d.set(realFloor, forKey: "avp.realFloor")
         d.set(occlusionQueries, forKey: "avp.occlusion")
         d.set(reportedHz.rawValue, forKey: "avp.reportHz")
         d.set(runningStart, forKey: "avp.runStart")
@@ -259,7 +265,7 @@ final class AVPSettings: ObservableObject {
         anisotropy = fresh.anisotropy; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao; msaa = fresh.msaa; frameRate = fresh.frameRate; handHoldPredict = fresh.handHoldPredict
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
-        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; occlusionQueries = fresh.occlusionQueries
+        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
         reportedHz = fresh.reportedHz; runningStart = fresh.runningStart; abTest = fresh.abTest
         preset = fresh.preset
@@ -491,6 +497,7 @@ final class AVPSettings: ObservableObject {
             ("VPVK_AMPLIFY", amplify ? "1" : "0"),
             ("KLVR_EYE_DIRECT", eyeDirect ? "1" : "0"),
             ("KLVR_HEIGHT_OFFSET", String(format: "%.3f", heightOffsetCm / 100)),
+            ("KLVR_REAL_FLOOR", realFloor ? "1" : "0"),   // B58: KleptonFloor.swift
             ("KL_VRR_SRGB_1X", "1"),   // build 42: always (B41 log: the A/B toggle left off = the B35 subtitle bug again)
             ("VPVK_OCCLUSION", occlusionQueries ? "1" : "0"),
             ("KLVR_REPORT_HZ_FIXED", reportedHz.env),
@@ -591,7 +598,7 @@ final class AVPSettings: ObservableObject {
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
-                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart), test A/B \(abTest), preset \(preset.rawValue), fps \(frameRate), manos al centro \(handHoldPredict)")
+                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, altura real \(realFloor), oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart), test A/B \(abTest), preset \(preset.rawValue), fps \(frameRate), manos al centro \(handHoldPredict)")
         return env
     }
 
@@ -695,6 +702,7 @@ end, nil)
         // racing getenv is a crash. Each live setting goes straight to its owner.
         KleptonCompositor.fpsHudEnabled = showFps
         klvr_plat_set_height_offset(Float(heightOffsetCm / 100))
+        KleptonFloor.enabled = realFloor   // B58: off eases the floor shift back to 0; on (re)starts detection
         KleptonCompositor.skipSameEnabled = Self.composeNewOnly
         KleptonTAA.reloadSettings(percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
         KleptonCompositor.setPeripheryRecon(on: reconActive, percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
@@ -705,7 +713,7 @@ end, nil)
             KleptonCompositor.setRoundFovea(on: Self.roundSharpZone, degrees: nil, edge: Float(periphery))
         }
         applyToVPKEngine()
-        AVPLog.log("Ajustes en vivo: foveado \(foveationOn) periferia \(Int((periphery * 100).rounded())) %, VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % nitidez \(vpktaaSharpness), FPS \(showFps)")
+        AVPLog.log("Ajustes en vivo: foveado \(foveationOn) periferia \(Int((periphery * 100).rounded())) %, VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % nitidez \(vpktaaSharpness), FPS \(showFps), altura \(Int(heightOffsetCm)) cm, altura real \(realFloor)")
     }
 
     func applyToVPKEngine() {

@@ -495,6 +495,9 @@ final class KleptonCompositor {
     private let handsWanted = HandTrackingProvider.isSupported && klEnvOn("KL_HANDS", default: true)
     #endif
     private let controllers = KleptonControllers()
+    /// Build 58 (user report): the real floor (PlaneDetectionProvider in THIS session), so the game's height is
+    /// measured against the floor and not against wherever the immersive space put its origin. KleptonFloor.swift.
+    private let realFloor = KleptonFloor()
     private var arRunning = false
 
     // How much work reprojection is doing, sampled for the log.
@@ -732,6 +735,30 @@ final class KleptonCompositor {
 
     private func startARKit() { Task { await runARKit() } }
 
+    // Build 58 (review): runs are SERIALISED. A controller change, the floor's authorisation and a live switch of
+    // "Altura real" can each ask for a run while another is in flight; two run() calls interleaving could leave the
+    // session with the older provider list (the plane provider dropped, or a stale accessory provider). A request
+    // made during a run is folded into ONE more run after it, built from the state at that moment.
+    // Under arRunLock, only through the sync helpers below (never held across an await).
+    private let arRunLock = NSLock()
+    private var arRunInFlight = false
+    private var arRunAgain = false
+
+    private func beginARRun() -> Bool {
+        arRunLock.lock(); defer { arRunLock.unlock() }
+        if arRunInFlight { arRunAgain = true; return false }
+        arRunInFlight = true
+        return true
+    }
+
+    /// True = someone asked for a run while this one was in flight: run again.
+    private func endARRun() -> Bool {
+        arRunLock.lock(); defer { arRunLock.unlock() }
+        if arRunAgain { arRunAgain = false; return true }
+        arRunInFlight = false
+        return false
+    }
+
     /// Build the provider set and run the session.
     ///
     /// Idempotent and **re-runnable**: `AccessoryTrackingProvider` takes its
@@ -741,6 +768,19 @@ final class KleptonCompositor {
     /// stopped first, world and hand tracking carry straight on, and this is
     /// how reconnects are meant to be handled.
     private func runARKit() async {
+        guard beginARRun() else { return }   // the run in flight runs once more when it ends
+        repeat { await runARKitOnce() } while endARRun()
+        // Build 58 (review): the floor's world-sensing permission is asked only AFTER the head and hands are
+        // running, on its own task: tracking never waits on the permission dialog. Allowed, that task runs the
+        // session again with the plane provider added.
+        if arRunning, realFloor.claimAuthorization() { Task { await askFloorAuthorization() } }
+    }
+
+    private func askFloorAuthorization() async {
+        if await realFloor.authorize(arSession) { await runARKit() }
+    }
+
+    private func runARKitOnce() async {
         do {
             // Hand tracking is requested separately because it is the half
             // that can be refused: world tracking is available to any full
@@ -758,10 +798,26 @@ final class KleptonCompositor {
             #endif
             let accessories = await controllers.makeAccessoryProvider()
             if let accessories { providers.append(accessories) }
-            try await arSession.run(providers)
+            // Build 58: the floor planes ride in the same session (the provider list is fixed at run(), and this
+            // function is already the re-run). Only once world sensing is ALLOWED (never asked here: see runARKit);
+            // once included, every later run keeps it, so a controller change cannot drop it.
+            var planes = realFloor.providerForRun()
+            if let planes { providers.append(planes) }
+            do {
+                try await arSession.run(providers)
+            } catch let error where planes != nil {
+                // The head must never depend on the floor: without the plane provider, as up to B57.
+                NSLog("[cp] ARKit run with plane detection failed (\(error)) — retrying without it")
+                realFloor.runFailed(with: planes)
+                planes = nil
+                providers.removeLast()
+                try await arSession.run(providers)
+            }
             arRunning = true
+            realFloor.didRun(with: planes)
+            // `planes` is what is in the session that just ran: false after the fallback above.
             NSLog("[cp] ARKit running (hands: \(handsWanted ? "on" : "off (KL_HANDS=0 or KL_NO_HANDS)"), "
-                  + "sense: \(controllers.senseConnected))")
+                  + "sense: \(controllers.senseConnected), floor planes: \(planes != nil))")
             if let accessories {
                 // A fresh anchor stream per provider. The previous one ends
                 // when its provider is replaced, so these do not accumulate.
@@ -876,7 +932,14 @@ final class KleptonCompositor {
             // klovrp_derive_motion in runtime/xr/kl_ovrp.c.
             kl_ovrp_set_head_pose_time(presentationTime)
             kl_ovrp_set_head_pose(p.x, p.y, p.z, q.imag.x, q.imag.y, q.imag.z, q.real)
+            // Build 58: the device's own Y (same ARKit space as the floor planes) for the floor's plausibility and log.
+            realFloor.tick(headY: anchor.originFromAnchorTransform.columns.3.y)
+        } else {
+            realFloor.tick(headY: nil)
         }
+        // Build 58: "Altura real" switched on live in a session that started with it off — ask for world sensing
+        // now (claimed once); allowed, that task runs the session again with the plane provider added.
+        if arRunning, realFloor.claimAuthorization() { Task { await askFloorAuthorization() } }
 
         // Hands and controllers both go through KleptonControllers, which is a
         // merge rather than a switch: a Sense controller wins per hand where it

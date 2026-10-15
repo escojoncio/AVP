@@ -1,0 +1,553 @@
+From 1d199e7e96eff044c71967266d15b3e5e2562e2f Mon Sep 17 00:00:00 2001
+From: Claude <claude@users.invalid>
+Date: Thu, 15 Oct 2026 19:48:09 +0000
+Subject: [PATCH] VPKEngine 0041: log every Vulkan/Metal allocation or device
+ failure (size, result, footprint)
+
+---
+ .../include/vpgpu/metal2/metal_backend.h      |  5 ++
+ gpu/metal2/src/metal_backend.mm               | 78 ++++++++++++++++---
+ gpu/vulkan/include/vpvk/platform.h            |  5 ++
+ gpu/vulkan/src/commands.h                     |  5 +-
+ gpu/vulkan/src/entry.cpp                      | 71 +++++++++++++++--
+ gpu/vulkan/src/motion.cpp                     |  4 +
+ gpu/vulkan/src/pipelines.cpp                  | 28 ++++++-
+ gpu/vulkan/src/platform_metal.mm              |  2 +
+ gpu/vulkan/src/sync.cpp                       | 57 ++++++++++++--
+ gpu/vulkan/src/vpvk.h                         |  9 +++
+ 10 files changed, 235 insertions(+), 29 deletions(-)
+
+diff --git a/gpu/metal2/include/vpgpu/metal2/metal_backend.h b/gpu/metal2/include/vpgpu/metal2/metal_backend.h
+index 3ec8269..26d7736 100644
+--- a/gpu/metal2/include/vpgpu/metal2/metal_backend.h
++++ b/gpu/metal2/include/vpgpu/metal2/metal_backend.h
+@@ -157,6 +157,11 @@ class MetalBackend final : public Backend {
+   // The id<MTLCommandQueue> frames are committed to now (a new one after gpu.recover), unretained.
+   void* nativeQueue() const;
+   void* nativeTexture(TextureId);
++  // True when Metal refused the resource behind a live id (nil MTLBuffer / failed MTLTexture, gpu.err
++  // logged), or the id is unknown or stale. A render target whose memory is deferred to first use
++  // reads false until that use fails. Thread-safe; for VPVulkan's vkBind*Memory result.
++  bool allocationFailed(BufferId) const;
++  bool allocationFailed(TextureId) const;
+   // Writes the pipeline binary archive under cacheRoot; false (and a gpu.err line) on failure.
+   bool saveArchive();
+   struct ArchiveStats {
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 234adcd..12f1b49 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -792,6 +792,26 @@ struct MetalBackend::Impl {
+     std::lock_guard lock(logMutex);
+     log(line);
+   }
++  // Metal refused to create an object (nil), usually under jetsam memory pressure. Counted per kind:
++  // the first one is logged in full and then every power-of-two count, each with n= and the process
++  // memory (memNote), so a storm of refusals neither floods the log nor goes unseen. Failure paths only.
++  enum Fail : uint8_t { kFailTexture, kFailBuffer, kFailMemoryless, kFailView, kFailCommandBuffer, kFailRing, kFailKinds };
++  std::atomic<uint32_t> failCount[kFailKinds] = {};
++  bool failDue(Fail k, uint32_t& n) {
++    n = failCount[k].fetch_add(1, std::memory_order_relaxed) + 1;
++    return (n & (n - 1)) == 0;
++  }
++  // " footprint_mb=.. avail_mb=.." (avail 0 = unknown: not visionOS/iOS).
++  static std::string memNote() {
++    uint64_t avail = 0;
++#if TARGET_OS_IPHONE
++    avail = uint64_t(os_proc_available_memory());
++#endif
++    char b[80];
++    std::snprintf(b, sizeof b, " footprint_mb=%llu avail_mb=%llu", (unsigned long long)(MetalBackend::footprint() >> 20),
++                  (unsigned long long)(avail >> 20));
++    return b;
++  }
+ 
+   void init();
+   void calibrate();
+@@ -862,6 +882,12 @@ void MetalBackend::Impl::init() {
+     s.indirect.label = @"vpgpu.indirect";
+     s.visibility = [device newBufferWithLength:kVisSlots * 8 options:kSharedUntracked];
+     s.visibility.label = @"vpgpu.visibility";
++    if (!s.args || !s.indirect || !s.visibility) {
++      uint32_t k;
++      if (failDue(kFailRing, k))
++        err("what=alloc_failed kind=slot_ring args=%d indirect=%d visibility=%d n=%u%s", s.args != nil,
++            s.indirect != nil, s.visibility != nil, k, memNote().c_str());
++    }
+     if (!stageSamples) continue;
+     MTLCounterSampleBufferDescriptor* sd = [MTLCounterSampleBufferDescriptor new];
+     sd.counterSet = timestamps;
+@@ -966,9 +992,10 @@ id<MTLTexture> MetalBackend::Impl::view(TextureId t) {
+                                              slices:NSMakeRange(d.baseLayer, d.layers)];
+   }
+   v.failed = v.texture == nil;
+-  if (v.failed)
+-    err("what=texture_view base=%u type=%d format=%s mips=%u+%u layers=%u+%u", v.base.index, int(type),
+-        formatInfo(d.format).name, d.baseMip, d.mips, d.baseLayer, d.layers);
++  uint32_t k;
++  if (v.failed && failDue(kFailView, k))
++    err("what=texture_view base=%u type=%d format=%s mips=%u+%u layers=%u+%u n=%u%s", v.base.index, int(type),
++        formatInfo(d.format).name, d.baseMip, d.mips, d.baseLayer, d.layers, k, memNote().c_str());
+   return v.texture;
+ }
+ 
+@@ -988,8 +1015,11 @@ id<MTLTexture> MetalBackend::Impl::texture(TextureId t) {
+   tex.texture = [device newTextureWithDescriptor:textureDescriptor(tex.desc)];
+   if (!tex.texture) {
+     tex.failed = true;
+-    err("what=texture index=%u format=%s size=%ux%u label=%s", t.index, formatInfo(tex.desc.format).name,
+-        tex.desc.width, tex.desc.height, token(tex.desc.label).c_str());
++    uint32_t k;
++    if (failDue(kFailTexture, k))
++      err("what=texture index=%u format=%s size=%ux%ux%u mips=%u layers=%u samples=%u label=%s n=%u%s", t.index,
++          formatInfo(tex.desc.format).name, tex.desc.width, tex.desc.height, tex.desc.depth, unsigned(tex.desc.mips),
++          unsigned(tex.desc.layers), unsigned(tex.desc.samples), token(tex.desc.label).c_str(), k, memNote().c_str());
+     return nil;
+   }
+   if (!tex.desc.label.empty()) tex.texture.label = @(tex.desc.label.c_str());
+@@ -1037,7 +1067,10 @@ id<MTLTexture> MetalBackend::Impl::memorylessTexture(const TextureDesc& d, std::
+     td.usage = MTLTextureUsageRenderTarget;
+     id<MTLTexture> t = [device newTextureWithDescriptor:td];
+     if (!t) {
+-      err("what=memoryless format=%s size=%ux%u", formatInfo(d.format).name, d.width, d.height);
++      uint32_t k;
++      if (failDue(kFailMemoryless, k))
++        err("what=memoryless format=%s size=%ux%u n=%u%s", formatInfo(d.format).name, d.width, d.height, k,
++            memNote().c_str());
+       return nil;
+     }
+     t.label = @"vpgpu.tile";
+@@ -2129,6 +2162,11 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+   MTLCommandBufferDescriptor* cbd = [MTLCommandBufferDescriptor new];
+   cbd.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;  // per-encoder fault in the log
+   id<MTLCommandBuffer> cb = [queue commandBufferWithDescriptor:cbd];
++  if (!cb) {  // nothing of this frame can run (its completion would never come either): say why
++    uint32_t k;
++    if (failDue(kFailCommandBuffer, k))
++      err("what=alloc_failed kind=command_buffer f=%llu n=%u%s", (unsigned long long)frameIndex, k, memNote().c_str());
++  }
+   cb.label = [NSString stringWithFormat:@"vpgpu.f%llu", (unsigned long long)frameIndex];
+ 
+   const auto& cmds = frame.commands();
+@@ -3783,8 +3821,8 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+       for (id<MTLCommandBufferEncoderInfo> i in infos)
+         if (i.errorState == MTLCommandEncoderErrorStateFaulted || i.errorState == MTLCommandEncoderErrorStateAffected)
+           encs += (encs.empty() ? "" : ",") + token(i.label.UTF8String ?: "?");
+-      impl->err("what=command_buffer f=%llu error=%s encoders=%s", (unsigned long long)frameIndex,
+-                token(str(finished.error)).c_str(), encs.c_str());
++      impl->err("what=command_buffer f=%llu code=%ld error=%s encoders=%s%s", (unsigned long long)frameIndex,
++                (long)finished.error.code, token(str(finished.error)).c_str(), encs.c_str(), Impl::memNote().c_str());
+       const std::string what = str(finished.error);
+       const bool ignored = what.find("SubmissionsIgnored") != std::string::npos;
+       const bool victim = what.find("InnocentVictim") != std::string::npos;
+@@ -4169,8 +4207,10 @@ void MetalBackend::createBuffer(BufferId handle, const BufferDesc& d) {
+     b.buffer = [m.device newBufferWithLength:d.size options:kSharedUntracked];
+   }
+   if (!b.buffer) {
+-    m.err("what=buffer index=%u size=%llu guest=%d label=%s", handle.index, (unsigned long long)d.size,
+-          d.guestMemory != nullptr, token(d.label).c_str());
++    uint32_t k;
++    if (m.failDue(Impl::kFailBuffer, k))
++      m.err("what=buffer index=%u size=%llu guest=%d label=%s n=%u%s", handle.index, (unsigned long long)d.size,
++            d.guestMemory != nullptr, token(d.label).c_str(), k, Impl::memNote().c_str());
+     return;
+   }
+   if (!d.label.empty()) b.buffer.label = @(d.label.c_str());
+@@ -4286,8 +4326,8 @@ bool MetalBackend::compilePipeline(const PipelineState& s, std::string& error) {
+     }
+     const bool built = s.computeShader ? impl_->buildCompute(s, p, error) : impl_->buildRender(s, p, error);
+     if (!built) {
+-      impl_->err("what=pipeline key=%016llx label=%s error=%s", (unsigned long long)s.key().value,
+-                 token(s.label).c_str(), token(error).c_str());
++      impl_->err("what=pipeline key=%016llx label=%s error=%s%s", (unsigned long long)s.key().value,
++                 token(s.label).c_str(), token(error).c_str(), Impl::memNote().c_str());
+       return false;
+     }
+     {
+@@ -4353,6 +4393,20 @@ void MetalBackend::destroyView(TextureId t) {
+ void* MetalBackend::nativeDevice() const { return (__bridge void*)impl_->device; }
+ void* MetalBackend::nativeQueue() const { return (__bridge void*)impl_->queue; }
+ 
++bool MetalBackend::allocationFailed(BufferId handle) const {
++  if (!ok()) return true;
++  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
++  auto it = impl_->buffers.find(handle.index);
++  return it == impl_->buffers.end() || it->second.generation != handle.generation || !it->second.buffer;
++}
++
++bool MetalBackend::allocationFailed(TextureId handle) const {
++  if (!ok()) return true;
++  std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
++  auto it = impl_->textures.find(handle.index);
++  return it == impl_->textures.end() || it->second.generation != handle.generation || it->second.failed;
++}
++
+ void* MetalBackend::nativeTexture(TextureId handle) {
+   std::lock_guard<std::recursive_mutex> tables(impl_->tableMutex);
+   return (__bridge void*)impl_->texture(handle);
+diff --git a/gpu/vulkan/include/vpvk/platform.h b/gpu/vulkan/include/vpvk/platform.h
+index 999e12a..048be1c 100644
+--- a/gpu/vulkan/include/vpvk/platform.h
++++ b/gpu/vulkan/include/vpvk/platform.h
+@@ -74,6 +74,11 @@ class Platform {
+   virtual ArchiveStats archiveStats() { return {}; }
+   // Process footprint in bytes (visionOS: phys_footprint, what jetsam counts), 0 = unknown.
+   virtual uint64_t footprint() { return 0; }
++  // The backend refused the native object behind a live id (Metal returned nil, logged as gpu.err):
++  // vkBind*Memory then fails with VK_ERROR_OUT_OF_DEVICE_MEMORY instead of handing out a resource
++  // with no storage. A render target allocated lazily on first use reads false until that use.
++  virtual bool allocationFailed(vpgpu::BufferId) { return false; }
++  virtual bool allocationFailed(vpgpu::TextureId) { return false; }
+ };
+ 
+ // Defined by exactly one platform source linked into the dylib.
+diff --git a/gpu/vulkan/src/commands.h b/gpu/vulkan/src/commands.h
+index 937f8a5..fb2dd17 100644
+--- a/gpu/vulkan/src/commands.h
++++ b/gpu/vulkan/src/commands.h
+@@ -168,7 +168,10 @@ struct UploadArena {
+   // Copies `size` bytes, 256-aligned (constant buffers need 16). Returns the chunk's buffer.
+   vpgpu::BufferId put(Device* d, const void* data, VkDeviceSize size, VkDeviceSize& offset);
+   // Host address of the bytes the last put() stored.
+-  const uint8_t* lastHost() const { return chunks[current].host + chunks[current].used - lastSize; }
++  // Null when the last put() got no memory.
++  const uint8_t* lastHost() const {
++    return current < chunks.size() && lastSize ? chunks[current].host + chunks[current].used - lastSize : nullptr;
++  }
+   VkDeviceSize lastSize = 0;
+   void reset() {
+     for (auto& c : chunks) c.used = 0;
+diff --git a/gpu/vulkan/src/entry.cpp b/gpu/vulkan/src/entry.cpp
+index cfdf9d0..f683671 100644
+--- a/gpu/vulkan/src/entry.cpp
++++ b/gpu/vulkan/src/entry.cpp
+@@ -47,6 +47,39 @@ void logf(const char* fmt, ...) {
+ 
+ CommandBuffer::~CommandBuffer() = default;
+ 
++const char* resultName(VkResult r) {
++  switch (r) {
++    case VK_SUCCESS: return "VK_SUCCESS";
++    case VK_NOT_READY: return "VK_NOT_READY";
++    case VK_TIMEOUT: return "VK_TIMEOUT";
++    case VK_INCOMPLETE: return "VK_INCOMPLETE";
++    case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
++    case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
++    case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
++    case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
++    case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
++    case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
++    case VK_ERROR_OUT_OF_POOL_MEMORY: return "VK_ERROR_OUT_OF_POOL_MEMORY";
++    default: return "VK_RESULT_OTHER";
++  }
++}
++
++void fail(Device* d, Fail kind, VkResult result, const char* fmt, ...) {
++  static std::atomic<uint32_t> counts[size_t(Fail::Count)] = {};
++  const uint32_t n = counts[size_t(kind)].fetch_add(1, std::memory_order_relaxed) + 1;
++  if (n & (n - 1)) return;  // 1, 2, 4, 8, ...: the count keeps growing in the next line that is logged
++  char what[640];
++  va_list ap;
++  va_start(ap, fmt);
++  std::vsnprintf(what, sizeof what, fmt, ap);
++  va_end(ap);
++  const uint64_t foot = d && d->platform ? d->platform->footprint() : 0;
++  const uint64_t avail = d && d->platform ? d->platform->availableMemory() : 0;
++  logf("vk.fail %s result=%s n=%u footprint_mb=%llu avail_mb=%llu vk_alloc_mb=%llu", what, resultName(result), n,
++       (unsigned long long)(foot >> 20), (unsigned long long)(avail >> 20),
++       (unsigned long long)(allocatedBytes().load(std::memory_order_relaxed) >> 20));
++}
++
+ std::atomic<uint64_t>& allocatedBytes() {
+   static std::atomic<uint64_t> n{0};
+   return n;
+@@ -584,10 +617,14 @@ VPVK_EXPORT VKAPI_ATTR void VKAPI_CALL vkGetDeviceQueue2(VkDevice dv, const VkDe
+ // ---------------------------------------------------------------------------------------------
+ // Memory
+ // ---------------------------------------------------------------------------------------------
+-VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice, const VkMemoryAllocateInfo* ai,
++VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice dv, const VkMemoryAllocateInfo* ai,
+                                                             const VkAllocationCallbacks*,
+                                                             VkDeviceMemory* out) {
+-  if (ai->memoryTypeIndex >= memoryProperties().memoryTypeCount) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++  if (ai->memoryTypeIndex >= memoryProperties().memoryTypeCount) {
++    fail(from<Device>(dv), Fail::AllocateMemory, VK_ERROR_OUT_OF_DEVICE_MEMORY, "vkAllocateMemory size=%llu type=%u bad_type=1",
++         (unsigned long long)ai->allocationSize, ai->memoryTypeIndex);
++    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++  }
+   auto* m = new DeviceMemory;
+   m->size = ai->allocationSize;
+   m->typeIndex = ai->memoryTypeIndex;
+@@ -595,7 +632,9 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice, const VkMe
+   m->host = static_cast<uint8_t*>(std::aligned_alloc(kPage, alignUp(std::max<uint64_t>(m->size, 1), kPage)));
+   if (!m->host) {
+     delete m;
+-    logf("vk.err what=alloc size=%llu", static_cast<unsigned long long>(ai->allocationSize));
++    fail(from<Device>(dv), Fail::AllocateMemory, VK_ERROR_OUT_OF_DEVICE_MEMORY, "vkAllocateMemory size=%llu type=%u heap=%u",
++         (unsigned long long)ai->allocationSize, ai->memoryTypeIndex,
++         memoryProperties().memoryTypes[ai->memoryTypeIndex].heapIndex);
+     return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+   allocatedBytes() += m->size;
+@@ -687,8 +726,16 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory(VkDevice dv, VkBuf
+   d.size = b->size;
+   d.guestMemory = m->host + off;
+   d.label = "vk.buffer";
+-  b->id = from<Device>(dv)->gpu->createBuffer(std::move(d));
+-  return b->id ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
++  Device* dev = from<Device>(dv);
++  b->id = dev->gpu->createBuffer(std::move(d));
++  if (b->id && !dev->platform->allocationFailed(b->id)) return VK_SUCCESS;
++  fail(dev, Fail::BindBuffer, VK_ERROR_OUT_OF_DEVICE_MEMORY, "vkBindBufferMemory size=%llu offset=%llu memory_size=%llu usage=0x%x %s",
++       (unsigned long long)b->size, (unsigned long long)off, (unsigned long long)m->size, unsigned(b->usage),
++       b->id ? "metal=refused" : "desc=invalid");
++  // Logged only: before 0041 a refused Metal object still returned VK_SUCCESS and the game lived on with that
++  // resource missing; turning it into an error could make Source 2 abort where it used to survive.
++  if (b->id) return VK_SUCCESS;
++  return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ }
+ 
+ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory2(VkDevice dv, uint32_t n,
+@@ -790,8 +837,18 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory(VkDevice dv, VkImag
+   Image* i = from<Image>(im);
+   i->memory = from<DeviceMemory>(mem);
+   i->offset = off;
+-  i->id = from<Device>(dv)->gpu->createTexture(i->desc);
+-  return i->id ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
++  Device* dev = from<Device>(dv);
++  i->id = dev->gpu->createTexture(i->desc);
++  if (i->id && !dev->platform->allocationFailed(i->id)) return VK_SUCCESS;
++  fail(dev, Fail::BindImage, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++       "vkBindImageMemory %ux%ux%u mips=%u layers=%u samples=%u format=%d usage=0x%x bytes=%llu %s", i->desc.width,
++       i->desc.height, i->desc.depth, unsigned(i->desc.mips), unsigned(i->desc.layers), unsigned(i->desc.samples),
++       int(i->info.format), unsigned(i->info.usage), (unsigned long long)imageBytes(i->desc),
++       i->id ? "metal=refused" : "desc=invalid");
++  // Logged only: before 0041 a refused Metal object still returned VK_SUCCESS and the game lived on with that
++  // resource missing; turning it into an error could make Source 2 abort where it used to survive.
++  if (i->id) return VK_SUCCESS;
++  return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ }
+ 
+ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory2(VkDevice dv, uint32_t n,
+diff --git a/gpu/vulkan/src/motion.cpp b/gpu/vulkan/src/motion.cpp
+index 860926c..93d37e4 100644
+--- a/gpu/vulkan/src/motion.cpp
++++ b/gpu/vulkan/src/motion.cpp
+@@ -117,6 +117,10 @@ struct MotionState {
+       Arena n;
+       n.size = std::max<uint32_t>(a.size * 2, 4u << 20);
+       n.host = static_cast<uint8_t*>(std::aligned_alloc(16384, n.size));
++      if (!n.host) {  // no memory: this draw gets no motion vectors (as when the arena is full)
++        fail(&d, Fail::HostAlloc, VK_ERROR_OUT_OF_HOST_MEMORY, "motion_prev_arena bytes=%u", n.size);
++        return UINT32_MAX;
++      }
+       vpgpu::BufferDesc bd;
+       bd.size = n.size, bd.guestMemory = n.host, bd.label = "vk.motion_prev";
+       {
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index 8702db5..4b39cc3 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -41,6 +41,13 @@ vpgpu::BufferId UploadArena::put(Device* d, const void* data, VkDeviceSize size,
+     Chunk c;
+     c.size = std::max<VkDeviceSize>(65536, (need + 16383) & ~VkDeviceSize(16383));
+     c.host = static_cast<uint8_t*>(std::aligned_alloc(16384, c.size));
++    if (!c.host) {  // no host memory: the command loses its data (its copy/draw is skipped), no crash
++      fail(d, Fail::UploadArena, VK_ERROR_OUT_OF_HOST_MEMORY, "upload_arena chunk=%llu chunks=%zu put=%llu",
++           (unsigned long long)c.size, chunks.size(), (unsigned long long)size);
++      offset = 0;
++      lastSize = 0;
++      return {};
++    }
+     vpgpu::BufferDesc bd;
+     bd.size = c.size;
+     bd.guestMemory = c.host;
+@@ -50,6 +57,9 @@ vpgpu::BufferId UploadArena::put(Device* d, const void* data, VkDeviceSize size,
+       std::lock_guard<std::mutex> lock(d->submitMutex);
+       c.id = d->gpu->createBuffer(bd);
+     }
++    if (!c.id || d->platform->allocationFailed(c.id))  // the host bytes stay valid; the GPU skips its users
++      fail(d, Fail::UploadArena, VK_ERROR_OUT_OF_DEVICE_MEMORY, "upload_arena chunk=%llu chunks=%zu metal=refused",
++           (unsigned long long)c.size, chunks.size());
+     chunks.push_back(c);
+   }
+   Chunk& c = chunks[current];
+@@ -1013,14 +1023,28 @@ bool vpvk::translateRecipeStage(const spirv::SpirvModule& m, const spirv::SpirvL
+ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice dv, VkPipelineCache, uint32_t n,
+                                                                      const VkGraphicsPipelineCreateInfo* ci,
+                                                                      const VkAllocationCallbacks*, VkPipeline* out) {
+-  for (uint32_t i = 0; i < n; ++i) out[i] = to<VkPipeline>(createGraphics(from<Device>(dv), ci[i]));
++  for (uint32_t i = 0; i < n; ++i) {
++    PipelineObj* p = createGraphics(from<Device>(dv), ci[i]);
++    out[i] = to<VkPipeline>(p);
++    // Kept as VK_SUCCESS on purpose (its draws are skipped, the game keeps running); the vk.err lines
++    // before this one say what failed to translate.
++    if (!p->ok)
++      fail(from<Device>(dv), Fail::Pipeline, VK_SUCCESS, "vkCreateGraphicsPipelines label=%s translated=0 draws=skipped",
++           p->state.label.c_str());
++  }
+   return VK_SUCCESS;
+ }
+ 
+ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateComputePipelines(VkDevice dv, VkPipelineCache, uint32_t n,
+                                                                     const VkComputePipelineCreateInfo* ci,
+                                                                     const VkAllocationCallbacks*, VkPipeline* out) {
+-  for (uint32_t i = 0; i < n; ++i) out[i] = to<VkPipeline>(createCompute(from<Device>(dv), ci[i]));
++  for (uint32_t i = 0; i < n; ++i) {
++    PipelineObj* p = createCompute(from<Device>(dv), ci[i]);
++    out[i] = to<VkPipeline>(p);
++    if (!p->ok)
++      fail(from<Device>(dv), Fail::Pipeline, VK_SUCCESS, "vkCreateComputePipelines label=%s translated=0 dispatches=skipped",
++           p->state.label.c_str());
++  }
+   return VK_SUCCESS;
+ }
+ 
+diff --git a/gpu/vulkan/src/platform_metal.mm b/gpu/vulkan/src/platform_metal.mm
+index d5f6041..bb7bae1 100644
+--- a/gpu/vulkan/src/platform_metal.mm
++++ b/gpu/vulkan/src/platform_metal.mm
+@@ -32,6 +32,8 @@ class MetalPlatform final : public Platform {
+   void waitIdle() override { backend_.waitIdle(); }
+   uint64_t availableMemory() override { return os_proc_available_memory(); }
+   uint64_t footprint() override { return vpgpu::metal2::MetalBackend::footprint(); }
++  bool allocationFailed(vpgpu::BufferId id) override { return backend_.allocationFailed(id); }
++  bool allocationFailed(vpgpu::TextureId id) override { return backend_.allocationFailed(id); }
+   ArchiveStats archiveStats() override {
+     const auto a = backend_.archiveStats();
+     ArchiveStats r;
+diff --git a/gpu/vulkan/src/sync.cpp b/gpu/vulkan/src/sync.cpp
+index 872de35..0747373 100644
+--- a/gpu/vulkan/src/sync.cpp
++++ b/gpu/vulkan/src/sync.cpp
+@@ -21,6 +21,10 @@
+ 
+ namespace vpvk {
+ 
++// A wait the client gave at least this long and still timed out is logged (vk.fail): short polls are
++// normal, a long wait that expires is a stuck GPU or a game about to give up.
++constexpr uint64_t kLongWaitNs = 100000000;  // 100 ms
++
+ bool Device::frameDone(uint64_t frame) { return frame == kNoFrame || gpu->completedFrames() > frame; }
+ 
+ // The backend reports completion by polling (gpu/metal2 completion handlers set it): a short spin,
+@@ -287,8 +291,19 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dv, uint32_t
+   if (all || n == 1) {
+     for (uint32_t i = 0; i < n; ++i) {
+       Fence* f = from<Fence>(fs[i]);
+-      if (!f->signaled) return VK_TIMEOUT;  // never submitted: no host signal exists for fences here
+-      if (!d->waitFrame(f->frame, left())) return VK_TIMEOUT;
++      if (!f->signaled) {  // never submitted: no host signal exists for fences here
++        if (timeout >= kLongWaitNs)
++          fail(d, Fail::WaitTimeout, VK_TIMEOUT, "vkWaitForFences fence=%u/%u never_submitted=1 timeout_ms=%llu", i, n,
++               (unsigned long long)(timeout / 1000000));
++        return VK_TIMEOUT;
++      }
++      if (!d->waitFrame(f->frame, left())) {
++        if (timeout >= kLongWaitNs)
++          fail(d, Fail::WaitTimeout, VK_TIMEOUT, "vkWaitForFences fence=%u/%u frame=%llu completed=%llu timeout_ms=%llu",
++               i, n, (unsigned long long)f->frame.load(), (unsigned long long)d->gpu->completedFrames(),
++               (unsigned long long)(timeout / 1000000));
++        return VK_TIMEOUT;
++      }
+     }
+     return VK_SUCCESS;
+   }
+@@ -299,8 +314,12 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dv, uint32_t
+     if (f->signaled) earliest = std::min(earliest, f->frame.load());
+     if (f->signaled && f->frame == kNoFrame) return VK_SUCCESS;
+   }
+-  if (earliest == kNoFrame) return VK_TIMEOUT;
+-  return d->waitFrame(earliest, left()) ? VK_SUCCESS : VK_TIMEOUT;
++  if (earliest != kNoFrame && d->waitFrame(earliest, left())) return VK_SUCCESS;
++  if (timeout >= kLongWaitNs)
++    fail(d, Fail::WaitTimeout, VK_TIMEOUT, "vkWaitForFences any=1 count=%u frame=%llu completed=%llu timeout_ms=%llu%s", n,
++         (unsigned long long)earliest, (unsigned long long)d->gpu->completedFrames(),
++         (unsigned long long)(timeout / 1000000), earliest == kNoFrame ? " never_submitted=1" : "");
++  return VK_TIMEOUT;
+ }
+ 
+ // ---------------------------------------------------------------------------------------------
+@@ -340,13 +359,25 @@ VPVK_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(VkDevice dv, const V
+   };
+   if (!any) {
+     for (uint32_t i = 0; i < wi->semaphoreCount; ++i)
+-      if (!waitSemaphore(*d, *from<Semaphore>(wi->pSemaphores[i]), wi->pValues[i], left())) return VK_TIMEOUT;
++      if (!waitSemaphore(*d, *from<Semaphore>(wi->pSemaphores[i]), wi->pValues[i], left())) {
++        if (timeout >= kLongWaitNs)
++          fail(d, Fail::WaitTimeout, VK_TIMEOUT, "vkWaitSemaphores sem=%u/%u want=%llu have=%llu completed=%llu timeout_ms=%llu",
++               i, wi->semaphoreCount, (unsigned long long)wi->pValues[i],
++               (unsigned long long)semaphoreValue(*d, *from<Semaphore>(wi->pSemaphores[i])),
++               (unsigned long long)d->gpu->completedFrames(), (unsigned long long)(timeout / 1000000));
++        return VK_TIMEOUT;
++      }
+     return VK_SUCCESS;
+   }
+   for (;;) {
+     for (uint32_t i = 0; i < wi->semaphoreCount; ++i)
+       if (semaphoreValue(*d, *from<Semaphore>(wi->pSemaphores[i])) >= wi->pValues[i]) return VK_SUCCESS;
+-    if (!left()) return VK_TIMEOUT;
++    if (!left()) {
++      if (timeout >= kLongWaitNs)
++        fail(d, Fail::WaitTimeout, VK_TIMEOUT, "vkWaitSemaphores any=1 count=%u completed=%llu timeout_ms=%llu",
++             wi->semaphoreCount, (unsigned long long)d->gpu->completedFrames(), (unsigned long long)(timeout / 1000000));
++      return VK_TIMEOUT;
++    }
+     std::this_thread::sleep_for(std::chrono::microseconds(200));
+   }
+ }
+@@ -483,10 +514,20 @@ struct Staging {
+   Staging(Device& dev, uint64_t bytes) : d(&dev) {
+     const uint64_t size = (std::max<uint64_t>(bytes, 1) + 16383) & ~uint64_t(16383);
+     host = static_cast<uint8_t*>(std::aligned_alloc(16384, size));
++    if (!host) {  // id stays null: the caller returns VK_ERROR_OUT_OF_HOST_MEMORY
++      fail(d, Fail::HostAlloc, VK_ERROR_OUT_OF_HOST_MEMORY, "host_image_copy staging bytes=%llu", (unsigned long long)size);
++      return;
++    }
+     vpgpu::BufferDesc bd;
+     bd.size = size, bd.guestMemory = host, bd.label = "vk.host_image_copy";
+     std::lock_guard<std::mutex> lock(d->submitMutex);
+     id = d->gpu->createBuffer(bd);
++    if (id && d->platform->allocationFailed(id)) {
++      fail(d, Fail::HostAlloc, VK_ERROR_OUT_OF_HOST_MEMORY, "host_image_copy staging bytes=%llu metal=refused",
++           (unsigned long long)size);
++      d->gpu->destroy(id);
++      id = {};
++    }
+   }
+   ~Staging() {
+     {
+@@ -522,7 +563,9 @@ VkResult runNow(Device& d, const vpgpu::Frame& frame) {
+     f = d.gpu->submit(frame).frame;
+     d.lastFrame = f;
+   }
+-  return d.waitFrame(f, UINT64_MAX) ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
++  if (d.waitFrame(f, UINT64_MAX)) return VK_SUCCESS;
++  fail(&d, Fail::DeviceLost, VK_ERROR_DEVICE_LOST, "host_copy_wait frame=%llu", (unsigned long long)f);
++  return VK_ERROR_DEVICE_LOST;
+ }
+ 
+ }  // namespace
+diff --git a/gpu/vulkan/src/vpvk.h b/gpu/vulkan/src/vpvk.h
+index 4ff0738..4739463 100644
+--- a/gpu/vulkan/src/vpvk.h
++++ b/gpu/vulkan/src/vpvk.h
+@@ -37,6 +37,15 @@ struct Device;
+ // every kMemLogFrames submitted frames.
+ void logDeviceMemory(Device& d, const char* when, uint64_t frame);
+ void memFrameSubmitted(Device& d, uint64_t frame);
++// A Vulkan call that failed (or degraded) because Metal / the OS refused memory or the GPU gave up:
++// "vk.fail <call> <details> result=<VkResult> n=<count of this kind> footprint_mb=.. avail_mb=..".
++// The first failure of each kind is logged, then every power-of-two count (rate limited, never
++// silent). Failure paths only: nothing runs on success. d may be null (no memory numbers then).
++enum class Fail : uint8_t {
++  AllocateMemory, BindBuffer, BindImage, HostAlloc, UploadArena, Pipeline, WaitTimeout, DeviceLost, Count
++};
++void fail(Device* d, Fail kind, VkResult result, const char* fmt, ...) __attribute__((format(printf, 4, 5)));
++const char* resultName(VkResult);
+ 
+ // Dispatchable handles start with the loader word (vk_icd.h): harmless without a loader and
+ // required if one is ever put in front of the driver.
+-- 
+2.43.0
+

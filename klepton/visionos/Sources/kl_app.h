@@ -129,6 +129,10 @@ void kl_app_guest_publish(void);
 void kl_guest_set_panel_hz(float hz);
 // Build 38: the player height offset the game sees (metres, negative = lower), live (klvr_platform_klepton.c).
 void klvr_plat_set_height_offset(float m);
+// Build 58: the real floor's Y in ARKit tracking space (KleptonFloor.swift, eased; 0 = unknown), and the resulting
+// vertical shift of every pose the game sees (manual offset - floor Y), for the [height] log.
+void klvr_plat_set_floor_y(float y);
+float klvr_plat_height_shift(void);
 void kl_app_guest_stop(void);
 
 // Where the guest thread has got to. 0 = still in _begin (nothing to present

@@ -192,6 +192,13 @@ struct AVPSettingsView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
             }
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(AVPL("Altura real (detecta el suelo)", "Real height (detects the floor)"), isOn: $s.realFloor)
+                Text(AVPL("El visor mide el suelo de tu habitación y tu altura sobre él cada pocos segundos, sentado o de pie, para que la altura de Alyx sea la tuya. La altura del jugador pasa a ser un ajuste fino. Pide permiso de detección del entorno la primera vez.",
+                          "The headset measures your room's floor and your height above it every few seconds, seated or standing, so Alyx's height matches yours. Player height becomes a fine adjustment. Asks for the surroundings-sensing permission once."))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
             Stepper(AVPL("Altura del jugador: \(Int(s.heightOffsetCm)) cm", "Player height: \(Int(s.heightOffsetCm)) cm"),
                     value: $s.heightOffsetCm, in: -60...30, step: 5)
             Toggle(AVPL("Sincronizar partidas con Steam Cloud", "Sync saves with Steam Cloud"), isOn: $s.cloudSync)
