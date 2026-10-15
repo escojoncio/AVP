@@ -198,20 +198,121 @@ static void snap_take(id<MTLCommandBuffer> cb) {
 }
 
 static void mg_flush(void *cb);
+// ---- B50: GPU idle inside the frame, explained (KL_GPU_GAP, on by default; KL_GPU_GAP=0 off) -------------------
+// ~5 ms of "GPU idle inside the span" every frame whatever the resolution, untouched by running start (B45) or
+// producer-only waits (0038). Every ~15 s, all command buffers of both queues committed during 8 guest frames are
+// recorded (CPU commit time, GPUStartTime/GPUEndTime); each frame's idle time between its first GPU start and last end
+// is split by cause: CPU (no game work committed yet: the game submitted late) or GPU-WAIT (committed, not started:
+// a fence, earlier work, the driver), plus how long the compositor alone held the GPU.
+enum { kGapMax = 512, kGapFrames = 8 };
+typedef struct { uint32_t frame; int role; double commit, start, end; int done; } gap_rec;
+static gap_rec g_gap[kGapMax];
+static unsigned g_gap_n, g_gap_done;
+static uint32_t g_gap_from, g_gap_to;   // frames being recorded [from, to); 0 = not recording
+static double g_gap_next;
+static int g_gap_on = -1;
+static void gap_print(void) {
+    static gap_rec r[kGapMax];
+    unsigned n;
+    uint32_t from, to;
+    os_unfair_lock_lock(&g_lk);
+    n = g_gap_n; from = g_gap_from; to = g_gap_to;
+    memcpy(r, g_gap, n * sizeof r[0]);
+    g_gap_n = g_gap_done = 0; g_gap_from = g_gap_to = 0;
+    os_unfair_lock_unlock(&g_lk);
+    double sum_cpu = 0, sum_wait = 0, sum_comp = 0, sum_span = 0;
+    unsigned frames = 0;
+    for (uint32_t f = from; f < to; f++) {
+        double t0 = 1e30, t1 = 0, c0 = 1e30;
+        for (unsigned i = 0; i < n; i++)
+            if (r[i].role == 0 && r[i].frame == f && r[i].start > 0) {
+                if (r[i].start < t0) t0 = r[i].start;
+                if (r[i].end > t1) t1 = r[i].end;
+                if (r[i].commit < c0) c0 = r[i].commit;
+            }
+        if (t1 <= t0) continue;
+        unsigned k = 0;
+        for (unsigned i = 0; i < n; i++) {
+            if (r[i].start <= 0) continue;
+            int mine = r[i].role == 0 && r[i].frame == f;
+            int overlaps = r[i].end > t0 && r[i].start < t1;
+            if (!mine && !(r[i].role == 1 && overlaps)) continue;
+            fprintf(stderr, "[gap] f=%u %s cb%u commit %+7.2f start %+7.2f end %+7.2f ms (queued %.2f, gpu %.2f)\n", f,
+                    r[i].role ? "compositor" : "game", k++, (r[i].commit - t0) * 1e3, (r[i].start - t0) * 1e3,
+                    (r[i].end - t0) * 1e3, (r[i].start - r[i].commit) * 1e3, (r[i].end - r[i].start) * 1e3);
+        }
+        double cpu = 0, wait = 0, comp = 0;
+        const double dt = 0.05e-3;
+        for (double t = t0; t < t1; t += dt) {
+            int guest = 0, compo = 0, pending = 0;
+            for (unsigned i = 0; i < n; i++) {
+                if (r[i].start <= 0) continue;
+                if (t >= r[i].start && t < r[i].end) {
+                    if (r[i].role) compo = 1; else guest = 1;
+                }
+                if (r[i].role == 0 && r[i].frame == f && r[i].commit <= t && t < r[i].start) pending = 1;
+            }
+            if (compo && !guest) comp += dt;
+            if (guest || compo) continue;
+            if (pending) wait += dt; else cpu += dt;
+        }
+        fprintf(stderr, "[gap] f=%u span %.2f ms: GPU idle %.2f ms = CPU (no game work committed yet) %.2f + GPU-WAIT "
+                "(committed, not started) %.2f; compositor alone on the GPU %.2f ms; first commit %.2f ms before the first start\n",
+                f, (t1 - t0) * 1e3, (cpu + wait) * 1e3, cpu * 1e3, wait * 1e3, comp * 1e3, (t0 - c0) * 1e3);
+        sum_cpu += cpu; sum_wait += wait; sum_comp += comp; sum_span += t1 - t0; frames++;
+    }
+    if (frames)
+        fprintf(stderr, "[gap] SUMMARY %u frames: span %.2f ms, idle CPU %.2f ms, idle GPU-WAIT %.2f ms, compositor alone "
+                "%.2f ms (per frame)\n", frames, sum_span / frames * 1e3, sum_cpu / frames * 1e3, sum_wait / frames * 1e3,
+                sum_comp / frames * 1e3);
+}
+static void gap_tick(uint32_t frame) {
+    if (g_gap_on < 0) { const char *e = getenv("KL_GPU_GAP"); g_gap_on = !(e && *e == '0'); }
+    if (!g_gap_on) return;
+    double now = CACurrentMediaTime();
+    if (!g_gap_next) g_gap_next = now + 20.0;
+    os_unfair_lock_lock(&g_lk);
+    uint32_t to = g_gap_to;
+    int complete = to && frame > to + 2 && g_gap_done == g_gap_n;
+    int stale = to && frame > to + 60;   // a command buffer that never completed: drop the window
+    int start = !to && now >= g_gap_next;
+    if (start) { g_gap_from = frame + 1; g_gap_to = frame + 1 + kGapFrames; g_gap_n = g_gap_done = 0; }
+    if (stale && !complete) { g_gap_n = g_gap_done = 0; g_gap_from = g_gap_to = 0; }
+    os_unfair_lock_unlock(&g_lk);
+    if (start) g_gap_next = now + 15.0;
+    if (complete) gap_print();
+}
+
 static void kl_commit(id self, SEL sel) {
     mg_flush((__bridge void *)self);
     if (g_snap_tex) snap_take((id<MTLCommandBuffer>)self);
     id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)self;
     void *q = (__bridge void *)[cb commandQueue];
+    const double commit_t = CACurrentMediaTime();
     os_unfair_lock_lock(&g_lk);
     int role = watched(q);
     uint32_t f = g_frame;
     if (role >= 0) slot_of(f)->committed++;
+    int gi = -1;   // B50 gap recording: every command buffer of either queue while the window is open
+    if (role >= 0 && g_gap_to && f >= g_gap_from && f <= g_gap_to && g_gap_n < kGapMax) {
+        gi = (int)g_gap_n++;
+        g_gap[gi] = (gap_rec){ f, role, commit_t, 0, 0, 0 };
+    }
     os_unfair_lock_unlock(&g_lk);
     if (role >= 0) {
         excl_init();
         if (role == 0) excl_vp_resolve();
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            if (gi >= 0) {
+                os_unfair_lock_lock(&g_lk);
+                if ((unsigned)gi < g_gap_n && g_gap[gi].commit == commit_t && !g_gap[gi].done) {
+                    g_gap[gi].start = done.GPUStartTime;
+                    g_gap[gi].end = done.GPUEndTime;
+                    g_gap[gi].done = 1;
+                    g_gap_done++;
+                }
+                os_unfair_lock_unlock(&g_lk);
+            }
             on_complete(f, role, done.GPUStartTime, done.GPUEndTime, (__bridge void *)done);
         }];
     }
@@ -2663,6 +2764,7 @@ void kl_gpu_time_frame_end(void) {
         if (!ab_active()) prof_tick(frame);   // opens the next due one (not while the A/B test measures)
     }
     ab_tick(frame, 1);        // KL_ABTEST: the automatic A/B test's state machine
+    gap_tick(frame);          // B50: where the GPU idles inside a frame
     // Every few seconds: the finished frames' GPU time.
     static unsigned last_f, n;
     static double sum, csum, worst, since;
