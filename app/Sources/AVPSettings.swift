@@ -113,10 +113,6 @@ final class AVPSettings: ObservableObject {
     /// each heavy shader is left out once; what saves stays on for the session and everything goes to the log. While on,
     /// the compositor's diagnostic captures stop after guest frame 120 (each stalls ~250 ms).
     @Published var abTest: Bool { didSet { save() } }
-    /// Build 53: graphics engine for an A/B run. VPKEngine (VPVulkan) is the default; MoltenVK (bundled) is a test: none
-    /// of VPKEngine's patches apply (measured occlusion, amplification, constant tables, exclusive GPU time).
-    enum Engine: String, CaseIterable { case vpkengine, moltenvk }
-    @Published var engine: Engine { didSet { save() } }
     /// Build 53: settings layout version. Older saved settings are wiped once so every validated value is the default
     /// (the options left out of the menu keep their default for good).
     static let schema = 53
@@ -199,7 +195,6 @@ final class AVPSettings: ObservableObject {
         reportedHz = ReportedHz(rawValue: d.object(forKey: "avp.reportHz") as? Int ?? 0) ?? .measured
         runningStart = d.object(forKey: "avp.runStart") as? Bool ?? true
         abTest = d.object(forKey: "avp.abTest") as? Bool ?? false
-        engine = Engine(rawValue: d.string(forKey: "avp.engine") ?? "") ?? .vpkengine
         subtitleSize = SubtitleSize(rawValue: d.object(forKey: "avp.subSize") as? Int ?? 0) ?? .small
         subtitleFoveation = d.object(forKey: "avp.subFov") as? Bool ?? true
         loading = false
@@ -237,7 +232,6 @@ final class AVPSettings: ObservableObject {
         d.set(reportedHz.rawValue, forKey: "avp.reportHz")
         d.set(runningStart, forKey: "avp.runStart")
         d.set(abTest, forKey: "avp.abTest")
-        d.set(engine.rawValue, forKey: "avp.engine")
         d.set(preset.rawValue, forKey: "avp.preset")
         d.set(Self.schema, forKey: "avp.schema")
         d.set(subtitleSize.rawValue, forKey: "avp.subSize")
@@ -257,7 +251,7 @@ final class AVPSettings: ObservableObject {
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
         postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; occlusionQueries = fresh.occlusionQueries
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
-        reportedHz = fresh.reportedHz; runningStart = fresh.runningStart; abTest = fresh.abTest; engine = fresh.engine
+        reportedHz = fresh.reportedHz; runningStart = fresh.runningStart; abTest = fresh.abTest
         preset = fresh.preset
         AVPLog.log("Ajustes: valores por defecto")
     }
@@ -430,7 +424,7 @@ final class AVPSettings: ObservableObject {
         var args = forcedConvars().map { "+\($0.0) \($0.1)" }.joined(separator: " ")
         args += " +log_verbosity VR max -condebug -language \(lang.name)"
 
-        // B53: MoltenVK only when picked AND the launcher really fell back to it (no VPVulkan loaded).
+        // MoltenVK settings only if VPVulkan failed to load (the launcher's fallback; B53's MoltenVK test option is gone).
         let vpk = AVPLaunch.driverPath != nil
         var env: [(String, String)] = [
             ("KL_ALYX_PROFILE_ARGS", args),
@@ -586,7 +580,7 @@ final class AVPSettings: ObservableObject {
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
-                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart), test A/B \(abTest), motor \(engine.rawValue), preset \(preset.rawValue)")
+                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart), test A/B \(abTest), preset \(preset.rawValue)")
         return env
     }
 

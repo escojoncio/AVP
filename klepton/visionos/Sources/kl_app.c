@@ -1474,7 +1474,10 @@ static void guest_pace_wait(void) {
         }
     }
     unsigned eff = div, ex = g_pace_extra;
-    if (pace_hz > 0 && ex && last_rate > 0 && last_rate / (div + ex) >= 31.5) eff = div + ex;
+    // B53 fix (Logs_Alyx_43): this floor was still 31.5 when B52 let the governor pick 30 at 90 Hz (pace_plan 29.5),
+    // so 90/3 = 30 was refused here: the governor logged "fallback 30", the game was told 30 Hz, yet it kept running
+    // at 45 with frames late (2/3 refreshes). Same floor as pace_plan now.
+    if (pace_hz > 0 && ex && last_rate > 0 && last_rate / (div + ex) >= 29.5) eff = div + ex;
     if (pace_hz > 0 && last_rate > 20) g_pace_fps = (float)(last_rate / eff);
     {
         static unsigned said_eff;

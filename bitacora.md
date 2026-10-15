@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). To
 descarga → conversión ELF→Mach-O (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `vpkengine.ref` + `vpkengine-patches/`
 0011–0040 (CI: `scripts/apply-vpkengine-patches.sh`; un parche nuevo = fichero `00NN-*.patch` en esa carpeta, generado
-con `git format-patch` sobre ref+parches). Sin MetalFX, MoltenVK solo como motor de prueba (B53), sin LOD/cull que cambie lo
+con `git format-patch` sobre ref+parches). Sin MetalFX, MoltenVK solo como fallback automático, sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
 IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B53**, compilada OK).
@@ -220,6 +220,19 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
   → juego 13–18 → 28–32 ms). 42 empezó nominal, serious a 2 min 47 s. MoltenVK da tiempo «union» (sobrestima);
   antes del calor ambos rondan 13–20 ms. Para comparar: visor frío, misma zona, mismo tiempo.
 - Problema principal ahora: térmico (critical duplica el tiempo de GPU) y la zona no cabe en 45 ni a 70 %.
+
+## B54 (Logs_Alyx_43): el fallback 30 nunca se aplicaba
+- **Bug**: `kl_app.c` (pacer del invitado) rechazaba el divisor extra si `rate/(div+ex) < 31.5`; B52 bajó solo
+  `pace_plan` a 29.5. A 90 Hz el regulador decía «fallback 30» y `told 30 Hz`, pero el juego seguía a 45 (log 43:
+  `[openvr] clock ... 45.0 fps, told 30 Hz` toda la partida; nunca salió `[guest] pace governor: 1/3`). Ahora 29.5 en
+  ambos. Validar: `[guest] pace governor: 1/3 of 90.0 Hz -> 30.0 fps` y `[openvr] clock` ≈ 30 fps en fallback.
+- Compositor: NO recompone (skip-same funciona: 1 composición por imagen nueva, el resto lo reproyecta visionOS; el
+  «x70» era la ventana con la carga). Coste por imagen nueva 3–6 ms: composición 1,7–2,8 + vista ancha 2×0,46–1,52
+  (sube mucho con calor) + recon 2×0,14–0,28. Nuevo log cada 5 s: `[cp] refreshes/s: T = composed new N + recomposed
+  same S (cap/not allowed/timing) + black/loading B + left to visionOS K`. Pendiente: abaratar la vista ancha
+  (211x173 por ojo: desde un mip o dentro del pase de composición).
+- Quitada la opción MoltenVK (queda solo como fallback automático si VPVulkan no carga). Selectores segmentados
+  (preset, MSAA, movimiento, subtítulos, tamaño).
 
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su
