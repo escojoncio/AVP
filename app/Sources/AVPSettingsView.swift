@@ -52,27 +52,35 @@ struct AVPSettingsView: View {
     private var picture: some View {
         Section {
             let eye = s.eyeSize
-            Picker(AVPL("Preset", "Preset"), selection: $s.preset) {
-                Text("M2").tag(AVPSettings.Preset.m2)
-                Text("M5").tag(AVPSettings.Preset.m5)
-                Text(AVPL("Personalizado", "Custom")).tag(AVPSettings.Preset.custom)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(AVPL("Preset", "Preset"))
+                Picker(AVPL("Preset", "Preset"), selection: $s.preset) {
+                    Text("M2").tag(AVPSettings.Preset.m2)
+                    Text("M5").tag(AVPSettings.Preset.m5)
+                    Text(AVPL("Personalizado", "Custom")).tag(AVPSettings.Preset.custom)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
-            .pickerStyle(.segmented)
             Stepper(AVPL("Resolución: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) por ojo)",
                          "Resolution: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) per eye)"),
                     value: $s.renderPercent, in: 50...130, step: 5)
-            Picker(AVPL("Fotogramas (al arrancar el juego)", "Frame rate (at game start)"), selection: $s.frameRate) {
-                Text("Auto").tag(AVPSettings.FrameRate.auto)
-                Text("45/50").tag(AVPSettings.FrameRate.high)
-                Text("30/33").tag(AVPSettings.FrameRate.steady)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(AVPL("Fotogramas (al arrancar el juego)", "Frame rate (at game start)"))
+                Picker(AVPL("Fotogramas (al arrancar el juego)", "Frame rate (at game start)"), selection: $s.frameRate) {
+                    Text("Auto").tag(AVPSettings.FrameRate.auto)
+                    Text(AVPL("45/50 fps", "45/50 fps")).tag(AVPSettings.FrameRate.high)
+                    Text(AVPL("30/33 fps", "30/33 fps")).tag(AVPSettings.FrameRate.steady)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
-            .pickerStyle(.segmented)
             Toggle(AVPL("Mostrar FPS", "Show FPS"), isOn: $s.showFps)
         } header: {
             Text(AVPL("Imagen", "Picture"))
         } footer: {
-            Text(AVPL("100 % = lo que pide el Vision Pro (3072×2464 por ojo). Menos resolución = más fluidez. El juego va a 50 fps cuando la GPU llega y a 33 cuando no; el visor siempre a 100 Hz. Al arrancar el juego.",
-                      "100 % = what Vision Pro asks for (3072×2464 per eye). Lower resolution = smoother. The game runs at 50 fps when the GPU keeps up and 33 when it does not; the headset always at 100 Hz. At game start."))
+            Text(AVPL("Preset: M2 y M5 aplican los valores probados para cada visor; si tocas cualquier ajuste de imagen pasa a Personalizado. Resolución: 100 % = lo que pide el Vision Pro (3072×2464 por ojo); menos resolución = más margen de GPU. Fotogramas: el visor muestra siempre 90 Hz (100 Hz con luz artificial) y reproyecta cada imagen del juego con el movimiento de tu cabeza; esto elige cuántas imágenes nuevas hace el juego. Auto: 45/50 cuando la GPU llega y 30/33 cuando no. 45/50: siempre alto, las imágenes que lleguen tarde se reproyectan (más fluido, algún tirón). 30/33: siempre estable (cada imagen se muestra 3 veces a 90/100 Hz). Al arrancar el juego.",
+                      "Preset: M2 and M5 apply the values tested for each headset; changing any picture setting switches to Custom. Resolution: 100 % = what Vision Pro asks for (3072×2464 per eye); lower = more GPU headroom. Frame rate: the headset always shows 90 Hz (100 Hz under artificial light) and reprojects each game picture with your head motion; this picks how many new pictures the game makes. Auto: 45/50 when the GPU keeps up, else 30/33. 45/50: always high, late pictures are reprojected (smoother, some hitches). 30/33: always steady (each picture shown 3 times at 90/100 Hz). At game start."))
         }
     }
 
@@ -106,21 +114,33 @@ struct AVPSettingsView: View {
 
     private var textures: some View {
         Section {
-            Picker(AVPL("Tamaño máximo de textura", "Maximum texture size"), selection: $s.textureCap) {
-                Text("1024").tag(1024)
-                Text("2048").tag(2048)
-                Text("4096").tag(4096)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(AVPL("Tamaño máximo de textura", "Maximum texture size"))
+                Picker(AVPL("Tamaño máximo de textura", "Maximum texture size"), selection: $s.textureCap) {
+                    Text("1024").tag(1024)
+                    Text("2048").tag(2048)
+                    Text("4096").tag(4096)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
-            .pickerStyle(.segmented)
-            Picker(AVPL("Filtrado anisotrópico", "Anisotropic filtering"), selection: $s.anisotropy) {
-                Text("Off").tag(0); Text("x2").tag(2); Text("x4").tag(4); Text("x8").tag(8); Text("x16").tag(16)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(AVPL("Filtrado anisotrópico", "Anisotropic filtering"))
+                Picker(AVPL("Filtrado anisotrópico", "Anisotropic filtering"), selection: $s.anisotropy) {
+                    Text("Off").tag(0); Text("x2").tag(2); Text("x4").tag(4); Text("x8").tag(8); Text("x16").tag(16)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
-            .pickerStyle(.segmented)
             Toggle(AVPL("Oclusión ambiental (SSAO)", "Ambient occlusion (SSAO)"), isOn: $s.ssao)
-            Picker(AVPL("Antialiasing (MSAA)", "Antialiasing (MSAA)"), selection: $s.msaa) {
-                Text("Off").tag(0); Text("x2").tag(2); Text("x4").tag(4)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(AVPL("Antialiasing (MSAA)", "Antialiasing (MSAA)"))
+                Picker(AVPL("Antialiasing (MSAA)", "Antialiasing (MSAA)"), selection: $s.msaa) {
+                    Text("Off").tag(0); Text("x2").tag(2); Text("x4").tag(4)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
-            .pickerStyle(.segmented)
             if s.msaa == 0 {
                 Text(AVPL("Sin MSAA no se aplica el foveado.", "Without MSAA foveation is not applied."))
                     .font(.footnote)
@@ -132,7 +152,8 @@ struct AVPSettingsView: View {
             Text(s.textureCap == 4096
                  ? AVPL("4096 necesita más memoria de la que tiene el visor (~3,3 GB): puede haber texturas que aparecen tarde. 2048 es lo probado. Al arrancar el juego.",
                         "4096 needs more memory than the headset has (~3.3 GB): textures may pop in late. 2048 is the tested value. At game start.")
-                 : AVPL("2048 es lo probado. Al arrancar el juego.", "2048 is the tested value. At game start."))
+                 : AVPL("2048 es lo probado. Anisotrópico: nitidez de las texturas vistas en ángulo (suelos, paredes). SSAO: sombras de contacto en esquinas y juntas. MSAA: suaviza los bordes dentados (x4 más suave, x2 más barato); sin MSAA no se aplica el foveado. Al arrancar el juego.",
+                        "2048 is the tested value. Anisotropic: sharpness of textures seen at an angle (floors, walls). SSAO: contact shadows in corners and joints. MSAA: smooths jagged edges (x4 smoother, x2 cheaper); without MSAA foveation is not applied. At game start."))
         }
     }
 
@@ -140,25 +161,37 @@ struct AVPSettingsView: View {
         Section {
             Toggle(AVPL("Idioma del sistema si el juego lo tiene (si no, inglés)", "System language if the game has it (else English)"),
                    isOn: $s.systemLanguage)
-            Picker(AVPL("Movimiento (jugador nuevo)", "Movement (new player)"), selection: $s.movement) {
-                Text(AVPL("Teletransporte", "Teleport")).tag(AVPSettings.Movement.teleport)
-                Text(AVPL("Cabeza", "Head")).tag(AVPSettings.Movement.continuousHead)
-                Text(AVPL("Mano", "Hand")).tag(AVPSettings.Movement.continuousHand)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(AVPL("Movimiento (jugador nuevo)", "Movement (new player)"))
+                Picker(AVPL("Movimiento (jugador nuevo)", "Movement (new player)"), selection: $s.movement) {
+                    Text(AVPL("Teletransporte", "Teleport")).tag(AVPSettings.Movement.teleport)
+                    Text(AVPL("Cabeza", "Head")).tag(AVPSettings.Movement.continuousHead)
+                    Text(AVPL("Mano", "Hand")).tag(AVPSettings.Movement.continuousHand)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
-            .pickerStyle(.segmented)
-            Picker(AVPL("Subtítulos", "Subtitles"), selection: $s.subtitles) {
-                Text(AVPL("Abajo", "Bottom")).tag(AVPSettings.SubtitlePlacement.game)
-                Text(AVPL("Más arriba", "Higher")).tag(AVPSettings.SubtitlePlacement.higher)
-                Text(AVPL("A la vista", "Eye level")).tag(AVPSettings.SubtitlePlacement.eyeLevel)
-                Text(AVPL("Encima", "Above")).tag(AVPSettings.SubtitlePlacement.high)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(AVPL("Subtítulos", "Subtitles"))
+                Picker(AVPL("Subtítulos", "Subtitles"), selection: $s.subtitles) {
+                    Text(AVPL("Abajo", "Bottom")).tag(AVPSettings.SubtitlePlacement.game)
+                    Text(AVPL("Más arriba", "Higher")).tag(AVPSettings.SubtitlePlacement.higher)
+                    Text(AVPL("A la vista", "Eye level")).tag(AVPSettings.SubtitlePlacement.eyeLevel)
+                    Text(AVPL("Encima", "Above")).tag(AVPSettings.SubtitlePlacement.high)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
-            .pickerStyle(.segmented)
-            Picker(AVPL("Tamaño de subtítulos", "Subtitle size"), selection: $s.subtitleSize) {
-                Text(AVPL("Pequeño", "Small")).tag(AVPSettings.SubtitleSize.small)
-                Text(AVPL("Medio", "Medium")).tag(AVPSettings.SubtitleSize.medium)
-                Text(AVPL("Grande", "Large")).tag(AVPSettings.SubtitleSize.large)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(AVPL("Tamaño de subtítulos", "Subtitle size"))
+                Picker(AVPL("Tamaño de subtítulos", "Subtitle size"), selection: $s.subtitleSize) {
+                    Text(AVPL("Pequeño", "Small")).tag(AVPSettings.SubtitleSize.small)
+                    Text(AVPL("Medio", "Medium")).tag(AVPSettings.SubtitleSize.medium)
+                    Text(AVPL("Grande", "Large")).tag(AVPSettings.SubtitleSize.large)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
-            .pickerStyle(.segmented)
             Stepper(AVPL("Altura del jugador: \(Int(s.heightOffsetCm)) cm", "Player height: \(Int(s.heightOffsetCm)) cm"),
                     value: $s.heightOffsetCm, in: -60...30, step: 5)
             Toggle(AVPL("Sincronizar partidas con Steam Cloud", "Sync saves with Steam Cloud"), isOn: $s.cloudSync)
