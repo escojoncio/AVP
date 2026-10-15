@@ -7,7 +7,7 @@ juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `v
 con `git format-patch` sobre ref+parches). Sin MetalFX, sin MoltenVK (solo referencia), sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B51**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B52**, pendiente de compilar).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -153,6 +153,16 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
 - B51: running start 6→9 ms (y un lead ≥ periodo se limita al 90 % en vez de desactivarse; kl_app.c); `KL_EYE_TRIM=1`
   por defecto; `kl_wide_f` máx. 2x2 taps. Validar: `[gap] SUMMARY` idle CPU ≈ 0 y `refreshes per composited picture`
   con mayoría en `2:`.
+
+## Logs_Alyx_38 (B51, menú + nivel)
+- Menú: `refreshes per picture` 2:248–250 → baile del menú RESUELTO; `[gap]` idle CPU 0–0,3 ms.
+- Nivel: juego 25–30 ms + compositor 5–8 ms; `thermal fair` a los ~2,5 min (14:41:04) justo cuando el juego pasa de
+  21 a 28 ms y el compositor de 3,8 a 7 ms → estrangulamiento térmico del M2 con la GPU al 100 %. Memoria 6,8 GB.
+- El regulador no podía bajar a 30 a 90 Hz (`pace_plan`: fallback solo si ≥ 32 fps) → alternancia 2/3 refrescos.
+- Sombras que «salen tarde» en el nivel: sospecha de las esperas a productores (0038 bit0).
+- B52: fallback a 90 Hz = 30 fps (umbral 29,5; klvr_platform_klepton.c `pace_plan`); `VPVK_RUNTIME_OPTS=0`.
+- Pendiente: con la GPU al 100 % el visor se calienta; sin bajar carga (resolución/MSAA) solo queda elegir entre 45
+  con baile o 30 estable. Validar sombras con bit0 off.
 
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su
