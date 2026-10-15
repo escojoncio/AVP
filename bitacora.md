@@ -3,11 +3,11 @@
 Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Todo en el visor: Steam oficial →
 descarga → conversión ELF→Mach-O (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `vpkengine.ref` + `vpkengine-patches/`
-0011–0039 (CI: `scripts/apply-vpkengine-patches.sh`; un parche nuevo = fichero `00NN-*.patch` en esa carpeta, generado
+0011–0040 (CI: `scripts/apply-vpkengine-patches.sh`; un parche nuevo = fichero `00NN-*.patch` en esa carpeta, generado
 con `git format-patch` sobre ref+parches). Sin MetalFX, sin MoltenVK (solo referencia), sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B48**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B49**, pendiente de compilar).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -116,6 +116,22 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
   ranking por ahorro exclusivo, MSL de los ≥ 0,3 ms.
 - Ideas de traductor (pendientes de datos): arrays privados de solo constantes → `constant` LUT; quitar guardas de
   bucle con contador acotado.
+
+## Logs_Alyx_2_14 (B47b otra vez, no B48) y análisis del corpus de shaders
+- Knockout (unión): vk.comp15 (niebla volumétrica) 2,16 ms, pipe6950 (escena MSAA, 3 draws) 1,53, pipe6692 (pase de
+  ojo, 4 draws) 0,91; MSL de los tres en los logs.
+- Corpus: `steamapp_pipeline_cache.foz` del PC (A:\SteamLibrary\steamapps\shadercache\546560\fozpipelinesv6, 2539
+  gráficos + 22 compute → 1675 shaders únicos). Harness local: VPVulkan null + fossilize-replay (Valve, 556da9f),
+  `VPVK_DUMP_MSL=<dir>` (0040) vuelca cada MSL (y SPIR-V si `VPVK_DUMP_DIR` también está). 0 errores de traducción.
+- Hallazgos: 0 decoraciones RelaxedPrecision (nada de fp16 automático); fast math ya activo; guardas de bucle NO
+  impiden desenrollar (probado con clang -O2: los bucles de 4 iteraciones se desenrollan igual con vp_guard/vp_budget);
+  91 shaders con arrays privados, 37 de ellos solo tablas constantes (discos de Poisson, kernels, jitter de la niebla:
+  256–512 B escritos por píxel/hilo en memoria de pila).
+- `0040`: `planConstTables` (msl.cpp) → `constant uint4 vp_k<slot>[]` de programa; `VPMSL_CONST_TABLES=0` lo apaga.
+  Revisado: semántica igual (todas las cargas dentro del bloque B tras su último store). Riesgo menor: índice
+  divergente por hilo en `constant` (la niebla) — medir en el knockout de B49 (vk.comp15 debería bajar).
+- Pendiente/ideas: copias de 1058² de Panorama (13 copias/frame, ~2,7 ms en «blit»); `packed_float4` en lecturas de
+  vértices desde buffers (584 VS); `preserveInvariance=YES` global (no tocar sin A/B: puntitos prepass/color).
 
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su
