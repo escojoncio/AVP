@@ -133,6 +133,15 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
 - Pendiente/ideas: copias de 1058² de Panorama (13 copias/frame, ~2,7 ms en «blit»); `packed_float4` en lecturas de
   vértices desde buffers (584 VS); `preserveInvariance=YES` global (no tocar sin A/B: puntitos prepass/color).
 
+## Conclusión tras B46–B49 (para no repetir)
+- La resolución NO es palanca: 80 %→50 % solo baja el span 25,3→18,5 ms; ~14 ms son FIJOS (no escalan con píxeles).
+  Los shaders de fragmento escalan con píxeles → optimizarlos rinde poco. El objetivo es el coste fijo:
+  hueco de GPU parada ~5 ms al inicio del frame (causa desconocida: ni running start B45 ni esperas a productores
+  0038 lo mueven; el clear skip lo empeora), UI Panorama ~3,5 ms (menú), vértices ~3,2, compute ~1,4, copias ojos ~1,5.
+- SIGUIENTE (B50): diagnóstico del hueco: por command buffer, hora de commit en CPU, GPUStartTime/EndTime y en qué
+  fence/encoder espera el primer encoder que arranca tarde; ver si es CPU del juego (submit tarde), una fence (join /
+  cola anterior) o el compositor ocupando la GPU.
+
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su
    MSL/coste. Si indirect-count codificado ≫ real → `MTLIndirectCommandBuffer` / compactar en el fix-up.
