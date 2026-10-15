@@ -30,6 +30,7 @@
 #include <time.h>
 #include <mach/mach_time.h>
 #include <dlfcn.h>
+#include <unistd.h>
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -1908,6 +1909,43 @@ static struct {
     int verdict_done;
 } g_ab;
 
+// Every [abtest] line also goes to "abtest-result.txt" in the logs folder (KL_CAPTURE_DIR, else VP_DUMP_DIR), synced to
+// disk when the test ends: Logs_Alyx_35 lost the boot log's last ~10 s (the knockout's end and the verdict) although the
+// HUD had said the test was over: the copy of the File Provider folder did not have the latest writes.
+static FILE *g_ab_file;
+static int g_ab_file_tried;
+static void ab_out(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void ab_out(const char *fmt, ...) {
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    // Called from several threads (ab_env's once block runs on whichever thread asks first): one open, once.
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_ab_file_tried = 1;
+        const char *dir = getenv("KL_CAPTURE_DIR");
+        if (!dir || !*dir) dir = getenv("VP_DUMP_DIR");
+        if (dir && *dir) {
+            char path[1024];
+            snprintf(path, sizeof path, "%s/abtest-result.txt", dir);
+            g_ab_file = fopen(path, "w");
+            if (g_ab_file) setvbuf(g_ab_file, NULL, _IOLBF, 0);
+        }
+    });
+    if (g_ab_file) vfprintf(g_ab_file, fmt, ap2);
+    va_end(ap2);
+}
+// The test is over (done or failed): both files flushed and synced, so a copy of the logs folder made now has it all.
+static void ab_sync(void) {
+    fflush(stderr);
+    fsync(STDERR_FILENO);
+    if (g_ab_file) {
+        fflush(g_ab_file);
+        fsync(fileno(g_ab_file));
+    }
+}
 static void ab_hud(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void ab_hud(const char *fmt, ...) {
     char t[sizeof g_ab_hud_text];
@@ -1930,7 +1968,7 @@ static int ab_env(void) {
             atomic_store(&g_ab_trim_flag, (g_ab.def_mask & 4u) ? 1 : 0);   // bit 2 as the default until the test runs
             g_ab.state = kAbWait;
             ab_hud("TEST: esperando al menú (tras el logo de Valve) · quédate quieto");
-            fprintf(stderr, "[abtest] automatic A/B test on (KL_ABTEST=1): starts 25 s after the first frame, outside loads\n");
+            ab_out("[abtest] automatic A/B test on (KL_ABTEST=1): starts 25 s after the first frame, outside loads\n");
         }
     });
     return g_ab_env;
@@ -1962,9 +2000,9 @@ int kl_abtest_eye_trim(void) {
         unsafe = why != NULL;
         env_trim = ab_env_is("KL_EYE_TRIM", "1");
         if (why)
-            fprintf(stderr, "[abtest] eye-copy trim unsafe: %s reads the whole eye image; the trim stays off (bit 2 inactive)\n", why);
+            ab_out("[abtest] eye-copy trim unsafe: %s reads the whole eye image; the trim stays off (bit 2 inactive)\n", why);
         else if (!ab_env() && env_trim)
-            fprintf(stderr, "[abtest] eye-copy trim on (KL_EYE_TRIM=1)\n");
+            ab_out("[abtest] eye-copy trim on (KL_EYE_TRIM=1)\n");
     });
     if (unsafe) return 0;
     return ab_env() ? atomic_load(&g_ab_trim_flag) : env_trim;
@@ -2002,10 +2040,10 @@ static int ab_resolve(void) {
                      : !ab_counters ? "vpgpu_metal2_opt_counters" : !ab_census ? "vpgpu_metal2_census"
                      : !ab_census_get ? "vpgpu_metal2_census_get" : NULL;
     if (miss) {
-        fprintf(stderr, "[abtest] VPVulkan has no %s (patch 0038 missing): the test does nothing\n", miss);
+        ab_out("[abtest] VPVulkan has no %s (patch 0038 missing): the test does nothing\n", miss);
         return 0;
     }
-    if (!ab_hangs) fprintf(stderr, "[abtest] no vpgpu_metal2_gpu_hangs: BREAKS cannot be detected\n");
+    if (!ab_hangs) ab_out("[abtest] no vpgpu_metal2_gpu_hangs: BREAKS cannot be detected\n");
     return 1;
 }
 // Bits 0-1 to VPKEngine, bit 2 to the eye copies.
@@ -2143,7 +2181,7 @@ static void ab_census_begin(double now) {
     (void)ab_census(1);
     g_ab.phase_t0 = now;
     ab_hud_progress(now);
-    fprintf(stderr, "[abtest] census: 3 s of pipeline counts (default mask %u)\n", g_ab.def_mask);
+    ab_out("[abtest] census: 3 s of pipeline counts (default mask %u)\n", g_ab.def_mask);
 }
 static void ab_opt_window_begin(double now) {
     int s = g_ab.step, r = s / kAbCfgs, cfg = (r + s % kAbCfgs) % kAbCfgs;
@@ -2162,8 +2200,8 @@ static void ab_knock_begin(double now) {
     ab_apply(g_ab.def_mask);   // each shader's share of the frame in the configuration the session really runs
     g_ab.nsteps = 0; g_ab.nbase = 0; g_ab.knock_done = 0; g_ab.step = 0;
     if (!g_ab.nc) {
-        if (!g_ab.census_frames) fprintf(stderr, "[abtest] census saw 0 real frames: knockout skipped\n");
-        else fprintf(stderr, "[abtest] no pipeline in >= 80 %% of the %llu census frames: knockout skipped\n",
+        if (!g_ab.census_frames) ab_out("[abtest] census saw 0 real frames: knockout skipped\n");
+        else ab_out("[abtest] no pipeline in >= 80 %% of the %llu census frames: knockout skipped\n",
                      (unsigned long long)g_ab.census_frames);
         ab_finish(now);
         return;
@@ -2173,7 +2211,7 @@ static void ab_knock_begin(double now) {
         g_ab.steps[g_ab.nsteps++] = i;
         if ((i + 1) % 5 == 0 || i + 1 == g_ab.nc) g_ab.steps[g_ab.nsteps++] = -1;
     }
-    fprintf(stderr, "[abtest] knockout: %d candidates, %d windows (default mask %u)\n", g_ab.nc, g_ab.nsteps, g_ab.def_mask);
+    ab_out("[abtest] knockout: %d candidates, %d windows (default mask %u)\n", g_ab.nc, g_ab.nsteps, g_ab.def_mask);
     ab_knock_window_begin(now);
 }
 // The step in hand, from its beginning (after a pause).
@@ -2190,7 +2228,7 @@ static void ab_pause(void) {
     ab_set_knock(0);
     ab_apply(g_ab.def_mask);
     if (g_ab.state == kAbCensus) (void)ab_census(0);
-    fprintf(stderr, "[abtest] a load started: step discarded, the test resumes 3 s after the scene is shown\n");
+    ab_out("[abtest] a load started: step discarded, the test resumes 3 s after the scene is shown\n");
     ab_hud("TEST en pausa (cargando)");
 }
 
@@ -2208,7 +2246,7 @@ static void ab_census_tick(double now) {
     uint64_t frames = ab_census(0);
     int n = 0;
     if (keys && fr && dr && cp && taken && lab) n = ab_census_get(keys, fr, dr, cp, lab, kAbCensusMax);
-    else fprintf(stderr, "[abtest] census: no memory for the pipeline list\n");
+    else ab_out("[abtest] census: no memory for the pipeline list\n");
     if (n < 0) n = 0;
     if (n > kAbCensusMax) n = kAbCensusMax;
     if (taken) memset(taken, 0, kAbCensusMax);
@@ -2235,16 +2273,16 @@ static void ab_census_tick(double now) {
             snprintf(g_ab.cand[c].label, sizeof g_ab.cand[c].label, "%s", lab[best][0] ? lab[best] : "-");
         }
     }
-    fprintf(stderr, "[abtest] census: %llu real frames, %d pipelines, %d candidates\n", (unsigned long long)frames, n, g_ab.nc);
-    if (!frames) fprintf(stderr, "[abtest] census saw 0 real frames: no candidates\n");
-    else if (!g_ab.nc) fprintf(stderr, "[abtest] census: no pipeline in >= 80 %% of the %llu frames\n", (unsigned long long)frames);
+    ab_out("[abtest] census: %llu real frames, %d pipelines, %d candidates\n", (unsigned long long)frames, n, g_ab.nc);
+    if (!frames) ab_out("[abtest] census saw 0 real frames: no candidates\n");
+    else if (!g_ab.nc) ab_out("[abtest] census: no pipeline in >= 80 %% of the %llu frames\n", (unsigned long long)frames);
     for (int i = 0; i < g_ab.nc; i++)
-        fprintf(stderr, "[abtest] candidate %d key=%016llx compute=%d frames=%llu/%llu draws/frame=%.1f label=%s\n", i,
+        ab_out("[abtest] candidate %d key=%016llx compute=%d frames=%llu/%llu draws/frame=%.1f label=%s\n", i,
                 (unsigned long long)g_ab.cand[i].key, g_ab.cand[i].compute, (unsigned long long)g_ab.cand[i].frames,
                 (unsigned long long)frames, frames ? (double)g_ab.cand[i].draws / (double)frames : 0.0, g_ab.cand[i].label);
     g_ab.state = kAbOpts;
     g_ab.step = 0;
-    fprintf(stderr, "[abtest] optimisations: %d rounds x %d masks, %.1f s settle + %.1f s measured each\n", kAbRounds, kAbCfgs,
+    ab_out("[abtest] optimisations: %d rounds x %d masks, %.1f s settle + %.1f s measured each\n", kAbRounds, kAbCfgs,
             AB_OPT_SETTLE, AB_OPT_MEASURE);
     ab_opt_window_begin(now);
 }
@@ -2255,7 +2293,7 @@ static void ab_opts_tick(double now, uint32_t frame, uint32_t f, double uni, dou
     int s = g_ab.step, r = s / kAbCfgs, cfg = (r + s % kAbCfgs) % kAbCfgs;
     g_ab.opt[r][cfg] = res;
     const uint64_t *d = res.dc;
-    fprintf(stderr, "[abtest] window r=%d cfg=%s mask=%u frames=%u union med %.2f mean %.2f excl %.2f fps %.1f prodcb %llu/%llu "
+    ab_out("[abtest] window r=%d cfg=%s mask=%u frames=%u union med %.2f mean %.2f excl %.2f fps %.1f prodcb %llu/%llu "
             "fencewaits/cb %.1f clears %llu/%llu trims %u indirect calls %llu encoded %llu real %llu hangs %u%s\n",
             r, k_ab_cfg[cfg], k_ab_mask[cfg], res.n, res.med, res.mean, res.excl, res.fps, (unsigned long long)d[1],
             (unsigned long long)d[0], d[0] ? (double)d[2] / (double)d[0] : 0.0, (unsigned long long)d[4],
@@ -2278,7 +2316,7 @@ static void ab_knock_report_group(int g) {
         int ok = b0->valid && b1->valid && k->valid;
         g_ab.save[i] = ok ? base - k->med : 0;
         g_ab.save_ok[i] = ok;
-        fprintf(stderr, "[abtest] knock %d key=%016llx %s union med %.2f saving %.2f ms (%.0f %% of frame) knocked draws/frame %.1f "
+        ab_out("[abtest] knock %d key=%016llx %s union med %.2f saving %.2f ms (%.0f %% of frame) knocked draws/frame %.1f "
                 "hangs %u%s\n", i, (unsigned long long)g_ab.cand[i].key, g_ab.cand[i].label, k->med, g_ab.save[i],
                 ok && base > 0 ? 100.0 * g_ab.save[i] / base : 0.0, k->ends ? (double)k->dc[5] / (double)k->ends : 0.0,
                 k->hangs, ok ? "" : " (a window had too few frames: not used)");
@@ -2292,7 +2330,7 @@ static void ab_knock_tick(double now, uint32_t frame, uint32_t f, double uni, do
     if (hangs_now != g_ab.w.hb) {
         ab_set_knock(0);
         ab_apply(g_ab.def_mask);
-        fprintf(stderr, "[abtest] knockout aborted: GPU hang with key %016llx (%s), %u new hang(s); on to the verdict\n",
+        ab_out("[abtest] knockout aborted: GPU hang with key %016llx (%s), %u new hang(s); on to the verdict\n",
                 c >= 0 ? (unsigned long long)g_ab.cand[c].key : 0ull, c >= 0 ? g_ab.cand[c].label : "baseline: nothing knocked out",
                 hangs_now - g_ab.w.hb);
         ab_finish(now);
@@ -2306,7 +2344,7 @@ static void ab_knock_tick(double now, uint32_t frame, uint32_t f, double uni, do
     } else {
         if (g_ab.nbase < kAbBaseMax) g_ab.base[g_ab.nbase] = res;
         g_ab.nbase++;
-        fprintf(stderr, "[abtest] knock baseline %d union med %.2f mean %.2f frames %u hangs %u%s\n", g_ab.nbase - 1, res.med,
+        ab_out("[abtest] knock baseline %d union med %.2f mean %.2f frames %u hangs %u%s\n", g_ab.nbase - 1, res.med,
                 res.mean, res.n, res.hangs, res.valid ? "" : " (too few frames)");
         if (g_ab.nbase >= 2) ab_knock_report_group(g_ab.nbase - 2);
     }
@@ -2334,7 +2372,7 @@ static void ab_opts_verdict(void) {
     if (noise < 0.30) noise = 0.30;
     g_ab.save_bits = 0;
     g_ab.bad_bits = 0;
-    fprintf(stderr, "[abtest] VERDICT noise %.2f ms (sigma %.3f ms from %d round pairs); SAVES = gain > %.2f ms and > 0.25 ms "
+    ab_out("[abtest] VERDICT noise %.2f ms (sigma %.3f ms from %d round pairs); SAVES = gain > %.2f ms and > 0.25 ms "
             "with every round > 0; WORSE = gain < -%.2f ms with every round < 0\n", noise, sigma, npd, 2 * noise, 2 * noise);
     for (int b = 0; b < 3; b++) {
         double g[kAbRounds], gc[kAbRounds];
@@ -2367,7 +2405,7 @@ static void ab_opts_verdict(void) {
         int u = 0;
         per[0] = 0;
         for (int k = 0; k < ng && u < (int)sizeof per - 12; k++) u += snprintf(per + u, sizeof per - u, " %.2f", g[k]);
-        fprintf(stderr, "[abtest] VERDICT %s: %s, gain %.2f ms (per round:%s); acted %llu (%s); hangs with it %u, without %u\n",
+        ab_out("[abtest] VERDICT %s: %s, gain %.2f ms (per round:%s); acted %llu (%s); hangs with it %u, without %u\n",
                 k_ab_bit[b], cls, gain, ng ? per : " none", (unsigned long long)acted,
                 b == 0 ? "command buffers with producer waits" : b == 1 ? "depth clears skipped" : "eye copies trimmed",
                 hang_on, hang_off);
@@ -2388,7 +2426,7 @@ static void ab_opts_verdict(void) {
                 nt++;
             }
         double gain = ab_median(t, nt), mo = ab_median(off, nt), ma = ab_median(all, nt);
-        fprintf(stderr, "[abtest] VERDICT total ALL vs OFF: %s %.2f ms (per round:%s; union median OFF %.2f, ALL %.2f, %d rounds)\n",
+        ab_out("[abtest] VERDICT total ALL vs OFF: %s %.2f ms (per round:%s; union median OFF %.2f, ALL %.2f, %d rounds)\n",
                 !nt ? "UNMEASURED" : gain > 2 * noise && gain > 0.25 && allpos ? "SAVES"
                     : gain < -2 * noise && allneg ? "WORSE" : "NO EFFECT",
                 gain, nt ? per : " none", mo, ma, nt);
@@ -2401,14 +2439,14 @@ static void ab_opts_verdict(void) {
                 ends += g_ab.opt[r][c].ends;
             }
         if (!calls || !ends)
-            fprintf(stderr, "[abtest] VERDICT indirect-count: no indirect-count draws in the measured frames\n");
+            ab_out("[abtest] VERDICT indirect-count: no indirect-count draws in the measured frames\n");
         else
-            fprintf(stderr, "[abtest] VERDICT indirect-count: %.1f calls, %.1f Metal draws encoded, %.1f asked for by the GPU "
+            ab_out("[abtest] VERDICT indirect-count: %.1f calls, %.1f Metal draws encoded, %.1f asked for by the GPU "
                     "counters per frame: indirect-count over-encoding %.0f %%\n", (double)calls / ends, (double)enc / ends,
                     (double)real / ends, real ? 100.0 * ((double)enc - (double)real) / (double)real : 0.0);
     }
     unsigned m = (g_ab.def_mask | g_ab.save_bits) & ~g_ab.bad_bits;
-    fprintf(stderr, "[abtest] VERDICT mask after the test: %u (default %u, + SAVES %u, - WORSE/BREAKS %u)\n", m, g_ab.def_mask,
+    ab_out("[abtest] VERDICT mask after the test: %u (default %u, + SAVES %u, - WORSE/BREAKS %u)\n", m, g_ab.def_mask,
             g_ab.save_bits, g_ab.bad_bits);
 }
 
@@ -2426,23 +2464,23 @@ static void ab_finish(double now) {
         for (int i = 0; i < ni; i++)
             for (int j = i + 1; j < ni; j++)
                 if (g_ab.save[idx[j]] > g_ab.save[idx[i]]) { int tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp; }
-        fprintf(stderr, "[abtest] VERDICT knockout (mask %u, baseline union median %.2f ms): %d of %d candidates measured\n",
+        ab_out("[abtest] VERDICT knockout (mask %u, baseline union median %.2f ms): %d of %d candidates measured\n",
                 g_ab.def_mask, bavg, ni, g_ab.nc);
         for (int k = 0; k < ni && k < 10; k++) {
             int i = idx[k];
-            fprintf(stderr, "[abtest] VERDICT knockout #%d: key=%016llx %s compute=%d saves %.2f ms (%.0f %% of frame), %.1f draws/frame\n",
+            ab_out("[abtest] VERDICT knockout #%d: key=%016llx %s compute=%d saves %.2f ms (%.0f %% of frame), %.1f draws/frame\n",
                     k + 1, (unsigned long long)g_ab.cand[i].key, g_ab.cand[i].label, g_ab.cand[i].compute, g_ab.save[i],
                     bavg > 0 ? 100.0 * g_ab.save[i] / bavg : 0.0,
                     g_ab.census_frames ? (double)g_ab.cand[i].draws / (double)g_ab.census_frames : 0.0);
         }
     }
     if (g_ab.nc && !ab_census_detail)
-        fprintf(stderr, "[abtest] no vpgpu_metal2_census_detail (patch 0039 missing): no pipeline details\n");
+        ab_out("[abtest] no vpgpu_metal2_census_detail (patch 0039 missing): no pipeline details\n");
     for (int i = 0; i < g_ab.nc && ab_census_detail; i++) {
         char d[320];
         d[0] = 0;
         int ok = ab_census_detail(g_ab.cand[i].key, d, (int)sizeof d);
-        fprintf(stderr, "[abtest] detail key=%016llx %s %s\n", (unsigned long long)g_ab.cand[i].key, g_ab.cand[i].label,
+        ab_out("[abtest] detail key=%016llx %s %s\n", (unsigned long long)g_ab.cand[i].key, g_ab.cand[i].label,
                 ok ? d : "(not in the census)");
     }
     {   // The MSL of the 3 largest savers (>= 0.5 ms), for an offline look at what they cost.
@@ -2452,30 +2490,32 @@ static void ab_finish(double now) {
             int i = idx[k];
             if (g_ab.save[i] < 0.5) break;
             if (!ab_dump_msl)
-                fprintf(stderr, "[abtest] msl key=%016llx skipped: no vpgpu_metal2_dump_pipeline_msl (patch 0039 missing)\n",
+                ab_out("[abtest] msl key=%016llx skipped: no vpgpu_metal2_dump_pipeline_msl (patch 0039 missing)\n",
                         (unsigned long long)g_ab.cand[i].key);
             else if (!dir || !*dir)
-                fprintf(stderr, "[abtest] msl key=%016llx skipped: no folder (VP_DUMP_DIR / KL_CAPTURE_DIR unset: «Capturas» off)\n",
+                ab_out("[abtest] msl key=%016llx skipped: no folder (VP_DUMP_DIR / KL_CAPTURE_DIR unset: «Capturas» off)\n",
                         (unsigned long long)g_ab.cand[i].key);
             else
-                fprintf(stderr, "[abtest] msl key=%016llx files=%d dir=%s\n", (unsigned long long)g_ab.cand[i].key,
+                ab_out("[abtest] msl key=%016llx files=%d dir=%s\n", (unsigned long long)g_ab.cand[i].key,
                         ab_dump_msl(g_ab.cand[i].key, dir), dir);
         }
     }
     unsigned final_mask = (g_ab.def_mask | g_ab.save_bits) & ~g_ab.bad_bits;
     ab_apply(final_mask);
-    fprintf(stderr, "[abtest] final mask %u:%s%s%s%s (default %u + SAVES %u - WORSE/BREAKS %u; kept for the session); the test took "
+    ab_out("[abtest] final mask %u:%s%s%s%s (default %u + SAVES %u - WORSE/BREAKS %u; kept for the session); the test took "
             "%.0f s\n", final_mask, final_mask & 1u ? " producer-waits" : "", final_mask & 2u ? " clear-skip" : "",
             final_mask & 4u ? " eye-trim" : "", final_mask ? "" : " none (legacy)", g_ab.def_mask, g_ab.save_bits, g_ab.bad_bits,
             g_ab.t_start ? now - g_ab.t_start : 0.0);
     g_ab.state = kAbDone;
+    ab_sync();
     ab_hud("TEST TERMINADO ✓ ya puedes salir y mandar los logs");
     ab_hud_expire(now);
 }
 static void ab_fail(double now, const char *why) {
     g_ab.state = kAbFailed;
     ab_apply(g_ab.def_mask);   // without the engine's switches only bit 2 takes; the engine keeps VPVK_RUNTIME_OPTS
-    fprintf(stderr, "[abtest] test not run: %s\n", why);
+    ab_out("[abtest] test not run: %s\n", why);
+    ab_sync();
     ab_hud("TEST no disponible (mira el log)");
     ab_hud_expire(now);
 }
@@ -2528,7 +2568,7 @@ static void ab_tick(uint32_t frame, int timing) {
             const char *path = getenv("KL_MVK_DYLIB");
             void *h = path && *path ? dlopen(path, RTLD_NOW | RTLD_NOLOAD) : NULL;
             last_enc = (uint32_t (*)(void))dlsym(h ? h : RTLD_DEFAULT, "vpgpu_metal2_last_real_encoders");
-            if (!last_enc) fprintf(stderr, "[abtest] no vpgpu_metal2_last_real_encoders: the menu is not waited for\n");
+            if (!last_enc) ab_out("[abtest] no vpgpu_metal2_last_real_encoders: the menu is not waited for\n");
         }
         if (last_enc) {
             const uint32_t enc = last_enc();
@@ -2536,7 +2576,7 @@ static void ab_tick(uint32_t frame, int timing) {
                 g_ab.menu_low = 0;
                 if (!g_ab.menu_since) {
                     g_ab.menu_since = now;
-                    fprintf(stderr, "[abtest] menu-like frames (%u encoders) %.1f s after the first frame\n", enc, now - g_ab.t_first);
+                    ab_out("[abtest] menu-like frames (%u encoders) %.1f s after the first frame\n", enc, now - g_ab.t_first);
                 }
             } else if (++g_ab.menu_low >= 3) {   // one odd frame does not restart the 5 s
                 g_ab.menu_since = 0;
@@ -2549,7 +2589,7 @@ static void ab_tick(uint32_t frame, int timing) {
             }
             if (timed_out && !g_ab.menu_said) {
                 g_ab.menu_said = 1;
-                fprintf(stderr, "[abtest] no menu-like frames (last %u encoders) 180 s after the first frame: starting anyway\n", enc);
+                ab_out("[abtest] no menu-like frames (last %u encoders) 180 s after the first frame: starting anyway\n", enc);
             }
         }
         if (!ab_resolve()) {
@@ -2557,7 +2597,7 @@ static void ab_tick(uint32_t frame, int timing) {
             return;
         }
         g_ab.t_start = now;
-        fprintf(stderr, "[abtest] starting %.1f s after the first frame; default mask %u (VPVK_RUNTIME_OPTS & 3%s): the census, "
+        ab_out("[abtest] starting %.1f s after the first frame; default mask %u (VPVK_RUNTIME_OPTS & 3%s): the census, "
                 "the knockout and pauses run at it; details/MSL dumps %s/%s\n", now - g_ab.t_first, g_ab.def_mask,
                 g_ab.def_mask & 4u ? ", KL_EYE_TRIM" : "", ab_census_detail ? "yes" : "no", ab_dump_msl ? "yes" : "no");
         ab_census_begin(now);
@@ -2566,7 +2606,7 @@ static void ab_tick(uint32_t frame, int timing) {
     if (g_ab.paused) {
         if (loading || now < g_ab.resume_at) { ab_hud("TEST en pausa (cargando)"); return; }
         g_ab.paused = 0;
-        fprintf(stderr, "[abtest] resumed: the step is measured again from its start\n");
+        ab_out("[abtest] resumed: the step is measured again from its start\n");
         ab_step_begin(now);
         return;
     }
