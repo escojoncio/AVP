@@ -1122,7 +1122,14 @@ int klb_sysinfo(void *out) {
 static _Atomic int g_lowmem_armed = 1;
 static _Atomic uint64_t g_lowmem_fired;
 
+// B57: the last OS memory-pressure level seen (0 none, 1 warning, 2 critical) and when, for the heartbeat's relief.
+_Atomic int kl_mem_os_level;
+_Atomic long long kl_mem_os_level_t;
 void kl_mem_pressure_fire(const char *why) {
+    if (strstr(why, "system")) {
+        atomic_store(&kl_mem_os_level, strstr(why, "critical") ? 2 : 1);
+        atomic_store(&kl_mem_os_level_t, (long long)time(NULL));
+    }
     if (!kl_jni_low_memory()) {
         static _Atomic int said;
         if (atomic_fetch_add(&said, 1) == 0)

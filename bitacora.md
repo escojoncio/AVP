@@ -252,6 +252,17 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
 - Interpolación tipo Motion Smoothing descartada por ahora (vectores de movimiento de VPKEngine a cero, coste GPU,
   artefactos). Idea pendiente: dar profundidad a visionOS para reproyección posicional.
 
+## Logs_Alyx_46 (B56) — cierre por memoria → B57
+- Sesión 20:11–20:17:47 cortada en seco (sin informe ni `_exit`): jetsam. 20:16:08 `[mem] pressure (system
+  critical)` sin nadie que actúe (Source 2 no registra low-memory); footprint 6,44→6,55 GB al cargar zona tras
+  autoguardados, avail 1,6 GB. Footprint ~6–6,5 GB ya en B52 (log 40, mismo aviso). MSAA 4 (preset M2).
+  La sesión de las 20:10 terminó con `_exit(0)` del juego (normal).
+- B57: `kl_libc.c` guarda el nivel de presión del SO (`kl_mem_os_level`, `_t`); `kl_app.c` `mem_relief_tick`
+  (hilo heartbeat): `malloc_zone_pressure_relief` cada 15 s con presión del SO (últimos 30 s) o cada 60 s con
+  avail < 1 GB; log `[mem] relief (...)`. Cada 30 s `[mem] breakdown: footprint = Metal objects + rest; growth
+  MB/min` (`kl_metal_allocated_bytes` en `kl_gpu_time.m`). Pendiente según el desglose: si pesa Metal/texturas →
+  bajar `r_texture_pool_size` (2560) o liberar cachés de VPKEngine; si «rest» crece sin parar → fuga.
+
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su
    MSL/coste. Si indirect-count codificado ≫ real → `MTLIndirectCommandBuffer` / compactar en el fix-up.

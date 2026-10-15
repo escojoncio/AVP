@@ -2849,3 +2849,12 @@ void *kl_mtl_buffer_texture_r32f(void *mtl_buffer, unsigned w, unsigned h, unsig
 }
 void kl_mtl_release(void *obj) { if (obj) CFRelease(obj); }
 void *kl_mtl_retain(void *obj) { if (obj) CFRetain(obj); return obj; }
+
+
+// B57 (Logs_Alyx_46): what the process holds in Metal objects (textures, buffers, heaps, pipelines), for the memory
+// breakdown in the heartbeat. VPVulkan creates its device with MTLCreateSystemDefaultDevice, the same object.
+long long kl_metal_allocated_bytes(void) {
+    static id<MTLDevice> dev;
+    if (!dev) dev = MTLCreateSystemDefaultDevice();
+    return dev ? (long long)dev.currentAllocatedSize : -1;
+}
