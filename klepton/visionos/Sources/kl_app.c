@@ -1509,14 +1509,16 @@ static void guest_pace_wait(void) {
     pthread_mutex_lock(&g_guest.mu);
 #define KL_AVAIL() ((long long)(g_guest.published - g_guest.consumed) - owed)
     int early_release = 0;
-    if (lead_s > 0 && period > 0 && lead_s < period) {
+    // B51: a lead at or past the refresh period is held at 90 % of it (it used to turn running start off).
+    const double lead = period > 0 && lead_s >= period ? period * 0.9 : lead_s;
+    if (lead > 0 && period > 0) {
         // One refresh short of the turn, then wait until `lead` before the refresh that completes it (or for that
         // publish itself, whichever comes first).
         const long long early = eff > 1 ? (long long)eff - 1 : 0;
         while (!g_guest.stop && KL_AVAIL() < early)
             if (pthread_cond_timedwait(&g_guest.cv, &g_guest.mu, &ts) == ETIMEDOUT) break;
         if (!g_guest.stop && KL_AVAIL() < (long long)eff && g_guest.pub_t > 0) {
-            const double target = g_guest.pub_t + period - lead_s;
+            const double target = g_guest.pub_t + period - lead;
             struct timespec mn;
             clock_gettime(CLOCK_MONOTONIC, &mn);
             const double wait = target - (mn.tv_sec + mn.tv_nsec * 1e-9);

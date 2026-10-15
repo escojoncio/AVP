@@ -7,7 +7,7 @@ juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `v
 con `git format-patch` sobre ref+parches). Sin MetalFX, sin MoltenVK (solo referencia), sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B50**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B51**, pendiente de compilar).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -142,6 +142,17 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
   (commit/start/end) y `[gap] f=… GPU idle = CPU + GPU-WAIT; compositor alone`, `[gap] SUMMARY`. Diagnóstico del hueco: por command buffer, hora de commit en CPU, GPUStartTime/EndTime y en qué
   fence/encoder espera el primer encoder que arranca tarde; ver si es CPU del juego (submit tarde), una fence (join /
   cola anterior) o el compositor ocupando la GPU.
+
+## Logs_Alyx_37 (B50, menú, 90 Hz) — causa del «baile» de fps
+- `[gap]`: el hueco de 5 ms ya no existe; GPU parada ~1–1,5 ms/frame (≈1 CPU tarde + 0,4 espera). Frames malos
+  (~30 %): el cb principal (cb1, 17–20 ms de GPU) se entrega ~3 ms tarde → 2–3 ms de GPU parada → frame > 22,2 ms.
+- GPU total por frame = juego ~19,7 + compositor ~3,2 ms ≈ 23 > 22,2 (45 fps a 90 Hz) → `[cp] refreshes per picture`
+  2:~100 3:~140 de 250: la mayoría de imágenes se ven 3 refrescos (~30 fps) → baile 30/45 aunque el juego dé 45.
+- Compositor: `kl_wide_f` (vista ancha 250x202 rgba16F) ~1 ms por pase x ~1,5/frame; composición 1856x1760x2 1,8 ms;
+  `kl_widerecon_f` 750x606 0,22 ms.
+- B51: running start 6→9 ms (y un lead ≥ periodo se limita al 90 % en vez de desactivarse; kl_app.c); `KL_EYE_TRIM=1`
+  por defecto; `kl_wide_f` máx. 2x2 taps. Validar: `[gap] SUMMARY` idle CPU ≈ 0 y `refreshes per composited picture`
+  con mayoría en `2:`.
 
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su

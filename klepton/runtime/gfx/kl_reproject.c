@@ -650,10 +650,11 @@ static const char kl_msl_reproject[] =
 "    float2 dx = dfdx(in.uv), dy = dfdy(in.uv);\n"
 // Build 41: as many taps per axis as the texel's own footprint needs (each bilinear tap covers ~2 eye texels), up to
 // `taps`: 4 x 4 only in the full-rate rectangle's corners and bands, 1 where the eye is already at the periphery's
-// rate (most of the view), where 16 taps inside one texel averaged to that one bilinear sample anyway.
+// rate (most of the view), where 16 taps inside one texel averaged to that one bilinear sample anyway. B51: at most
+// 2 x 2 (Logs_Alyx_37: this 250x202 pass cost ~1 ms each, ~2 ms of compositor GPU per game frame).
 "    float2 sz = float2(float(tex.get_width()), float(tex.get_height()));\n"
 "    float fp = max(length(dx * sz), length(dy * sz));\n"
-"    uint n = clamp(uint(ceil(fp * 0.5)), 1u, clamp(u.taps, 1u, 4u));\n"
+"    uint n = clamp(uint(ceil(fp * 0.5)), 1u, clamp(u.taps, 1u, 2u));\n"
 "    float inv = 1.0 / float(n);\n"
 "    float4 acc = float4(0.0);\n"
 "    for (uint j = 0u; j < n; j++) {\n"
