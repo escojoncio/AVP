@@ -1830,20 +1830,24 @@ static void watch(void *mtl_queue, int role) {
 //             not while a [passes] window is open
 //   census    3 s: which pipelines the real frames encode. Candidates: present in >= 80 % of those frames, the 20
 //             non-compute and the 6 compute ones with the most draws
-//   opts      3 rounds x 5 masks (OFF, ALL, ALL without each bit), round r in an order rotated by r so drift spreads
-//             over the configs; 0.6 s to settle, 2.0 s measured. Bits: 0 producer-only fence waits, 1 redundant
-//             depth-clear skip (VPKEngine), 2 eye-copy trim (klvr_vk_submit.cpp, kl_abtest_eye_trim)
-//   knockout  mask 0; each candidate's draws skipped (0.4 s settle, 1.4 s measured) between baselines (first, after
-//             every 5 candidates, last): the saving is the baselines' median interpolated at the candidate minus its own
+//   opts      3 rounds x 4 masks (OFF, ALL, ALL without each bit), round r in an order rotated by r so drift spreads
+//             over the configs; 0.6 s to settle, 1.6 s measured. Bits: 0 producer-only fence waits (VPKEngine), 2 eye-copy
+//             trim (klvr_vk_submit.cpp, kl_abtest_eye_trim). Bit 1 (depth-clear skip) is never set (test v3)
+//   knockout  the default mask; each candidate's draws skipped (0.4 s settle, 1.6 s measured) between baselines (first,
+//             after every 5 candidates, last): the saving is the baselines' median interpolated at the candidate minus its own
 //   verdict   per bit SAVES / NO EFFECT / WORSE / INACTIVE / BREAKS; the bits that save stay on for the session
-// The metric is the guest frame's UNION GPU span (busy[0], the frame's command buffers on the wall clock): producer-only
-// waits gain through overlap, which the exclusive time does not show. The exclusive time is logged beside it. A load
+// Test v3: the metric is the guest frame's EXCLUSIVE GPU time median (stable at 19.6-19.9 ms over Logs_Alyx_36's
+// windows); the UNION span (busy[0]) is bimodal by phase against the compositor (~20.3 / ~22.4 ms) and gave false
+// knockout savings, so it is only logged beside it (and decides a window with fewer than 8 exclusive frames). A load
 // during a step pauses the test (everything back to legacy); the step is measured again once the scene has been shown
 // for 3 s. The [passes] windows do not open while the test measures (their timestamps would perturb it).
-enum { kAbMaxFrames = 512, kAbCfgs = 5, kAbRounds = 3, kAbCandMax = 26, kAbCensusMax = 4096, kAbBaseMax = 16, kAbStepsMax = 40 };
+enum { kAbMaxFrames = 512, kAbCfgs = 4, kAbRounds = 3, kAbCandMax = 26, kAbCensusMax = 4096, kAbBaseMax = 16, kAbStepsMax = 40 };
 enum { kAbOff, kAbWait, kAbCensus, kAbOpts, kAbKnock, kAbDone, kAbFailed };
-static const unsigned k_ab_mask[kAbCfgs] = { 0, 7, 6, 5, 3 };   // OFF, ALL, ALL minus bit 0, 1, 2
-static const char *const k_ab_cfg[kAbCfgs] = { "OFF", "ALL", "ALL-prodwait", "ALL-clearskip", "ALL-eyetrim" };
+// Test v3 (Logs_Alyx_36): bit 1 (redundant depth-clear skip) is out of the test and of every mask applied: WORSE by
+// 2.5 ms of union span with no change in exclusive time. Configs: OFF, ALL (bits 0 + 2), ALL minus bit 0, ALL minus bit 2.
+static const unsigned k_ab_mask[kAbCfgs] = { 0, 5, 4, 1 };
+static const char *const k_ab_cfg[kAbCfgs] = { "OFF", "ALL", "ALL-prodwait", "ALL-eyetrim" };
+static const int k_ab_tbit[2] = { 0, 2 };   // the bits tested; bit k_ab_tbit[j] is off in config 2 + j
 static const char *const k_ab_bit[3] = { "producer-only fence waits (bit0)", "redundant depth-clear skip (bit1)",
                                          "eye-copy trim (bit2)" };
 typedef struct {
@@ -1852,17 +1856,22 @@ typedef struct {
     uint32_t first_frame;          // final frames from this one on are measured
     unsigned ends, n;              // guest frames closed during the measurement; final frames measured
     float ms[kAbMaxFrames];        // their union ms
+    float xs[kAbMaxFrames];        // their exclusive ms (frames with every buffer accounted only)
     double sum, excl_sum;
-    unsigned excl_n;
+    unsigned excl_n;               // entries in xs
     uint64_t c0[9];                // vpgpu_metal2_opt_counters at the measurement start
     uint32_t h0;                   // GPU hangs then
     uint32_t hb;                   // GPU hangs at the window's start (settle included)
     unsigned tr0;                  // eye-copy trims then
 } ab_window;
 typedef struct {
-    int valid;                     // enough frames (8+) for a median
-    unsigned n, ends;
-    double med, mean, excl, fps;   // union median / mean (ms), exclusive mean (ms, -1 = never accounted), guest fps
+    int valid;                     // enough frames (8+) for the decision median
+    int fallback;                  // fewer than 8 frames with exclusive time: med is the union's
+    unsigned n, ends, xn;          // final frames measured (union), of them with exclusive time
+    // Test v3: med = the EXCLUSIVE median (the decision metric: the union span is bimodal, ~20.3 / ~22.4 ms by phase
+    // against the compositor, Logs_Alyx_35/36), the union's when fallback. umed / mean = union median / mean, excl =
+    // exclusive mean (-1 = never accounted), fps = guest fps.
+    double med, umed, mean, excl, fps;
     uint64_t dc[9];                // counter deltas
     uint32_t hangs;
     unsigned trims;
@@ -1892,7 +1901,7 @@ static struct {
     unsigned seen_loads, seen_shows;
     uint32_t last_fed;                        // the newest final frame already fed to a window
     ab_window w;
-    int step;                                 // opts: 0..14; knockout: index into steps
+    int step;                                 // opts: 0..11; knockout: index into steps
     ab_result opt[kAbRounds][kAbCfgs];
     int nc;                                   // candidates
     uint64_t census_frames;
@@ -1900,9 +1909,9 @@ static struct {
     int nsteps, nbase, knock_done;
     int steps[kAbStepsMax];                   // -1 = a baseline, else a candidate
     ab_result knock[kAbCandMax], base[kAbBaseMax];
-    double save[kAbCandMax];
+    double save[kAbCandMax], usave[kAbCandMax];   // knockout savings: exclusive (ranks), union (logged beside it)
     int save_ok[kAbCandMax];
-    // The default mask (VPVK_RUNTIME_OPTS & 3, | 4 with KL_EYE_TRIM=1): what the session runs without the test, and
+    // The default mask (VPVK_RUNTIME_OPTS & 1, | 4 with KL_EYE_TRIM=1; bit 1 never since test v3): what the session runs without the test, and
     // what the census, the knockout, pauses and a failed test run at. The optimisations' verdict (printed when that
     // phase ends) adds the bits that SAVE and drops those that are WORSE or BREAK.
     unsigned def_mask, save_bits, bad_bits;
@@ -1964,7 +1973,7 @@ static int ab_env(void) {
         g_ab_env = e && *e == '1';
         if (g_ab_env) {
             const char *o = getenv("VPVK_RUNTIME_OPTS"), *t = getenv("KL_EYE_TRIM");
-            g_ab.def_mask = (o && *o ? (unsigned)(strtoul(o, NULL, 0) & 3u) : 0u) | (t && *t == '1' ? 4u : 0u);
+            g_ab.def_mask = (o && *o ? (unsigned)(strtoul(o, NULL, 0) & 1u) : 0u) | (t && *t == '1' ? 4u : 0u);
             atomic_store(&g_ab_trim_flag, (g_ab.def_mask & 4u) ? 1 : 0);   // bit 2 as the default until the test runs
             g_ab.state = kAbWait;
             ab_hud("TEST: esperando al menú (tras el logo de Valve) · quédate quieto");
@@ -2048,7 +2057,7 @@ static int ab_resolve(void) {
 }
 // Bits 0-1 to VPKEngine, bit 2 to the eye copies.
 static void ab_apply(unsigned mask) {
-    if (ab_set_opts) ab_set_opts(mask & 3u);
+    if (ab_set_opts) ab_set_opts(mask & 1u);   // bit 1 (clear skip) never: out since test v3
     atomic_store(&g_ab_trim_flag, (mask & 4u) ? 1 : 0);
 }
 static int ab_active(void) { return g_ab.state == kAbCensus || g_ab.state == kAbOpts || g_ab.state == kAbKnock; }
@@ -2114,7 +2123,7 @@ static int ab_win_tick(double now, uint32_t frame, uint32_t f, double uni, doubl
     if (f && f >= w->first_frame && w->n < kAbMaxFrames) {
         w->ms[w->n++] = (float)uni;
         w->sum += uni;
-        if (ex >= 0) { w->excl_sum += ex; w->excl_n++; }
+        if (ex >= 0) { w->xs[w->excl_n++] = (float)ex; w->excl_sum += ex; }
     }
     if (now - w->m_t0 < w->measure) return 0;
     memset(r, 0, sizeof *r);
@@ -2122,15 +2131,25 @@ static int ab_win_tick(double now, uint32_t frame, uint32_t f, double uni, doubl
     r->n = w->n;
     r->ends = w->ends;
     r->fps = secs > 0 ? w->ends / secs : 0;
-    r->valid = w->n >= 8;
+    r->xn = w->excl_n;
+    float tmp[kAbMaxFrames];
     if (w->n) {
-        float tmp[kAbMaxFrames];
         memcpy(tmp, w->ms, w->n * sizeof tmp[0]);
         qsort(tmp, w->n, sizeof tmp[0], ab_cmpf);
-        r->med = w->n % 2 ? tmp[w->n / 2] : 0.5 * ((double)tmp[w->n / 2 - 1] + tmp[w->n / 2]);
+        r->umed = w->n % 2 ? tmp[w->n / 2] : 0.5 * ((double)tmp[w->n / 2 - 1] + tmp[w->n / 2]);
         r->mean = w->sum / w->n;
     }
     r->excl = w->excl_n ? w->excl_sum / w->excl_n : -1;
+    if (w->excl_n >= 8) {
+        memcpy(tmp, w->xs, w->excl_n * sizeof tmp[0]);
+        qsort(tmp, w->excl_n, sizeof tmp[0], ab_cmpf);
+        r->med = w->excl_n % 2 ? tmp[w->excl_n / 2] : 0.5 * ((double)tmp[w->excl_n / 2 - 1] + tmp[w->excl_n / 2]);
+        r->valid = 1;
+    } else {   // too few frames with exclusive time: logged with its union, but never compared (the units differ)
+        r->fallback = 1;
+        r->med = r->umed;
+        r->valid = 0;
+    }
     uint64_t c1[9];
     ab_counters_now(c1);
     for (int k = 0; k < 9; k++) r->dc[k] = c1[k] - w->c0[k];
@@ -2145,7 +2164,7 @@ static void ab_opts_verdict(void);
 #define AB_OPT_SETTLE 0.6
 #define AB_OPT_MEASURE 1.6
 #define AB_KNOCK_SETTLE 0.4
-#define AB_KNOCK_MEASURE 1.4
+#define AB_KNOCK_MEASURE 1.6
 // Knockout windows for n candidates: one each, a baseline first and one after every 5 (the last group included).
 static int ab_knock_windows(int n) { return n > 0 ? n + (n + 4) / 5 + 1 : 0; }
 // Seconds the test still needs (whole windows left x their length, minus what the current one has run).
@@ -2293,9 +2312,10 @@ static void ab_opts_tick(double now, uint32_t frame, uint32_t f, double uni, dou
     int s = g_ab.step, r = s / kAbCfgs, cfg = (r + s % kAbCfgs) % kAbCfgs;
     g_ab.opt[r][cfg] = res;
     const uint64_t *d = res.dc;
-    ab_out("[abtest] window r=%d cfg=%s mask=%u frames=%u union med %.2f mean %.2f excl %.2f fps %.1f prodcb %llu/%llu "
-            "fencewaits/cb %.1f clears %llu/%llu trims %u indirect calls %llu encoded %llu real %llu hangs %u%s\n",
-            r, k_ab_cfg[cfg], k_ab_mask[cfg], res.n, res.med, res.mean, res.excl, res.fps, (unsigned long long)d[1],
+    ab_out("[abtest] window r=%d cfg=%s mask=%u frames=%u (excl %u) excl med %.2f mean %.2f | union med %.2f mean %.2f%s | fps %.1f "
+            "prodcb %llu/%llu fencewaits/cb %.1f clears %llu/%llu trims %u indirect calls %llu encoded %llu real %llu hangs %u%s\n",
+            r, k_ab_cfg[cfg], k_ab_mask[cfg], res.n, res.xn, res.fallback ? -1.0 : res.med, res.excl, res.umed, res.mean,
+            res.fallback ? " (FALLBACK: < 8 frames with exclusive time; not used)" : "", res.fps, (unsigned long long)d[1],
             (unsigned long long)d[0], d[0] ? (double)d[2] / (double)d[0] : 0.0, (unsigned long long)d[4],
             (unsigned long long)d[3], res.trims, (unsigned long long)d[6], (unsigned long long)d[7],
             (unsigned long long)d[8], res.hangs, res.valid ? "" : " (too few frames: not used)");
@@ -2316,10 +2336,16 @@ static void ab_knock_report_group(int g) {
         int ok = b0->valid && b1->valid && k->valid;
         g_ab.save[i] = ok ? base - k->med : 0;
         g_ab.save_ok[i] = ok;
-        ab_out("[abtest] knock %d key=%016llx %s union med %.2f saving %.2f ms (%.0f %% of frame) knocked draws/frame %.1f "
-                "hangs %u%s\n", i, (unsigned long long)g_ab.cand[i].key, g_ab.cand[i].label, k->med, g_ab.save[i],
+        // The union's saving, for comparison only (bimodal: Logs_Alyx_35's 2.3 / 1.8 ms were that, not the shaders).
+        double ubase = b0->umed + (b1->umed - b0->umed) * (double)(i - i0 + 1) / (double)(gs + 1);
+        g_ab.usave[i] = ubase - k->umed;
+        ab_out("[abtest] knock %d key=%016llx %s excl med %.2f saving %.2f ms (%.0f %% of frame) knocked draws/frame %.1f "
+                "hangs %u%s%s\n", i, (unsigned long long)g_ab.cand[i].key, g_ab.cand[i].label, k->med, g_ab.save[i],
                 ok && base > 0 ? 100.0 * g_ab.save[i] / base : 0.0, k->ends ? (double)k->dc[5] / (double)k->ends : 0.0,
-                k->hangs, ok ? "" : " (a window had too few frames: not used)");
+                k->hangs, k->fallback || b0->fallback || b1->fallback ? " (FALLBACK to union in a window)" : "",
+                ok ? "" : " (a window had too few frames: not used)");
+        ab_out("[abtest] knock %d key=%016llx union med %.2f saving %.2f ms (secondary, for comparison)\n", i,
+                (unsigned long long)g_ab.cand[i].key, k->umed, g_ab.usave[i]);
     }
 }
 static void ab_knock_tick(double now, uint32_t frame, uint32_t f, double uni, double ex) {
@@ -2344,8 +2370,9 @@ static void ab_knock_tick(double now, uint32_t frame, uint32_t f, double uni, do
     } else {
         if (g_ab.nbase < kAbBaseMax) g_ab.base[g_ab.nbase] = res;
         g_ab.nbase++;
-        ab_out("[abtest] knock baseline %d union med %.2f mean %.2f frames %u hangs %u%s\n", g_ab.nbase - 1, res.med,
-                res.mean, res.n, res.hangs, res.valid ? "" : " (too few frames)");
+        ab_out("[abtest] knock baseline %d excl med %.2f (%u frames) | union med %.2f mean %.2f (%u frames) hangs %u%s%s\n",
+                g_ab.nbase - 1, res.med, res.xn, res.umed, res.mean, res.n, res.hangs,
+                res.fallback ? " (FALLBACK: not used)" : "", res.valid ? "" : " (too few frames)");
         if (g_ab.nbase >= 2) ab_knock_report_group(g_ab.nbase - 2);
     }
     if (++g_ab.step < g_ab.nsteps) { ab_knock_window_begin(now); return; }
@@ -2358,7 +2385,7 @@ static void ab_knock_tick(double now, uint32_t frame, uint32_t f, double uni, do
 static void ab_opts_verdict(void) {
     g_ab.verdict_done = 1;
     // Noise: a robust sigma of one window's median from the pairwise differences between rounds of the same config,
-    // |x_i - x_j| / sqrt 2 (no self-differences: those are zero), median over every pair of every config (up to 15);
+    // |x_i - x_j| / sqrt 2 (no self-differences: those are zero), median over every pair of every config (up to 12);
     // noise = max(0.30 ms, 1.5 x sigma). SAVES / WORSE also need every valid round to agree on the sign.
     double pd[kAbCfgs * kAbRounds * (kAbRounds - 1) / 2];
     int npd = 0;
@@ -2374,11 +2401,14 @@ static void ab_opts_verdict(void) {
     g_ab.bad_bits = 0;
     ab_out("[abtest] VERDICT noise %.2f ms (sigma %.3f ms from %d round pairs); SAVES = gain > %.2f ms and > 0.25 ms "
             "with every round > 0; WORSE = gain < -%.2f ms with every round < 0\n", noise, sigma, npd, 2 * noise, 2 * noise);
-    for (int b = 0; b < 3; b++) {
+    ab_out("[abtest] VERDICT %s: not tested since test v3 (Logs_Alyx_36: WORSE by 2.5 ms of union, exclusive unchanged); never applied\n",
+           k_ab_bit[1]);
+    for (int j = 0; j < 2; j++) {
+        const int b = k_ab_tbit[j], cb = 2 + j;   // the bit and the config without it
         double g[kAbRounds], gc[kAbRounds];
         int ng = 0;
         for (int r = 0; r < kAbRounds; r++)
-            if (g_ab.opt[r][1].valid && g_ab.opt[r][2 + b].valid) g[ng++] = g_ab.opt[r][2 + b].med - g_ab.opt[r][1].med;
+            if (g_ab.opt[r][1].valid && g_ab.opt[r][cb].valid) g[ng++] = g_ab.opt[r][cb].med - g_ab.opt[r][1].med;
         memcpy(gc, g, sizeof gc);
         double gain = ng ? ab_median(gc, ng) : 0;
         int allpos = ng > 0, allneg = ng > 0;
@@ -2426,7 +2456,7 @@ static void ab_opts_verdict(void) {
                 nt++;
             }
         double gain = ab_median(t, nt), mo = ab_median(off, nt), ma = ab_median(all, nt);
-        ab_out("[abtest] VERDICT total ALL vs OFF: %s %.2f ms (per round:%s; union median OFF %.2f, ALL %.2f, %d rounds)\n",
+        ab_out("[abtest] VERDICT total ALL vs OFF: %s %.2f ms (per round:%s; exclusive median OFF %.2f, ALL %.2f, %d rounds)\n",
                 !nt ? "UNMEASURED" : gain > 2 * noise && gain > 0.25 && allpos ? "SAVES"
                     : gain < -2 * noise && allneg ? "WORSE" : "NO EFFECT",
                 gain, nt ? per : " none", mo, ma, nt);
@@ -2445,7 +2475,7 @@ static void ab_opts_verdict(void) {
                     "counters per frame: indirect-count over-encoding %.0f %%\n", (double)calls / ends, (double)enc / ends,
                     (double)real / ends, real ? 100.0 * ((double)enc - (double)real) / (double)real : 0.0);
     }
-    unsigned m = (g_ab.def_mask | g_ab.save_bits) & ~g_ab.bad_bits;
+    unsigned m = (g_ab.def_mask | g_ab.save_bits) & ~g_ab.bad_bits & ~2u;
     ab_out("[abtest] VERDICT mask after the test: %u (default %u, + SAVES %u, - WORSE/BREAKS %u)\n", m, g_ab.def_mask,
             g_ab.save_bits, g_ab.bad_bits);
 }
@@ -2464,13 +2494,13 @@ static void ab_finish(double now) {
         for (int i = 0; i < ni; i++)
             for (int j = i + 1; j < ni; j++)
                 if (g_ab.save[idx[j]] > g_ab.save[idx[i]]) { int tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp; }
-        ab_out("[abtest] VERDICT knockout (mask %u, baseline union median %.2f ms): %d of %d candidates measured\n",
+        ab_out("[abtest] VERDICT knockout (mask %u, baseline exclusive median %.2f ms): %d of %d candidates measured\n",
                 g_ab.def_mask, bavg, ni, g_ab.nc);
         for (int k = 0; k < ni && k < 10; k++) {
             int i = idx[k];
-            ab_out("[abtest] VERDICT knockout #%d: key=%016llx %s compute=%d saves %.2f ms (%.0f %% of frame), %.1f draws/frame\n",
-                    k + 1, (unsigned long long)g_ab.cand[i].key, g_ab.cand[i].label, g_ab.cand[i].compute, g_ab.save[i],
-                    bavg > 0 ? 100.0 * g_ab.save[i] / bavg : 0.0,
+            ab_out("[abtest] VERDICT knockout #%d: key=%016llx %s compute=%d saves %.2f ms excl (%.0f %% of frame; union %.2f), "
+                    "%.1f draws/frame\n", k + 1, (unsigned long long)g_ab.cand[i].key, g_ab.cand[i].label, g_ab.cand[i].compute,
+                    g_ab.save[i], bavg > 0 ? 100.0 * g_ab.save[i] / bavg : 0.0, g_ab.usave[i],
                     g_ab.census_frames ? (double)g_ab.cand[i].draws / (double)g_ab.census_frames : 0.0);
         }
     }
@@ -2488,7 +2518,7 @@ static void ab_finish(double now) {
         if (!dir || !*dir) dir = getenv("KL_CAPTURE_DIR");
         for (int k = 0; k < ni && k < 3; k++) {
             int i = idx[k];
-            if (g_ab.save[i] < 0.5) break;
+            if (g_ab.save[i] < 0.3) break;   // exclusive saving
             if (!ab_dump_msl)
                 ab_out("[abtest] msl key=%016llx skipped: no vpgpu_metal2_dump_pipeline_msl (patch 0039 missing)\n",
                         (unsigned long long)g_ab.cand[i].key);
@@ -2500,7 +2530,7 @@ static void ab_finish(double now) {
                         ab_dump_msl(g_ab.cand[i].key, dir), dir);
         }
     }
-    unsigned final_mask = (g_ab.def_mask | g_ab.save_bits) & ~g_ab.bad_bits;
+    unsigned final_mask = (g_ab.def_mask | g_ab.save_bits) & ~g_ab.bad_bits & ~2u;
     ab_apply(final_mask);
     ab_out("[abtest] final mask %u:%s%s%s%s (default %u + SAVES %u - WORSE/BREAKS %u; kept for the session); the test took "
             "%.0f s\n", final_mask, final_mask & 1u ? " producer-waits" : "", final_mask & 2u ? " clear-skip" : "",
@@ -2597,7 +2627,7 @@ static void ab_tick(uint32_t frame, int timing) {
             return;
         }
         g_ab.t_start = now;
-        ab_out("[abtest] starting %.1f s after the first frame; default mask %u (VPVK_RUNTIME_OPTS & 3%s): the census, "
+        ab_out("[abtest] starting %.1f s after the first frame; default mask %u (VPVK_RUNTIME_OPTS & 1%s): the census, "
                 "the knockout and pauses run at it; details/MSL dumps %s/%s\n", now - g_ab.t_first, g_ab.def_mask,
                 g_ab.def_mask & 4u ? ", KL_EYE_TRIM" : "", ab_census_detail ? "yes" : "no", ab_dump_msl ? "yes" : "no");
         ab_census_begin(now);
