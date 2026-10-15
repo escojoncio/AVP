@@ -110,6 +110,16 @@ struct AVPSettingsView: View {
             }
             .pickerStyle(.segmented)
             Toggle(AVPL("Oclusión ambiental (SSAO)", "Ambient occlusion (SSAO)"), isOn: $s.ssao)
+            Picker(AVPL("Antialiasing (MSAA)", "Antialiasing (MSAA)"), selection: $s.msaa) {
+                Text(AVPL("No", "Off")).tag(0)
+                Text("x2").tag(2)
+                Text("x4").tag(4)
+            }
+            if s.msaa == 0 {
+                Text(AVPL("Sin MSAA no se aplica el foveado.", "Without MSAA foveation is not applied."))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
         } header: {
             Text(AVPL("Texturas y efectos", "Textures and effects"))
         } footer: {

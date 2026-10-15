@@ -1667,9 +1667,9 @@ static id kl_rce(id self, SEL sel, MTLRenderPassDescriptor *d) {
             int srgb1x = srgb1x_on > 0 && !dt && ct && ct.sampleCount == 1 && ct.width >= 1024 && d.renderTargetArrayLength == 2 &&
                          (ct.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB || ct.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB) &&
                          d.colorAttachments[0].loadAction == MTLLoadActionLoad;
-            if (t && (t.sampleCount >= 4 || scene1x || srgb1x) && t.width >= 1024) {
+            if (t && (t.sampleCount >= 2 || scene1x || srgb1x) && t.width >= 1024) {
                 static int said1x, saidSrgb;
-                if (scene1x && t.sampleCount < 4 && said1x < 4) {
+                if (scene1x && t.sampleCount < 2 && said1x < 4) {
                     said1x++;
                     fprintf(stderr, "[vrr] foveating a 1x layered pass with depth (overlays after the resolve): colour fmt %lu, "
                             "depth fmt %lu, %lux%lu x%lu, load %lu\n", ct ? (unsigned long)ct.pixelFormat : 0ul,
@@ -1722,7 +1722,7 @@ static id kl_rce(id self, SEL sel, MTLRenderPassDescriptor *d) {
         }
         if (role == 0 && g_vrr_mode == 2 && on && !d.rasterizationRateMap) {
             id<MTLTexture> t = d.colorAttachments[0].texture ? d.colorAttachments[0].texture : d.depthAttachment.texture;
-            if (t && t.sampleCount >= 4 && t.width >= 1024) {
+            if (t && (t.sampleCount >= 4 || (t.sampleCount >= 2 && d.renderTargetArrayLength == 2)) && t.width >= 1024) {
                 NSUInteger layers = d.renderTargetArrayLength > 1 ? d.renderTargetArrayLength : 1;
                 // The map covers the render area (the eye textures are allocated at the largest
                 // fidelity level's size and rendered in their top-left corner).

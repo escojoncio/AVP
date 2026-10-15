@@ -4,7 +4,7 @@ Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). To
 descarga → conversión ELF→Mach-O (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `vpkengine.ref` + `vpkengine-patches/`
 0011–0040 (CI: `scripts/apply-vpkengine-patches.sh`; un parche nuevo = fichero `00NN-*.patch` en esa carpeta, generado
-con `git format-patch` sobre ref+parches). Sin MetalFX, sin MoltenVK (solo referencia), sin LOD/cull que cambie lo
+con `git format-patch` sobre ref+parches). Sin MetalFX, MoltenVK solo como motor de prueba (B53), sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
 IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B52**, compilada OK).
@@ -180,12 +180,37 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
 - Regulador: bajar a 30 en ~0,3 s (primeros frames tarde) y volver a 45 solo tras ~15 s holgados. La resolución
   dinámica (auto-fidelity de Alyx) se quitó porque rompía el foveado (mapa fijo al lanzar): rehacerla = trabajo grande.
 
-## PRÓXIMA BUILD (pedido del usuario)
-- Limpieza de opciones del menú: dejar solo las útiles/necesarias (quitar: test A/B, ojos sin copia, post al área
-  física, Hz al juego, arranque anticipado, orden por recursos, oclusión medida, amplificación…: fijar sus valores
-  validados en código) y REGENERAR la configuración guardada (UserDefaults `avp.*`: versión de esquema → valores por
-  defecto) dejando activado solo lo necesario: «Medir GPU por pase» y «Capturas» OFF por defecto.
-- Validar B52 con su log: fallback 30 a 90 Hz en nivel, `refreshes per picture` estable, sombras con bit0 off.
+## Logs_Alyx_41 (B52, 70 %) — «a 70 % va peor que a 80 %»
+- Sombras tarde: el usuario probó oclusión medida OFF → no es eso, es del propio juego. Oclusión queda ON.
+- A 70 % la GPU cabe en la base (juego 12–15 ms de 22,2) → el regulador (solo mira tiempo de GPU) sube a 45, pero el
+  compositor recibe 16–20 imágenes nuevas/0,5 s en vez de 22 (~36 fps, alternando 2 y 3 refrescos): `[passes]` W4/W5
+  busy 12 ms con span 34 ms (GPU ociosa 21 ms dentro del frame: CPU/orden, no trabajo de GPU). A 80 % la GPU no cabía
+  → se quedaba en 30 estable. Causa: el regulador no veía frames entregados tarde por causas ajenas a la GPU.
+
+## B53 (pendiente de compilar/validar)
+- `klvr_platform_klepton.c` `pace_governor`:
+  - bajada rápida: ≥0,3 s y ≥10 frames con >40 % tarde por GPU **o** >25 % de imágenes entregadas tarde;
+  - cadencia real: dt entre llamadas a `klvr_plat_wait_frame` >1,25 periodos base (y <3 periodos; >250 ms ignorado)
+    = refresco perdido; >15 % en la ventana de 1 s → fallback;
+  - vuelta a la base: `need_s` ventanas seguidas <80 % del presupuesto con ≤3 % tarde (mín. 1 frame); `need_s` =
+    15 s, se dobla (máx. 120) si la base falla en <20 s, vuelve a 15 tras 60 s aguantando;
+  - log: «N of M pictures missed their refresh; next return to the base after X s».
+- `kl_gpu_time.m`: mapa de foveado también con MSAA x2 (≥4, o ≥2 si `renderTargetArrayLength == 2`).
+- App (`AVPSettings.swift`, `AVPSettingsView.swift`, `AVPLaunch.swift`):
+  - esquema `avp.schema` = 53: borra una vez los `avp.*` salvo `keptKeys` (bookmark, signatureVariant, prepared) y
+    los personales (idioma, movimiento, subtítulos, altura, dedos, nube, FPS);
+  - presets de imagen M2 / M5 / Personalizado (`preset`, `applyPreset`, `graphicsChanged` pasa a Personalizado al
+    tocar a mano). M2 = valores de Logs_Alyx_40 con resolución 70 %: tex 2048, foveado ON 70°/10 %, VPKTAA 100 %/1.0,
+    aniso 16, MSAA 4, SSAO ON. **M5 = igual que M2 hasta medirlo en un M5**;
+  - MSAA No/x2/x4 (`msaa`, `avp.msaa`, `gameMSAA`); sin MSAA no hay foveado (`foveationUsable` gobierna también recon,
+    `applyLive` y `foveation_mode`);
+  - motor VPKEngine / MoltenVK (prueba) (`avp.engine`): con MoltenVK `selectDriver` no carga VPVulkan; env
+    `KL_VK_MERGE(_VIS)=1`, `KL_VK_CLEAR_NEW=0`, `KL_LOG_TAG=moltenvk`, sin caché de pipelines de VPKEngine. Cambiar de
+    motor = cerrar la app del todo. Con MoltenVK el regulador usa tiempo «union» (~2×) → probablemente fijo en 30;
+  - Diagnóstico solo: Capturas (OFF), Medir GPU por pase (OFF), Oclusión medida (ON), motor. Quitados del menú con
+    valor fijo: orden por recursos ON, amplificación ON, ojos sin copia OFF, arranque anticipado 9 ms, test A/B OFF,
+    Hz al juego medido, post al área física **ON**.
+- Validar con log: líneas del regulador (sin bailes 45↔30), MSAA x2 con foveado correcto, MoltenVK arranca.
 
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su

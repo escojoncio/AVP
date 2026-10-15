@@ -253,8 +253,18 @@ static void pace_governor(void) {
         started = 1; g_pace_extra = 1; kl_guest_pace_extra(1);
         fprintf(stderr, "  [openvr] pace governor: starting at the fallback, %.1f fps\n", fb);
     }
-    static double t0, sum;
-    static int n, late, over, good, nexcl;
+    static double t0, sum, prev_call, base_since, need_s = 15;
+    static int n, late, over, good, nexcl, clate, nc;
+    // Build 53 (Logs_Alyx_41, 70 %): at the base the GPU fit (12-15 ms of 22.2) yet the compositor got 16-20 new
+    // pictures per 0.5 s instead of 22: frames spanned 34 ms with the GPU idle 21 ms inside (CPU / ordering, not GPU
+    // work), so the GPU-only test never saw them late and the game sat at ~36 fps, alternating 2 and 3 refreshes.
+    // The time between two wait_frame calls is the frame actually delivered: one past 1.25 base periods missed its
+    // refresh, whatever the cause. Hitches past 3 periods (streaming, shader builds) and loads (> 250 ms) do not count.
+    {
+        double tc = klvr_plat_now(), dtc = prev_call > 0 ? (tc - prev_call) * 1000.0 : 0;
+        prev_call = tc;
+        if (dtc > 0 && dtc < 250.0) { nc++; if (!g_pace_extra && dtc > 1.25 * 1000.0 / base && dtc < 3.0 * 1000.0 / base) clate++; }
+    }
     if (game > 0) {
         // The compositor draws once per panel refresh; at the fallback pace a frame
         // holds more refreshes than at the base, so scale its share to the base frame.
@@ -270,11 +280,11 @@ static void pace_governor(void) {
     if (!t0) t0 = now;
     // Build 53 (Logs_Alyx_40): at the base, a burst of late frames used to wait for the 1 s window (and two of them)
     // while the picture alternated 2 and 3 refreshes. Drop as soon as 0.3 s hold 10+ frames with over 40 % late.
-    int fast = !g_pace_extra && now - t0 >= 0.3 && n >= 10 && late > 0.40 * n;
+    int fast = !g_pace_extra && now - t0 >= 0.3 && ((n >= 10 && late > 0.40 * n) || (nc >= 10 && clate > 0.25 * nc));
     if (!fast && now - t0 < 1.0) return;
     double avg = n ? sum / n : 0;
-    int nl = late, nn = n, ne = nexcl;
-    t0 = now; sum = 0; n = 0; late = 0; nexcl = 0;
+    int nl = late, nn = n, ne = nexcl, ncl = clate, ncc = nc;
+    t0 = now; sum = 0; n = 0; late = 0; nexcl = 0; clate = 0; nc = 0;
     if (!nn) return;
     unsigned want = g_pace_extra;
     // Build 31 (Logs 22): at 100 Hz the choice is 50 or 33 and nothing between. The base was left after ONE
@@ -302,7 +312,9 @@ static void pace_governor(void) {
         double lim_ok = ne > nn / 2 ? 0.03 * nn : 0.08 * nn;
         if (lim_ok < 1.0) lim_ok = 1.0;              // ~33 frames a window: 3 % would mean zero late frames
         good = (avg < 0.80 * 1000.0 / base && nl <= lim_ok) ? good + 1 : 0;
-        if (good >= 15) want = 0;
+        if (good >= need_s) want = 0;
+    } else if (ncc >= 10 && ncl > 0.15 * ncc) {     // at the base, pictures missing their refresh
+        want = 1;
     } else if (ne > nn / 2) {                        // at the base, exclusive time
         over = (avg > 0.95 * 1000.0 / base || nl > 0.25 * nn) ? over + 1 : 0;
         if (over >= 2 || nl > 0.40 * nn) want = 1;
@@ -319,6 +331,13 @@ static void pace_governor(void) {
     }
     if (want != g_pace_extra) {
         said_at = now;
+        // Back-off: a base that fails within 20 s of coming back doubles the wait for the next try (15 -> 120 s);
+        // one that holds 60 s resets it.
+        if (want && base_since > 0) need_s = now - base_since < 20.0 ? (need_s * 2 > 120 ? 120 : need_s * 2) : now - base_since >= 60.0 ? 15 : need_s;
+        base_since = want ? 0 : now;
+        if (want)
+            fprintf(stderr, "  [openvr] pace governor: %d of %d pictures missed their refresh; next return to the base after %.0f s\n",
+                    ncl, ncc, need_s);
         fprintf(stderr, "  [openvr] pace governor: GPU %.2f ms per %.0f fps frame (%s; %d of %d frames late) -> %s\n", avg, base,
                 ne > nn / 2 ? "exclusive" : "union", nl, nn, want ? "fallback pace, top quality kept" : "base pace");
         g_pace_extra = want;
