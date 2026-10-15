@@ -7,7 +7,7 @@ juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `v
 con `git format-patch` sobre ref+parches). Sin MetalFX, MoltenVK solo como fallback automático, sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B54**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B56**, compilada OK).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -242,7 +242,7 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
   (`frameRate`, `avp.fps`, por defecto Auto). Auto: vuelta tras 10 s <85 % con ≤5 % tarde, back-off 10→120 s.
   `klvr_plat_pace_hz` activo en modos 1 y 2; `klvr_plat_gpu_report_scale` usa la base en modo 0.
 
-## B56
+## B56 (compilada OK, pendiente de validar)
 - Ajustes: selectores segmentados con título visible (VStack Text + Picker `.labelsHidden()`); pies explicativos
   (fotogramas: visor siempre 90/100 Hz, cabeza reproyectada; MSAA/aniso/SSAO). B55 salió sin títulos (no usar).
 - Manos: `klvr_plat_hand_raw` adelanta la pose (refrescos−1)/2 periodos de panel (30/33: +1, 45/50: +0,5) al centro
