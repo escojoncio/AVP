@@ -7,7 +7,7 @@ juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `v
 con `git format-patch` sobre ref+parches). Sin MetalFX, MoltenVK solo como fallback automático, sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B56**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B57**, compilada OK).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -257,7 +257,7 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
   critical)` sin nadie que actúe (Source 2 no registra low-memory); footprint 6,44→6,55 GB al cargar zona tras
   autoguardados, avail 1,6 GB. Footprint ~6–6,5 GB ya en B52 (log 40, mismo aviso). MSAA 4 (preset M2).
   La sesión de las 20:10 terminó con `_exit(0)` del juego (normal).
-- B57: `kl_libc.c` guarda el nivel de presión del SO (`kl_mem_os_level`, `_t`); `kl_app.c` `mem_relief_tick`
+- B57 (compilada OK): `kl_libc.c` guarda el nivel de presión del SO (`kl_mem_os_level`, `_t`); `kl_app.c` `mem_relief_tick`
   (hilo heartbeat): `malloc_zone_pressure_relief` cada 15 s con presión del SO (últimos 30 s) o cada 60 s con
   avail < 1 GB; log `[mem] relief (...)`. Cada 30 s `[mem] breakdown: footprint = Metal objects + rest; growth
   MB/min` (`kl_metal_allocated_bytes` en `kl_gpu_time.m`). Pendiente según el desglose: si pesa Metal/texturas →
