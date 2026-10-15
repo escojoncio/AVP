@@ -7,7 +7,7 @@ juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `v
 con `git format-patch` sobre ref+parches). Sin MetalFX, MoltenVK solo como fallback automático, sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B57**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B58**, compilada OK).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -268,7 +268,7 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
   1,55–1,85 GB; sin fuga (meseta). Presión «system critical» casi continua; `malloc_zone_pressure_relief` devolvió
   0 MB siempre (se deja por decisión del usuario).
 - Corrección log 46: el cierre de 20:18:07 fue SIGABRT en `librendersystemvulkan.so` (hilo de trabajo), no jetsam.
-- B58 (pendiente de compilar):
+- B58 (compilada OK, pendiente de validar):
   - VPKEngine 0041 (`vk.fail ...`): fallos de vkAllocateMemory/bind/arenas/pipelines/fences/DEVICE_LOST con tamaño,
     resultado, footprint/avail; gpu.err limitados por potencias de 2. Bind con Metal rechazado se registra pero sigue
     devolviendo VK_SUCCESS (como antes, para no provocar abortos nuevos).
