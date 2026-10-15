@@ -51,6 +51,9 @@ final class AVPSettings: ObservableObject {
     @Published var showFps: Bool { didSet { save() } }
     /// Ambient occlusion (r_ssao). On by default on every headset: fidelity is kept, performance comes from resolution.
     @Published var ssao: Bool { didSet { graphicsChanged() } }
+    /// Build 53: the game's MSAA (0 off, 2, 4). Foveation needs an MSAA scene target to find the eye passes, so with
+    /// MSAA off it is not applied.
+    @Published var msaa: Int { didSet { graphicsChanged() } }
     /// Build 27 (VPKEngine 0031): command buffers wait only on the previous ones they really depend on (VP_CB_ORDER=2)
     /// instead of all of them (0029, VP_CB_ORDER=1). Logs 23: a whole session with it, no hang, no vertex explosion,
     /// out_of_order=0 → on by default since build 32. If vertex explosions come back, turn it off.
@@ -130,7 +133,7 @@ final class AVPSettings: ObservableObject {
         guard preset != .custom else { return }
         applyingPreset = true
         renderPercent = 70; textureCap = 2048; foveationOn = true; wideDegrees = 70; periphery = 0.10
-        vpktaa = true; vpktaaPercent = 100; vpktaaSharpness = 1.0; anisotropy = 16; ssao = true
+        vpktaa = true; vpktaaPercent = 100; vpktaaSharpness = 1.0; anisotropy = 16; msaa = 4; ssao = true
         applyingPreset = false
     }
     /// Keys the B53 wipe and Restablecer keep (paths, signing, preparation state).
@@ -180,6 +183,7 @@ final class AVPSettings: ObservableObject {
         systemLanguage = d.object(forKey: "avp.sysLang") as? Bool ?? true
         showFps = d.object(forKey: "avp.showFps") as? Bool ?? false
         ssao = d.object(forKey: "avp.ssao") as? Bool ?? true
+        msaa = [0, 2, 4].contains(d.integer(forKey: "avp.msaa")) && d.object(forKey: "avp.msaa") != nil ? d.integer(forKey: "avp.msaa") : 4
         trackedOrder = d.object(forKey: "avp.cbOrder2c") as? Bool ?? true
         diagCaptures = d.object(forKey: "avp.diagCaptures") as? Bool ?? false
         gpuPassProfiling = d.object(forKey: "avp.gpuPasses2") as? Bool ?? false
@@ -217,6 +221,7 @@ final class AVPSettings: ObservableObject {
         d.set(systemLanguage, forKey: "avp.sysLang")
         d.set(showFps, forKey: "avp.showFps")
         d.set(ssao, forKey: "avp.ssao")
+        d.set(msaa, forKey: "avp.msaa")
         d.set(trackedOrder, forKey: "avp.cbOrder2c")
         d.set(diagCaptures, forKey: "avp.diagCaptures")
         d.set(gpuPassProfiling, forKey: "avp.gpuPasses2")
@@ -247,7 +252,7 @@ final class AVPSettings: ObservableObject {
         renderPercent = fresh.renderPercent; textureCap = fresh.textureCap
         foveationOn = fresh.foveationOn; wideDegrees = fresh.wideDegrees; periphery = fresh.periphery
         vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
-        anisotropy = fresh.anisotropy; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao
+        anisotropy = fresh.anisotropy; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao; msaa = fresh.msaa
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
         postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; occlusionQueries = fresh.occlusionQueries
@@ -291,8 +296,10 @@ final class AVPSettings: ObservableObject {
     /// (kl_eye_recon, KL_CP_RECON) where the foveated eye is magnified. The temporal VPKTAA (KleptonTAA, 1x game,
     /// jitter) stays off until it has a linearised depth and camera motion from depth + pose.
     var temporalTAA: Bool { false }
-    var reconActive: Bool { vpktaa && foveationOn }
-    var gameMSAA: Int { temporalTAA ? 0 : 4 }
+    /// Foveation needs an MSAA scene target to find the eye passes (kl_gpu_time.m): off with MSAA off.
+    var foveationUsable: Bool { gameMSAA >= 2 && foveationOn }
+    var reconActive: Bool { vpktaa && foveationUsable }
+    var gameMSAA: Int { temporalTAA ? 0 : msaa }
     /// The periphery's shading rate: 10 % (the P.T. setting) to 65 % (an M5 has room for it).
     static let peripheryRange: ClosedRange<Double> = 0.10...0.65
     /// The texture streaming pool for the chosen maximum texture size (it used to be a separate stepper nobody could
@@ -510,7 +517,6 @@ final class AVPSettings: ObservableObject {
         // an MSAA eye-size target. At 1x (build 19) only layered depth passes could be told apart and the colour-only
         // eye passes landed unfoveated on a foveated picture; with the game's MSAA 4x on every engine, every scene
         // pass carries the MSAA target, as in MoltenVK's validated runs.
-        let foveationUsable = gameMSAA >= 4 && foveationOn
         if foveationUsable {
             env += [("KL_VRR", "1"), ("KL_VRR_MAP", "wide"), ("KL_VRR_EDGE", String(format: "%.3f", periphery)),
                     ("KL_VRR_WIDE_DEG", String(format: "%.0f", wideDegrees))]
@@ -688,7 +694,7 @@ end, nil)
         KleptonTAA.reloadSettings(percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
         KleptonCompositor.setPeripheryRecon(on: reconActive, percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
         // On/off needs a restart (the scene-pass hook is installed at start); the periphery is live.
-        if foveationOn {
+        if foveationUsable {
             kl_vrr_set(2, -1, -1, Float(periphery))
             // The round sharp zone follows the map, at its live periphery (degrees stay the launch's).
             KleptonCompositor.setRoundFovea(on: Self.roundSharpZone, degrees: nil, edge: Float(periphery))
@@ -699,7 +705,7 @@ end, nil)
 
     func applyToVPKEngine() {
         var c = avp_gfx_config()
-        c.foveation_mode = foveationOn ? 1 : 0   // 1 = the wide map (what the M2 preset was)
+        c.foveation_mode = foveationUsable ? 1 : 0   // 1 = the wide map (what the M2 preset was)
         c.sharp_zone = 0.18
         c.periphery = Float(periphery)
         c.transition = 0.32
