@@ -166,6 +166,13 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
 - Pendiente: con la GPU al 100 %; sin bajar carga (resolución/MSAA) solo queda elegir entre 45
   con baile o 30 estable. Validar sombras con bit0 off.
 
+## Logs_Alyx_39 (B52, 80 %, post al área física ON, medir GPU/capturas OFF)
+- Fallback a 30 fps a 90 Hz funciona (pace plan: base 45, fallback 30). Pero el regulador alterna 45↔30 seis veces
+  en ~3 min (vuelve a 45 tras 5 s por debajo del 85 %): hacerlo más pegajoso a 90 Hz (p. ej. volver tras 15 s < 80 %).
+- Térmico: nominal 16:47:12 → fair 16:52:37 (5 min 25 s) → **serious 16:54:57 (7 min 45 s)**; fin del log 16:55:13.
+- Juego en nivel 25–33 ms (picos al tener un objeto delante de la cara: relleno de píxeles), menú/zonas ligeras 13–17.
+- Post al área física: sin quejas visuales (sin medida de ahorro: medir GPU OFF).
+
 ## PRÓXIMA BUILD (pedido del usuario)
 - Limpieza de opciones del menú: dejar solo las útiles/necesarias (quitar: test A/B, ojos sin copia, post al área
   física, Hz al juego, arranque anticipado, orden por recursos, oclusión medida, amplificación…: fijar sus valores
