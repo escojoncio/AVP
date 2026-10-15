@@ -440,6 +440,8 @@ final class AVPSettings: ObservableObject {
             // Build 31: MSAA scene targets resolve from tile instead of storing every sample (VPKEngine 0034).
             ("VP_MSAA_TILE", Self.msaaOnTile ? "1" : "0"),
             ("VP_CB_ORDER", trackedOrder ? "2" : "1"),
+            // VPKEngine 0038/0039 runtime opts at start: bit 0 producer-only fence waits (Logs_Alyx_35: -1.5 ms in the menu at 80 %).
+            ("VPVK_RUNTIME_OPTS", "1"),
             // Build 32: exclusive per-encoder timing only with the per-pass profiling (it costs sample buffers on every
             // encoder); gpu.enc detail (tile=/mem= per attachment, VPKEngine 0035) every 3000 core frames (~20 s).
             ("VP_EXCL_TIMING", gpuPassProfiling ? "1" : "0"),
