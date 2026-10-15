@@ -3,11 +3,11 @@
 Half-Life: Alyx (build ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Todo en el visor: Steam oficial →
 descarga → conversión ELF→Mach-O (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → precompilado de pipelines →
 juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `vpkengine.ref` + `vpkengine-patches/`
-0011–0038 (CI: `scripts/apply-vpkengine-patches.sh`; un parche nuevo = fichero `00NN-*.patch` en esa carpeta, generado
+0011–0039 (CI: `scripts/apply-vpkengine-patches.sh`; un parche nuevo = fichero `00NN-*.patch` en esa carpeta, generado
 con `git format-patch` sobre ref+parches). Sin MetalFX, sin MoltenVK (solo referencia), sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B46b**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B47**, pendiente de compilar).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -76,6 +76,25 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
   HUD: línea amarilla con la fase y «TEST TERMINADO» (desaparece 60 s después). Capturas solo hasta el frame 120.
 - Validar con el log: `grep "\[abtest\]"`: ventanas, VERDICT (SAVES/NO EFFECT/WORSE/INACTIVE/BREAKS), top knockout,
   sobre-codificación indirect-count. Preguntar al usuario si vio fallos visuales y en qué fase del HUD.
+
+## Logs_Alyx_35 (B46b, 80 %, menú, 45 fps, panel 90 Hz) — primer test A/B
+- Esperas solo a productores (bit0): OFF 22,1/22,6/22,5 ms de span unión vs ALL 20,8/21,0/20,9 → **−1,5 ms**, sin
+  cuelgues. Ruido bimodal entre ventanas (~20,8 vs ~22,2) y paso a «thermal fair» a mitad: atribución por bit ruidosa.
+- Clear skip (bit1): 0 candidatos → bug: el atlas tiene render area 4096x4096 (Vulkan siempre la da) y se exigía 0.
+- Recorte de ojos (bit2): activo (182 copias/ventana) sin efecto medible.
+- Knockout (mask 0, 14/22: el usuario salió antes): **vk.pipe6857** (key 9c3c6a1c73ab3fe1, 12 draws/frame) **2,31 ms**
+  y **vk.pipe6965** (key b7bf7501c33cbd71, 15 draws/frame) **1,78 ms** = ~18 % del frame. El resto < 0,4 ms.
+- Indirect-count: 0 llamadas en el menú.
+
+## B47 — en la IPA, PENDIENTE DE VALIDAR
+- `0039`: clear skip acepta render area ≥ mip; censo con detalle (vs/fs/cs, encoder destino, verts·inst/frame) →
+  `vpgpu_metal2_census_detail`; `vpgpu_metal2_dump_pipeline_msl(key, dir)` escribe `shader-<key>-vs|fs|cs.metal`;
+  `VPVK_RUNTIME_OPTS` = máscara inicial.
+- App: `VPVK_RUNTIME_OPTS=1` siempre (esperas a productores por defecto).
+- Test: máscara por defecto (1) en pausa/knockout/final; final = defecto + SAVES − WORSE/BREAKS; veredicto de opts
+  impreso al acabar esa fase; ventanas 0,6 + 1,6 s; tras el knockout `[abtest] detail` de cada candidato y MSL de los
+  3 que más ahorran (≥ 0,5 ms) en la carpeta de logs (requiere «Capturas»); HUD con tiempo restante.
+- Validar: `[abtest] detail`/`msl` de pipe6857/pipe6965 → leer su MSL y su encoder destino para optimizarlos.
 
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su
