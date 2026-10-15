@@ -47,16 +47,17 @@ struct AVPSettingsView: View {
 
     // Build 32: one screen anyone can read. What a run showed to be the only sane value is no longer a setting
     // (AVPSettings: gpuQueueDepth, composeNewOnly, guestHz, roundSharpZone, msaaOnTile; dynamic resolution, the
-    // texture pool are gone). Build 53: picture presets M2/M5/Personalizado and a MoltenVK test engine are back.
+    // texture pool are gone). Build 53: picture presets M2/M5/Personalizado.
 
     private var picture: some View {
         Section {
             let eye = s.eyeSize
             Picker(AVPL("Preset", "Preset"), selection: $s.preset) {
-                Text("Vision Pro M2").tag(AVPSettings.Preset.m2)
-                Text("Vision Pro M5").tag(AVPSettings.Preset.m5)
+                Text("M2").tag(AVPSettings.Preset.m2)
+                Text("M5").tag(AVPSettings.Preset.m5)
                 Text(AVPL("Personalizado", "Custom")).tag(AVPSettings.Preset.custom)
             }
+            .pickerStyle(.segmented)
             Stepper(AVPL("Resolución: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) por ojo)",
                          "Resolution: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) per eye)"),
                     value: $s.renderPercent, in: 50...130, step: 5)
@@ -111,10 +112,9 @@ struct AVPSettingsView: View {
             .pickerStyle(.segmented)
             Toggle(AVPL("Oclusión ambiental (SSAO)", "Ambient occlusion (SSAO)"), isOn: $s.ssao)
             Picker(AVPL("Antialiasing (MSAA)", "Antialiasing (MSAA)"), selection: $s.msaa) {
-                Text(AVPL("No", "Off")).tag(0)
-                Text("x2").tag(2)
-                Text("x4").tag(4)
+                Text("Off").tag(0); Text("x2").tag(2); Text("x4").tag(4)
             }
+            .pickerStyle(.segmented)
             if s.msaa == 0 {
                 Text(AVPL("Sin MSAA no se aplica el foveado.", "Without MSAA foveation is not applied."))
                     .font(.footnote)
@@ -136,20 +136,23 @@ struct AVPSettingsView: View {
                    isOn: $s.systemLanguage)
             Picker(AVPL("Movimiento (jugador nuevo)", "Movement (new player)"), selection: $s.movement) {
                 Text(AVPL("Teletransporte", "Teleport")).tag(AVPSettings.Movement.teleport)
-                Text(AVPL("Continuo (cabeza)", "Continuous (head)")).tag(AVPSettings.Movement.continuousHead)
-                Text(AVPL("Continuo (mano)", "Continuous (hand)")).tag(AVPSettings.Movement.continuousHand)
+                Text(AVPL("Cabeza", "Head")).tag(AVPSettings.Movement.continuousHead)
+                Text(AVPL("Mano", "Hand")).tag(AVPSettings.Movement.continuousHand)
             }
+            .pickerStyle(.segmented)
             Picker(AVPL("Subtítulos", "Subtitles"), selection: $s.subtitles) {
-                Text(AVPL("Como el juego (abajo)", "As the game (bottom)")).tag(AVPSettings.SubtitlePlacement.game)
+                Text(AVPL("Abajo", "Bottom")).tag(AVPSettings.SubtitlePlacement.game)
                 Text(AVPL("Más arriba", "Higher")).tag(AVPSettings.SubtitlePlacement.higher)
-                Text(AVPL("A la altura de la vista", "At eye level")).tag(AVPSettings.SubtitlePlacement.eyeLevel)
-                Text(AVPL("Por encima de la vista", "Above eye level")).tag(AVPSettings.SubtitlePlacement.high)
+                Text(AVPL("A la vista", "Eye level")).tag(AVPSettings.SubtitlePlacement.eyeLevel)
+                Text(AVPL("Encima", "Above")).tag(AVPSettings.SubtitlePlacement.high)
             }
+            .pickerStyle(.segmented)
             Picker(AVPL("Tamaño de subtítulos", "Subtitle size"), selection: $s.subtitleSize) {
                 Text(AVPL("Pequeño", "Small")).tag(AVPSettings.SubtitleSize.small)
                 Text(AVPL("Medio", "Medium")).tag(AVPSettings.SubtitleSize.medium)
                 Text(AVPL("Grande", "Large")).tag(AVPSettings.SubtitleSize.large)
             }
+            .pickerStyle(.segmented)
             Stepper(AVPL("Altura del jugador: \(Int(s.heightOffsetCm)) cm", "Player height: \(Int(s.heightOffsetCm)) cm"),
                     value: $s.heightOffsetCm, in: -60...30, step: 5)
             Toggle(AVPL("Sincronizar partidas con Steam Cloud", "Sync saves with Steam Cloud"), isOn: $s.cloudSync)
@@ -167,14 +170,6 @@ struct AVPSettingsView: View {
             Toggle(AVPL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $s.diagCaptures)
             Toggle(AVPL("Medir el tiempo de GPU por pase", "Per-pass GPU timing"), isOn: $s.gpuPassProfiling)
             Toggle(AVPL("Occlusion culling medido (consultas de GPU)", "Measured occlusion culling (GPU queries)"), isOn: $s.occlusionQueries)
-            Picker(AVPL("Motor gráfico", "Graphics engine"), selection: $s.engine) {
-                Text("VPKEngine").tag(AVPSettings.Engine.vpkengine)
-                Text(AVPL("MoltenVK (prueba)", "MoltenVK (test)")).tag(AVPSettings.Engine.moltenvk)
-            }
-            Text(AVPL("Tras cambiar el motor, cierra la app del todo y vuelve a abrirla.",
-                      "After changing the engine, quit the app completely and open it again."))
-                .font(.footnote)
-                .foregroundStyle(.secondary)
             Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
                    role: .destructive) { confirmQuarantine = true }
                 .disabled(quarantined == 0)

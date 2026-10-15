@@ -420,6 +420,17 @@ final class KleptonCompositor {
     private var cadHist = [0, 0, 0, 0, 0, 0]       // build 42: composites by refreshes shown (index 1...5+)
     private var cadCount = 0
     private var skippedTotal = 0                   // for the liveness line
+    // Build 54 (Logs_Alyx_42/43): proof of what each panel refresh cost, one line every 5 s ("[cp] refreshes/s").
+    // Those logs read as ~70 composites/s against 30-45 game pictures/s, but the x70.4 was the first 30 s window
+    // (loading panel at the full panel rate, skip off while loading) and the 211x173/633x519 passes are the round
+    // fovea's wide view + its reconstruction, per EYE of each new picture (2 per composite). In game the composite
+    // count already equals the game's fps (refreshes per composited picture 2:250). This line splits it so no log
+    // has to be decoded again: composites of a NEW picture, recomposites of the SAME one (by why: skipMax cap,
+    // skip not allowed = loading/video/first picture, timing = no virtual refresh to skip on), black/loading,
+    // and refreshes left to visionOS (no frame queried, zero GPU).
+    private var acctNew = 0, acctSameCap = 0, acctSameNotAllowed = 0, acctSameTiming = 0, acctBlack = 0
+    private var acctSkipped = 0                    // skippedTotal at the window's start
+    private var acctSince = Date()
     // Build 27: a skipped refresh queries NO frame (skipRefreshIfSame). Its instants come from the last frame that
     // was queried (predictTiming) plus k display periods, and a refresh whose picture changed during the wait is
     // handed to the normal path with its pose still owed to the guest.
@@ -2025,6 +2036,7 @@ final class KleptonCompositor {
                       + (noFence ? " (NOFENCE)" : "") + skipNote)
                 NSLog("[cp] \(cadenceSummary())")
                 NSLog("[cp] \(stageSummary())")
+                logRefreshAccounting()
             }
         }
         NSLog("[cp] render loop ended after \(presented) presented frames, "
@@ -2301,6 +2313,26 @@ final class KleptonCompositor {
         Self.skipSameEnabled && !syncGuest && loggedFirstPicture && (loadingDone || !Self.loadingEnabled)
             && kl_loadingvideo_active() == 0 && loadingVideo == nil
             && lastPresentedPicture != 0 && skippedInARow < Self.skipMax
+    }
+
+    /// Build 54: every 5 s, what the panel refreshes cost (see acctNew). Every refresh is exactly one of: a composite
+    /// of a new picture, a recomposite of the same one (cap / not allowed / timing), a black or loading-panel
+    /// composite, or a refresh left to visionOS. "same" > 0 in game is GPU that could be saved; "new" ~ game fps.
+    private func logRefreshAccounting() {
+        let now = Date()
+        let span = now.timeIntervalSince(acctSince)
+        guard span >= 5 else { return }
+        let skipped = skippedTotal - acctSkipped
+        let same = acctSameCap + acctSameNotAllowed + acctSameTiming
+        let total = acctNew + same + acctBlack + skipped
+        func ps(_ n: Int) -> String { String(format: "%.1f", Double(n) / span) }
+        NSLog("%@", "[cp] refreshes/s: \(ps(total)) = composed new \(ps(acctNew)) + recomposed same \(ps(same))"
+              + " (cap \(ps(acctSameCap)), not allowed \(ps(acctSameNotAllowed)), timing \(ps(acctSameTiming)))"
+              + " + black/loading \(ps(acctBlack)) + left to visionOS \(ps(skipped))"
+              + " [skip \(Self.skipSameEnabled ? "on" : "off"), max \(Self.skipMax), loading \(loadingDone || !Self.loadingEnabled ? "done" : "on")]")
+        acctNew = 0; acctSameCap = 0; acctSameNotAllowed = 0; acctSameTiming = 0; acctBlack = 0
+        acctSkipped = skippedTotal
+        acctSince = now
     }
 
     /// The guest's newest complete picture is the one the last composite showed.
@@ -2882,8 +2914,22 @@ final class KleptonCompositor {
             cadCount = 0
         }
         // What this composite showed, for the next refresh's skip check (0: no guest picture, never skipped against).
-        lastPresentedPicture = encoded > 0 && haveRendered && completeStage >= 0
+        let shownPicture: UInt64 = encoded > 0 && haveRendered && completeStage >= 0
             ? Self.pictureId(completeStage, UInt64(rendered.serial)) : 0
+        // Build 54: account this composite (see acctNew). Classified before skippedInARow is reset: the cap reason
+        // needs it.
+        if encoded == 0 {
+            acctBlack += 1
+        } else if shownPicture == 0 || shownPicture != lastPresentedPicture {
+            acctNew += 1
+        } else if Self.skipSameEnabled && skippedInARow >= Self.skipMax {
+            acctSameCap += 1
+        } else if !skipAllowed() {
+            acctSameNotAllowed += 1
+        } else {
+            acctSameTiming += 1
+        }
+        lastPresentedPicture = shownPicture
         skippedInARow = 0
         frame.endSubmission()      // only here — see startSubmission above
         return encoded > 0 ? 1 : 0
