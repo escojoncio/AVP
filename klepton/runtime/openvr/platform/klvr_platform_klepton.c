@@ -200,17 +200,18 @@ int klvr_plat_mem_free_mb(void) {
     }
     return -1;
 }
+static int g_governor_on = -1;   // KLVR_PACE_FALLBACK (0 off, 1 auto, 2 fixed steady), read by pace_governor on its first call
 float klvr_plat_gpu_report_scale(void) {
     float base, fb;
     pace_plan(&base, &fb);
-    float s = (fb > 0 ? fb : base) / 60.0f;
+    // B55: with the governor off (frame rate "45/50") the game runs at the base: report against the base frame.
+    float s = (fb > 0 && __atomic_load_n(&g_governor_on, __ATOMIC_RELAXED) != 0 ? fb : base) / 60.0f;
     return s < 0.5f ? 0.5f : s > 1.0f ? 1.0f : s;
 }
-static int g_governor_on = -1;   // KLVR_PACE_FALLBACK, read by pace_governor on its first call
 int klvr_plat_pace_hz(float *base, float *current) {
     // Only with the governor running: without it nothing holds the game at a plan rate, and the shim's
     // measured rate (the behaviour before build 44) is the honest answer.
-    if (__atomic_load_n(&g_governor_on, __ATOMIC_RELAXED) != 1) return 0;
+    if (__atomic_load_n(&g_governor_on, __ATOMIC_RELAXED) < 1) return 0;   // 1 auto, 2 fixed steady
     float b, fb;
     pace_plan(&b, &fb);
     if (!(b > 0)) return 0;
@@ -222,9 +223,11 @@ static void pace_governor(void) {
     int on = __atomic_load_n(&g_governor_on, __ATOMIC_RELAXED);
     if (on < 0) {
         const char *e = getenv("KLVR_PACE_FALLBACK");
-        on = e && *e == '1';
+        // B55: the app's frame-rate choice. 0 = always the base (45/50, late frames reprojected), 1 = automatic,
+        // 2 = always the fallback (30/33, steady).
+        on = e && *e == '1' ? 1 : e && *e == '2' ? 2 : 0;
         __atomic_store_n(&g_governor_on, on, __ATOMIC_RELAXED);
-        if (on) fprintf(stderr, "  [openvr] pace governor: top quality at the slowest allowed pace, 60 when it fits\n");
+        if (on) fprintf(stderr, "  [openvr] pace governor: %s\n", on == 2 ? "fixed at the fallback pace (steady)" : "automatic");
     }
     if (!on) return;
     float base, fb;
@@ -236,6 +239,11 @@ static void pace_governor(void) {
                 base, fb, fb > 0 ? fb : base);
     }
     static int started;
+    if (on == 2) {                                   // fixed steady pace: the fallback whenever there is one
+        unsigned w = fb > 0;
+        if (g_pace_extra != w) { g_pace_extra = w; kl_guest_pace_extra(w); }
+        return;
+    }
     if (fb <= 0) {                                   // no slower pace to choose: stay at the base
         if (g_pace_extra) { g_pace_extra = 0; kl_guest_pace_extra(0); }
         started = 0;
@@ -253,7 +261,7 @@ static void pace_governor(void) {
         started = 1; g_pace_extra = 1; kl_guest_pace_extra(1);
         fprintf(stderr, "  [openvr] pace governor: starting at the fallback, %.1f fps\n", fb);
     }
-    static double t0, sum, prev_call, base_since, need_s = 15;
+    static double t0, sum, prev_call, base_since, need_s = 10;
     static int n, late, over, good, nexcl, clate, nc;
     // Build 53 (Logs_Alyx_41, 70 %): at the base the GPU fit (12-15 ms of 22.2) yet the compositor got 16-20 new
     // pictures per 0.5 s instead of 22: frames spanned 34 ms with the GPU idle 21 ms inside (CPU / ordering, not GPU
@@ -309,9 +317,11 @@ static void pace_governor(void) {
     // quiet second between two heavy ones no longer flips 30 <-> 45.
     if (fast) want = 1;
     else if (g_pace_extra) {
-        double lim_ok = ne > nn / 2 ? 0.03 * nn : 0.08 * nn;
-        if (lim_ok < 1.0) lim_ok = 1.0;              // ~33 frames a window: 3 % would mean zero late frames
-        good = (avg < 0.80 * 1000.0 / base && nl <= lim_ok) ? good + 1 : 0;
+        // B55 (Logs_Alyx_45, 100 Hz): with < 80 % and <= 3 % late the base never came back in 5 min (GPU 12-17 ms
+        // + compositor ~3 of 20): locked at 33. Now 10 s under 85 % with <= 5 % late; the back-off still doubles.
+        double lim_ok = ne > nn / 2 ? 0.05 * nn : 0.08 * nn;
+        if (lim_ok < 1.0) lim_ok = 1.0;
+        good = (avg < 0.85 * 1000.0 / base && nl <= lim_ok) ? good + 1 : 0;
         if (good >= need_s) want = 0;
     } else if (ncc >= 10 && ncl > 0.15 * ncc) {     // at the base, pictures missing their refresh
         want = 1;
@@ -331,9 +341,9 @@ static void pace_governor(void) {
     }
     if (want != g_pace_extra) {
         said_at = now;
-        // Back-off: a base that fails within 20 s of coming back doubles the wait for the next try (15 -> 120 s);
+        // Back-off: a base that fails within 20 s of coming back doubles the wait for the next try (10 -> 120 s);
         // one that holds 60 s resets it.
-        if (want && base_since > 0) need_s = now - base_since < 20.0 ? (need_s * 2 > 120 ? 120 : need_s * 2) : now - base_since >= 60.0 ? 15 : need_s;
+        if (want && base_since > 0) need_s = now - base_since < 20.0 ? (need_s * 2 > 120 ? 120 : need_s * 2) : now - base_since >= 60.0 ? 10 : need_s;
         base_since = want ? 0 : now;
         if (want)
             fprintf(stderr, "  [openvr] pace governor: %d of %d pictures missed their refresh; next return to the base after %.0f s\n",
