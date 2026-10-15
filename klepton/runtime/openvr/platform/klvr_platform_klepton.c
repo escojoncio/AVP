@@ -614,10 +614,23 @@ static float height_off(void) {
     }
     return atomic_load(&g_height_off);
 }
+// Build 58 (user report): the height was wrong seated and standing alike, and the manual offset could not fix it,
+// because the immersive-space origin is NOT reliably on the real floor (head Y 0.94 m seated and about the same
+// standing). KleptonFloor.swift measures the real floor (ARKit floor planes, same space as the head) and pushes its
+// Y here, already eased (it never jumps), from the compositor's render thread. The game's standing universe is then
+// head - floor, and the manual "Altura del jugador" stays as a fine trim on top. 0 = no floor known (feature off,
+// permission denied, nothing detected yet): exactly the B38 behaviour. Atomic: the game, input and compositor
+// threads all read it; no setenv at runtime.
+static _Atomic float g_floor_y;
+void klvr_plat_set_floor_y(float y) {
+    if (isfinite(y) && y > -5.0f && y < 5.0f) atomic_store(&g_floor_y, y);
+}
+// The vertical shift every pose the game sees gets (head and both hands alike, so the body stays one piece).
+float klvr_plat_height_shift(void) { return height_off() - atomic_load(&g_floor_y); }
 static void klvr_plat_head_raw(double t, klvr_tracked *out);
 void klvr_plat_head(double t, klvr_tracked *out) {
     klvr_plat_head_raw(t, out);
-    if (out->valid) out->pose.p[1] += height_off();
+    if (out->valid) out->pose.p[1] += klvr_plat_height_shift();
 }
 static void klvr_plat_head_raw(double t, klvr_tracked *out) {
     memset(out, 0, sizeof *out);
@@ -658,7 +671,7 @@ static double ctrl_grace(void) {
 static void klvr_plat_hand_raw(int hand, double t, klvr_tracked *out);
 void klvr_plat_hand(int hand, double t, klvr_tracked *out) {
     klvr_plat_hand_raw(hand, t, out);
-    if (out->valid) out->pose.p[1] += height_off();
+    if (out->valid) out->pose.p[1] += klvr_plat_height_shift();   // B58: the head's shift, so hands stay on the body
 }
 static void klvr_plat_hand_raw(int hand, double t, klvr_tracked *out) {
     memset(out, 0, sizeof *out);

@@ -713,7 +713,57 @@ static int configure_rest(const char *container) {
 // The file stays the default because it is what survives the process: an
 // unimplemented JNI call aborts by design, a launch from the Home View has no
 // console at all, and the in-window boot report is read back out of this path.
+#ifdef KL_APP_ALYX
+// The game's own console (-condebug: <KL_ALYX_GAME>/hlvr/console.log) starts over on every launch, so a
+// crash's last words were gone by the next one: the previous run's file is moved to
+// <log dir>/console-previous.log first (copied: the game folder can be on another volume than the logs),
+// only when it exists, so a launch that never reached the game keeps the last one. The fault handler
+// reads its tail on SIGABRT (kl_fault_set_console_path).
+// What happened goes into the boot log once it is open (g_console_note, printed by open_log).
+static char g_console_note[160];
+static void keep_previous_console(void) {
+    const char *g = getenv("KL_ALYX_GAME");
+    static char cur[1200];
+    char prev[1100];
+    if (!g || !*g || !*g_logdir) return;
+    if (snprintf(cur, sizeof cur, "%s/hlvr/console.log", g) >= (int)sizeof cur) return;
+    if (snprintf(prev, sizeof prev, "%s/console-previous.log", g_logdir) >= (int)sizeof prev) return;
+    kl_fault_set_console_path(cur);
+    struct stat st;
+    if (stat(cur, &st) != 0 || st.st_size <= 0) return;
+    // Build 58 (review): every way out below clears the current console.log, the failed copy included. The fault
+    // handler prints the tail of `cur` on a SIGABRT; a console left behind would show the PREVIOUS run's last lines
+    // as if they were this crash's.
+    long long copied = 0;
+    int ok = 0;
+    int in = open(cur, O_RDONLY);
+    char tmp[1120];
+    snprintf(tmp, sizeof tmp, "%s.tmp", prev);
+    int out = in >= 0 ? open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644) : -1;
+    if (in >= 0 && out >= 0) {
+        static char buf[1 << 16];
+        ssize_t r;
+        ok = 1;
+        while ((r = read(in, buf, sizeof buf)) > 0) {
+            if (write(out, buf, (size_t)r) != r) { ok = 0; break; }
+            copied += r;
+        }
+        if (r < 0) ok = 0;
+    }
+    if (in >= 0) close(in);
+    if (out >= 0 && close(out) != 0) ok = 0;
+    if (!(ok && rename(tmp, prev) == 0)) { ok = 0; unlink(tmp); }
+    // This run's console starts empty either way; unlink can fail where truncating still works.
+    if (unlink(cur) != 0) (void)truncate(cur, 0);
+    snprintf(g_console_note, sizeof g_console_note, "[klepton] previous game console %s -> console-previous.log (%lld bytes)\n",
+             ok ? "kept" : "NOT kept", copied);
+}
+#endif
+
 static int open_log(void) {
+#ifdef KL_APP_ALYX
+    keep_previous_console();
+#endif
     if (!kl_env_on("KL_LOG_FILE", 1)) {
         // Same buffering discipline either way. The reason is unchanged — a
         // fully-buffered stream loses the report when the process dies on a
@@ -732,6 +782,9 @@ static int open_log(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     dup2(fileno(stdout), STDERR_FILENO);   // the guest's own writes(2) land here too
     setvbuf(stderr, NULL, _IOLBF, 0);
+#ifdef KL_APP_ALYX
+    if (g_console_note[0]) fputs(g_console_note, stderr);
+#endif
     return 0;
 }
 

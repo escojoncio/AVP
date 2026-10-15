@@ -54,6 +54,42 @@ static void klf_emit(const char *b, size_t n) {
     if (g_crash_fd >= 0) { w = write(g_crash_fd, b, n); (void)w; }
 }
 
+static char g_console_path[1024];
+
+void kl_fault_set_console_path(const char *path) {
+    if (!path) { g_console_path[0] = 0; return; }
+    snprintf(g_console_path, sizeof g_console_path, "%s", path);
+}
+
+// The last lines of the guest's console file, for an abort the guest raised itself: its fatal
+// message is usually the last thing it wrote there. Async-signal-safe: a static buffer, open,
+// lseek, pread, write. Whatever the guest still holds in its own stdio buffer is not on disk yet.
+static void klf_console_tail(void) {
+    enum { kTailBytes = 6144, kTailLines = 40 };
+    static char tail[kTailBytes];
+    if (!g_console_path[0]) return;
+    static const char none[] = "[klepton] guest console: none to read (no console file)\n";
+    int fd = open(g_console_path, O_RDONLY);
+    if (fd < 0) { klf_emit(none, sizeof none - 1); return; }
+    off_t end = lseek(fd, 0, SEEK_END);
+    off_t from = end > kTailBytes ? end - kTailBytes : 0;
+    ssize_t n = end > 0 ? pread(fd, tail, kTailBytes, from) : 0;
+    close(fd);
+    if (n <= 0) { klf_emit(none, sizeof none - 1); return; }
+    size_t start = 0;
+    int lines = 0;
+    for (ssize_t i = n - 1; i >= 0; i--)  // the newline that ends the line kTailLines + 1 from the end
+        if (tail[i] == '\n' && i != n - 1 && ++lines >= kTailLines) { start = (size_t)i + 1; break; }
+    if (start == 0 && from > 0)  // read mid-file: drop the partial first line
+        for (ssize_t i = 0; i < n; i++)
+            if (tail[i] == '\n') { start = (size_t)i + 1; break; }
+    static const char head[] = "[klepton] guest console, last lines before the abort:\n";
+    static const char foot[] = "\n[klepton] end of guest console\n";
+    klf_emit(head, sizeof head - 1);
+    klf_emit(tail + start, (size_t)n - start);
+    klf_emit(foot, sizeof foot - 1);
+}
+
 static void (*g_extra[KL_FAULT_MAX_REPORTERS])(FILE *);
 static unsigned g_extra_n;
 
@@ -480,6 +516,10 @@ static void report_fault(int sig, siginfo_t *si, void *uctx) {
         if (next <= fp) break;                  // stacks grow down; anything else is junk
         fp = next;
     }
+
+    // An abort/trap the guest raised on purpose: its reason is in its own console, if it keeps one.
+    // Before the stdio reports below (not async-signal-safe), so nothing can stand in its way.
+    if (sig == SIGABRT || sig == SIGTRAP) klf_console_tail();
 
     // SIGABRT here is usually the *guest* dying, not us — Unity's audio thread
     // aborts outright when FMOD cannot open an output device. Those paths never

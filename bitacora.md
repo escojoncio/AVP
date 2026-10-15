@@ -263,6 +263,23 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
   MB/min` (`kl_metal_allocated_bytes` en `kl_gpu_time.m`). Pendiente según el desglose: si pesa Metal/texturas →
   bajar `r_texture_pool_size` (2560) o liberar cachés de VPKEngine; si «rest» crece sin parar → fuga.
 
+## Logs_Alyx_47 (B57) → B58
+- 14 min sin cierre. Memoria en juego: footprint 6,0–6,65 GB = Metal 3,6–3,8 GB + resto 2,7–2,8 GB; disponible
+  1,55–1,85 GB; sin fuga (meseta). Presión «system critical» casi continua; `malloc_zone_pressure_relief` devolvió
+  0 MB siempre (se deja por decisión del usuario).
+- Corrección log 46: el cierre de 20:18:07 fue SIGABRT en `librendersystemvulkan.so` (hilo de trabajo), no jetsam.
+- B58 (pendiente de compilar):
+  - VPKEngine 0041 (`vk.fail ...`): fallos de vkAllocateMemory/bind/arenas/pipelines/fences/DEVICE_LOST con tamaño,
+    resultado, footprint/avail; gpu.err limitados por potencias de 2. Bind con Metal rechazado se registra pero sigue
+    devolviendo VK_SUCCESS (como antes, para no provocar abortos nuevos).
+  - `kl_app.c keep_previous_console`: console.log del juego → `console-previous.log` al arrancar (AVPLog lo comparte);
+    `kl_fault.c`: en SIGABRT/SIGTRAP vuelca las últimas 40 líneas de console.log al informe de cierre.
+  - Altura real: `KleptonFloor.swift` (PlaneDetectionProvider, planos `.floor`, permiso world sensing pedido aparte
+    tras arrancar la sesión; `runARKit` serializado), `klvr_plat_set_floor_y` + `klvr_plat_height_shift` (cabeza y
+    manos: Y = headY − floorY + ajuste manual), transición suave 1 s, cambios > 3 cm confirmados 2 veces. Opción
+    «Altura real (detecta el suelo)» (`realFloor`, `avp.realFloor`, `KLVR_REAL_FLOOR`, ON). Logs `[height] ...`.
+    Ojo: la altura manual guardada se suma encima (el usuario tenía −15 cm).
+
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su
    MSL/coste. Si indirect-count codificado ≫ real → `MTLIndirectCommandBuffer` / compactar en el fix-up.
