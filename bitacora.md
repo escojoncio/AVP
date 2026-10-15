@@ -166,6 +166,13 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
 - Pendiente: con la GPU al 100 %; sin bajar carga (resolución/MSAA) solo queda elegir entre 45
   con baile o 30 estable. Validar sombras con bit0 off.
 
+## PRÓXIMA BUILD (pedido del usuario)
+- Limpieza de opciones del menú: dejar solo las útiles/necesarias (quitar: test A/B, ojos sin copia, post al área
+  física, Hz al juego, arranque anticipado, orden por recursos, oclusión medida, amplificación…: fijar sus valores
+  validados en código) y REGENERAR la configuración guardada (UserDefaults `avp.*`: versión de esquema → valores por
+  defecto) dejando activado solo lo necesario: «Medir GPU por pase» y «Capturas» OFF por defecto.
+- Validar B52 con su log: fallback 30 a 90 Hz en nivel, `refreshes per picture` estable, sombras con bit0 off.
+
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su
    MSL/coste. Si indirect-count codificado ≫ real → `MTLIndirectCommandBuffer` / compactar en el fix-up.
