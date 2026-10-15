@@ -33,24 +33,24 @@ final class AVPSettings: ObservableObject {
     static let nativeEye = (width: 3072, height: 2464)
 
     /// Render resolution as a percentage of the native eye size (50...130).
-    @Published var renderPercent: Double { didSet { save() } }
-    @Published var textureCap: Int { didSet { save() } }        // 1024 | 2048 | 4096
+    @Published var renderPercent: Double { didSet { graphicsChanged() } }
+    @Published var textureCap: Int { didSet { graphicsChanged() } }        // 1024 | 2048 | 4096
     /// Foveation (on by default): Klepton's KL_VRR_MAP=wide, the user's P.T. map (a round sharp zone of `wideDegrees`
     /// at full rate, centred 10° below each eye's forward axis) with the periphery at `periphery` (10 % to 65 %).
     /// The old M2/M5/custom presets were the same map (M5 only allowed a better periphery) and a rectangular custom
     /// map nobody could reason about: build 32 keeps one switch and two numbers.
-    @Published var foveationOn: Bool { didSet { save() } }
+    @Published var foveationOn: Bool { didSet { graphicsChanged() } }
     /// The sharp zone's width in degrees (30...70, PTVisionPro's 60 by default); the rest at `periphery`.
-    @Published var wideDegrees: Double { didSet { save() } }
-    @Published var periphery: Double { didSet { save() } }      // 0.1...0.65 shading rate at the edge
-    @Published var vpktaa: Bool { didSet { save() } }
-    @Published var vpktaaPercent: Double { didSet { save() } }  // 0...100
-    @Published var vpktaaSharpness: Double { didSet { save() } } // 0...1
-    @Published var anisotropy: Int { didSet { save() } }        // 0, 2, 4, 8, 16
+    @Published var wideDegrees: Double { didSet { graphicsChanged() } }
+    @Published var periphery: Double { didSet { graphicsChanged() } }      // 0.1...0.65 shading rate at the edge
+    @Published var vpktaa: Bool { didSet { graphicsChanged() } }
+    @Published var vpktaaPercent: Double { didSet { graphicsChanged() } }  // 0...100
+    @Published var vpktaaSharpness: Double { didSet { graphicsChanged() } } // 0...1
+    @Published var anisotropy: Int { didSet { graphicsChanged() } }        // 0, 2, 4, 8, 16
     @Published var systemLanguage: Bool { didSet { save() } }
     @Published var showFps: Bool { didSet { save() } }
     /// Ambient occlusion (r_ssao). On by default on every headset: fidelity is kept, performance comes from resolution.
-    @Published var ssao: Bool { didSet { save() } }
+    @Published var ssao: Bool { didSet { graphicsChanged() } }
     /// Build 27 (VPKEngine 0031): command buffers wait only on the previous ones they really depend on (VP_CB_ORDER=2)
     /// instead of all of them (0029, VP_CB_ORDER=1). Logs 23: a whole session with it, no hang, no vertex explosion,
     /// out_of_order=0 → on by default since build 32. If vertex explosions come back, turn it off.
@@ -117,6 +117,24 @@ final class AVPSettings: ObservableObject {
     /// Build 53: settings layout version. Older saved settings are wiped once so every validated value is the default
     /// (the options left out of the menu keep their default for good).
     static let schema = 53
+    /// Build 53: picture presets. Changing any picture setting by hand switches to Personalizado (custom).
+    enum Preset: String, CaseIterable { case m2, m5, custom }
+    @Published var preset: Preset { didSet { if preset != oldValue, !loading { applyPreset() }; save() } }
+    private var applyingPreset = false
+    private func graphicsChanged() {
+        if !loading && !applyingPreset && preset != .custom { preset = .custom }
+        save()
+    }
+    /// M2: the values of the user's Logs_Alyx_40 run with the resolution at 70 %. M5: not measured yet (same as M2).
+    func applyPreset() {
+        guard preset != .custom else { return }
+        applyingPreset = true
+        renderPercent = 70; textureCap = 2048; foveationOn = true; wideDegrees = 70; periphery = 0.10
+        vpktaa = true; vpktaaPercent = 100; vpktaaSharpness = 1.0; anisotropy = 16; ssao = true
+        applyingPreset = false
+    }
+    /// Keys the B53 wipe and Restablecer keep (paths, signing, preparation state).
+    private static let keptKeys: Set<String> = ["avp.folderBookmark", "avp.signatureVariant", "avp.prepared"]
 
     // Fixed since build 32 (they used to be settings; every validated value is now the only value):
     /// 12 command buffers in flight (build 24 orders them; 3 was the build-23 A/B test).
@@ -139,12 +157,16 @@ final class AVPSettings: ObservableObject {
     private init() {
         let d = UserDefaults.standard
         if d.integer(forKey: "avp.schema") < Self.schema {
-            for k in d.dictionaryRepresentation().keys where k.hasPrefix("avp.") && k != "avp.folderBookmark"
-                && k != "avp.signatureVariant" {
+            // Personal choices (language, movement, subtitles, height, fingers, cloud, FPS) survive the wipe.
+            let personal: Set<String> = ["avp.sysLang", "avp.movement", "avp.subtitles", "avp.subSize", "avp.subFov",
+                                         "avp.cloudSync", "avp.handFingers", "avp.heightCm", "avp.showFps"]
+            for k in d.dictionaryRepresentation().keys where k.hasPrefix("avp.") && !Self.keptKeys.contains(k)
+                && !personal.contains(k) {
                 d.removeObject(forKey: k)
             }
             d.set(Self.schema, forKey: "avp.schema")
         }
+        preset = Preset(rawValue: d.string(forKey: "avp.preset") ?? "") ?? (Self.isM5 ? .m5 : .m2)
         renderPercent = d.object(forKey: "avp.renderPercent") as? Double ?? 90
         textureCap = d.object(forKey: "avp.texCap") as? Int ?? 2048
         // Build 32: the M2/M5/custom picker (avp.fov2: 0 off, 1 M2, 2 M5, 3 custom) becomes one switch.
@@ -177,6 +199,7 @@ final class AVPSettings: ObservableObject {
         subtitleSize = SubtitleSize(rawValue: d.object(forKey: "avp.subSize") as? Int ?? 0) ?? .small
         subtitleFoveation = d.object(forKey: "avp.subFov") as? Bool ?? true
         loading = false
+        if preset != .custom { applyPreset() }   // a preset's values always win over stale saved ones
     }
 
     private func save() {
@@ -210,14 +233,14 @@ final class AVPSettings: ObservableObject {
         d.set(runningStart, forKey: "avp.runStart")
         d.set(abTest, forKey: "avp.abTest")
         d.set(engine.rawValue, forKey: "avp.engine")
+        d.set(preset.rawValue, forKey: "avp.preset")
         d.set(Self.schema, forKey: "avp.schema")
         d.set(subtitleSize.rawValue, forKey: "avp.subSize")
         d.set(subtitleFoveation, forKey: "avp.subFov")
     }
 
     func resetToDefaults() {
-        for k in UserDefaults.standard.dictionaryRepresentation().keys where k.hasPrefix("avp.") && k != "avp.folderBookmark"
-            && k != "avp.signatureVariant" {
+        for k in UserDefaults.standard.dictionaryRepresentation().keys where k.hasPrefix("avp.") && !Self.keptKeys.contains(k) {
             UserDefaults.standard.removeObject(forKey: k)
         }
         let fresh = AVPSettings.makeDefaults()
@@ -230,6 +253,7 @@ final class AVPSettings: ObservableObject {
         postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; occlusionQueries = fresh.occlusionQueries
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
         reportedHz = fresh.reportedHz; runningStart = fresh.runningStart; abTest = fresh.abTest; engine = fresh.engine
+        preset = fresh.preset
         AVPLog.log("Ajustes: valores por defecto")
     }
 
@@ -556,7 +580,7 @@ final class AVPSettings: ObservableObject {
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
-                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart), test A/B \(abTest), motor \(engine.rawValue)")
+                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart), test A/B \(abTest), motor \(engine.rawValue), preset \(preset.rawValue)")
         return env
     }
 

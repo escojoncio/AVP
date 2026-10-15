@@ -299,23 +299,16 @@ static void pace_governor(void) {
     // quiet second between two heavy ones no longer flips 30 <-> 45.
     if (fast) want = 1;
     else if (g_pace_extra) {
-        double lim_ok = ne > nn / 2 ? 0.03 : 0.08;
-        good = (avg < 0.80 * 1000.0 / base && nl <= lim_ok * nn) ? good + 1 : 0;
+        double lim_ok = ne > nn / 2 ? 0.03 * nn : 0.08 * nn;
+        if (lim_ok < 1.0) lim_ok = 1.0;              // ~33 frames a window: 3 % would mean zero late frames
+        good = (avg < 0.80 * 1000.0 / base && nl <= lim_ok) ? good + 1 : 0;
         if (good >= 15) want = 0;
-    } else if (ne > nn / 2) {
-        if (!g_pace_extra) {
-            over = (avg > 0.95 * 1000.0 / base || nl > 0.25 * nn) ? over + 1 : 0;
-            if (over >= 2 || nl > 0.40 * nn) want = 1;
-        } else {
-            good = (avg < 0.85 * 1000.0 / base && nl <= 0.05 * nn) ? good + 1 : 0;
-            if (good >= 5) want = 0;
-        }
-    } else if (!g_pace_extra) {                      // at the base: leave when it clearly does not fit
+    } else if (ne > nn / 2) {                        // at the base, exclusive time
+        over = (avg > 0.95 * 1000.0 / base || nl > 0.25 * nn) ? over + 1 : 0;
+        if (over >= 2 || nl > 0.40 * nn) want = 1;
+    } else {                                         // at the base, union time
         over = (avg > 0.95 * 1000.0 / base || nl > 0.30 * nn) ? over + 1 : 0;
         if (over >= 2) want = 1;
-    } else {                                         // at the fallback: up with headroom
-        good = (avg < 0.85 * 1000.0 / base && nl <= 0.10 * nn) ? good + 1 : 0;
-        if (good >= 3) want = 0;
     }
     // Once a minute while nothing changes: what the governor sees (the 5 s [gputime] line is the same figure).
     static double said_at;

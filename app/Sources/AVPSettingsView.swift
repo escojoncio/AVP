@@ -47,11 +47,16 @@ struct AVPSettingsView: View {
 
     // Build 32: one screen anyone can read. What a run showed to be the only sane value is no longer a setting
     // (AVPSettings: gpuQueueDepth, composeNewOnly, guestHz, roundSharpZone, msaaOnTile; dynamic resolution, the
-    // texture pool, the M2/M5/custom foveation presets and the MoltenVK engine are gone).
+    // texture pool are gone). Build 53: picture presets M2/M5/Personalizado and a MoltenVK test engine are back.
 
     private var picture: some View {
         Section {
             let eye = s.eyeSize
+            Picker(AVPL("Preset", "Preset"), selection: $s.preset) {
+                Text("Vision Pro M2").tag(AVPSettings.Preset.m2)
+                Text("Vision Pro M5").tag(AVPSettings.Preset.m5)
+                Text(AVPL("Personalizado", "Custom")).tag(AVPSettings.Preset.custom)
+            }
             Stepper(AVPL("Resolución: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) por ojo)",
                          "Resolution: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) per eye)"),
                     value: $s.renderPercent, in: 50...130, step: 5)
@@ -156,6 +161,10 @@ struct AVPSettingsView: View {
                 Text("VPKEngine").tag(AVPSettings.Engine.vpkengine)
                 Text(AVPL("MoltenVK (prueba)", "MoltenVK (test)")).tag(AVPSettings.Engine.moltenvk)
             }
+            Text(AVPL("Tras cambiar el motor, cierra la app del todo y vuelve a abrirla.",
+                      "After changing the engine, quit the app completely and open it again."))
+                .font(.footnote)
+                .foregroundStyle(.secondary)
             Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
                    role: .destructive) { confirmQuarantine = true }
                 .disabled(quarantined == 0)
