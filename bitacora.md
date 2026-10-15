@@ -7,7 +7,7 @@ juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `v
 con `git format-patch` sobre ref+parches). Sin MetalFX, sin MoltenVK (solo referencia), sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B47**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B47b**, pendiente de compilar).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -94,6 +94,8 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
 - Test: máscara por defecto (1) en pausa/knockout/final; final = defecto + SAVES − WORSE/BREAKS; veredicto de opts
   impreso al acabar esa fase; ventanas 0,6 + 1,6 s; tras el knockout `[abtest] detail` de cada candidato y MSL de los
   3 que más ahorran (≥ 0,5 ms) en la carpeta de logs (requiere «Capturas»); HUD con tiempo restante.
+- B47b: cada línea `[abtest]` también en `Logs Alyx/abtest-result.txt` (`ab_out`, fsync al terminar): en Logs_Alyx_35 el
+  usuario vio «TEST TERMINADO» pero la copia del log acababa ~10 s antes (sin veredicto).
 - Validar: `[abtest] detail`/`msl` de pipe6857/pipe6965 → leer su MSL y su encoder destino para optimizarlos.
 
 ## SIGUIENTES PASOS
