@@ -1,158 +1,4 @@
-# visionos - 199b0ff16ae1699a774b46f8d4c10ded94686e2b - 2026-10-15T10:18:52Z
-
-## vpvulkan.log:      381 lines
-### errors
-### end
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |                                                       ^~~~~~~
-      |                                                       delete
-1 warning generated.
-[27/37] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/precompile.cpp.o
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/precompile.cpp:26:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/vpvk.h:19:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/device.h:15:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/backend.h:9:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/frame_compiler.h:22:
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |        ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:174:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
-  174 |   } front, back;
-      |     ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:55: note: replace 'default' with 'delete'
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |                                                       ^~~~~~~
-      |                                                       delete
-1 warning generated.
-[28/37] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/pipelines.cpp.o
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/pipelines.cpp:27:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/commands.h:16:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/vpvk.h:19:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/device.h:15:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/backend.h:9:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/frame_compiler.h:22:
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |        ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:174:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
-  174 |   } front, back;
-      |     ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:55: note: replace 'default' with 'delete'
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |                                                       ^~~~~~~
-      |                                                       delete
-1 warning generated.
-[29/37] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/recipes.cpp.o
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/recipes.cpp:1:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/recipes.h:31:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/pipeline_cache.h:16:
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |        ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:174:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
-  174 |   } front, back;
-      |     ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:55: note: replace 'default' with 'delete'
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |                                                       ^~~~~~~
-      |                                                       delete
-1 warning generated.
-[30/37] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/core13.cpp.o
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/core13.cpp:11:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/commands.h:16:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/vpvk.h:19:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/device.h:15:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/backend.h:9:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/frame_compiler.h:22:
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |        ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:174:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
-  174 |   } front, back;
-      |     ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:55: note: replace 'default' with 'delete'
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |                                                       ^~~~~~~
-      |                                                       delete
-1 warning generated.
-[31/37] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/queries.cpp.o
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/queries.cpp:12:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/commands.h:16:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/vpvk.h:19:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/device.h:15:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/backend.h:9:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/frame_compiler.h:22:
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |        ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:174:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
-  174 |   } front, back;
-      |     ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:55: note: replace 'default' with 'delete'
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |                                                       ^~~~~~~
-      |                                                       delete
-1 warning generated.
-[32/37] Building OBJCXX object vulkan/CMakeFiles/VPVulkan.dir/src/platform_metal.mm.o
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/platform_metal.mm:3:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/metal2/include/vpgpu/metal2/metal_backend.h:35:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/backend.h:9:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/frame_compiler.h:22:
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |        ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:174:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
-  174 |   } front, back;
-      |     ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:55: note: replace 'default' with 'delete'
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |                                                       ^~~~~~~
-      |                                                       delete
-1 warning generated.
-[33/37] Building CXX object vulkan/CMakeFiles/VPVulkan.dir/src/motion.cpp.o
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/motion.cpp:28:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/commands.h:16:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/vulkan/src/vpvk.h:19:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/device.h:15:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/backend.h:9:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/frame_compiler.h:22:
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |        ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:174:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
-  174 |   } front, back;
-      |     ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:55: note: replace 'default' with 'delete'
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |                                                       ^~~~~~~
-      |                                                       delete
-1 warning generated.
-[34/37] Building OBJCXX object metal2/CMakeFiles/vpgpu_metal2.dir/src/metal_backend.mm.o
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/metal2/src/metal_backend.mm:13:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/metal2/include/vpgpu/metal2/metal_backend.h:35:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/backend.h:9:
-In file included from /Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/frame_compiler.h:22:
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:8: warning: explicitly defaulted equality comparison operator is implicitly deleted [-Wdefaulted-function-deleted]
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |        ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:174:5: note: defaulted 'operator==' is implicitly deleted because there is no viable 'operator==' for member 'front'
-  174 |   } front, back;
-      |     ^
-/Users/runner/work/AVP/AVP/vpkengine/gpu/core/include/vpgpu/core/commands.h:175:55: note: replace 'default' with 'delete'
-  175 |   bool operator==(const DepthStencilDynamic&) const = default;
-      |                                                       ^~~~~~~
-      |                                                       delete
-1 warning generated.
-[35/37] Linking CXX static library metal2/libvpgpu_metal2.a
-[36/37] Linking CXX shared library vulkan/libVPVulkan.dylib
- platform VISIONOS
-    minos 26.0
-exported vk* symbols: 222
-total 3400
-drwxr-xr-x  4 runner  staff      128 Oct 15 10:16 .
-drwxr-xr-x  4 runner  staff      128 Oct 15 10:16 ..
--rw-r--r--  1 runner  staff      663 Oct 15 10:16 Info.plist
--rwxr-xr-x  1 runner  staff  1734640 Oct 15 10:16 VPVulkan
+# visionos - 2b2bcbb659c96e3183f0ce850080a8970b9d1cce - 2026-10-15T10:25:59Z
 
 ## runtime.log:       42 lines
 ### errors
@@ -203,23 +49,14 @@ runtime/linux/kl_glibc.c:1223:28: warning: 'tmpnam' is deprecated: This function
 ## app.log:      918 lines
 ### errors
 ### end
-PrecompileModule /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/ExplicitPrecompiledModules/Darwin-EPL4RW5EDDYO8PDBAHRNR15MB.scan
-    cd /
-    builtin-precompileModule /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/ExplicitPrecompiledModules/Darwin-EPL4RW5EDDYO8PDBAHRNR15MB.scan
+    builtin-ScanDependencies -o /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_config.o.scan -- /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -x c -ivfsstatcache /Users/runner/work/AVP/AVP/build/dd/SDKStatCaches.noindex/xros26.5-23O469-688ef53f1462e2c8f657fdc38a81448f0ade8266673b0cdb1441e69d898f0d23.sdkstatcache -target arm64-apple-xros26.0 -fmessage-length\=0 -fdiagnostics-show-note-include-stack -fmacro-backtrace-limit\=0 -fno-color-diagnostics -fmodules-prune-interval\=86400 -fmodules-prune-after\=345600 -fbuild-session-file\=/Users/runner/work/AVP/AVP/build/dd/ModuleCache.noindex/Session.modulevalidation -fmodules-validate-once-per-build-session -Wnon-modular-include-in-framework-module -Werror\=non-modular-include-in-framework-module -Wno-trigraphs -Wno-missing-field-initializers -Wno-missing-prototypes -Werror\=return-type -Wdocumentation -Wunreachable-code -Wquoted-include-in-framework-header -Werror\=deprecated-objc-isa-usage -Werror\=objc-root-class -Wno-missing-braces -Wparentheses -Wswitch -Wunused-function -Wno-unused-label -Wno-unused-parameter -Wunused-variable -Wunused-value -Wempty-body -Wuninitialized -Wconditional-uninitialized -Wno-unknown-pragmas -Wno-shadow -Wno-four-char-constants -Wno-conversion -Wconstant-conversion -Wint-conversion -Wbool-conversion -Wenum-conversion -Wno-float-conversion -Wnon-literal-null-conversion -Wobjc-literal-conversion -Wshorten-64-to-32 -Wpointer-sign -Wno-newline-eof -Wno-implicit-fallthrough -isysroot /Applications/Xcode_26.6.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS26.5.sdk -fstrict-aliasing -Wdeprecated-declarations -Wno-sign-conversion -Winfinite-recursion -Wcomma -Wblock-capture-autoreleasing -Wstrict-prototypes -Wno-semicolon-before-method-body -Wunguarded-availability @/Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/7187679823f38a2a940e0043cdf9d637-common-args.resp -MMD -MT dependencies -MF /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_config.d --serialize-diagnostics /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_config.dia -c /Users/runner/work/AVP/AVP/app/Native/avp_config.c -o /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_config.o
 
-CompileC /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_pipelines.o /Users/runner/work/AVP/AVP/app/Native/avp_pipelines.c normal arm64 c com.apple.compilers.llvm.clang.1_0.compiler (in target 'AVP' from project 'AVP')
+ScanDependencies /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.o /Users/runner/work/AVP/AVP/app/Steam/CSteamSupport/lzma/LzmaDec.c normal arm64 c com.apple.compilers.llvm.clang.1_0.compiler (in target 'AVP' from project 'AVP')
     cd /Users/runner/work/AVP/AVP
     
     Using response file: /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/7187679823f38a2a940e0043cdf9d637-common-args.resp
     
-    /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -x c -ivfsstatcache /Users/runner/work/AVP/AVP/build/dd/SDKStatCaches.noindex/xros26.5-23O469-688ef53f1462e2c8f657fdc38a81448f0ade8266673b0cdb1441e69d898f0d23.sdkstatcache -target arm64-apple-xros26.0 -fmessage-length\=0 -fdiagnostics-show-note-include-stack -fmacro-backtrace-limit\=0 -fno-color-diagnostics -fmodules-prune-interval\=86400 -fmodules-prune-after\=345600 -fbuild-session-file\=/Users/runner/work/AVP/AVP/build/dd/ModuleCache.noindex/Session.modulevalidation -fmodules-validate-once-per-build-session -Wnon-modular-include-in-framework-module -Werror\=non-modular-include-in-framework-module -Wno-trigraphs -Wno-missing-field-initializers -Wno-missing-prototypes -Werror\=return-type -Wdocumentation -Wunreachable-code -Wquoted-include-in-framework-header -Werror\=deprecated-objc-isa-usage -Werror\=objc-root-class -Wno-missing-braces -Wparentheses -Wswitch -Wunused-function -Wno-unused-label -Wno-unused-parameter -Wunused-variable -Wunused-value -Wempty-body -Wuninitialized -Wconditional-uninitialized -Wno-unknown-pragmas -Wno-shadow -Wno-four-char-constants -Wno-conversion -Wconstant-conversion -Wint-conversion -Wbool-conversion -Wenum-conversion -Wno-float-conversion -Wnon-literal-null-conversion -Wobjc-literal-conversion -Wshorten-64-to-32 -Wpointer-sign -Wno-newline-eof -Wno-implicit-fallthrough -isysroot /Applications/Xcode_26.6.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS26.5.sdk -fstrict-aliasing -Wdeprecated-declarations -Wno-sign-conversion -Winfinite-recursion -Wcomma -Wblock-capture-autoreleasing -Wstrict-prototypes -Wno-semicolon-before-method-body -Wunguarded-availability @/Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/7187679823f38a2a940e0043cdf9d637-common-args.resp -MMD -MT dependencies -MF /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_pipelines.d --serialize-diagnostics /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_pipelines.dia -c /Users/runner/work/AVP/AVP/app/Native/avp_pipelines.c -o /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_pipelines.o
-
-CompileC /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_deb.o /Users/runner/work/AVP/AVP/app/Native/avp_deb.c normal arm64 c com.apple.compilers.llvm.clang.1_0.compiler (in target 'AVP' from project 'AVP')
-    cd /Users/runner/work/AVP/AVP
-    
-    Using response file: /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/7187679823f38a2a940e0043cdf9d637-common-args.resp
-    
-    /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -x c -ivfsstatcache /Users/runner/work/AVP/AVP/build/dd/SDKStatCaches.noindex/xros26.5-23O469-688ef53f1462e2c8f657fdc38a81448f0ade8266673b0cdb1441e69d898f0d23.sdkstatcache -target arm64-apple-xros26.0 -fmessage-length\=0 -fdiagnostics-show-note-include-stack -fmacro-backtrace-limit\=0 -fno-color-diagnostics -fmodules-prune-interval\=86400 -fmodules-prune-after\=345600 -fbuild-session-file\=/Users/runner/work/AVP/AVP/build/dd/ModuleCache.noindex/Session.modulevalidation -fmodules-validate-once-per-build-session -Wnon-modular-include-in-framework-module -Werror\=non-modular-include-in-framework-module -Wno-trigraphs -Wno-missing-field-initializers -Wno-missing-prototypes -Werror\=return-type -Wdocumentation -Wunreachable-code -Wquoted-include-in-framework-header -Werror\=deprecated-objc-isa-usage -Werror\=objc-root-class -Wno-missing-braces -Wparentheses -Wswitch -Wunused-function -Wno-unused-label -Wno-unused-parameter -Wunused-variable -Wunused-value -Wempty-body -Wuninitialized -Wconditional-uninitialized -Wno-unknown-pragmas -Wno-shadow -Wno-four-char-constants -Wno-conversion -Wconstant-conversion -Wint-conversion -Wbool-conversion -Wenum-conversion -Wno-float-conversion -Wnon-literal-null-conversion -Wobjc-literal-conversion -Wshorten-64-to-32 -Wpointer-sign -Wno-newline-eof -Wno-implicit-fallthrough -isysroot /Applications/Xcode_26.6.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS26.5.sdk -fstrict-aliasing -Wdeprecated-declarations -Wno-sign-conversion -Winfinite-recursion -Wcomma -Wblock-capture-autoreleasing -Wstrict-prototypes -Wno-semicolon-before-method-body -Wunguarded-availability @/Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/7187679823f38a2a940e0043cdf9d637-common-args.resp -MMD -MT dependencies -MF /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_deb.d --serialize-diagnostics /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_deb.dia -c /Users/runner/work/AVP/AVP/app/Native/avp_deb.c -o /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_deb.o
+    builtin-ScanDependencies -o /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.o.scan -- /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -x c -ivfsstatcache /Users/runner/work/AVP/AVP/build/dd/SDKStatCaches.noindex/xros26.5-23O469-688ef53f1462e2c8f657fdc38a81448f0ade8266673b0cdb1441e69d898f0d23.sdkstatcache -target arm64-apple-xros26.0 -fmessage-length\=0 -fdiagnostics-show-note-include-stack -fmacro-backtrace-limit\=0 -fno-color-diagnostics -fmodules-prune-interval\=86400 -fmodules-prune-after\=345600 -fbuild-session-file\=/Users/runner/work/AVP/AVP/build/dd/ModuleCache.noindex/Session.modulevalidation -fmodules-validate-once-per-build-session -Wnon-modular-include-in-framework-module -Werror\=non-modular-include-in-framework-module -Wno-trigraphs -Wno-missing-field-initializers -Wno-missing-prototypes -Werror\=return-type -Wdocumentation -Wunreachable-code -Wquoted-include-in-framework-header -Werror\=deprecated-objc-isa-usage -Werror\=objc-root-class -Wno-missing-braces -Wparentheses -Wswitch -Wunused-function -Wno-unused-label -Wno-unused-parameter -Wunused-variable -Wunused-value -Wempty-body -Wuninitialized -Wconditional-uninitialized -Wno-unknown-pragmas -Wno-shadow -Wno-four-char-constants -Wno-conversion -Wconstant-conversion -Wint-conversion -Wbool-conversion -Wenum-conversion -Wno-float-conversion -Wnon-literal-null-conversion -Wobjc-literal-conversion -Wshorten-64-to-32 -Wpointer-sign -Wno-newline-eof -Wno-implicit-fallthrough -isysroot /Applications/Xcode_26.6.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS26.5.sdk -fstrict-aliasing -Wdeprecated-declarations -Wno-sign-conversion -Winfinite-recursion -Wcomma -Wblock-capture-autoreleasing -Wstrict-prototypes -Wno-semicolon-before-method-body -Wunguarded-availability @/Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/7187679823f38a2a940e0043cdf9d637-common-args.resp -DZSTD_NO_TRACE -w -MMD -MT dependencies -MF /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.d --serialize-diagnostics /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.dia -c /Users/runner/work/AVP/AVP/app/Steam/CSteamSupport/lzma/LzmaDec.c -o /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.o
 
 CompileC /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_config.o /Users/runner/work/AVP/AVP/app/Native/avp_config.c normal arm64 c com.apple.compilers.llvm.clang.1_0.compiler (in target 'AVP' from project 'AVP')
     cd /Users/runner/work/AVP/AVP
@@ -228,16 +65,32 @@ CompileC /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.bui
     
     /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -x c -ivfsstatcache /Users/runner/work/AVP/AVP/build/dd/SDKStatCaches.noindex/xros26.5-23O469-688ef53f1462e2c8f657fdc38a81448f0ade8266673b0cdb1441e69d898f0d23.sdkstatcache -target arm64-apple-xros26.0 -fmessage-length\=0 -fdiagnostics-show-note-include-stack -fmacro-backtrace-limit\=0 -fno-color-diagnostics -fmodules-prune-interval\=86400 -fmodules-prune-after\=345600 -fbuild-session-file\=/Users/runner/work/AVP/AVP/build/dd/ModuleCache.noindex/Session.modulevalidation -fmodules-validate-once-per-build-session -Wnon-modular-include-in-framework-module -Werror\=non-modular-include-in-framework-module -Wno-trigraphs -Wno-missing-field-initializers -Wno-missing-prototypes -Werror\=return-type -Wdocumentation -Wunreachable-code -Wquoted-include-in-framework-header -Werror\=deprecated-objc-isa-usage -Werror\=objc-root-class -Wno-missing-braces -Wparentheses -Wswitch -Wunused-function -Wno-unused-label -Wno-unused-parameter -Wunused-variable -Wunused-value -Wempty-body -Wuninitialized -Wconditional-uninitialized -Wno-unknown-pragmas -Wno-shadow -Wno-four-char-constants -Wno-conversion -Wconstant-conversion -Wint-conversion -Wbool-conversion -Wenum-conversion -Wno-float-conversion -Wnon-literal-null-conversion -Wobjc-literal-conversion -Wshorten-64-to-32 -Wpointer-sign -Wno-newline-eof -Wno-implicit-fallthrough -isysroot /Applications/Xcode_26.6.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS26.5.sdk -fstrict-aliasing -Wdeprecated-declarations -Wno-sign-conversion -Winfinite-recursion -Wcomma -Wblock-capture-autoreleasing -Wstrict-prototypes -Wno-semicolon-before-method-body -Wunguarded-availability @/Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/7187679823f38a2a940e0043cdf9d637-common-args.resp -MMD -MT dependencies -MF /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_config.d --serialize-diagnostics /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_config.dia -c /Users/runner/work/AVP/AVP/app/Native/avp_config.c -o /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/avp_config.o
 
-PrecompileModule /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/ExplicitPrecompiledModules/MachO-AEC8IB7JMXGH58PYNURTD11DY.scan
+PrecompileModule /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/ExplicitPrecompiledModules/_Builtin_stdint-40NH2ZREMY7KIQ9XJZTWSKTRO.scan
     cd /
-    builtin-precompileModule /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/ExplicitPrecompiledModules/MachO-AEC8IB7JMXGH58PYNURTD11DY.scan
+    builtin-precompileModule /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/ExplicitPrecompiledModules/_Builtin_stdint-40NH2ZREMY7KIQ9XJZTWSKTRO.scan
 
-ScanDependencies /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.o /Users/runner/work/AVP/AVP/app/Steam/CSteamSupport/lzma/LzmaDec.c normal arm64 c com.apple.compilers.llvm.clang.1_0.compiler (in target 'AVP' from project 'AVP')
+CompileC /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.o /Users/runner/work/AVP/AVP/app/Steam/CSteamSupport/lzma/LzmaDec.c normal arm64 c com.apple.compilers.llvm.clang.1_0.compiler (in target 'AVP' from project 'AVP')
     cd /Users/runner/work/AVP/AVP
     
     Using response file: /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/7187679823f38a2a940e0043cdf9d637-common-args.resp
     
-    builtin-ScanDependencies -o /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.o.scan -- /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -x c -ivfsstatcache /Users/runner/work/AVP/AVP/build/dd/SDKStatCaches.noindex/xros26.5-23O469-688ef53f1462e2c8f657fdc38a81448f0ade8266673b0cdb1441e69d898f0d23.sdkstatcache -target arm64-apple-xros26.0 -fmessage-length\=0 -fdiagnostics-show-note-include-stack -fmacro-backtrace-limit\=0 -fno-color-diagnostics -fmodules-prune-interval\=86400 -fmodules-prune-after\=345600 -fbuild-session-file\=/Users/runner/work/AVP/AVP/build/dd/ModuleCache.noindex/Session.modulevalidation -fmodules-validate-once-per-build-session -Wnon-modular-include-in-framework-module -Werror\=non-modular-include-in-framework-module -Wno-trigraphs -Wno-missing-field-initializers -Wno-missing-prototypes -Werror\=return-type -Wdocumentation -Wunreachable-code -Wquoted-include-in-framework-header -Werror\=deprecated-objc-isa-usage -Werror\=objc-root-class -Wno-missing-braces -Wparentheses -Wswitch -Wunused-function -Wno-unused-label -Wno-unused-parameter -Wunused-variable -Wunused-value -Wempty-body -Wuninitialized -Wconditional-uninitialized -Wno-unknown-pragmas -Wno-shadow -Wno-four-char-constants -Wno-conversion -Wconstant-conversion -Wint-conversion -Wbool-conversion -Wenum-conversion -Wno-float-conversion -Wnon-literal-null-conversion -Wobjc-literal-conversion -Wshorten-64-to-32 -Wpointer-sign -Wno-newline-eof -Wno-implicit-fallthrough -isysroot /Applications/Xcode_26.6.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS26.5.sdk -fstrict-aliasing -Wdeprecated-declarations -Wno-sign-conversion -Winfinite-recursion -Wcomma -Wblock-capture-autoreleasing -Wstrict-prototypes -Wno-semicolon-before-method-body -Wunguarded-availability @/Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/7187679823f38a2a940e0043cdf9d637-common-args.resp -DZSTD_NO_TRACE -w -MMD -MT dependencies -MF /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.d --serialize-diagnostics /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.dia -c /Users/runner/work/AVP/AVP/app/Steam/CSteamSupport/lzma/LzmaDec.c -o /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.o
+    /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -x c -ivfsstatcache /Users/runner/work/AVP/AVP/build/dd/SDKStatCaches.noindex/xros26.5-23O469-688ef53f1462e2c8f657fdc38a81448f0ade8266673b0cdb1441e69d898f0d23.sdkstatcache -target arm64-apple-xros26.0 -fmessage-length\=0 -fdiagnostics-show-note-include-stack -fmacro-backtrace-limit\=0 -fno-color-diagnostics -fmodules-prune-interval\=86400 -fmodules-prune-after\=345600 -fbuild-session-file\=/Users/runner/work/AVP/AVP/build/dd/ModuleCache.noindex/Session.modulevalidation -fmodules-validate-once-per-build-session -Wnon-modular-include-in-framework-module -Werror\=non-modular-include-in-framework-module -Wno-trigraphs -Wno-missing-field-initializers -Wno-missing-prototypes -Werror\=return-type -Wdocumentation -Wunreachable-code -Wquoted-include-in-framework-header -Werror\=deprecated-objc-isa-usage -Werror\=objc-root-class -Wno-missing-braces -Wparentheses -Wswitch -Wunused-function -Wno-unused-label -Wno-unused-parameter -Wunused-variable -Wunused-value -Wempty-body -Wuninitialized -Wconditional-uninitialized -Wno-unknown-pragmas -Wno-shadow -Wno-four-char-constants -Wno-conversion -Wconstant-conversion -Wint-conversion -Wbool-conversion -Wenum-conversion -Wno-float-conversion -Wnon-literal-null-conversion -Wobjc-literal-conversion -Wshorten-64-to-32 -Wpointer-sign -Wno-newline-eof -Wno-implicit-fallthrough -isysroot /Applications/Xcode_26.6.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS26.5.sdk -fstrict-aliasing -Wdeprecated-declarations -Wno-sign-conversion -Winfinite-recursion -Wcomma -Wblock-capture-autoreleasing -Wstrict-prototypes -Wno-semicolon-before-method-body -Wunguarded-availability @/Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/7187679823f38a2a940e0043cdf9d637-common-args.resp -DZSTD_NO_TRACE -w -MMD -MT dependencies -MF /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.d --serialize-diagnostics /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.dia -c /Users/runner/work/AVP/AVP/app/Steam/CSteamSupport/lzma/LzmaDec.c -o /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.o
+
+PrecompileModule /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/ExplicitPrecompiledModules/_DarwinFoundation3-EKNUJNW6RISZDTQ78I0NWF4HT.scan
+    cd /
+    builtin-precompileModule /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/ExplicitPrecompiledModules/_DarwinFoundation3-EKNUJNW6RISZDTQ78I0NWF4HT.scan
+
+PrecompileModule /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/ExplicitPrecompiledModules/_Builtin_inttypes-CZTQD362RGS4EXCPDP83JEOZ6.scan
+    cd /
+    builtin-precompileModule /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/ExplicitPrecompiledModules/_Builtin_inttypes-CZTQD362RGS4EXCPDP83JEOZ6.scan
+
+PrecompileModule /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/ExplicitPrecompiledModules/Darwin-EPL4RW5EDDYO8PDBAHRNR15MB.scan
+    cd /
+    builtin-precompileModule /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/ExplicitPrecompiledModules/Darwin-EPL4RW5EDDYO8PDBAHRNR15MB.scan
+
+PrecompileModule /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/ExplicitPrecompiledModules/MachO-AEC8IB7JMXGH58PYNURTD11DY.scan
+    cd /
+    builtin-precompileModule /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/ExplicitPrecompiledModules/MachO-AEC8IB7JMXGH58PYNURTD11DY.scan
 
 CompileC /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/klepton_ld.o /Users/runner/work/AVP/AVP/klepton/tools/klepton_ld.c normal arm64 c com.apple.compilers.llvm.clang.1_0.compiler (in target 'AVP' from project 'AVP')
     cd /Users/runner/work/AVP/AVP
@@ -254,30 +107,23 @@ CompileC /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.bui
       |                                  ^~~~~~~~~~~~~~~~~~
 1 warning generated.
 
-CompileC /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.o /Users/runner/work/AVP/AVP/app/Steam/CSteamSupport/lzma/LzmaDec.c normal arm64 c com.apple.compilers.llvm.clang.1_0.compiler (in target 'AVP' from project 'AVP')
-    cd /Users/runner/work/AVP/AVP
-    
-    Using response file: /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/7187679823f38a2a940e0043cdf9d637-common-args.resp
-    
-    /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -x c -ivfsstatcache /Users/runner/work/AVP/AVP/build/dd/SDKStatCaches.noindex/xros26.5-23O469-688ef53f1462e2c8f657fdc38a81448f0ade8266673b0cdb1441e69d898f0d23.sdkstatcache -target arm64-apple-xros26.0 -fmessage-length\=0 -fdiagnostics-show-note-include-stack -fmacro-backtrace-limit\=0 -fno-color-diagnostics -fmodules-prune-interval\=86400 -fmodules-prune-after\=345600 -fbuild-session-file\=/Users/runner/work/AVP/AVP/build/dd/ModuleCache.noindex/Session.modulevalidation -fmodules-validate-once-per-build-session -Wnon-modular-include-in-framework-module -Werror\=non-modular-include-in-framework-module -Wno-trigraphs -Wno-missing-field-initializers -Wno-missing-prototypes -Werror\=return-type -Wdocumentation -Wunreachable-code -Wquoted-include-in-framework-header -Werror\=deprecated-objc-isa-usage -Werror\=objc-root-class -Wno-missing-braces -Wparentheses -Wswitch -Wunused-function -Wno-unused-label -Wno-unused-parameter -Wunused-variable -Wunused-value -Wempty-body -Wuninitialized -Wconditional-uninitialized -Wno-unknown-pragmas -Wno-shadow -Wno-four-char-constants -Wno-conversion -Wconstant-conversion -Wint-conversion -Wbool-conversion -Wenum-conversion -Wno-float-conversion -Wnon-literal-null-conversion -Wobjc-literal-conversion -Wshorten-64-to-32 -Wpointer-sign -Wno-newline-eof -Wno-implicit-fallthrough -isysroot /Applications/Xcode_26.6.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS26.5.sdk -fstrict-aliasing -Wdeprecated-declarations -Wno-sign-conversion -Winfinite-recursion -Wcomma -Wblock-capture-autoreleasing -Wstrict-prototypes -Wno-semicolon-before-method-body -Wunguarded-availability @/Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/7187679823f38a2a940e0043cdf9d637-common-args.resp -DZSTD_NO_TRACE -w -MMD -MT dependencies -MF /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.d --serialize-diagnostics /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.dia -c /Users/runner/work/AVP/AVP/app/Steam/CSteamSupport/lzma/LzmaDec.c -o /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/LzmaDec.o
-
 Ld /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/AVP normal (in target 'AVP' from project 'AVP')
     cd /Users/runner/work/AVP/AVP
     /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang -Xlinker -reproducible -target arm64-apple-xros26.0 -isysroot /Applications/Xcode_26.6.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS26.5.sdk -Os -L/Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/EagerLinkingTBDs/Release-xros -L/Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros -L/Users/runner/work/AVP/AVP/klepton/build/xros -L/Users/runner/work/AVP/AVP/build/deps/lib -F/Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/EagerLinkingTBDs/Release-xros -F/Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros -F/Users/runner/work/AVP/AVP/build/deps/Frameworks -Fbuild -Fbuild/deps/Frameworks -Fklepton/vendor-moltenvk/out/xros -filelist /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP.LinkFileList -Xlinker -rpath -Xlinker @executable_path/Frameworks -Xlinker -dead_strip -Xlinker -object_path_lto -Xlinker /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP_lto.o -Xlinker -dependency_info -Xlinker /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP_dependency_info.dat -fobjc-link-runtime -L/Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/xros -L/usr/lib/swift -Xlinker -add_ast_path -Xlinker /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP.swiftmodule @/Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP-linker-args.resp -lklepton -lluajit -lfossilize -lc++ -liconv -lz -lcompression -framework Metal -framework MetalFX -framework QuartzCore -framework CompositorServices -framework ARKit -framework GameController -framework CoreHaptics -framework AudioToolbox -framework AVFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework Security -framework CoreFoundation -framework Foundation -framework SDL3 -o /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/AVP
-
-Copy /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks/VPVulkan.framework /Users/runner/work/AVP/AVP/build/VPVulkan.framework (in target 'AVP' from project 'AVP')
-    cd /Users/runner/work/AVP/AVP
-    builtin-copy -exclude .DS_Store -exclude CVS -exclude .svn -exclude .git -exclude .hg -exclude Headers -exclude PrivateHeaders -exclude Modules -exclude \*.tbd -bitcode-strip all -bitcode-strip-tool /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip -resolve-src-symlinks -remove-static-executable /Users/runner/work/AVP/AVP/build/VPVulkan.framework /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks
-/Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip /Users/runner/work/AVP/AVP/build/VPVulkan.framework/VPVulkan -r -o /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks/VPVulkan.framework/VPVulkan
-Copy /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks/SDL2.framework /Users/runner/work/AVP/AVP/build/deps/Frameworks/SDL2.framework (in target 'AVP' from project 'AVP')
-    cd /Users/runner/work/AVP/AVP
-    builtin-copy -exclude .DS_Store -exclude CVS -exclude .svn -exclude .git -exclude .hg -exclude Headers -exclude PrivateHeaders -exclude Modules -exclude \*.tbd -bitcode-strip all -bitcode-strip-tool /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip -resolve-src-symlinks -remove-static-executable /Users/runner/work/AVP/AVP/build/deps/Frameworks/SDL2.framework /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks
-/Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip /Users/runner/work/AVP/AVP/build/deps/Frameworks/SDL2.framework/SDL2 -r -o /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks/SDL2.framework/SDL2
 
 Copy /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks/SDL3.framework /Users/runner/work/AVP/AVP/build/deps/Frameworks/SDL3.framework (in target 'AVP' from project 'AVP')
     cd /Users/runner/work/AVP/AVP
     builtin-copy -exclude .DS_Store -exclude CVS -exclude .svn -exclude .git -exclude .hg -exclude Headers -exclude PrivateHeaders -exclude Modules -exclude \*.tbd -bitcode-strip all -bitcode-strip-tool /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip -resolve-src-symlinks -remove-static-executable /Users/runner/work/AVP/AVP/build/deps/Frameworks/SDL3.framework /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks
 /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip /Users/runner/work/AVP/AVP/build/deps/Frameworks/SDL3.framework/SDL3 -r -o /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks/SDL3.framework/SDL3
+Copy /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks/SDL2.framework /Users/runner/work/AVP/AVP/build/deps/Frameworks/SDL2.framework (in target 'AVP' from project 'AVP')
+    cd /Users/runner/work/AVP/AVP
+    builtin-copy -exclude .DS_Store -exclude CVS -exclude .svn -exclude .git -exclude .hg -exclude Headers -exclude PrivateHeaders -exclude Modules -exclude \*.tbd -bitcode-strip all -bitcode-strip-tool /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip -resolve-src-symlinks -remove-static-executable /Users/runner/work/AVP/AVP/build/deps/Frameworks/SDL2.framework /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks
+/Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip /Users/runner/work/AVP/AVP/build/deps/Frameworks/SDL2.framework/SDL2 -r -o /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks/SDL2.framework/SDL2
+Copy /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks/VPVulkan.framework /Users/runner/work/AVP/AVP/build/VPVulkan.framework (in target 'AVP' from project 'AVP')
+    cd /Users/runner/work/AVP/AVP
+    builtin-copy -exclude .DS_Store -exclude CVS -exclude .svn -exclude .git -exclude .hg -exclude Headers -exclude PrivateHeaders -exclude Modules -exclude \*.tbd -bitcode-strip all -bitcode-strip-tool /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip -resolve-src-symlinks -remove-static-executable /Users/runner/work/AVP/AVP/build/VPVulkan.framework /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks
+/Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip /Users/runner/work/AVP/AVP/build/VPVulkan.framework/VPVulkan -r -o /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks/VPVulkan.framework/VPVulkan
+
 Copy /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks/MoltenVK.framework /Users/runner/work/AVP/AVP/klepton/vendor-moltenvk/out/xros/MoltenVK.framework (in target 'AVP' from project 'AVP')
     cd /Users/runner/work/AVP/AVP
     builtin-copy -exclude .DS_Store -exclude CVS -exclude .svn -exclude .git -exclude .hg -exclude Headers -exclude PrivateHeaders -exclude Modules -exclude \*.tbd -bitcode-strip all -bitcode-strip-tool /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip -resolve-src-symlinks -remove-static-executable /Users/runner/work/AVP/AVP/klepton/vendor-moltenvk/out/xros/MoltenVK.framework /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks
@@ -288,14 +134,14 @@ ProcessInfoPlistFile /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-
 
 CopySwiftLibs /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app (in target 'AVP' from project 'AVP')
     cd /Users/runner/work/AVP/AVP
-    builtin-swiftStdLibTool --copy --verbose --scan-executable /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/AVP --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/PlugIns --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/SystemExtensions --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Extensions --scan-folder /Users/runner/work/AVP/AVP/build/deps/Frameworks/SDL3.framework --platform xros --toolchain /var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.109.0.dPyTw1/Metal.xctoolchain --toolchain /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain --destination /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks --strip-bitcode --strip-bitcode-tool /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip --emit-dependency-info /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/SwiftStdLibToolInputDependencies.dep --filter-for-swift-os
+    builtin-swiftStdLibTool --copy --verbose --scan-executable /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/AVP --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/PlugIns --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/SystemExtensions --scan-folder /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Extensions --scan-folder /Users/runner/work/AVP/AVP/build/deps/Frameworks/SDL3.framework --platform xros --toolchain /var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.109.0.mDd9IA/Metal.xctoolchain --toolchain /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain --destination /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/Frameworks --strip-bitcode --strip-bitcode-tool /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/bitcode_strip --emit-dependency-info /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/SwiftStdLibToolInputDependencies.dep --filter-for-swift-os
 Ignoring --strip-bitcode because --sign was not passed
 
 ExtractAppIntentsMetadata (in target 'AVP' from project 'AVP')
     cd /Users/runner/work/AVP/AVP
-    /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/appintentsmetadataprocessor --toolchain-dir /var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.109.0.dPyTw1/Metal.xctoolchain --module-name AVP --sdk-root /Applications/Xcode_26.6.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS26.5.sdk --xcode-version 17F113 --platform-family xrOS --deployment-target 26.0 --bundle-identifier com.kdt.livecontainer --output /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app --target-triple arm64-apple-xros26.0 --binary-file /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/AVP --dependency-file /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP_dependency_info.dat --stringsdata-file /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/ExtractedAppShortcutsMetadata.stringsdata --source-file-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP.SwiftFileList --metadata-file-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/AVP.DependencyMetadataFileList --static-metadata-file-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/AVP.DependencyStaticMetadataFileList --swift-const-vals-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP.SwiftConstValuesFileList --compile-time-extraction --deployment-aware-processing --validate-assistant-intents --no-app-shortcuts-localization
-2026-10-15 10:18:48.501 appintentsmetadataprocessor[13950:42110] Starting appintentsmetadataprocessor export
-2026-10-15 10:18:48.523 appintentsmetadataprocessor[13950:42110] warning: Metadata extraction skipped. No AppIntents.framework dependency found.
+    /Applications/Xcode_26.6.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/appintentsmetadataprocessor --toolchain-dir /var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.6.109.0.mDd9IA/Metal.xctoolchain --module-name AVP --sdk-root /Applications/Xcode_26.6.app/Contents/Developer/Platforms/XROS.platform/Developer/SDKs/XROS26.5.sdk --xcode-version 17F113 --platform-family xrOS --deployment-target 26.0 --bundle-identifier com.kdt.livecontainer --output /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app --target-triple arm64-apple-xros26.0 --binary-file /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/AVP --dependency-file /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP_dependency_info.dat --stringsdata-file /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/ExtractedAppShortcutsMetadata.stringsdata --source-file-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP.SwiftFileList --metadata-file-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/AVP.DependencyMetadataFileList --static-metadata-file-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/AVP.DependencyStaticMetadataFileList --swift-const-vals-list /Users/runner/work/AVP/AVP/build/dd/Build/Intermediates.noindex/AVP.build/Release-xros/AVP.build/Objects-normal/arm64/AVP.SwiftConstValuesFileList --compile-time-extraction --deployment-aware-processing --validate-assistant-intents --no-app-shortcuts-localization
+2026-10-15 10:25:56.454 appintentsmetadataprocessor[7146:24100] Starting appintentsmetadataprocessor export
+2026-10-15 10:25:56.465 appintentsmetadataprocessor[7146:24100] warning: Metadata extraction skipped. No AppIntents.framework dependency found.
 
 GenerateDSYMFile /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app.dSYM /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app/AVP (in target 'AVP' from project 'AVP')
     cd /Users/runner/work/AVP/AVP
@@ -330,26 +176,26 @@ Touch /Users/runner/work/AVP/AVP/build/dd/Build/Products/Release-xros/AVP.app (i
 
 build/dd/Build/Products/Release-xros/AVP.app:
 total 43368
-drwxr-xr-x  14 runner  staff       448 Oct 15 10:18 .
-drwxr-xr-x@  5 runner  staff       160 Oct 15 10:18 ..
--rw-r--r--   1 runner  staff   4112192 Oct 15 10:17 alyx.recipe
--rw-r--r--   1 runner  staff      5697 Oct 15 10:17 app-convars.lua
--rw-r--r--   1 runner  staff   4256584 Oct 15 10:17 Assets.car
--rwxr-xr-x   1 runner  staff  13793856 Oct 15 10:18 AVP
--rw-r--r--   1 runner  staff      1824 Oct 15 10:17 device-info.json
-drwxr-xr-x   6 runner  staff       192 Oct 15 10:18 Frameworks
--rw-r--r--   1 runner  staff      2224 Oct 15 10:18 Info.plist
--rw-r--r--   1 runner  staff         8 Oct 15 10:18 PkgInfo
--rw-r--r--   1 runner  staff      4507 Oct 15 10:17 runtime-debs.json
--rw-r--r--   1 runner  staff      1940 Oct 15 10:17 video2-visionpro-demo.txt
-drwxr-xr-x   8 runner  staff       256 Oct 15 10:17 VPKEngineCertificates
--rw-r--r--   1 runner  staff       310 Oct 15 10:17 vr_fidelity_fixed_1.0.csv
+drwxr-xr-x  14 runner  staff       448 Oct 15 10:25 .
+drwxr-xr-x@  5 runner  staff       160 Oct 15 10:25 ..
+-rw-r--r--   1 runner  staff   4112192 Oct 15 10:24 alyx.recipe
+-rw-r--r--   1 runner  staff      5697 Oct 15 10:24 app-convars.lua
+-rw-r--r--   1 runner  staff   4256584 Oct 15 10:25 Assets.car
+-rwxr-xr-x   1 runner  staff  13794296 Oct 15 10:25 AVP
+-rw-r--r--   1 runner  staff      1824 Oct 15 10:24 device-info.json
+drwxr-xr-x   6 runner  staff       192 Oct 15 10:25 Frameworks
+-rw-r--r--   1 runner  staff      2224 Oct 15 10:25 Info.plist
+-rw-r--r--   1 runner  staff         8 Oct 15 10:25 PkgInfo
+-rw-r--r--   1 runner  staff      4507 Oct 15 10:24 runtime-debs.json
+-rw-r--r--   1 runner  staff      1940 Oct 15 10:24 video2-visionpro-demo.txt
+drwxr-xr-x   8 runner  staff       256 Oct 15 10:24 VPKEngineCertificates
+-rw-r--r--   1 runner  staff       310 Oct 15 10:24 vr_fidelity_fixed_1.0.csv
 
 build/dd/Build/Products/Release-xros/AVP.app/Frameworks:
 total 0
-drwxr-xr-x   6 runner  staff  192 Oct 15 10:18 .
-drwxr-xr-x  14 runner  staff  448 Oct 15 10:18 ..
-drwxr-xr-x   4 runner  staff  128 Oct 15 10:18 MoltenVK.framework
-drwxr-xr-x   5 runner  staff  160 Oct 15 10:18 SDL2.framework
-drwxr-xr-x   5 runner  staff  160 Oct 15 10:18 SDL3.framework
-drwxr-xr-x   4 runner  staff  128 Oct 15 10:18 VPVulkan.framework
+drwxr-xr-x   6 runner  staff  192 Oct 15 10:25 .
+drwxr-xr-x  14 runner  staff  448 Oct 15 10:25 ..
+drwxr-xr-x   4 runner  staff  128 Oct 15 10:25 MoltenVK.framework
+drwxr-xr-x   5 runner  staff  160 Oct 15 10:25 SDL2.framework
+drwxr-xr-x   5 runner  staff  160 Oct 15 10:25 SDL3.framework
+drwxr-xr-x   4 runner  staff  128 Oct 15 10:25 VPVulkan.framework
