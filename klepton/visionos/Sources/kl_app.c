@@ -4,6 +4,7 @@
 #include <mach/mach.h>          // task_info(TASK_VM_INFO) — the heartbeat's footprint
 #include <math.h>              // ceil — KL_GUEST_PACE_HZ
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -833,6 +834,48 @@ static void perf_tick(void) {
 static void perf_tick(void) {}
 #endif
 
+// B57 (Logs_Alyx_46): the game was ended by the system at 6.5 GB footprint, 1.5 min after a system-critical memory
+// warning that nothing acted on (Source 2 registers no low-memory callback). Two things here:
+//  1. Relief: while the OS reports warning/critical pressure (last 30 s; every 15 s) or headroom is under 1 GB
+//     (every 60 s), hand the allocator's free pages back to the system (malloc_zone_pressure_relief: only memory
+//     already freed, nothing the game or the GPU is using), logging what it got.
+//  2. A breakdown every 30 s: footprint, Metal objects (textures/buffers/pipelines) and the rest (CPU heap, code),
+//     and its growth per minute, so a steady climb (a leak) shows as such.
+#include <malloc/malloc.h>
+extern _Atomic int kl_mem_os_level;
+extern _Atomic long long kl_mem_os_level_t;
+long long kl_metal_allocated_bytes(void);
+static void mem_relief_tick(int ticks) {
+    const long long avail = kl_avail_memory(), foot = kl_phys_footprint();
+    const long long now = (long long)time(NULL);
+    const int level = atomic_load(&kl_mem_os_level);
+    const int os_recent = level > 0 && now - atomic_load(&kl_mem_os_level_t) < 30;
+    static long long last_relief;
+    // OS pressure: every 15 s; our own low headroom (< 1 GB) alone: every 60 s (each pass briefly locks the
+    // allocator, and the game can sit near that line for a whole session).
+    const int low = avail > 0 && avail < (1024LL << 20);
+    if ((os_recent && now - last_relief >= 15) || (low && now - last_relief >= 60)) {
+        last_relief = now;
+        size_t got = malloc_zone_pressure_relief(NULL, 0);
+        long long after = kl_phys_footprint();
+        fprintf(stderr, "[mem] relief (%s, %lld MB available): allocator returned %zu MB, footprint %lld -> %lld MB\n",
+                os_recent ? (level == 2 ? "system critical" : "system warning") : "low headroom",
+                avail >> 20, got >> 20, foot >> 20, after >> 20);
+        fflush(stderr);
+    }
+    if (ticks > 0 && ticks % 120 == 0) {   // every 30 s (not at launch: Metal loads on first use)
+        static long long first_foot, first_t;
+        if (!first_t && foot > (2048LL << 20)) { first_foot = foot; first_t = now; }
+        const long long metal = kl_metal_allocated_bytes();
+        const double mins = first_t && now > first_t ? (now - first_t) / 60.0 : 0;
+        fprintf(stderr, "[mem] breakdown: footprint %lld MB = Metal objects %lld MB + rest %lld MB; available %lld MB; "
+                        "growth %+.0f MB/min since %lld MB\n",
+                foot >> 20, (metal > 0 ? metal : 0) >> 20, (foot - (metal > 0 ? metal : 0)) >> 20, avail >> 20,
+                mins > 0.5 ? ((foot - first_foot) >> 20) / mins : 0.0, first_foot >> 20);
+        fflush(stderr);
+    }
+}
+
 static void *heartbeat(void *arg) {
     (void)arg;
     // Polled faster than it prints, so a phase change is reported when it
@@ -870,6 +913,7 @@ static void *heartbeat(void *arg) {
             }
             last_phase = phase;
         }
+        mem_relief_tick(ticks);
         perf_tick();
         ticks++;
         struct timespec iv = { 0, 250000000 };  // nanosleep: usleep is EINVAL at >= 1e6
