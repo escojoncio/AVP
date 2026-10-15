@@ -7,7 +7,7 @@ juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `v
 con `git format-patch` sobre ref+parches). Sin MetalFX, sin MoltenVK (solo referencia), sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B49**, pendiente de compilar).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B49**, compilada OK).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
