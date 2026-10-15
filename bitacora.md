@@ -7,7 +7,7 @@ juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `v
 con `git format-patch` sobre ref+parches). Sin MetalFX, MoltenVK solo como fallback automático, sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B53**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B54**, compilada OK).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -221,7 +221,7 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
   antes del calor ambos rondan 13–20 ms. Para comparar: visor frío, misma zona, mismo tiempo.
 - Problema principal ahora: térmico (critical duplica el tiempo de GPU) y la zona no cabe en 45 ni a 70 %.
 
-## B54 (Logs_Alyx_43): el fallback 30 nunca se aplicaba
+## B54 (compilada OK; Logs_Alyx_43): el fallback 30 nunca se aplicaba
 - **Bug**: `kl_app.c` (pacer del invitado) rechazaba el divisor extra si `rate/(div+ex) < 31.5`; B52 bajó solo
   `pace_plan` a 29.5. A 90 Hz el regulador decía «fallback 30» y `told 30 Hz`, pero el juego seguía a 45 (log 43:
   `[openvr] clock ... 45.0 fps, told 30 Hz` toda la partida; nunca salió `[guest] pace governor: 1/3`). Ahora 29.5 en
