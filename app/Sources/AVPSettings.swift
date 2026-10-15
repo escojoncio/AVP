@@ -54,6 +54,10 @@ final class AVPSettings: ObservableObject {
     /// Build 53: the game's MSAA (0 off, 2, 4). Foveation needs an MSAA scene target to find the eye passes, so with
     /// MSAA off it is not applied.
     @Published var msaa: Int { didSet { graphicsChanged() } }
+    /// Build 55: frame rate. Auto = the governor (45/50 when it fits, else 30/33); high = always 45/50 (late frames
+    /// reprojected by visionOS); steady = always 30/33 (KLVR_PACE_FALLBACK 1 / 0 / 2).
+    enum FrameRate: Int, CaseIterable { case auto = 1, high = 0, steady = 2 }
+    @Published var frameRate: FrameRate { didSet { save() } }
     /// Build 27 (VPKEngine 0031): command buffers wait only on the previous ones they really depend on (VP_CB_ORDER=2)
     /// instead of all of them (0029, VP_CB_ORDER=1). Logs 23: a whole session with it, no hang, no vertex explosion,
     /// out_of_order=0 → on by default since build 32. If vertex explosions come back, turn it off.
@@ -179,6 +183,7 @@ final class AVPSettings: ObservableObject {
         systemLanguage = d.object(forKey: "avp.sysLang") as? Bool ?? true
         showFps = d.object(forKey: "avp.showFps") as? Bool ?? false
         ssao = d.object(forKey: "avp.ssao") as? Bool ?? true
+        frameRate = FrameRate(rawValue: d.object(forKey: "avp.fps") as? Int ?? 1) ?? .auto
         msaa = [0, 2, 4].contains(d.integer(forKey: "avp.msaa")) && d.object(forKey: "avp.msaa") != nil ? d.integer(forKey: "avp.msaa") : 4
         trackedOrder = d.object(forKey: "avp.cbOrder2c") as? Bool ?? true
         diagCaptures = d.object(forKey: "avp.diagCaptures") as? Bool ?? false
@@ -217,6 +222,7 @@ final class AVPSettings: ObservableObject {
         d.set(showFps, forKey: "avp.showFps")
         d.set(ssao, forKey: "avp.ssao")
         d.set(msaa, forKey: "avp.msaa")
+        d.set(frameRate.rawValue, forKey: "avp.fps")
         d.set(trackedOrder, forKey: "avp.cbOrder2c")
         d.set(diagCaptures, forKey: "avp.diagCaptures")
         d.set(gpuPassProfiling, forKey: "avp.gpuPasses2")
@@ -246,7 +252,7 @@ final class AVPSettings: ObservableObject {
         renderPercent = fresh.renderPercent; textureCap = fresh.textureCap
         foveationOn = fresh.foveationOn; wideDegrees = fresh.wideDegrees; periphery = fresh.periphery
         vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
-        anisotropy = fresh.anisotropy; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao; msaa = fresh.msaa
+        anisotropy = fresh.anisotropy; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao; msaa = fresh.msaa; frameRate = fresh.frameRate
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
         postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; occlusionQueries = fresh.occlusionQueries
@@ -443,7 +449,7 @@ final class AVPSettings: ObservableObject {
             // its fences: off.
             ("KL_VK_MERGE", vpk ? "0" : "1"),
             ("KL_VK_MERGE_VIS", vpk ? "0" : "1"),
-            ("KLVR_PACE_FALLBACK", "1"),   // 50 fps on 100 Hz when the GPU fits, else 33.3
+            ("KLVR_PACE_FALLBACK", String(frameRate.rawValue)),   // 50 fps on 100 Hz when the GPU fits, else 33.3
             ("KL_LOG_TAG", vpk ? "vpkengine" : "moltenvk"),
             ("KL_CP_QUALITY", "0.40"),
             ("MVK_CONFIG_USE_MTLHEAP", "0"),
@@ -580,7 +586,7 @@ final class AVPSettings: ObservableObject {
                    + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
-                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart), test A/B \(abTest), preset \(preset.rawValue)")
+                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart), test A/B \(abTest), preset \(preset.rawValue), fps \(frameRate)")
         return env
     }
 

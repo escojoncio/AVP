@@ -234,6 +234,14 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
 - Quitada la opción MoltenVK (queda solo como fallback automático si VPVulkan no carga). Selectores segmentados
   (preset, MSAA, movimiento, subtítulos, tamaño).
 
+## Logs_Alyx_45 (B54, 100 Hz) → B55
+- Fix B54 OK: 33,3 fps clavados toda la partida (100 Hz), térmico solo fair, GPU juego 12–17 ms + comp ~3. Pero nunca
+  volvió a 50 (regla B53 <80 %, ≤3 % tarde demasiado estricta) → usuario lo nota peor. Parón ~5 s a 19:28:30 = carga
+  del juego (memoria 2,0→3,7 GB), no nuestro.
+- B55: `KLVR_PACE_FALLBACK` = modo (0 siempre base 45/50, 1 auto, 2 siempre fallback 30/33); selector «Fotogramas»
+  (`frameRate`, `avp.fps`, por defecto Auto). Auto: vuelta tras 10 s <85 % con ≤5 % tarde, back-off 10→120 s.
+  `klvr_plat_pace_hz` activo en modos 1 y 2; `klvr_plat_gpu_report_scale` usa la base en modo 0.
+
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su
    MSL/coste. Si indirect-count codificado ≫ real → `MTLIndirectCommandBuffer` / compactar en el fix-up.

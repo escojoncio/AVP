@@ -61,6 +61,12 @@ struct AVPSettingsView: View {
             Stepper(AVPL("Resolución: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) por ojo)",
                          "Resolution: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) per eye)"),
                     value: $s.renderPercent, in: 50...130, step: 5)
+            Picker(AVPL("Fotogramas (al arrancar el juego)", "Frame rate (at game start)"), selection: $s.frameRate) {
+                Text("Auto").tag(AVPSettings.FrameRate.auto)
+                Text("45/50").tag(AVPSettings.FrameRate.high)
+                Text("30/33").tag(AVPSettings.FrameRate.steady)
+            }
+            .pickerStyle(.segmented)
             Toggle(AVPL("Mostrar FPS", "Show FPS"), isOn: $s.showFps)
         } header: {
             Text(AVPL("Imagen", "Picture"))
