@@ -7,7 +7,7 @@ juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `v
 con `git format-patch` sobre ref+parches). Sin MetalFX, sin MoltenVK (solo referencia), sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B49**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B50**, pendiente de compilar).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -138,7 +138,8 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
   Los shaders de fragmento escalan con píxeles → optimizarlos rinde poco. El objetivo es el coste fijo:
   hueco de GPU parada ~5 ms al inicio del frame (causa desconocida: ni running start B45 ni esperas a productores
   0038 lo mueven; el clear skip lo empeora), UI Panorama ~3,5 ms (menú), vértices ~3,2, compute ~1,4, copias ojos ~1,5.
-- SIGUIENTE (B50): diagnóstico del hueco: por command buffer, hora de commit en CPU, GPUStartTime/EndTime y en qué
+- B50 (en la IPA): `kl_gpu_time.m` `gap_tick/gap_print` (KL_GPU_GAP, on): cada 15 s, 8 frames: líneas `[gap]` por cb
+  (commit/start/end) y `[gap] f=… GPU idle = CPU + GPU-WAIT; compositor alone`, `[gap] SUMMARY`. Diagnóstico del hueco: por command buffer, hora de commit en CPU, GPUStartTime/EndTime y en qué
   fence/encoder espera el primer encoder que arranca tarde; ver si es CPU del juego (submit tarde), una fence (join /
   cola anterior) o el compositor ocupando la GPU.
 
