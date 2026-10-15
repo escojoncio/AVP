@@ -164,6 +164,7 @@ __attribute__((weak)) void kl_guest_pace_extra(unsigned extra) { (void)extra; }
 float kl_guest_display_rate(void);
 __attribute__((weak)) float kl_guest_display_rate(void) { return 0; }
 static unsigned g_pace_extra;
+static float g_plan_panel;   // the panel rate pace_plan last planned from (hand prediction, B56)
 static void pace_plan(float *base, float *fallback) {
     float panel;
     const char *hf = getenv("KLVR_HOST_FPS");
@@ -182,6 +183,7 @@ static void pace_plan(float *base, float *fallback) {
         panel = peak > 20 ? roundf(peak) : kl_ovrp_display_frequency();
     }
     if (!(panel > 20)) panel = 90;
+    g_plan_panel = panel;
     unsigned div = (unsigned)ceil(panel / 60.0 - 0.05);
     if (div < 1) div = 1;
     *base = panel / div;
@@ -712,6 +714,23 @@ static void klvr_plat_hand_raw(int hand, double t, klvr_tracked *out) {
     // a caller asking for another instant is carried there on the measured
     // velocity, capped so a bad sample cannot fling the hand.
     double dt = t - kl_ovrp_predicted_display_time();
+    // B56: a picture stays up for several refreshes (3 at 30/33 fps, 2 at 45/50) while visionOS only reprojects it
+    // for the head, so the hands drawn in it are right on its first refresh and late on the others. Predicted to
+    // the middle of that hold instead (+1 period at 30/33, +0.5 at 45/50), they lag the real hand half as much on
+    // average. KLVR_HAND_HOLD_PREDICT=0 turns it off.
+    static int hold_on = -1;
+    if (hold_on < 0) {
+        const char *e = getenv("KLVR_HAND_HOLD_PREDICT");
+        hold_on = !(e && *e == '0');
+        fprintf(stderr, "  [openvr] hands predicted to the middle of the picture's hold: %s (KLVR_HAND_HOLD_PREDICT)\n", hold_on ? "on" : "off");
+    }
+    if (hold_on) {
+        float base, fb;
+        pace_plan(&base, &fb);                       // also sets g_plan_panel (> 20)
+        float fps = __atomic_load_n(&g_pace_extra, __ATOMIC_RELAXED) && fb > 0 ? fb : base;
+        float refreshes = fps > 0 ? roundf(g_plan_panel / fps) : 1;
+        if (refreshes > 1 && refreshes < 5) dt += (refreshes - 1) * 0.5 / g_plan_panel;
+    }
     if (dt > 0.05) dt = 0.05;
     if (dt < -0.05) dt = -0.05;
     for (int i = 0; i < 3; i++) out->pose.p[i] += (float)(out->vel[i] * dt);
