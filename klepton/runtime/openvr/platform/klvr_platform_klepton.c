@@ -185,7 +185,9 @@ static void pace_plan(float *base, float *fallback) {
     unsigned div = (unsigned)ceil(panel / 60.0 - 0.05);
     if (div < 1) div = 1;
     *base = panel / div;
-    *fallback = panel / (div + 1) >= 32.0f ? panel / (div + 1) : 0;   // 100 Hz: 50 -> 33.3; 90 Hz: none (30)
+    // 100 Hz: 50 -> 33.3; 90 Hz: 45 -> 30 (B52: Logs_Alyx_38, in a level with the GPU at 25-30 ms a frame and no
+    // fallback allowed at 90 Hz, pictures alternated 2 and 3 refreshes for minutes, worse than a steady 30).
+    *fallback = panel / (div + 1) >= 29.5f ? panel / (div + 1) : 0;
 }
 // os_proc_available_memory(): visionOS/iOS only, so weak (NULL on the Mac, where the answer is "unknown").
 extern size_t os_proc_available_memory(void) __attribute__((weak_import));
