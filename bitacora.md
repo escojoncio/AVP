@@ -7,7 +7,7 @@ juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `v
 con `git format-patch` sobre ref+parches). Sin MetalFX, MoltenVK solo como motor de prueba (B53), sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B52**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B53**, compilada OK).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -187,7 +187,7 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
   busy 12 ms con span 34 ms (GPU ociosa 21 ms dentro del frame: CPU/orden, no trabajo de GPU). A 80 % la GPU no cabía
   → se quedaba en 30 estable. Causa: el regulador no veía frames entregados tarde por causas ajenas a la GPU.
 
-## B53 (pendiente de compilar/validar)
+## B53 (compilada OK, pendiente de validar)
 - `klvr_platform_klepton.c` `pace_governor`:
   - bajada rápida: ≥0,3 s y ≥10 frames con >40 % tarde por GPU **o** >25 % de imágenes entregadas tarde;
   - cadencia real: dt entre llamadas a `klvr_plat_wait_frame` >1,25 periodos base (y <3 periodos; >250 ms ignorado)
