@@ -242,6 +242,16 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
   (`frameRate`, `avp.fps`, por defecto Auto). Auto: vuelta tras 10 s <85 % con ≤5 % tarde, back-off 10→120 s.
   `klvr_plat_pace_hz` activo en modos 1 y 2; `klvr_plat_gpu_report_scale` usa la base en modo 0.
 
+## B56
+- Ajustes: selectores segmentados con título visible (VStack Text + Picker `.labelsHidden()`); pies explicativos
+  (fotogramas: visor siempre 90/100 Hz, cabeza reproyectada; MSAA/aniso/SSAO). B55 salió sin títulos (no usar).
+- Manos: `klvr_plat_hand_raw` adelanta la pose (refrescos−1)/2 periodos de panel (30/33: +1, 45/50: +0,5) al centro
+  del tiempo que la imagen está en pantalla; `g_plan_panel` de `pace_plan`. Opción Diagnóstico «Manos adelantadas al
+  centro de cada imagen» (`handHoldPredict`, `avp.handHold`, `KLVR_HAND_HOLD_PREDICT`, ON). Log:
+  `[openvr] hands predicted to the middle of the picture's hold: on`.
+- Interpolación tipo Motion Smoothing descartada por ahora (vectores de movimiento de VPKEngine a cero, coste GPU,
+  artefactos). Idea pendiente: dar profundidad a visionOS para reproyección posicional.
+
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su
    MSL/coste. Si indirect-count codificado ≫ real → `MTLIndirectCommandBuffer` / compactar en el fix-up.

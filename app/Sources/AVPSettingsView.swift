@@ -209,6 +209,13 @@ struct AVPSettingsView: View {
             Toggle(AVPL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $s.diagCaptures)
             Toggle(AVPL("Medir el tiempo de GPU por pase", "Per-pass GPU timing"), isOn: $s.gpuPassProfiling)
             Toggle(AVPL("Occlusion culling medido (consultas de GPU)", "Measured occlusion culling (GPU queries)"), isOn: $s.occlusionQueries)
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(AVPL("Manos adelantadas al centro de cada imagen", "Hands predicted to the middle of each picture"), isOn: $s.handHoldPredict)
+                Text(AVPL("Cada imagen del juego se ve 2 o 3 refrescos; las manos se colocan donde estarán a mitad de ese tiempo para que vayan menos por detrás de las tuyas.",
+                          "Each game picture is shown for 2 or 3 refreshes; the hands are placed where they will be halfway through, so they trail yours less."))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
             Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
                    role: .destructive) { confirmQuarantine = true }
                 .disabled(quarantined == 0)
