@@ -151,23 +151,10 @@ struct AVPSettingsView: View {
         Section {
             Toggle(AVPL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $s.diagCaptures)
             Toggle(AVPL("Medir el tiempo de GPU por pase", "Per-pass GPU timing"), isOn: $s.gpuPassProfiling)
-            Toggle(AVPL("Orden de GPU por recursos", "GPU ordering by resources"), isOn: $s.trackedOrder)
-            Toggle(AVPL("Amplificación de vértices", "Vertex amplification"), isOn: $s.amplify)
-            Toggle(AVPL("Post-procesado solo en el área foveada (prueba)", "Post-processing on the foveated area only (test)"), isOn: $s.postPhysical)
-            Toggle(AVPL("Ojos al compositor sin copia", "Eyes to the compositor without a copy"), isOn: $s.eyeDirect)
             Toggle(AVPL("Occlusion culling medido (consultas de GPU)", "Measured occlusion culling (GPU queries)"), isOn: $s.occlusionQueries)
-            Toggle(AVPL("Arranque anticipado del frame (CPU en paralelo con la GPU)", "Running start (CPU in parallel with the GPU)"), isOn: $s.runningStart)
-            VStack(alignment: .leading, spacing: 4) {
-                Toggle(AVPL("Test automático de rendimiento", "Automatic performance test"), isOn: $s.abTest)
-                Text(AVPL("Unos 2 minutos tras cargar, quieto en el menú; el HUD avisa cuando termina. Solo deja activo lo que mejora.",
-                          "About 2 minutes after loading, standing still in the menu; the HUD says when it is done. Only what helps stays on."))
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-            Picker(AVPL("Frecuencia que se le dice al juego", "Refresh rate told to the game"), selection: $s.reportedHz) {
-                Text(AVPL("Automática (ritmo real)", "Automatic (the real pace)")).tag(AVPSettings.ReportedHz.measured)
-                Text(AVPL("Fija 50 Hz", "Fixed 50 Hz")).tag(AVPSettings.ReportedHz.fixed50)
-                Text(AVPL("Fija 90 Hz", "Fixed 90 Hz")).tag(AVPSettings.ReportedHz.fixed90)
+            Picker(AVPL("Motor gráfico", "Graphics engine"), selection: $s.engine) {
+                Text("VPKEngine").tag(AVPSettings.Engine.vpkengine)
+                Text(AVPL("MoltenVK (prueba)", "MoltenVK (test)")).tag(AVPSettings.Engine.moltenvk)
             }
             Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
                    role: .destructive) { confirmQuarantine = true }
