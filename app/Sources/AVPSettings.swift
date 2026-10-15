@@ -387,7 +387,12 @@ final class AVPSettings: ObservableObject {
             ("KLVR_EYE_SIZE", "\(eye.width),\(eye.height)"),
             ("KL_DISPLAY_HZ", String(Self.guestHz)),
             ("KL_GUEST_PACE_HZ", String(Self.guestHz / 2)),
-            ("KL_GUEST_PACE_LEAD_MS", runningStart ? "6" : "0"),
+            // B51: 9 ms (was 6). Logs_Alyx_37 [gap]: frames whose main command buffer was committed late left the GPU idle
+            // 2-3 ms and overran the 45 fps budget (pictures held 3 refreshes: the judder in menus).
+            ("KL_GUEST_PACE_LEAD_MS", runningStart ? "9" : "0"),
+            // B51: eye copies trimmed to the foveation map's physical area by default (A/B: +0.4-1.1 ms in all 6 rounds of
+            // Logs_Alyx_36 and 2_14, under the noise threshold but never negative).
+            ("KL_EYE_TRIM", "1"),
             ("KL_ABTEST", abTest ? "1" : "0"),
             // Klepton's encoder merging is MoltenVK's (MSAA scene chunks). VPKEngine merges same-target passes in its
             // own frame compiler, and now that its queue is watched those hooks would hold its encoders open across
