@@ -173,6 +173,13 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
 - Juego en nivel 25–33 ms (picos al tener un objeto delante de la cara: relleno de píxeles), menú/zonas ligeras 13–17.
 - Post al área física: sin quejas visuales (sin medida de ahorro: medir GPU OFF).
 
+## Logs_Alyx_40 (B52)
+- Explosión: juego 29→41 ms durante ~15 s (partículas que llenan la vista; sin compilaciones de pipelines ni
+  anomalías) → 23–27 fps. Sombras siguen 1–2 s tarde con bit0 OFF → sospecha: «oclusión medida» (VPVK_OCCLUSION,
+  B39): resultados de consultas que llegan tarde → casters culled. Usuario prueba con la opción OFF (sin build).
+- Regulador: bajar a 30 en ~0,3 s (primeros frames tarde) y volver a 45 solo tras ~15 s holgados. La resolución
+  dinámica (auto-fidelity de Alyx) se quitó porque rompía el foveado (mapa fijo al lanzar): rehacerla = trabajo grande.
+
 ## PRÓXIMA BUILD (pedido del usuario)
 - Limpieza de opciones del menú: dejar solo las útiles/necesarias (quitar: test A/B, ojos sin copia, post al área
   física, Hz al juego, arranque anticipado, orden por recursos, oclusión medida, amplificación…: fijar sus valores
