@@ -7,7 +7,7 @@ juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `v
 con `git format-patch` sobre ref+parches). Sin MetalFX, sin MoltenVK (solo referencia), sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B47b**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B48**, pendiente de compilar).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -97,6 +97,25 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
 - B47b: cada línea `[abtest]` también en `Logs Alyx/abtest-result.txt` (`ab_out`, fsync al terminar): en Logs_Alyx_35 el
   usuario vio «TEST TERMINADO» pero la copia del log acababa ~10 s antes (sin veredicto).
 - Validar: `[abtest] detail`/`msl` de pipe6857/pipe6965 → leer su MSL y su encoder destino para optimizarlos.
+
+## Logs_Alyx_36 (B47b, 80 %, menú) — test v2
+- **Panel 90 Hz de día / 100 Hz de noche** (anti-parpadeo de luz de 50 Hz, lo elige visionOS): B45 de noche 100 Hz → 50 fps;
+  B46b/B47b de día 90 Hz → 45 fps con el mismo trabajo de GPU (~19,7 ms excl). No es regresión.
+- El span UNIÓN es bimodal por ventana (~20,3 / ~22,4 ms según la fase con el compositor) → los «shaders caros» de
+  Logs_35 (pipe6858 2,3 ms, pipe6966 1,8 ms) eran falsos: en 36 ahorran 0,09 / −0,40. El exclusivo es estable (19,6–19,9).
+- Clear skip (bit1) ya actúa (73/73) pero **empeora 2,5 ms de unión** (excl igual) → retirado del test y de cualquier máscara.
+- Esperas a productores: ≈ −0,2 ms excl (sin efecto); recorte de ojos ≈ +0,5 unión, no significativo.
+- Knockout (unión, poco fiable): ningún shader > 0,8 ms. Top: vk.comp15 (cs 27a976ed39a2e805, niebla volumétrica 3D,
+  tabla de 32 float2 inicializada en memoria privada por hilo + índice dinámico, 6 bucles anidados con contadores
+  `vp_guard`/`vp_budget`) 0,78 ms. MSL guardado.
+- Detalle del censo: pipe6707 (2f0796fd…) 830 k verts·inst/frame y pipe6966 528 k en la escena MSAA (enc 3).
+
+## B48 — en la IPA, PENDIENTE DE VALIDAR
+- Test v3: decide con la MEDIANA EXCLUSIVA por ventana (`xs`), unión solo informativa; ventana con < 8 frames con
+  exclusivo = no usada. Configs OFF/ALL(5)/ALL−bit0(4)/ALL−bit2(1); bit1 nunca se aplica. Knockout 0,4 + 1,6 s,
+  ranking por ahorro exclusivo, MSL de los ≥ 0,3 ms.
+- Ideas de traductor (pendientes de datos): arrays privados de solo constantes → `constant` LUT; quitar guardas de
+  bucle con contador acotado.
 
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su
