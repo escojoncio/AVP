@@ -7,7 +7,7 @@ juego. Gráficos: **solo VPKEngine** = `escojoncio/VPKEngine` en el commit de `v
 con `git format-patch` sobre ref+parches). Sin MetalFX, MoltenVK solo como fallback automático, sin LOD/cull que cambie lo
 visible, sin bajar fidelidad: el rendimiento sale de resolución y de optimización pura del motor.
 Plan: `PLAN.md`. Historial completo: `git log -p bitacora.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B58**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B59**, compilada OK).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## 100 % funcional (validado en el visor)
@@ -280,7 +280,7 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
     «Altura real (detecta el suelo)» (`realFloor`, `avp.realFloor`, `KLVR_REAL_FLOOR`, ON). Logs `[height] ...`.
     Ojo: la altura manual guardada se suma encima (el usuario tenía −15 cm).
 
-## Build 59 (sin validar): nitidez del centro (RCAS)
+## Build 59 (compilada OK, sin validar en el visor): nitidez del centro (RCAS)
 Ajuste «Nitidez del centro» (0–100 %, def. 50 %, 0 = pase omitido): RCAS (FSR1) solo en la zona de tasa completa de cada
 imagen de ojo, en vivo desde la pausa.
 - `app/Sources/AVPSettings.swift`: `centerSharpness: Double` (`avp.centerSharp`), en `init` (def. 0.5), `save()`,
