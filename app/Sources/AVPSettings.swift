@@ -56,7 +56,14 @@ final class AVPSettings: ObservableObject {
     @Published var msaa: Int { didSet { graphicsChanged() } }
     /// Build 59: «Nitidez del centro» 0...1 (0 = off, pass skipped). RCAS (FSR1) in the compositor on the full-rate zone
     /// of each eye image only (KleptonCompositor.sharpenedEye); live from the pause menu (KL_CP_SHARP at launch).
-    @Published var centerSharpness: Double { didSet { save() } }
+    @Published var centerSharpness: Double {
+        didSet {
+            // Quantised to the 5 % step (the Stepper's float drift would leave 0.0000001 instead of 0).
+            let q = (max(0, min(1, centerSharpness)) * 20).rounded() / 20
+            if q != centerSharpness { centerSharpness = q }
+            save()
+        }
+    }
     /// Build 55: frame rate. Auto = the governor (45/50 when it fits, else 30/33); high = always 45/50 (late frames
     /// reprojected by visionOS); steady = always 30/33 (KLVR_PACE_FALLBACK 1 / 0 / 2).
     enum FrameRate: Int, CaseIterable { case auto = 1, high = 0, steady = 2 }
@@ -189,7 +196,7 @@ final class AVPSettings: ObservableObject {
         vpktaaPercent = d.object(forKey: "avp.reconPercent") as? Double ?? 80
         vpktaaSharpness = d.object(forKey: "avp.reconSharp") as? Double ?? 1.0
         anisotropy = d.object(forKey: "avp.aniso") as? Int ?? 16
-        centerSharpness = min(1, max(0, d.object(forKey: "avp.centerSharp") as? Double ?? 0.5))
+        centerSharpness = (min(1, max(0, d.object(forKey: "avp.centerSharp") as? Double ?? 0.5)) * 20).rounded() / 20
         systemLanguage = d.object(forKey: "avp.sysLang") as? Bool ?? true
         showFps = d.object(forKey: "avp.showFps") as? Bool ?? false
         ssao = d.object(forKey: "avp.ssao") as? Bool ?? true

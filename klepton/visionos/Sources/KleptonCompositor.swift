@@ -276,10 +276,14 @@ final class KleptonCompositor {
     private var sharpOut: [MTLTexture?] = [nil, nil]
     private var loggedSharpen = false
     private var sharpPipeFmt: MTLPixelFormat?
+    /// The pixel format the RCAS pipeline failed to build for (nil: no failure). Logged once, not retried until the format changes.
+    private var sharpPipeFailedFmt: MTLPixelFormat?
     /// Full-rate zone per array slice of the eye texture (texels), cached per slot until the rate map or the size changes.
     private struct SharpZoneCache {
         var map: UnsafeMutableRawPointer?
         var w = -1, h = -1, n = -1
+        var physW = -1, physH = -1, layers = -1
+        var bottomUp = false
         var zones: [SIMD4<Float>]?
     }
     private var sharpZoneCache = [SharpZoneCache(), SharpZoneCache()]
@@ -1477,18 +1481,30 @@ final class KleptonCompositor {
     /// measured: nil, and the pass is skipped (never sharpen what cannot be bounded). The zone is a rectangle that
     /// holds the round sharp zone, so its corners can reach outside the circle the composite shows at full rate.
     /// Cached per slot: the map pointer changes when the foveation settings do (kl_vrr_reload).
-    private func sharpZones(for src: MTLTexture, slot: Int) -> [SIMD4<Float>]? {
-        let mp = kl_vrr_map_for(Int32(src.width), Int32(src.height)) ?? kl_glfb_eye_rate_map()
+    private func sharpZones(for src: MTLTexture, slot: Int, bottomUp: Bool) -> [SIMD4<Float>]? {
+        let vrrMap = kl_vrr_map_for(Int32(src.width), Int32(src.height))
+        // Klepton's VRR is on (KL_VRR=1, read once like kl_vrr_grid_ctx) but its map is not there: the 1-2 frames after a
+        // live kl_vrr_set. Skip this frame and cache nothing; an unbounded rect would sharpen the squeezed periphery.
+        if vrrMap == nil && Self.vrrOn { return nil }
+        let mp = vrrMap ?? kl_glfb_eye_rate_map()
         let n = max(1, src.arrayLength)
+        let rmKey = mp.flatMap { Unmanaged<AnyObject>.fromOpaque($0).takeUnretainedValue() as? MTLRasterizationRateMap }
+        let phys = rmKey?.physicalSize(layer: 0)
+        let physW = Int(phys?.width ?? 0), physH = Int(phys?.height ?? 0), layers = rmKey?.layerCount ?? 0
         var c = sharpZoneCache[slot]
-        if c.map == mp && c.w == src.width && c.h == src.height && c.n == n { return c.zones }
-        c = SharpZoneCache(map: mp, w: src.width, h: src.height, n: n, zones: nil)
-        if let mp, let rm = Unmanaged<AnyObject>.fromOpaque(mp).takeUnretainedValue() as? MTLRasterizationRateMap {
+        if c.map == mp && c.w == src.width && c.h == src.height && c.n == n
+            && c.physW == physW && c.physH == physH && c.layers == layers && c.bottomUp == bottomUp { return c.zones }
+        c = SharpZoneCache(map: mp, w: src.width, h: src.height, n: n, physW: physW, physH: physH, layers: layers,
+                           bottomUp: bottomUp, zones: nil)
+        if let rm = rmKey {
             var zs: [SIMD4<Float>] = []
             for s in 0..<n {
-                // One layer per eye when the map has two: the slice of a shared 2-slice array, else the slot (eye).
-                let layer = rm.layerCount > 1 ? min(rm.layerCount - 1, n > 1 ? s : slot) : 0
-                guard let z = Self.fullRateZone(rm, layer: layer) else { break }
+                // Klepton's VRR map: one layer per eye when it has two (the slice of a shared 2-slice array, else the
+                // slot), top-down image. The guest's own map (kl_glfb_eye_rate_map): layer 0, like the unwarp grid's
+                // screenToPhysical, and a bottom-up eye image (GL) is measured from the bottom: y -> tex_h - y.
+                let layer = vrrMap != nil && rm.layerCount > 1 ? min(rm.layerCount - 1, n > 1 ? s : slot) : 0
+                guard var z = Self.fullRateZone(rm, layer: layer) else { break }
+                if vrrMap == nil && bottomUp { z = SIMD4<Float>(z.x, Float(src.height) - z.w, z.z, Float(src.height) - z.y) }
                 zs.append(z)
             }
             if zs.count == n { c.zones = zs }
@@ -1539,12 +1555,14 @@ final class KleptonCompositor {
     /// (`centerSharp`, 0...1 -> `sharpStops`) or the legacy KL_EYE_SHARPEN stops, which wins. Only inside the full-rate
     /// zone (`sharpZones`). The output keeps the eye image's size, format and array length, so the unwarp grid, the
     /// slices and flipY the composite applies to it are unchanged. Returns `src` if anything is missing.
-    private func sharpenedEye(_ src: MTLTexture, slot: Int, cmd: MTLCommandBuffer) -> MTLTexture {
+    private func sharpenedEye(_ src: MTLTexture, slot: Int, bottomUp: Bool, cmd: MTLCommandBuffer) -> MTLTexture {
         let strength = Self.centerSharp
         let live: Float? = strength > 0 ? Self.sharpStops(strength) : nil
         guard let stops = eyeSharpen ?? live, src.textureType == .type2D || src.textureType == .type2DArray else { return src }
         let sv = src.textureType == .type2DArray ? src : arrayView(src)
         guard sv.textureType == .type2DArray else { return src }
+        if sharpPipeFailedFmt != nil && sharpPipeFailedFmt != src.pixelFormat { sharpPipeFailedFmt = nil }
+        if sharpPipeFailedFmt == src.pixelFormat { return src }
         if sharpPipeline == nil || sharpPipeFmt != src.pixelFormat {
             let msl = """
             #include <metal_stdlib>
@@ -1578,17 +1596,24 @@ final class KleptonCompositor {
                 return float4(c * c, 1.0);
             }
             """
-            guard let lib = try? src.device.makeLibrary(source: msl, options: nil) else { return src }
-            let pd = MTLRenderPipelineDescriptor()
-            pd.vertexFunction = lib.makeFunction(name: "klsh_v")
-            pd.fragmentFunction = lib.makeFunction(name: "klsh_f")
-            pd.colorAttachments[0].pixelFormat = src.pixelFormat
-            sharpPipeline = try? src.device.makeRenderPipelineState(descriptor: pd)
-            sharpPipeFmt = src.pixelFormat
+            do {
+                let lib = try src.device.makeLibrary(source: msl, options: nil)
+                let pd = MTLRenderPipelineDescriptor()
+                pd.vertexFunction = lib.makeFunction(name: "klsh_v")
+                pd.fragmentFunction = lib.makeFunction(name: "klsh_f")
+                pd.colorAttachments[0].pixelFormat = src.pixelFormat
+                sharpPipeline = try src.device.makeRenderPipelineState(descriptor: pd)
+                sharpPipeFmt = src.pixelFormat
+            } catch {
+                sharpPipeline = nil
+                sharpPipeFailedFmt = src.pixelFormat
+                NSLog("%@", "[cp] centre sharpness: RCAS pipeline FAILED for pixel format \(src.pixelFormat.rawValue), pass disabled until the format changes: \(error)")
+                return src
+            }
         }
         guard let ps = sharpPipeline else { return src }
         let n = max(1, sv.arrayLength)
-        guard let zones = sharpZones(for: sv, slot: slot) else {
+        guard let zones = sharpZones(for: sv, slot: slot, bottomUp: bottomUp) else {
             if !sharpZoneFailLogged {
                 sharpZoneFailLogged = true
                 NSLog("[cp] centre sharpness skipped: the full-rate zone of the foveated eye image could not be measured")
@@ -3163,6 +3188,8 @@ final class KleptonCompositor {
     /// AVPSettings; `roundDegrees` must be the map's (KL_VRR_WIDE_DEG, read once when the map is built), so the live
     /// path never changes it. KL_CP_ROUND=0 turns it off (A/B).
     private static func envStr(_ name: String) -> String? { getenv(name).map { String(cString: $0) } }
+    /// KL_VRR=1, read once (per-frame getenv can race a setenv on another thread).
+    private static let vrrOn: Bool = envStr("KL_VRR") == "1"
     nonisolated(unsafe) static var roundFovea: Bool = (envStr("KL_CP_ROUND") ?? "1") != "0"
         && envStr("KL_VRR") == "1" && envStr("KL_VRR_MAP") == "wide"
     nonisolated(unsafe) static var roundDegrees: Float =
@@ -3186,7 +3213,7 @@ final class KleptonCompositor {
     /// (con 0.42, moderate), 0.05 -> 2.4 (con 0.19). The lobe limit (-0.1875) and noise handling stay FSR1's.
     static func sharpStops(_ s: Float) -> Float { 2.5 * (1 - max(0, min(1, s))) }
     static func setCenterSharpness(_ s: Float) {
-        centerSharp = max(0, min(1, s))
+        centerSharp = (max(0, min(1, s)) * 20).rounded() / 20   // the 5 % step: 0 is exactly 0 (pass skipped)
         NSLog("%@", "[cp] centre sharpness (RCAS) \(centerSharp > 0 ? "on" : "off"): \(Int((centerSharp * 100).rounded())) %"
               + (centerSharp > 0 ? ", RCAS stops \(sharpStops(centerSharp))" : ""))
     }
@@ -3822,8 +3849,11 @@ final class KleptonCompositor {
                 }
                 if eyeSharpen != nil || Self.centerSharp > 0, sharpenActive() {
                     let s0 = m0, s1 = m1
-                    m0 = sharpenedEye(s0, slot: 0, cmd: pcmd)
-                    m1 = s1 === s0 ? m0 : sharpenedEye(s1, slot: 1, cmd: pcmd)
+                    // Bottom-up eye image (GL guest): the view's flip_y is 0 (kl_glfb_eye_mtl_origin_top_left false).
+                    let bu0 = uniforms.first.map { $0.flip_y == 0 } ?? false
+                    let bu1 = uniforms.count > 1 ? uniforms[1].flip_y == 0 : bu0
+                    m0 = sharpenedEye(s0, slot: 0, bottomUp: bu0, cmd: pcmd)
+                    m1 = s1 === s0 ? m0 : sharpenedEye(s1, slot: 1, bottomUp: bu1, cmd: pcmd)
                 }
                 if eyeMipsOn, let blit = pcmd.makeBlitCommandEncoder() {
                     let u0 = m0, u1 = m1

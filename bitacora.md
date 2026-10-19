@@ -304,6 +304,11 @@ imagen de ojo, en vivo desde la pausa.
     medible: pase omitido (log). Caché por mapa/tamaño (cambia con `kl_vrr_reload`).
   - logs: `[cp] centre sharpness: full-rate zone of the WxH eye image ...` (al medir), `[cp] eye sharpen (RCAS) first
     run: strength ..., stops, eye WxH xN, sharp zone ...` (primera vez) y el del setter (cambio en vivo).
+- Fixes de revisión (sin validar), en `KleptonCompositor.swift` salvo indicación:
+  - pipeline RCAS: `do/catch` con NSLog del error real; `sharpPipeFailedFmt` (formato fallido) evita recompilar el MSL cada frame, se limpia al cambiar `src.pixelFormat`; fallido → `return src`.
+  - caché de zonas (`sharpZones`): clave incluye `physicalSize(layer: 0)` y `layerCount`; con `KL_VRR=1` y sin `kl_vrr_map_for` → nil sin cachear (1-2 frames tras `kl_vrr_set`); rect sin límite solo si no hay mapa y no hay VRR.
+  - mapa del guest (`kl_glfb_eye_rate_map`): capa 0 como `screenToPhysical`; si la imagen es bottom-up (`flip_y == 0` de la vista) y = `tex_h - y` (min/max cruzados); `sharpenedEye`/`sharpZones` reciben `bottomUp` (en la clave de caché).
+  - deriva float: cuantizado a 5 % `(max(0,min(1,s))*20).rounded()/20` en `setCenterSharpness`, y en `AVPSettings.swift` (`didSet` de `centerSharpness` y carga en `init`); 0 % es exactamente 0.
 - Pendiente de validar en el visor: que el rect coincida con la zona nítida (log), que no haya costura en el borde, coste
   GPU (`[cp] eye prep ... GPU ms`), y si el rect (cuadrado) deja esquinas fuera del círculo de `roundFovea`.
 
