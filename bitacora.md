@@ -280,6 +280,33 @@ ojos incluidos) → se serializa al final. El hueco inicial coincide con el borr
     «Altura real (detecta el suelo)» (`realFloor`, `avp.realFloor`, `KLVR_REAL_FLOOR`, ON). Logs `[height] ...`.
     Ojo: la altura manual guardada se suma encima (el usuario tenía −15 cm).
 
+## Build 59 (sin validar): nitidez del centro (RCAS)
+Ajuste «Nitidez del centro» (0–100 %, def. 50 %, 0 = pase omitido): RCAS (FSR1) solo en la zona de tasa completa de cada
+imagen de ojo, en vivo desde la pausa.
+- `app/Sources/AVPSettings.swift`: `centerSharpness: Double` (`avp.centerSharp`), en `init` (def. 0.5), `save()`,
+  `resetToDefaults()`, línea de config y línea «Ajustes en vivo»; env `KL_CP_SHARP` (%.2f) en `writeConfig`;
+  `KleptonCompositor.setCenterSharpness` en `writeConfig` (2.º arranque en la misma sesión) y en `applyLive()`.
+- `app/Sources/AVPSettingsView.swift` (`textures`, tras MSAA): Stepper «Nitidez del centro: N %» (paso 0.05) + pie ES/EN.
+- `klepton/visionos/Sources/KleptonCompositor.swift`:
+  - estáticos `centerSharp` (de `KL_CP_SHARP`, 0 si no está), `sharpStops(_:)` = 2.5·(1−s) (1 → 0 stops = máx. FSR1;
+    0.5 → 1.25 stops, con 0.42; 0.05 → 2.4), `setCenterSharpness(_:)` (log `[cp] centre sharpness (RCAS) on/off ...`).
+    El frame lee el estático, nunca getenv. `KL_EYE_SHARPEN` (stops, legado) sigue mandando si está puesto.
+  - puerta de la prep de ojo (`eyeSharpen != nil || Self.centerSharp > 0`) y llamada a `sharpenedEye` en el mismo punto
+    de siempre (antes de mips/composite, una vez por serial de frame guest, reutiliza `prepOut`).
+  - `sharpenedEye` reescrito: acepta `.type2DArray` (la imagen de ojo de Alyx es array de 2 slices vía `arrayView`; antes
+    el guard `.type2D` lo dejaba pasar de largo), shader `texture2d_array` con slice, salida `.type2DArray` del mismo
+    tamaño/formato/`arrayLength` (un pase de render por slice) → rejilla de unwarp, slices y flipY del composite intactos;
+    textura de salida cacheada por slot (sin alloc por frame); pipeline se rehace si cambia el formato.
+  - solo centro: `sharpZones(for:slot:)` + `fullRateZone` miden en el `MTLRasterizationRateMap` (`kl_vrr_map_for(w,h)` ??
+    `kl_glfb_eye_rate_map()`, capa = slice si hay 2 capas) el tramo más largo con pendiente físico/pantalla ≥ 0.99 por eje
+    (256 pasos) y lo pasan a texels físicos (`physicalCoordinates`). El shader pondera el lóbulo RCAS con
+    `saturate(distancia_al_borde/12 texels)` y fuera del rect copia el texel tal cual. Sin mapa: ojo entero. Mapa sin zona
+    medible: pase omitido (log). Caché por mapa/tamaño (cambia con `kl_vrr_reload`).
+  - logs: `[cp] centre sharpness: full-rate zone of the WxH eye image ...` (al medir), `[cp] eye sharpen (RCAS) first
+    run: strength ..., stops, eye WxH xN, sharp zone ...` (primera vez) y el del setter (cambio en vivo).
+- Pendiente de validar en el visor: que el rect coincida con la zona nítida (log), que no haya costura en el borde, coste
+  GPU (`[cp] eye prep ... GPU ms`), y si el rect (cuadrado) deja esquinas fuera del círculo de `roundFovea`.
+
 ## SIGUIENTES PASOS
 1. Leer el VERDICT de B46. Lo que AHORRA → por defecto (sin test). Si el knockout señala un shader dominante → mirar su
    MSL/coste. Si indirect-count codificado ≫ real → `MTLIndirectCommandBuffer` / compactar en el fix-up.

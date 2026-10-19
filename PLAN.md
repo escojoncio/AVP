@@ -124,7 +124,7 @@ Enforced on **every** launch, overriding game files, in-game options and Steam C
 ## 7. Settings menu (in the app)
 Render resolution (% / native Vision Pro) · dynamic resolution on/off + range · texture quality
 (pool, cap) · foveation (off / M2 / M5: 60° sharp zone 10° below the forward axis, periphery quality 10–65 % /
-custom: sharp zone, periphery, transition) · VPKTAA periphery (on, intensity, sharpness) · anisotropy (x16 default) · language (system if
+custom: sharp zone, periphery, transition) · VPKTAA periphery (on, intensity, sharpness) · centre sharpness (RCAS on the full-rate zone only, 0–100 %, live) · anisotropy (x16 default) · language (system if
 available, else English; voice always English) · FPS HUD · movement defaults · diagnostics
 captures.
 

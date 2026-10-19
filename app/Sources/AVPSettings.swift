@@ -54,6 +54,9 @@ final class AVPSettings: ObservableObject {
     /// Build 53: the game's MSAA (0 off, 2, 4). Foveation needs an MSAA scene target to find the eye passes, so with
     /// MSAA off it is not applied.
     @Published var msaa: Int { didSet { graphicsChanged() } }
+    /// Build 59: «Nitidez del centro» 0...1 (0 = off, pass skipped). RCAS (FSR1) in the compositor on the full-rate zone
+    /// of each eye image only (KleptonCompositor.sharpenedEye); live from the pause menu (KL_CP_SHARP at launch).
+    @Published var centerSharpness: Double { didSet { save() } }
     /// Build 55: frame rate. Auto = the governor (45/50 when it fits, else 30/33); high = always 45/50 (late frames
     /// reprojected by visionOS); steady = always 30/33 (KLVR_PACE_FALLBACK 1 / 0 / 2).
     enum FrameRate: Int, CaseIterable { case auto = 1, high = 0, steady = 2 }
@@ -186,6 +189,7 @@ final class AVPSettings: ObservableObject {
         vpktaaPercent = d.object(forKey: "avp.reconPercent") as? Double ?? 80
         vpktaaSharpness = d.object(forKey: "avp.reconSharp") as? Double ?? 1.0
         anisotropy = d.object(forKey: "avp.aniso") as? Int ?? 16
+        centerSharpness = min(1, max(0, d.object(forKey: "avp.centerSharp") as? Double ?? 0.5))
         systemLanguage = d.object(forKey: "avp.sysLang") as? Bool ?? true
         showFps = d.object(forKey: "avp.showFps") as? Bool ?? false
         ssao = d.object(forKey: "avp.ssao") as? Bool ?? true
@@ -226,6 +230,7 @@ final class AVPSettings: ObservableObject {
         d.set(vpktaaPercent, forKey: "avp.reconPercent")
         d.set(vpktaaSharpness, forKey: "avp.reconSharp")
         d.set(anisotropy, forKey: "avp.aniso")
+        d.set(centerSharpness, forKey: "avp.centerSharp")
         d.set(systemLanguage, forKey: "avp.sysLang")
         d.set(showFps, forKey: "avp.showFps")
         d.set(ssao, forKey: "avp.ssao")
@@ -262,7 +267,7 @@ final class AVPSettings: ObservableObject {
         renderPercent = fresh.renderPercent; textureCap = fresh.textureCap
         foveationOn = fresh.foveationOn; wideDegrees = fresh.wideDegrees; periphery = fresh.periphery
         vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
-        anisotropy = fresh.anisotropy; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao; msaa = fresh.msaa; frameRate = fresh.frameRate; handHoldPredict = fresh.handHoldPredict
+        anisotropy = fresh.anisotropy; centerSharpness = fresh.centerSharpness; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao; msaa = fresh.msaa; frameRate = fresh.frameRate; handHoldPredict = fresh.handHoldPredict
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
         postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries
@@ -487,6 +492,7 @@ final class AVPSettings: ObservableObject {
             ("KL_CP_RECON", reconActive ? "1" : "0"),
             ("KL_CP_RECON_PCT", String(format: "%.0f", vpktaaPercent)),
             ("KL_CP_RECON_SHARP", String(format: "%.2f", vpktaaSharpness)),
+            ("KL_CP_SHARP", String(format: "%.2f", centerSharpness)),   // B59: RCAS on the sharp centre only
             ("VPVK_TEXTURE_CAP", String(textureCap)),
             ("KL_FPS_HUD", showFps ? "1" : "0"),
             ("KL_CAPTURE", diagCaptures ? "1" : "0"),
@@ -583,6 +589,7 @@ final class AVPSettings: ObservableObject {
         KleptonCompositor.reconRef = max(0.25, min(2, Float(eye.width) / Float(Self.nativeEye.width)))
         KleptonCompositor.setPeripheryRecon(on: reconActive, percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
         KleptonCompositor.skipSameEnabled = Self.composeNewOnly
+        KleptonCompositor.setCenterSharpness(Float(centerSharpness))
         // Round sharp zone (P.T.'s circle) over the wide map: its degrees are the map's (KL_VRR_WIDE_DEG above).
         KleptonCompositor.setRoundFovea(on: foveationUsable && Self.roundSharpZone, degrees: Float(wideDegrees.rounded()),
                                         edge: Float(periphery))
@@ -595,7 +602,7 @@ final class AVPSettings: ObservableObject {
         AVPLog.log("Config: \(p.configDir.path): ojo \(eye.width)x\(eye.height) (\(Int(renderPercent)) %), juego a \(Self.guestHz / 2) "
                    + "(o 50/33 según la pantalla), texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveationOn) (zona nítida "
                    + "\(Int(wideDegrees))°, periferia \(Int((periphery * 100).rounded())) %), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % "
-                   + "nitidez \(vpktaaSharpness), MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
+                   + "nitidez \(vpktaaSharpness), nitidez del centro \(Int((centerSharpness * 100).rounded())) %, MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
                    + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, altura real \(realFloor), oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart), test A/B \(abTest), preset \(preset.rawValue), fps \(frameRate), manos al centro \(handHoldPredict)")
@@ -706,6 +713,7 @@ end, nil)
         KleptonCompositor.skipSameEnabled = Self.composeNewOnly
         KleptonTAA.reloadSettings(percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
         KleptonCompositor.setPeripheryRecon(on: reconActive, percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
+        KleptonCompositor.setCenterSharpness(Float(centerSharpness))
         // On/off needs a restart (the scene-pass hook is installed at start); the periphery is live.
         if foveationUsable {
             kl_vrr_set(2, -1, -1, Float(periphery))
@@ -713,7 +721,7 @@ end, nil)
             KleptonCompositor.setRoundFovea(on: Self.roundSharpZone, degrees: nil, edge: Float(periphery))
         }
         applyToVPKEngine()
-        AVPLog.log("Ajustes en vivo: foveado \(foveationOn) periferia \(Int((periphery * 100).rounded())) %, VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % nitidez \(vpktaaSharpness), FPS \(showFps), altura \(Int(heightOffsetCm)) cm, altura real \(realFloor)")
+        AVPLog.log("Ajustes en vivo: foveado \(foveationOn) periferia \(Int((periphery * 100).rounded())) %, VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % nitidez \(vpktaaSharpness), nitidez del centro \(Int((centerSharpness * 100).rounded())) %, FPS \(showFps), altura \(Int(heightOffsetCm)) cm, altura real \(realFloor)")
     }
 
     func applyToVPKEngine() {

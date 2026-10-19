@@ -146,6 +146,12 @@ struct AVPSettingsView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
+            Stepper(AVPL("Nitidez del centro: \(pct(s.centerSharpness))", "Centre sharpness: \(pct(s.centerSharpness))"),
+                    value: $s.centerSharpness, in: 0...1, step: 0.05)
+            Text(AVPL("Afila solo la zona nítida (RCAS, sin halos); la periferia no se afila. 0 % lo desactiva. Se aplica en vivo.",
+                      "Sharpens only the sharp zone (RCAS, no halos); the periphery is not sharpened. 0 % turns it off. Applied live."))
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         } header: {
             Text(AVPL("Texturas y efectos", "Textures and effects"))
         } footer: {
