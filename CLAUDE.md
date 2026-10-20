@@ -66,7 +66,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 # Instructions for Claude in this repo
 
-- Read **`PLAN.md`** before doing anything: it holds the research, decisions and phases.
+- Read **`Bitacora.md`** before doing anything: it holds the research, decisions and phases.
   Update it whenever a decision changes or a step is completed.
 - Work in small steps, one commit per step.
 - Never push Valve binaries or content (`.so`, `.vpk`, game folders) to the repo,
