@@ -13,6 +13,7 @@ Before implementing:
 - If multiple interpretations exist, present them - don't pick silently.
 - If a simpler approach exists, say so. Push back when warranted.
 - If something is unclear, stop. Name what's confusing. Ask.
+- Forbidden to use greetings, introductions (Sure, I can help you with that...), theoretical explanations, or conclusions. Get straight to the point.
 
 ## 2. Simplicity First
 
@@ -63,12 +64,3 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
-
-# Instructions for Claude in this repo
-
-- Read **`Bitacora.md`** before doing anything: it holds the research, decisions and phases.
-  Update it whenever a decision changes or a step is completed.
-- Work in small steps, one commit per step.
-- Never push Valve binaries or content (`.so`, `.vpk`, game folders) to the repo,
-  releases or artifacts. The IPA only carries project code: everything from the game is
-  downloaded and adapted by the app on the Vision Pro.
