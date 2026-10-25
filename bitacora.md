@@ -17,6 +17,10 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
 - B61 segundo plano (`KleptonApp.swift`): `.background` con inmersivo → `kl_guest_set_paused(1)` (`Lifecycle.pausedByBackground`),
   reanuda solo en `.active` si no lo pausó el usuario; compositor sigue presentando (regla watchdog); stale-hide no salta.
 - B61 `kl_vulkan.c`: log `[vkmem]` dice qué limita (OS / `KL_VK_HEAP_MB` / heap anunciado). Valores sin cambio.
+- Logs B61 (Logs_Alyx_3): `gpu.time` p50 17,75 ms (B60 17,02; sin mejora), regulador 33 fps; `msaa_materialized` 252 (B60 286)
+  pero NO aparece ningún `stores_elided`/`elide_miss` → 0051 sin efecto visible o sin log (unverified); compositor p50 6,4 ms
+  (rcas fused); RAM pico 5,6 GB, mín. libre 2,6 GB, 0 avisos; archivo ON: `archive_memory` +378 MB, 1 `archive_save
+  Failed_to_generate_machO`, shaders compilados 276 (vs 2132); fondo: `[guest] paused`, 0 `gpu.err code 7` (arreglo OK).
 - Logs B60: memoryless activo pero 286 `msaa_materialized why=None` (= store del cliente); footprint 5,9 GB con 2,2 GB libres
   (límite real ~8,1 GB; los 6144 MB = heap fijo de VPVulkan `physical_device.cpp:152`, no limita: Metal usó ~3 GB); GPU juego
   20,7–22,6 ms; compositor 5–9 ms (antes 2,4–6: posible regresión del RCAS fusionado, unverified); A/B Lab: ALL −1,78 ms,
