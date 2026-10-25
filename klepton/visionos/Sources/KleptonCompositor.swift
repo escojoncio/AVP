@@ -317,8 +317,7 @@ final class KleptonCompositor {
     private var prepSerial: UInt64 = .max
     private var prepSrc: [ObjectIdentifier?] = [nil, nil]
     private var prepOut: [MTLTexture?] = [nil, nil]
-    private var prepStats = (n: 0, reused: 0, cpu: 0.0, gpu: 0.0, gpuN: 0, t0: 0.0)
-    private let prepLock = NSLock()
+    private var prepStats = (n: 0, reused: 0, encoded: 0, cpu: 0.0, t0: 0.0)
     private var cpCaptureT0: Double = 0
     /// Views this GPU can draw in one amplified pass. 2 everywhere real; 1
     /// forces the old per-view passes, and forces foveation off with them
@@ -370,6 +369,8 @@ final class KleptonCompositor {
     /// (one per eye) and what each slice was last built from, so it is built once per guest picture rather than per
     /// composite.
     private var widePipeline: MTLRenderPipelineState?
+    /// The same for both eyes of a shared eye texture in one draw of two instances (instance = array layer).
+    private var widePairPipeline: MTLRenderPipelineState?
     private var wideTex: MTLTexture?
     private struct WideKey: Equatable {
         var picture: UInt64
@@ -388,6 +389,7 @@ final class KleptonCompositor {
     /// (kl_widerecon_f) and read by the composite with one tap. KL_CP_WIDE_RECON=0 = per pixel in the composite.
     nonisolated(unsafe) static var wideReconOn: Bool = (getenv("KL_CP_WIDE_RECON").map { String(cString: $0) } ?? "1") != "0"
     private var wideReconPipeline: MTLRenderPipelineState?
+    private var wideReconPairPipeline: MTLRenderPipelineState?   // both eyes in one draw, like `widePairPipeline`
     private var wideReconTex: MTLTexture?
     private var wideReconKey: [WideReconKey?] = [nil, nil]
     private var wideReconUsable = false
@@ -684,14 +686,9 @@ final class KleptonCompositor {
     private let cmdLock = NSLock()
     private var cmdCompleted = 0
     private var cmdError: Error?
-    // GPU time (GPUEndTime - GPUStartTime) of the compositor's command buffers per new picture: the eye prep, the wide
-    // view and the composite itself, one line a second: `[cp] gpu p50/p95/max`. Written from the completion handlers
-    // under cmdLock. Indexed by CpGpuKind.rawValue.
-    private enum CpGpuKind: Int, CaseIterable {
-        case prep, wide, composite
-        var label: String { ["prep", "wide", "composite"][rawValue] }
-    }
-    private var cpGpuMs: [[Double]] = [[], [], []]
+    // GPU time (GPUEndTime - GPUStartTime) of the composite's command buffer, which carries the eye prep and the wide
+    // view too: one line a second, `[cp] gpu p50/p95/max`. Written from the completion handler under cmdLock.
+    private var cpGpuMs: [Double] = []
     private var cpGpuWindowStart = CFAbsoluteTimeGetCurrent()
     // Every composite command buffer that came back with an error (not only the first): build 12
     // hung the GPU from the guest's queue and only one "InnocentVictim" was ever printed here, so
@@ -1135,12 +1132,27 @@ final class KleptonCompositor {
             wdesc.colorAttachments[0].pixelFormat = .rgba16Float
             widePipeline = try? device.makeRenderPipelineState(descriptor: wdesc)
             NSLog("[cp] wide-view pipeline (round sharp zone): " + (widePipeline == nil ? "FAILED — the composite stays rectangular" : "ready"))
+            // Both eyes in one pass: [[render_target_array_index]] = [[instance_id]]. Failing to link only leaves one pass per eye.
+            let wdesc2 = MTLRenderPipelineDescriptor()
+            wdesc2.vertexFunction   = lib.makeFunction(name: "kl_wide2_v")
+            wdesc2.fragmentFunction = lib.makeFunction(name: "kl_wide2_f")
+            wdesc2.colorAttachments[0].pixelFormat = .rgba16Float
+            wdesc2.inputPrimitiveTopology = .triangle
+            widePairPipeline = try? device.makeRenderPipelineState(descriptor: wdesc2)
             let rdesc = MTLRenderPipelineDescriptor()
             rdesc.vertexFunction   = lib.makeFunction(name: "kl_widerecon_v")
             rdesc.fragmentFunction = lib.makeFunction(name: "kl_widerecon_f")
             rdesc.colorAttachments[0].pixelFormat = .rgba16Float
             wideReconPipeline = try? device.makeRenderPipelineState(descriptor: rdesc)
             NSLog("[cp] wide-view reconstruction pipeline: " + (wideReconPipeline == nil ? "FAILED — reconstructed per pixel in the composite" : "ready"))
+            let rdesc2 = MTLRenderPipelineDescriptor()
+            rdesc2.vertexFunction   = lib.makeFunction(name: "kl_widerecon2_v")
+            rdesc2.fragmentFunction = lib.makeFunction(name: "kl_widerecon2_f")
+            rdesc2.colorAttachments[0].pixelFormat = .rgba16Float
+            rdesc2.inputPrimitiveTopology = .triangle
+            wideReconPairPipeline = try? device.makeRenderPipelineState(descriptor: rdesc2)
+            NSLog("[cp] wide-view pair pipelines (both eyes in one pass): wide " + (widePairPipeline == nil ? "FAILED" : "ready")
+                  + ", reconstruction " + (wideReconPairPipeline == nil ? "FAILED" : "ready"))
             if Self.gameDepth {
                 // Same pass, the fragment that also writes [[depth(any)]]. Linked here so a failure says so once and
                 // the composite simply keeps the quad's depth.
@@ -1536,9 +1548,9 @@ final class KleptonCompositor {
             // No foveation: the whole eye is full rate, and sharpening all of it cost more than twice the foveated zone
             // (4.3 vs 1.9 ms GPU, measured). Only the central `sharpCentreFraction` of each axis, faded at its border
             // like a measured zone.
-            let m = Self.sharpCentreFraction
-            let z = SIMD4<Float>(Float(src.width) * (0.5 - m / 2), Float(src.height) * (0.5 - m / 2),
-                                 Float(src.width) * (0.5 + m / 2), Float(src.height) * (0.5 + m / 2))
+            let mx = Self.sharpCentreFraction.x, my = Self.sharpCentreFraction.y
+            let z = SIMD4<Float>(Float(src.width) * (0.5 - mx / 2), Float(src.height) * (0.5 - my / 2),
+                                 Float(src.width) * (0.5 + mx / 2), Float(src.height) * (0.5 + my / 2))
             c.zones = [SIMD4<Float>](repeating: z, count: n)
         }
         sharpZoneCache[slot] = c
@@ -3124,7 +3136,7 @@ final class KleptonCompositor {
             }
             if n <= 12 { NSLog("[cp] cmdbuf #\(n) COMPLETED" + (b.error != nil ? " err=\(b.error!)" : "")) }
             if first { NSLog("[cp] composite command buffer error: \(b.error!)") }
-            self.noteCompositeGpu(b, .composite)
+            self.noteCompositeGpu(b)
         }
         cmd.commit()
         cmdCommitted += 1
@@ -3232,13 +3244,14 @@ final class KleptonCompositor {
         roundEdge = max(0.05, min(1, edge))
         NSLog("[cp] round sharp zone \(roundFovea ? "on" : "off"): \(Int(roundDegrees)) deg, periphery \(Int(roundEdge * 100)) %")
     }
-    /// «Nitidez del centro» (KL_CP_SHARP 0..1; AVPSettings.centerSharpness): RCAS on the full-rate zone of each eye image,
-    /// 0 = off. Fused into the composite's eye sample (kl_rcas, `rcas_con`/`rcas_rect`) unless KL_CP_SHARP_FUSED=0, which
-    /// keeps the separate pass (`sharpenedEye`) for an A/B. Live through `setCenterSharpness`; read per frame from here,
-    /// never getenv.
+    /// RCAS on the centre is fused into the composite's eye sample (kl_rcas, `rcas_con`/`rcas_rect`) unless
+    /// KL_CP_SHARP_FUSED=0, which keeps the separate pass (`sharpenedEye`) for an A/B.
     private static let sharpFused: Bool = envStr("KL_CP_SHARP_FUSED") != "0"
-    /// Foveation off: the share of each axis of the eye the sharpening covers, centred (`sharpZones`).
-    private static let sharpCentreFraction: Float = 0.45
+    /// Foveation off: the share of each axis of the eye the sharpening covers, centred (`sharpZones`). The fractions the
+    /// foveated eye measures: 882/2016 wide and 861/1632 high.
+    private static let sharpCentreFraction = SIMD2<Float>(882.0 / 2016.0, 861.0 / 1632.0)
+    /// «Nitidez del centro» (KL_CP_SHARP 0..1; AVPSettings.centerSharpness): RCAS on the full-rate zone of each eye image,
+    /// 0 = off. Live through `setCenterSharpness`; read per frame from here, never getenv.
     nonisolated(unsafe) static var centerSharp: Float = {
         let v = getenv("KL_CP_SHARP").flatMap { Float(String(cString: $0)) } ?? 0
         return max(0, min(1, v))
@@ -3722,10 +3735,23 @@ final class KleptonCompositor {
         // uniformly and the unwarp then distorts a correct picture.
         pass.rasterizationRateMap = rateMap
 
-        guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return 0 }
-        enc.label = "klepton composite view\(viewIndices)"
-        if probe == 1 { enc.endEncoding(); return viewIndices.count }
-        guard let pipeline, let sampler else { enc.endEncoding(); return 0 }
+        // The composite's encoder is opened as late as it can be: the eye prep and the wide view are encoded on `cmd`
+        // before it (a command buffer has one open encoder at a time), after the guest's fence wait that `cmd` starts with.
+        func beginEncoder() -> MTLRenderCommandEncoder? {
+            guard let e = cmd.makeRenderCommandEncoder(descriptor: pass) else { return nil }
+            e.label = "klepton composite view\(viewIndices)"
+            return e
+        }
+        if probe == 1 {
+            guard let enc = beginEncoder() else { return 0 }
+            enc.endEncoding()
+            return viewIndices.count
+        }
+        guard let pipeline, let sampler else {
+            guard let enc = beginEncoder() else { return 0 }
+            enc.endEncoding()
+            return 0
+        }
 
         // Loading skybox. While an Equirect loading layer is live the guest's
         // eye is black - AC Nexus feeds that layer an Android MediaPlayer video
@@ -3740,6 +3766,7 @@ final class KleptonCompositor {
                 loadingVideoRequested = nil   // only a NEW request replays the game's video
             }
         } else if let tex = loadingVideoTexture() {
+            guard let enc = beginEncoder() else { return 0 }
             drawLoadingSkybox(enc, viewIndices: viewIndices, drawable: drawable,
                               layered: layered, originFromHead: originFromHead,
                               texture: tex, sampler: sampler)
@@ -3754,6 +3781,7 @@ final class KleptonCompositor {
             // Player up, no video frame yet (start, loop wrap): black + the guest's
             // overlays. Falling through to the eye showed its stale frame-0 picture
             // (AC Nexus log 34: purple flashes while the loading video started).
+            guard let enc = beginEncoder() else { return 0 }
             _ = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,
                                originFromHead: originFromHead, writeDepth: true)
             enc.endEncoding()
@@ -3865,7 +3893,7 @@ final class KleptonCompositor {
         // The centre sharpness is fused into the composite (rcas_con below) unless KL_CP_SHARP_FUSED=0 (A/B); the legacy
         // KL_EYE_SHARPEN keeps its own pass either way.
         let sharpPass = eyeSharpen != nil || (!Self.sharpFused && Self.centerSharp > 0)
-        if eyeMipsOn || eyeFXScale > 0 || sharpPass || eyeFXAA, let r0 = rawBind0, let r1 = rawBind1, let q = queue {
+        if eyeMipsOn || eyeFXScale > 0 || sharpPass || eyeFXAA, let r0 = rawBind0, let r1 = rawBind1 {
             let c0 = CACurrentMediaTime()
             let serial = UInt64(kl_vulkan_frame_serial())
             var m0 = r0, m1 = r1
@@ -3873,52 +3901,45 @@ final class KleptonCompositor {
                let o0 = prepOut[0], let o1 = prepOut[1] {
                 m0 = o0; m1 = o1                 // same guest frame: reuse the prepared textures
                 prepStats.reused += 1
-            } else if let pcmd = q.makeCommandBuffer() {
-                pcmd.label = "klepton eye prep"
+            } else {
+                // Encoded on `cmd` itself (after its guest fence wait, before the composite's encoder), so one command
+                // buffer per new picture and the prep never reads an eye the guest is still drawing.
                 if eyeFXScale > 0 {
-                    m0 = upscaledEye(r0, slot: 0, cmd: pcmd)
-                    m1 = r1 === r0 ? m0 : upscaledEye(r1, slot: 1, cmd: pcmd)
+                    m0 = upscaledEye(r0, slot: 0, cmd: cmd)
+                    m1 = r1 === r0 ? m0 : upscaledEye(r1, slot: 1, cmd: cmd)
                 }
                 if eyeFXAA, fxaaActive() {
                     let f0 = m0, f1 = m1
-                    m0 = fxaaEye(f0, slot: 0, cmd: pcmd)
-                    m1 = f1 === f0 ? m0 : fxaaEye(f1, slot: 1, cmd: pcmd)
+                    m0 = fxaaEye(f0, slot: 0, cmd: cmd)
+                    m1 = f1 === f0 ? m0 : fxaaEye(f1, slot: 1, cmd: cmd)
                 }
                 if sharpPass, sharpenActive() {
                     let s0 = m0, s1 = m1
                     // Bottom-up eye image (GL guest): the view's flip_y is 0 (kl_glfb_eye_mtl_origin_top_left false).
                     let bu0 = uniforms.first.map { $0.flip_y == 0 } ?? false
                     let bu1 = uniforms.count > 1 ? uniforms[1].flip_y == 0 : bu0
-                    m0 = sharpenedEye(s0, slot: 0, bottomUp: bu0, cmd: pcmd)
-                    m1 = s1 === s0 ? m0 : sharpenedEye(s1, slot: 1, bottomUp: bu1, cmd: pcmd)
+                    m0 = sharpenedEye(s0, slot: 0, bottomUp: bu0, cmd: cmd)
+                    m1 = s1 === s0 ? m0 : sharpenedEye(s1, slot: 1, bottomUp: bu1, cmd: cmd)
                 }
-                if eyeMipsOn, let blit = pcmd.makeBlitCommandEncoder() {
+                if eyeMipsOn, let blit = cmd.makeBlitCommandEncoder() {
                     let u0 = m0, u1 = m1
                     m0 = mippedEye(u0, slot: 0, blit: blit)
                     m1 = u1 === u0 ? m0 : mippedEye(u1, slot: 1, blit: blit)
                     blit.endEncoding()
                 }
-                pcmd.addCompletedHandler { [weak self] cb in
-                    guard let self else { return }
-                    let g = (cb.gpuEndTime - cb.gpuStartTime) * 1000
-                    self.prepLock.lock(); self.prepStats.gpu += g; self.prepStats.gpuN += 1; self.prepLock.unlock()
-                    self.noteCompositeGpu(cb, .prep)
-                }
-                pcmd.commit()           // ahead of `cmd` on the same queue, so it runs first
+                prepStats.encoded += 1
                 prepSerial = serial
                 prepSrc = [ObjectIdentifier(r0), ObjectIdentifier(r1)]
                 prepOut = [m0, m1]
             }
-            // Per-5 s report: how often the prep ran, its CPU cost here and its GPU cost.
+            // Per-5 s report: how often the prep ran and its CPU cost here (its GPU time is part of the composite's).
             prepStats.n += 1
             prepStats.cpu += (CACurrentMediaTime() - c0) * 1000
             if prepStats.t0 == 0 { prepStats.t0 = c0 }
             if c0 - prepStats.t0 >= 5 {
-                prepLock.lock(); let gpu = prepStats.gpu, gn = prepStats.gpuN; prepStats.gpu = 0; prepStats.gpuN = 0; prepLock.unlock()
-                NSLog(String(format: "[cp] eye prep: %d composites, %d reused, %d encoded; CPU %.2f ms avg; GPU %.2f ms avg per encode",
-                             prepStats.n, prepStats.reused, gn, prepStats.cpu / Double(max(1, prepStats.n)),
-                             gn > 0 ? gpu / Double(gn) : 0))
-                prepStats = (0, 0, 0, 0, 0, c0)
+                NSLog(String(format: "[cp] eye prep: %d composites, %d reused, %d encoded; CPU %.2f ms avg",
+                             prepStats.n, prepStats.reused, prepStats.encoded, prepStats.cpu / Double(max(1, prepStats.n))))
+                prepStats = (0, 0, 0, 0, c0)
             }
             bind0 = m0; bind1 = m1
             for n in sources.indices {
@@ -3926,15 +3947,15 @@ final class KleptonCompositor {
             }
         }
         if let rec = eyeRecorder, let c0 = bind0 { rec.noteEye(c0, serial: UInt64(kl_vulkan_frame_serial())) }
-        if !cpCaptureTimes.isEmpty, cpCaptureNext < cpCaptureTimes.count, let c0 = bind0, let c1 = bind1,
-           let q = queue, let ccmd = q.makeCommandBuffer() {
+        // On `cmd` (not a buffer of its own): the prep that makes these eyes is encoded on `cmd` too, so a buffer committed
+        // ahead of it would read last picture's.
+        if !cpCaptureTimes.isEmpty, cpCaptureNext < cpCaptureTimes.count, let c0 = bind0, let c1 = bind1 {
             let now = CACurrentMediaTime()
             if cpCaptureT0 == 0 { cpCaptureT0 = now }
             if now - cpCaptureT0 >= cpCaptureTimes[cpCaptureNext] {
                 let t = Int(cpCaptureTimes[cpCaptureNext])
-                captureEye(c0, name: String(format: "cp_t%04d_eye0.png", t), cmd: ccmd)
-                if c1 !== c0 { captureEye(c1, name: String(format: "cp_t%04d_eye1.png", t), cmd: ccmd) }
-                ccmd.commit()
+                captureEye(c0, name: String(format: "cp_t%04d_eye0.png", t), cmd: cmd)
+                if c1 !== c0 { captureEye(c1, name: String(format: "cp_t%04d_eye1.png", t), cmd: cmd) }
                 cpCaptureNext += 1
             }
         }
@@ -3969,14 +3990,18 @@ final class KleptonCompositor {
         // says, and the view's own bounds within a shared texture are part of
         // that. With amplification there is one per view, selected by the
         // mapping below rather than by the shader.
-        enc.setViewports(viewIndices.map { drawable.views[$0].textureMap.viewport })
-        if layered && viewIndices.count > 1 {
-            var mappings = viewIndices.enumerated().map { (n, vi) in
-                MTLVertexAmplificationViewMapping(
-                    viewportArrayIndexOffset: UInt32(n),
-                    renderTargetArrayIndexOffset: UInt32(drawable.views[vi].textureMap.sliceIndex))
+        func openComposite() -> MTLRenderCommandEncoder? {
+            guard let enc = beginEncoder() else { return nil }
+            enc.setViewports(viewIndices.map { drawable.views[$0].textureMap.viewport })
+            if layered && viewIndices.count > 1 {
+                var mappings = viewIndices.enumerated().map { (n, vi) in
+                    MTLVertexAmplificationViewMapping(
+                        viewportArrayIndexOffset: UInt32(n),
+                        renderTargetArrayIndexOffset: UInt32(drawable.views[vi].textureMap.sliceIndex))
+                }
+                enc.setVertexAmplificationCount(viewIndices.count, viewMappings: &mappings)
             }
-            enc.setVertexAmplificationCount(viewIndices.count, viewMappings: &mappings)
+            return enc
         }
 
         // The PER-LAYER composite, when the guest's last frame described its
@@ -3986,7 +4011,10 @@ final class KleptonCompositor {
         // files no list, which is every guest but Steam Link and every run
         // under KL_XR_LAYERS=0, and those take the eye pass unchanged.
         let nproj = projLayerCount
+        var openedEnc: MTLRenderCommandEncoder? = nil
         if nproj > 0 {
+            guard let enc = openComposite() else { return 0 }
+            openedEnc = enc
             visible = encodeProjLayers(enc, viewIndices: viewIndices,
                                        drawable: drawable,
                                        originFromHead: originFromHead,
@@ -4031,8 +4059,11 @@ final class KleptonCompositor {
             // Compared as values (tangents to the 3 decimals the line prints); the text is built only when it changes.
             let shape = viewIndices.map { vi -> EyeShape in
                 let u = uniforms[viewIndices.firstIndex(of: vi)!]
+                // The guest's tangents are not validated: NaN/inf -> 0, and a clamp keeps the Int32 conversion from trapping.
+                var t = u.tangents
+                for k in 0..<4 { t[k] = t[k].isFinite ? max(-1e6, min(1e6, t[k])) : 0 }
                 return EyeShape(vi: vi, slice: u.slice,
-                                tan: SIMD4<Int32>(u.tangents * 1000, rounding: .toNearestOrEven),
+                                tan: SIMD4<Int32>(t * 1000, rounding: .toNearestOrEven),
                                 visible: u.visible, flip: u.flip_y)
             }
             if shape != lastEyeShape {
@@ -4116,7 +4147,7 @@ final class KleptonCompositor {
             if Self.roundFovea, vrrGrid, probePipeline == nil, taaOut.isEmpty, let gridBuf {
                 wideBound = buildWideView(viewIndices: viewIndices, uniforms: uniforms, bind0: bind0, bind1: bind1,
                                           grid: gridBuf, gridVerts: gridVerts, stage: stage,
-                                          rendered: rendered, haveRendered: haveRendered)
+                                          rendered: rendered, haveRendered: haveRendered, cmd: cmd)
                 if wideBound != nil, wideReconUsable, let rt = wideReconTex {
                     // Build 41: the reconstruction is in the texture already: the composite takes one tap there.
                     wideBound = rt
@@ -4200,6 +4231,9 @@ final class KleptonCompositor {
                           + "\(bind0.width)x\(bind0.height), zone as fractions of the eye (x0,y0-x1,y1): " + zs.joined(separator: " | "))
                 }
             }
+            // Everything the eye pass reads is encoded (prep, wide view): now the composite's encoder.
+            guard let enc = openComposite() else { return 0 }
+            openedEnc = enc
             let useDepth = depthTex[0] != nil || depthTex[1] != nil
             enc.setRenderPipelineState(probePipeline ?? (useDepth ? depthPipeline! : pipeline))
             if let depthState { enc.setDepthStencilState(depthState) }
@@ -4225,6 +4259,7 @@ final class KleptonCompositor {
             enc.setVertexBuffer(gridBuf, offset: 0, index: 1)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: gridVerts)
         }
+        guard let enc = openedEnc ?? openComposite() else { return 0 }
         let panels = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,
                                     originFromHead: originFromHead,
                                     writeDepth: visible == 0)
@@ -4239,45 +4274,41 @@ final class KleptonCompositor {
         return panels > 0 ? viewIndices.count : 0
     }
 
-    /// GPU time of one command buffer of the compositor (called from its completion handler); once a second prints
-    /// p50/p95/max of each kind seen in the window.
-    private func noteCompositeGpu(_ b: MTLCommandBuffer, _ kind: CpGpuKind) {
+    /// GPU time of the composite's command buffer (called from its completion handler); once a second prints
+    /// p50/p95/max of the window.
+    private func noteCompositeGpu(_ b: MTLCommandBuffer) {
         let ms = (b.gpuEndTime - b.gpuStartTime) * 1000
         guard b.gpuStartTime > 0, ms > 0, ms < 1000 else { return }
-        var windows: [[Double]] = []
+        var window: [Double] = []
         cmdLock.lock()
-        cpGpuMs[kind.rawValue].append(ms)
+        cpGpuMs.append(ms)
         let now = CFAbsoluteTimeGetCurrent()
         if now - cpGpuWindowStart >= 1 {
-            windows = cpGpuMs.map { $0.sorted() }
-            for i in cpGpuMs.indices { cpGpuMs[i].removeAll(keepingCapacity: true) }
+            window = cpGpuMs.sorted()
+            cpGpuMs.removeAll(keepingCapacity: true)
             cpGpuWindowStart = now
         }
         cmdLock.unlock()
-        guard !windows.isEmpty else { return }
-        var parts: [String] = []
-        for k in CpGpuKind.allCases {
-            let w = windows[k.rawValue]
-            guard !w.isEmpty else { continue }
-            let p95 = w[min(w.count - 1, Int(Double(w.count) * 0.95))]
-            parts.append(String(format: "%@ %.2f/%.2f/%.2f ms (%ld cmdbufs)", k.label, w[w.count / 2], p95, w[w.count - 1], w.count))
-        }
+        guard !window.isEmpty else { return }
+        let p95 = window[min(window.count - 1, Int(Double(window.count) * 0.95))]
         let rcas = Self.centerSharp > 0 || eyeSharpen != nil
             ? ((Self.sharpFused && eyeSharpen == nil) ? "fused" : "separate pass") : "off"
-        NSLog("%@", "[cp] gpu p50/p95/max: " + parts.joined(separator: " | ") + " | rcas " + rcas)
+        NSLog("%@", String(format: "[cp] gpu composite (prep + wide view + composite) p50/p95/max: %.2f/%.2f/%.2f ms (%ld cmdbufs)",
+                           window[window.count / 2], p95, window[window.count - 1], window.count) + " | rcas " + rcas)
     }
 
     /// The round sharp zone's wide view: each visible eye's picture box-filtered to the periphery's density
     /// (kl_wide_f) into one slice of `wideTex`, slice = the view's eye. Rebuilt only when what it was built from
     /// changes (the guest picture, the texture, the grid, the size), so a composite of a picture already seen costs
-    /// nothing here. Encoded in a command buffer of its own, committed now: the composite's `cmd` is committed later
-    /// on the same queue, so this runs first, and Metal orders the composite's read of `wideTex` after these writes.
-    /// GL guests: it waits on the same guest fence as the composite (`taaWait`). Returns the texture, or nil when
-    /// it cannot be had (the composite then stays rectangular for this frame).
+    /// nothing here. Encoded on the composite's own `cmd`, ahead of the composite's encoder (so after the guest fence
+    /// wait `cmd` starts with, and Metal orders the composite's read of `wideTex` after these writes). Both eyes
+    /// of a shared eye texture go in one draw of two instances (`widePairPipeline`); otherwise one pass per eye.
+    /// Returns the texture, or nil when it cannot be had (the composite then stays rectangular for this frame).
     private func buildWideView(viewIndices: [Int], uniforms: [kl_reproject_uniforms],
                                bind0: MTLTexture, bind1: MTLTexture, grid: MTLBuffer, gridVerts: Int,
-                               stage: Int, rendered: kl_ovrp_render_pose, haveRendered: Bool) -> MTLTexture? {
-        guard let pipe = widePipeline, let samp = sampler, let q = queue, gridVerts > 0 else { return nil }
+                               stage: Int, rendered: kl_ovrp_render_pose, haveRendered: Bool,
+                               cmd: MTLCommandBuffer) -> MTLTexture? {
+        guard let pipe = widePipeline, let samp = sampler, gridVerts > 0 else { return nil }
         // The periphery's density (the map's edge rate), at most half the eye's: the M5 presets go to 65 %, where
         // the wide view would be most of an eye texture for a blur nobody sees.
         let dens = max(0.05, min(0.5, Self.roundEdge))
@@ -4303,30 +4334,58 @@ final class KleptonCompositor {
         guard let wt = wideTex else { return nil }
         // What the guest picture is; with no frame record nothing identifies it, so it is rebuilt every time.
         let picture = haveRendered ? Self.pictureId(stage, UInt64(rendered.serial)) : UInt64(cmdCommitted)
-        var wcmd: MTLCommandBuffer? = nil
-        for (n, vi) in viewIndices.enumerated() where vi >= 0 && vi < 2 && n < uniforms.count {
+        func wideKeyOf(_ n: Int) -> WideKey {
+            let u = uniforms[n]
+            return WideKey(picture: picture, noRecord: !haveRendered, src: ObjectIdentifier(n == 0 ? bind0 : bind1), slice: u.slice,
+                           flipY: u.flip_y, gridEye: u.grid_eye, grid: ObjectIdentifier(grid), taps: taps)
+        }
+        // Both eyes, one shared eye texture, wide view slice = view index: one pass of two instances, instance = layer.
+        let pair = viewIndices.count == 2 && viewIndices[0] == 0 && viewIndices[1] == 1 && uniforms.count >= 2
+            && uniforms[0].visible != 0 && uniforms[1].visible != 0 && bind0 === bind1 && wt.arrayLength == 2
+        let pairPipe = pair ? widePairPipeline : nil
+        if let pipe2 = pairPipe {
+            // A change in either eye's key rebuilds both (one draw).
+            let k0 = wideKeyOf(0), k1 = wideKeyOf(1)
+            if k0 != wideKey[0] || k1 != wideKey[1] {
+                let pass = MTLRenderPassDescriptor()
+                pass.colorAttachments[0].texture = wt
+                pass.colorAttachments[0].loadAction = .dontCare   // the grid covers the whole target
+                pass.colorAttachments[0].storeAction = .store
+                pass.renderTargetArrayLength = 2
+                guard let e = cmd.makeRenderCommandEncoder(descriptor: pass) else {
+                    wideKey = [nil, nil]       // nothing counts as built, so the next composite tries again
+                    return nil
+                }
+                e.label = "klepton wide view both eyes"
+                let p: [UInt32] = [uniforms[0].slice, uniforms[0].flip_y, uniforms[0].grid_eye, taps,
+                                   uniforms[1].slice, uniforms[1].flip_y, uniforms[1].grid_eye, taps]   // KLWide[2] in kl_reproject.c
+                e.setRenderPipelineState(pipe2)
+                p.withUnsafeBytes { b in
+                    e.setVertexBytes(b.baseAddress!, length: b.count, index: 0)
+                    e.setFragmentBytes(b.baseAddress!, length: b.count, index: 0)
+                }
+                e.setVertexBuffer(grid, offset: 0, index: 1)
+                e.setFragmentTexture(bind0, index: 0)
+                e.setFragmentSamplerState(samp, index: 0)
+                e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: gridVerts, instanceCount: 2)
+                e.endEncoding()
+                wideKey = [k0, k1]
+            }
+        }
+        for (n, vi) in viewIndices.enumerated() where pairPipe == nil && vi >= 0 && vi < 2 && n < uniforms.count {
             let u = uniforms[n]
             guard u.visible != 0 else { continue }
             let src = n == 0 ? bind0 : bind1
-            let key = WideKey(picture: picture, noRecord: !haveRendered, src: ObjectIdentifier(src), slice: u.slice,
-                              flipY: u.flip_y, gridEye: u.grid_eye, grid: ObjectIdentifier(grid), taps: taps)
+            let key = wideKeyOf(n)
             if key == wideKey[vi] { continue }
-            if wcmd == nil {
-                wcmd = q.makeCommandBuffer()
-                wcmd?.label = "klepton wide view"
-                if let w = taaWait { wcmd?.encodeWaitForEvent(w.0, value: w.1) }
-            }
-            guard let c = wcmd else { return nil }
             let pass = MTLRenderPassDescriptor()
             pass.colorAttachments[0].texture = wt
             pass.colorAttachments[0].slice = vi
             pass.colorAttachments[0].loadAction = .dontCare   // the grid covers the whole target
             pass.colorAttachments[0].storeAction = .store
-            guard let e = c.makeRenderCommandEncoder(descriptor: pass) else {
+            guard let e = cmd.makeRenderCommandEncoder(descriptor: pass) else {
                 // Whatever was encoded still runs; nothing counts as built, so the next composite tries again.
                 wideKey = [nil, nil]
-                c.addCompletedHandler { [weak self] b in self?.noteCompositeGpu(b, .wide) }
-                c.commit()
                 return nil
             }
             e.label = "klepton wide view eye \(vi)"
@@ -4372,24 +4431,54 @@ final class KleptonCompositor {
             }
             if allRecon, let rt = wideReconTex {
                 var ok = true
-                for (n, vi) in viewIndices.enumerated() where vi >= 0 && vi < 2 && n < uniforms.count {
+                // Same as the wide view: both eyes in one pass of two instances when its pair path is on; either eye's key
+                // changing rebuilds both.
+                let pairRecon = pairPipe != nil ? wideReconPairPipeline : nil
+                if let rp2 = pairRecon {
+                    if let w0 = wideKey[0], let w1 = wideKey[1] {
+                        let k0 = WideReconKey(wide: w0, strength: uniforms[0].recon_strength, sharp: uniforms[0].recon_sharp,
+                                              ref: uniforms[0].recon_ref)
+                        let k1 = WideReconKey(wide: w1, strength: uniforms[1].recon_strength, sharp: uniforms[1].recon_sharp,
+                                              ref: uniforms[1].recon_ref)
+                        if k0 != wideReconKey[0] || k1 != wideReconKey[1] {
+                            let pass = MTLRenderPassDescriptor()
+                            pass.colorAttachments[0].texture = rt
+                            pass.colorAttachments[0].loadAction = .dontCare   // the triangle covers the whole target
+                            pass.colorAttachments[0].storeAction = .store
+                            pass.renderTargetArrayLength = 2
+                            if let e = cmd.makeRenderCommandEncoder(descriptor: pass) {
+                                e.label = "klepton wide view reconstruction both eyes"
+                                // KLWideRecon[2] in kl_reproject.c
+                                let p = [(UInt32(0), uniforms[0].recon_strength, uniforms[0].recon_sharp, uniforms[0].recon_ref),
+                                         (UInt32(1), uniforms[1].recon_strength, uniforms[1].recon_sharp, uniforms[1].recon_ref)]
+                                e.setRenderPipelineState(rp2)
+                                p.withUnsafeBytes { e.setFragmentBytes($0.baseAddress!, length: $0.count, index: 0) }
+                                e.setFragmentTexture(wt, index: 0)
+                                e.setFragmentSamplerState(samp, index: 0)
+                                e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3, instanceCount: 2)
+                                e.endEncoding()
+                                wideReconKey = [k0, k1]
+                            } else {
+                                wideReconKey = [nil, nil]
+                                ok = false
+                            }
+                        }
+                    } else {
+                        ok = false
+                    }
+                }
+                for (n, vi) in viewIndices.enumerated() where pairRecon == nil && vi >= 0 && vi < 2 && n < uniforms.count {
                     let u = uniforms[n]
                     guard u.visible != 0 else { continue }
                     guard let wk = wideKey[vi] else { ok = false; break }
                     let key = WideReconKey(wide: wk, strength: u.recon_strength, sharp: u.recon_sharp, ref: u.recon_ref)
                     if key == wideReconKey[vi] { continue }
-                    if wcmd == nil {
-                        wcmd = q.makeCommandBuffer()
-                        wcmd?.label = "klepton wide view"
-                        if let w = taaWait { wcmd?.encodeWaitForEvent(w.0, value: w.1) }
-                    }
-                    guard let c = wcmd else { ok = false; break }
                     let pass = MTLRenderPassDescriptor()
                     pass.colorAttachments[0].texture = rt
                     pass.colorAttachments[0].slice = vi
                     pass.colorAttachments[0].loadAction = .dontCare   // the triangle covers the whole target
                     pass.colorAttachments[0].storeAction = .store
-                    guard let e = c.makeRenderCommandEncoder(descriptor: pass) else { wideReconKey = [nil, nil]; ok = false; break }
+                    guard let e = cmd.makeRenderCommandEncoder(descriptor: pass) else { wideReconKey = [nil, nil]; ok = false; break }
                     e.label = "klepton wide view reconstruction eye \(vi)"
                     var p = (UInt32(vi), u.recon_strength, u.recon_sharp, u.recon_ref)   // KLWideRecon in kl_reproject.c
                     e.setRenderPipelineState(rp)
@@ -4406,10 +4495,6 @@ final class KleptonCompositor {
                     NSLog("[cp] periphery reconstruction precomputed per picture: \(rw)x\(rh) x2 (\(factor)x the wide view); the composite reads it with one tap")
                 }
             }
-        }
-        if let w = wcmd {
-            w.addCompletedHandler { [weak self] b in self?.noteCompositeGpu(b, .wide) }
-            w.commit()
         }
         return wt
     }
@@ -6191,7 +6276,7 @@ final class KleptonCompositor {
             }
             // Every drawable the frame carries, not just the one measured from:
             // a frame that leaves one unpresented is a frame half-written.
-            for d in all { clearAndPresent(d, cmd: pcmd) }
+            for d in all { clearAndPresent(d, cmd: cmd) }
             pcmd.commit()
             // Only after a drawable was actually presented: ending a
             // submission on the no-drawable path is an abort.
