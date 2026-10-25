@@ -2,12 +2,19 @@
 
 Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam oficial → descarga → ELF→Mach-O
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
-(`escojoncio/VPKEngine` @ `vpkengine.ref` + `vpkengine-patches/` 0011–0041; parche nuevo = `00NN-*.patch` con
+(`escojoncio/VPKEngine` @ `vpkengine.ref` + `vpkengine-patches/` 0011–0052; parche nuevo = `00NN-*.patch` con
 `git format-patch` sobre ref+parches; CI `scripts/apply-vpkengine-patches.sh`). Plan: `PLAN.md`.
 IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B61**, compilada OK).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
-## Últimos hechos (B61 compilada OK en CI, sin validar en el visor)
+## Últimos hechos
+- B62 VPKEngine 0052: `VPVK_RELAXED_F16=1` → pase `vpir::demoteRelaxed` (`gpu/shader/ir/src/relaxed.cpp`, marcado en
+  `spirv/src/lower.cpp`): solo fragment, ops float RelaxedPrecision en `half`; taint hacia atrás excluye coords de imagen,
+  derivadas, interp, direcciones, builtins, enteros, condiciones; Dot/Length/Normalize/Rsq/Div/Rcp/Pow/Exp2 solo con operandos
+  acotados (sample/saturate/clamp/const/ya degradados); constantes no half-normales excluyen. Bit 2 de `translatorId`.
+  Log `vpvk.f16 shaders= decorated= demoted= excluded=` (1.º y cada 200); `gpu.time ... t=<ms>` (ms desde arranque).
+  Lab «Requieren reiniciar»: `avp.lab.relaxedF16` (def. OFF), en `sigKeys` solo si ON. Tests Linux 144/144 (`gpu_spirv.relaxed_f16`).
+  B62 al validar: arranque OK con ON, `vpvk.f16` demoted>0, scene-msaa frag ON vs OFF (misma zona, fov ON), bandas/manchas.
 - B61 VPKEngine 0051 (= main `454f7cc`): elisión de stores MSAA muertos (`VPVK_MSAA_DEAD_STORE=1`); `gpu.frame stores_elided=
   elide_miss=`, `gpu.msaa elide_miss`, `msaa_materialized ... load= store=`. Port: `Use::firstAttach` añadido al árbol AVP.
 - B61 Laboratorio: «Nitidez en la composición» fusionada/pase aparte EN CALIENTE (`KleptonCompositor.setSharpFused`, latch

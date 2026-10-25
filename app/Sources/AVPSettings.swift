@@ -148,9 +148,11 @@ final class AVPSettings: ObservableObject {
     @Published var labSharpFused: Bool { didSet { save(); if !loading { KleptonCompositor.setSharpFused(labSharpFused) } } }
     /// Lab, read at launch only (restart the game): VPKEngine's Metal binary archive of compiled shaders (writeConfig →
     /// AVPPipelineCache.configure; off by default: opening one costs ~30x its file size in memory) and the elision of
-    /// MSAA stores nobody reads (VPVK_MSAA_DEAD_STORE, on by default).
+    /// MSAA stores nobody reads (VPVK_MSAA_DEAD_STORE, on by default) and the f16 computation of the fragment ops the
+    /// game marks RelaxedPrecision (VPVK_RELAXED_F16, off by default).
     @Published var labArchive: Bool { didSet { save() } }
     @Published var labMsaaDeadStore: Bool { didSet { save() } }
+    @Published var labRelaxedF16: Bool { didSet { save() } }
     private var labBulk = false
     private var labAdoptedSerial: UInt32 = 0
     private var labWatcher: Timer?
@@ -189,11 +191,11 @@ final class AVPSettings: ObservableObject {
     }
     /// «Restaurar valores por defecto» of the lab: everything off but the eye trim.
     func resetLab() {
-        for k in ["producerWaits", "eyeTrim", "gatherCopies", "fuseClears", "stateElide", "sharpFused", "binaryArchive", "msaaDeadStore"] {
+        for k in ["producerWaits", "eyeTrim", "gatherCopies", "fuseClears", "stateElide", "sharpFused", "binaryArchive", "msaaDeadStore", "relaxedF16"] {
             UserDefaults.standard.removeObject(forKey: "avp.lab.\(k)")
         }
         setLabMask(4)
-        labSharpFused = true; labArchive = false; labMsaaDeadStore = true
+        labSharpFused = true; labArchive = false; labMsaaDeadStore = true; labRelaxedF16 = false
         AVPLog.log("Laboratorio del motor: valores por defecto")
     }
     /// A test that ended while the game ran left its winner in the engine: take it as the saved switches (once per test).
@@ -299,6 +301,7 @@ final class AVPSettings: ObservableObject {
         labSharpFused = d.object(forKey: "avp.lab.sharpFused") as? Bool ?? true
         labArchive = d.object(forKey: "avp.lab.binaryArchive") as? Bool ?? false
         labMsaaDeadStore = d.object(forKey: "avp.lab.msaaDeadStore") as? Bool ?? true
+        labRelaxedF16 = d.object(forKey: "avp.lab.relaxedF16") as? Bool ?? false
         labAdoptedSerial = UInt32(kl_abtest_result_serial())   // a test of an earlier game start (none) is not adopted
         subtitleSize = SubtitleSize(rawValue: d.object(forKey: "avp.subSize") as? Int ?? 0) ?? .small
         subtitleFoveation = d.object(forKey: "avp.subFov") as? Bool ?? true
@@ -349,6 +352,7 @@ final class AVPSettings: ObservableObject {
         d.set(labSharpFused, forKey: "avp.lab.sharpFused")
         d.set(labArchive, forKey: "avp.lab.binaryArchive")
         d.set(labMsaaDeadStore, forKey: "avp.lab.msaaDeadStore")
+        d.set(labRelaxedF16, forKey: "avp.lab.relaxedF16")
         d.set(preset.rawValue, forKey: "avp.preset")
         d.set(Self.schema, forKey: "avp.schema")
         d.set(subtitleSize.rawValue, forKey: "avp.subSize")
@@ -371,6 +375,7 @@ final class AVPSettings: ObservableObject {
         reportedHz = fresh.reportedHz; runningStart = fresh.runningStart; abTest = fresh.abTest
         setLabMask(fresh.labMask)
         labSharpFused = fresh.labSharpFused; labArchive = fresh.labArchive; labMsaaDeadStore = fresh.labMsaaDeadStore
+        labRelaxedF16 = fresh.labRelaxedF16
         preset = fresh.preset
         AVPLog.log("Ajustes: valores por defecto")
     }
@@ -622,6 +627,8 @@ final class AVPSettings: ObservableObject {
             ("VP_FRAME_DETAIL", "3000"),
             // Elisión de stores MSAA muertos, VPKEngine 0051; on by default, the lab's switch turns it off (corrupt frames).
             ("VPVK_MSAA_DEAD_STORE", labMsaaDeadStore ? "1" : "0"),
+            // Half precision for the ops the game marks RelaxedPrecision (VPKEngine, fragment shaders only); off by default.
+            ("VPVK_RELAXED_F16", labRelaxedF16 ? "1" : "0"),
         ]
         // VPKTAA inputs not usable yet (build 17 log): VPKEngine's motion vectors are all zero (its "eye frame"
         // restarts at every depth-clearing multiview pass, 4-7 per game frame, so no draw ever finds last frame's
@@ -676,6 +683,7 @@ final class AVPSettings: ObservableObject {
             // are read back from the env so the signature cannot drift from what VPKEngine actually gets.
             let sigKeys = ["VPVK_AMPLIFY", "VPVK_FETCH_NATIVE", "VP_CB_ORDER", "KL_VRR", "KL_VRR_PHYS", "VPVK_FORCE_1X",
                            "VPVK_MOTION", "VP_FRAMES_IN_FLIGHT", "VP_MSAA_TILE", "VPVK_MSAA_DEAD_STORE"]
+                + (labRelaxedF16 ? ["VPVK_RELAXED_F16"] : [])   // only when on: the key of users with it off stays as it was
             let signature = sigKeys.map { k in "\(k)=\(env.last { $0.0 == k }?.1 ?? "-")" }.joined(separator: "|")
                 + "|msaa=\(gameMSAA)"
             let cache = AVPPipelineCache.configure(data: p.dataDir, pipelines: p.pipelines, engine: "vpkengine",

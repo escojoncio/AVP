@@ -1,0 +1,885 @@
+From 69c5856d21a4a2460a1c729596bfec7c167eb21a Mon Sep 17 00:00:00 2001
+From: avp-bot <avp-bot@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 23:49:17 +0000
+Subject: [PATCH] shader: RelaxedPrecision en f16 opt-in (VPVK_RELAXED_F16),
+ contador vpvk.f16, t= en gpu.time
+
+---
+ gpu/core/src/device.cpp                       |   7 +
+ gpu/core/tests/core_tests.cpp                 |   2 +-
+ gpu/shader/ir/CMakeLists.txt                  |   3 +-
+ gpu/shader/ir/include/vpir/passes.h           |  16 ++
+ gpu/shader/ir/src/relaxed.cpp                 | 259 ++++++++++++++++++
+ gpu/shader/spirv/CMakeLists.txt               |   1 +
+ gpu/shader/spirv/src/lower.cpp                |  47 +++-
+ .../spirv/tests/asm/relaxed_f16.frag.spvasm   |  57 ++++
+ .../spirv/tests/asm/relaxed_f16_b.frag.spvasm |  65 +++++
+ gpu/shader/spirv/tests/asm/spvasm.py          |   4 +-
+ gpu/shader/spirv/tests/relaxed_f16.frag.spv   | Bin 0 -> 868 bytes
+ gpu/shader/spirv/tests/relaxed_f16_b.frag.spv | Bin 0 -> 1032 bytes
+ gpu/shader/spirv/tests/spirv_tests.cpp        |  95 +++++++
+ gpu/vulkan/include/vpvk/spirv_frontend.h      |   9 +
+ gpu/vulkan/src/pipelines.cpp                  |   9 +
+ gpu/vulkan/src/recipes.cpp                    |   8 +-
+ gpu/vulkan/src/recipes.h                      |   2 +
+ 17 files changed, 577 insertions(+), 7 deletions(-)
+ create mode 100644 gpu/shader/ir/src/relaxed.cpp
+ create mode 100644 gpu/shader/spirv/tests/asm/relaxed_f16.frag.spvasm
+ create mode 100644 gpu/shader/spirv/tests/asm/relaxed_f16_b.frag.spvasm
+ create mode 100644 gpu/shader/spirv/tests/relaxed_f16.frag.spv
+ create mode 100644 gpu/shader/spirv/tests/relaxed_f16_b.frag.spv
+
+diff --git a/gpu/core/src/device.cpp b/gpu/core/src/device.cpp
+index 9075d3a..2d38fda 100644
+--- a/gpu/core/src/device.cpp
++++ b/gpu/core/src/device.cpp
+@@ -9,6 +9,10 @@
+ 
+ namespace vpgpu {
+ 
++namespace {
++const auto kProcessStart = std::chrono::steady_clock::now();  // gpu.time t= counts from here
++}
++
+ Device::Device(Backend& backend, unsigned pipelineWorkers, LogSink log)
+     : backend_(backend), pipelines_(backend, pipelineWorkers), log_(std::move(log)) {
+   if (const char* e = std::getenv("VP_PASS_TIMING"); e && *e && *e != '0') {
+@@ -285,6 +289,9 @@ void Device::drainTimings() {
+         line += e;
+       }
+     }
++    std::snprintf(buf, sizeof buf, " t=%.1f",
++                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - kProcessStart).count());
++    line += buf;
+     log_(line);
+   }
+ }
+diff --git a/gpu/core/tests/core_tests.cpp b/gpu/core/tests/core_tests.cpp
+index ecb082d..f381da4 100644
+--- a/gpu/core/tests/core_tests.cpp
++++ b/gpu/core/tests/core_tests.cpp
+@@ -668,7 +668,7 @@ void testDevice() {
+         log[0].find(" wait_ms=") != std::string::npos);
+   CHECK(log[1].find("reorderable=") != std::string::npos);  // frame 0 is a sampled one
+   CHECK(log.size() == 4 && log[0].starts_with("gpu.frame f=0") && log[2].starts_with("gpu.enc") &&
+-        log[3].starts_with("gpu.time f=0"));
++        log[3].starts_with("gpu.time f=0") && log[3].find(" t=") != std::string::npos);  // monotonic ms
+   dev.destroy(b);
+   dev.destroy(b);  // double destroy is ignored
+   CHECK(be.calls[0] == "createTexture 0 RGBA8Unorm 1x1");
+diff --git a/gpu/shader/ir/CMakeLists.txt b/gpu/shader/ir/CMakeLists.txt
+index 35d79ae..1a1403c 100644
+--- a/gpu/shader/ir/CMakeLists.txt
++++ b/gpu/shader/ir/CMakeLists.txt
+@@ -5,7 +5,8 @@ add_library(vpir
+     src/print.cpp
+     src/verify.cpp
+     src/optimize.cpp
+-    src/fbfetch.cpp)
++    src/fbfetch.cpp
++    src/relaxed.cpp)
+ target_include_directories(vpir PUBLIC include)
+ target_compile_features(vpir PUBLIC cxx_std_20)
+ target_compile_options(vpir PRIVATE -Wall -Wextra)
+diff --git a/gpu/shader/ir/include/vpir/passes.h b/gpu/shader/ir/include/vpir/passes.h
+index 1ea56b5..927bb61 100644
+--- a/gpu/shader/ir/include/vpir/passes.h
++++ b/gpu/shader/ir/include/vpir/passes.h
+@@ -38,4 +38,20 @@ struct FetchRejection {
+ std::vector<FetchRejection> toFramebufferFetch(Module& module, const std::map<uint32_t, uint32_t>& attachments,
+                                                const std::set<uint32_t>& nearestSamplers);
+ 
++struct RelaxedStats {
++    uint32_t decorated = 0;  // relaxed candidate ops seen
++    uint32_t demoted = 0;    // ... computed in f16
++    uint32_t excluded = 0;   // ... kept f32 because they feed something that needs full precision
++};
++
++// Fragment shaders: computes in f16 the float ops the source marked RelaxedPrecision (`relaxed[v]` for the
++// result value v of the entry point), with explicit f32 <-> f16 converts at the boundaries (an operand that
++// is f32 is converted; a consumer that is not demoted reads an f32 copy). An op stays f32 when its result
++// feeds, directly or through operands, variables and memory, an image/atomic/derivative/subgroup/call
++// operand, a non-colour output (depth, sample mask), a memory address, an integer or bitcast, or an
++// if/return condition. Ops with `precise` stay f32, and so do ops with a constant operand f16 cannot hold as a
++// normal number (|c| > 65504 or 0 < |c| < 6.1e-5) and dot/length/normalize/rsq/div/rcp/pow/exp2 with an operand
++// that is not already f16 or bounded (texture result, saturate/clamp to constants, normalize, constant).
++RelaxedStats demoteRelaxed(Module& module, const std::vector<bool>& relaxed);
++
+ }  // namespace vpir
+diff --git a/gpu/shader/ir/src/relaxed.cpp b/gpu/shader/ir/src/relaxed.cpp
+new file mode 100644
+index 0000000..e194b12
+--- /dev/null
++++ b/gpu/shader/ir/src/relaxed.cpp
+@@ -0,0 +1,259 @@
++#include <bit>
++#include <cmath>
++#include <map>
++#include <set>
++#include <unordered_map>
++
++#include "vpir/passes.h"
++
++namespace vpir {
++
++namespace {
++
++// Float ops the source may mark relaxed that run in f16 with every float operand converted. Data
++// movement (extract/construct/shuffle/select) is included so a relaxed chain does not bounce
++// between f16 and f32 at each swizzle. Trig, rem and round stay f32.
++bool candidate(Op op) {
++    switch (op) {
++        case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Neg: case Op::Abs:
++        case Op::Min: case Op::Max: case Op::Fma: case Op::Clamp: case Op::Mix:
++        case Op::Floor: case Op::Ceil: case Op::Trunc: case Op::Fract:
++        case Op::Sqrt: case Op::Rsq: case Op::Rcp: case Op::Exp2: case Op::Log2: case Op::Pow:
++        case Op::Saturate: case Op::Dot: case Op::Length: case Op::Normalize:
++        case Op::Extract: case Op::Construct: case Op::Shuffle: case Op::Select: return true;
++        default: return false;
++    }
++}
++
++// Ops that blow up or flush in f16 when an operand is large or tiny (squares, reciprocals, powers): they are
++// only demoted when every f32 operand is bounded (see `bounded` below).
++bool sensitive(Op op) {
++    switch (op) {
++        case Op::Dot: case Op::Length: case Op::Normalize: case Op::Rsq: case Op::Div: case Op::Rcp: case Op::Pow:
++        case Op::Exp2: return true;
++        default: return false;
++    }
++}
++
++// A constant that f16 holds as a normal number (zero too).
++bool halfNormal(uint32_t bits) {
++    const float a = std::fabs(std::bit_cast<float>(bits));
++    return std::isfinite(a) && a <= 65504.0f && (a == 0.0f || a >= 6.104e-5f);
++}
++
++// Ops whose operands must keep full precision: atomics, images (coordinates, lod, compare…),
++// interpolation offsets, derivatives, subgroup/quad exchange, calls, bit reinterpretation.
++// (Ranges of the VPIR_OPS order: AtomicAdd..Fwidth, SubgroupBallot..MeshPrimitiveCount.)
++bool pinsOperands(Op op) {
++    return (op >= Op::AtomicAdd && op <= Op::Fwidth) || (op >= Op::SubgroupBallot && op <= Op::MeshPrimitiveCount) ||
++           op == Op::Call || op == Op::Bitcast;
++}
++
++}  // namespace
++
++RelaxedStats demoteRelaxed(Module& m, const std::vector<bool>& relaxed) {
++    RelaxedStats st;
++    if (m.stage != Stage::Fragment || !m.entry()) return st;
++    Function& f = m.functions[size_t(m.entry() - m.functions.data())];
++    const size_t n = f.valueTypes.size();
++
++    // ---- 1. Values that must stay f32: everything feeding, directly or through operands, variables
++    // and memory, a pinned operand, a non-colour output, an address, an integer, or a branch condition.
++    std::vector<const Inst*> def(n, nullptr);
++    std::vector<char> tainted(n, 0);
++    std::vector<ValueId> work;
++    std::vector<std::vector<ValueId>> varStores(f.vars.size());
++    std::map<uint32_t, std::vector<ValueId>> memStores;
++    auto mark = [&](ValueId v) {
++        if (v < n && !tainted[v]) tainted[v] = 1, work.push_back(v);
++    };
++    auto seed = [&](const Block& b, auto&& self) -> void {
++        for (const Node& nd : b) {
++            if (nd.kind == NodeKind::Inst) {
++                const Inst& in = nd.inst;
++                if (in.result != kNoValue && in.result < n) {
++                    def[in.result] = &in;
++                    if (in.type.isInt()) mark(in.result);
++                }
++                if (pinsOperands(in.op)) {
++                    for (ValueId a : in.args) mark(a);
++                } else if (in.op == Op::StoreVar) {
++                    varStores[in.sym].push_back(in.args[0]);
++                } else if (in.op == Op::StoreOutput) {
++                    if (m.outputs[in.sym].builtin != Builtin::None) mark(in.args[0]);  // depth, sample mask
++                } else if (in.op == Op::Load) {
++                    mark(in.args[0]);
++                } else if (in.op == Op::Store) {
++                    mark(in.args[0]);
++                    memStores[in.sym].push_back(in.args[1]);
++                }
++            } else if (nd.value != kNoValue) {
++                mark(nd.value);  // if condition, returned value
++            }
++            self(nd.body, self);
++            self(nd.elseBody, self);
++        }
++    };
++    seed(f.body, seed);
++    std::vector<char> varDone(f.vars.size(), 0);
++    std::set<uint32_t> memDone;
++    while (!work.empty()) {
++        const Inst* d = def[work.back()];
++        work.pop_back();
++        if (!d) continue;
++        for (ValueId a : d->args) mark(a);
++        if (d->op == Op::LoadVar && !varDone[d->sym]) {
++            varDone[d->sym] = 1;
++            for (ValueId s : varStores[d->sym]) mark(s);
++        }
++        if (d->op == Op::Load && memDone.insert(d->sym).second)
++            for (ValueId s : memStores[d->sym]) mark(s);
++    }
++
++    // ---- 2. Decorated candidates that are not tainted are demoted.
++    std::vector<char> demote(n, 0), needsFull(n, 0);
++    std::unordered_map<ValueId, std::vector<uint32_t>> constLits;  // f32 constants (the nodes move below)
++    auto constOk = [&](ValueId v) {
++        for (uint32_t l : constLits[v])
++            if (!halfNormal(l)) return false;
++        return true;
++    };
++    // Whether f32 value v is already f16 (demoted, so decided earlier in program order) or provably small and
++    // finite: a texture result, a saturate or a clamp to constant limits, a normalize, a representable constant,
++    // or data movement of those.
++    std::vector<char> boundedMemo(n, 0);  // 1 = yes, 2 = no
++    auto bounded = [&](ValueId v, auto&& self) -> bool {
++        if (v >= n) return false;
++        if (demote[v]) return true;
++        if (boundedMemo[v]) return boundedMemo[v] == 1;
++        const Inst* d = def[v];
++        bool ok = false;
++        if (d && d->op == Op::Const) {
++            ok = constOk(v);
++        } else if (d) {
++            switch (d->op) {
++                case Op::ImageSample: case Op::ImageGather: case Op::ImageFetch: case Op::Saturate: case Op::Normalize:
++                    ok = true;
++                    break;
++                case Op::Clamp:
++                    ok = constLits.count(d->args[1]) && constLits.count(d->args[2]) && constOk(d->args[1]) && constOk(d->args[2]);
++                    break;
++                case Op::Extract: case Op::Shuffle: case Op::Construct:
++                    ok = true;
++                    for (ValueId a : d->args) ok = ok && self(a, self);
++                    break;
++                case Op::Select:
++                    ok = self(d->args[1], self) && self(d->args[2], self);
++                    break;
++                default: break;
++            }
++        }
++        boundedMemo[v] = ok ? 1 : 2;
++        return ok;
++    };
++    auto choose = [&](const Block& b, auto&& self) -> void {
++        for (const Node& nd : b) {
++            const Inst& in = nd.inst;
++            if (nd.kind == NodeKind::Inst && in.result < n) {
++                if (in.op == Op::Const && in.type.scalar == Scalar::F32) constLits[in.result] = in.lits;
++                if (in.result < relaxed.size() && relaxed[in.result] && candidate(in.op) &&
++                    in.type.scalar == Scalar::F32 && !in.precise) {
++                    ++st.decorated;
++                    // A constant f16 cannot hold, or an unbounded operand of a sensitive op, keeps it f32.
++                    bool ok = !tainted[in.result];
++                    for (ValueId a : in.args) {
++                        if (!ok || a >= n || f.valueTypes[a].scalar != Scalar::F32) continue;
++                        if (constLits.count(a)) ok = constOk(a);
++                        else if (sensitive(in.op)) ok = bounded(a, bounded);
++                    }
++                    if (!ok) ++st.excluded;
++                    else demote[in.result] = 1, ++st.demoted;
++                }
++            }
++            self(nd.body, self);
++            self(nd.elseBody, self);
++        }
++    };
++    choose(f.body, choose);
++    if (!st.demoted) return st;
++
++    // ---- 3. Rewrite: f16 operands converted at the boundary, an f32 copy right after each demoted
++    // value that something not demoted reads.
++    auto usesFull = [&](const Block& b, auto&& self) -> void {
++        for (const Node& nd : b) {
++            if (nd.kind == NodeKind::Inst) {
++                if (!(nd.inst.result < n && demote[nd.inst.result]))
++                    for (ValueId a : nd.inst.args)
++                        if (a < n && demote[a]) needsFull[a] = 1;
++            } else if (nd.value < n && demote[nd.value]) {
++                needsFull[nd.value] = 1;
++            }
++            self(nd.body, self);
++            self(nd.elseBody, self);
++        }
++    };
++    usesFull(f.body, usesFull);
++
++    std::vector<ValueId> full(n, kNoValue);
++    auto fresh = [&](Inst in, Block& out) {
++        in.result = ValueId(f.valueTypes.size());
++        f.valueTypes.push_back(in.type);
++        Node nd;
++        nd.inst = std::move(in);
++        out.push_back(std::move(nd));
++        return ValueId(f.valueTypes.size() - 1);
++    };
++    // The f16 version of an operand: demoted values and non-float operands are as they are.
++    auto halfOf = [&](ValueId a, Block& out) {
++        const Type t = f.typeOf(a);
++        if (t.scalar != Scalar::F32) return a;
++        Inst c;
++        c.type = t.withScalar(Scalar::F16);
++        if (auto k = constLits.find(a); k != constLits.end()) {
++            c.op = Op::Const;
++            for (uint32_t l : k->second) c.lits.push_back(floatToHalf(std::bit_cast<float>(l)));
++        } else {
++            c.op = Op::Convert;
++            c.args = {a};
++        }
++        return fresh(std::move(c), out);
++    };
++    auto rewrite = [&](Block& b, auto&& self) -> void {
++        Block out;
++        out.reserve(b.size());
++        for (Node& nd : b) {
++            if (nd.kind != NodeKind::Inst) {
++                if (nd.value < n && demote[nd.value]) nd.value = full[nd.value];
++                self(nd.body, self);
++                self(nd.elseBody, self);
++                out.push_back(std::move(nd));
++                continue;
++            }
++            Inst& in = nd.inst;
++            if (!(in.result < n && demote[in.result])) {
++                for (ValueId& a : in.args)
++                    if (a < n && demote[a]) a = full[a];
++                out.push_back(std::move(nd));
++                continue;
++            }
++            for (ValueId& a : in.args) a = halfOf(a, out);
++            const ValueId r = in.result;
++            in.type = in.type.withScalar(Scalar::F16);
++            f.valueTypes[r] = in.type;
++            const Type back = in.type.withScalar(Scalar::F32);
++            out.push_back(std::move(nd));
++            if (needsFull[r]) {
++                Inst c;
++                c.op = Op::Convert;
++                c.type = back;
++                c.args = {r};
++                full[r] = fresh(std::move(c), out);
++            }
++        }
++        b = std::move(out);
++    };
++    rewrite(f.body, rewrite);
++    return st;
++}
++
++}  // namespace vpir
+diff --git a/gpu/shader/spirv/CMakeLists.txt b/gpu/shader/spirv/CMakeLists.txt
+index 6775dc3..2777a86 100644
+--- a/gpu/shader/spirv/CMakeLists.txt
++++ b/gpu/shader/spirv/CMakeLists.txt
+@@ -17,5 +17,6 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
+       endforeach()
+     endforeach()
+     add_test(NAME gpu_spirv.correctness COMMAND vpspirv_tests correctness plain ${CMAKE_CURRENT_SOURCE_DIR}/tests)
++    add_test(NAME gpu_spirv.relaxed_f16 COMMAND vpspirv_tests relaxed_f16 plain ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+   endif()
+ endif()
+diff --git a/gpu/shader/spirv/src/lower.cpp b/gpu/shader/spirv/src/lower.cpp
+index 9b6b8f0..d016089 100644
+--- a/gpu/shader/spirv/src/lower.cpp
++++ b/gpu/shader/spirv/src/lower.cpp
+@@ -29,6 +29,7 @@
+ //   * SpirvLowerOptions::nativeFetch: 16-bit float vertex attributes convert through half2 (one
+ //     native conversion) instead of the bit-exact integer expansion.
+ #include <algorithm>
++#include <atomic>
+ #include <cmath>
+ #include <cstring>
+ #include <functional>
+@@ -39,6 +40,7 @@
+ 
+ #include "module.h"
+ #include "vpir/builder.h"
++#include "vpir/passes.h"
+ #include "vpvk/spirv_frontend.h"
+ 
+ namespace spirv {
+@@ -144,6 +146,8 @@ struct Ctx {
+     std::vector<Pending> pending;
+ };
+ 
++std::atomic<uint64_t> gRelaxedDecorated{0}, gRelaxedDemoted{0}, gRelaxedExcluded{0};
++
+ uint32_t floatBits(float f) {
+     uint32_t b;
+     std::memcpy(&b, &f, 4);
+@@ -201,6 +205,9 @@ private:
+     int mvCurIn_ = -1, mvPrevIn_ = -1;
+     Scope* entryScope_ = nullptr;
+     std::unordered_map<uint32_t, uint64_t> specValue_;
++    // SpirvLowerOptions::relaxedF16: VPIR values (fragment) that are the result of a float op decorated
++    // RelaxedPrecision, for vpir::demoteRelaxed at the end of run().
++    std::vector<bool> relaxed_;
+ 
+     // ---- types ---------------------------------------------------------------------------------
+     const TypeInfo& T(uint32_t id) const {
+@@ -1754,7 +1761,11 @@ private:
+     // Emits one block; returns the next block to emit in this region, or 0.
+     uint32_t emitBlock(const Block& bl, uint32_t stop) {
+         scope_->block = bl.label;
+-        for (const Instr& in : bl.body) instruction(in);
++        for (const Instr& in : bl.body) {
++            const size_t first = b_fn().valueTypes.size();
++            instruction(in);
++            markRelaxed(in, first);
++        }
+         const Instr& t = bl.terminator;
+         switch (t.op) {
+             case OpBranch: {
+@@ -1982,6 +1993,32 @@ private:
+         return bin(op, a, c, resultVt(in));
+     }
+ 
++    // Records the result of `in` (lowered to values >= `first`) when it is a float op the shader decorated
++    // RelaxedPrecision. Only the final value: what the lowering built around it stays f32.
++    void markRelaxed(const Instr& in, size_t first) {
++        if (!o_.relaxedF16 || stage_ != vpir::Stage::Fragment) return;
++        switch (in.op) {
++            case OpFNegate: case OpFAdd: case OpFSub: case OpFMul: case OpFDiv: case OpVectorTimesScalar: case OpDot:
++            case OpCompositeExtract: case OpCompositeConstruct: case OpVectorShuffle: case OpSelect: break;
++            case OpExtInst:
++                switch (w(in, 4)) {
++                    case GLSL_FAbs: case GLSL_Floor: case GLSL_Ceil: case GLSL_Fract: case GLSL_Trunc: case GLSL_Sqrt:
++                    case GLSL_InverseSqrt: case GLSL_Exp2: case GLSL_Log2: case GLSL_Pow: case GLSL_FMin: case GLSL_NMin:
++                    case GLSL_FMax: case GLSL_NMax: case GLSL_FClamp: case GLSL_NClamp: case GLSL_FMix: case GLSL_Fma:
++                    case GLSL_Length: case GLSL_Distance: case GLSL_Normalize: break;
++                    default: return;
++                }
++                break;
++            default: return;
++        }
++        const Decorations* d = m_.deco(w(in, 2));
++        if (!d || !d->has(Deco::RelaxedPrecision)) return;
++        auto it = scope_->vals.find(w(in, 2));
++        if (it == scope_->vals.end() || it->second.v.size() != 1 || it->second.v[0] < first) return;
++        if (relaxed_.size() <= it->second.v[0]) relaxed_.resize(it->second.v[0] + 1);
++        relaxed_[it->second.v[0]] = true;
++    }
++
+     void instruction(const Instr& in) {
+         const uint16_t op = in.op;
+         switch (op) {
+@@ -3328,6 +3365,10 @@ void Lowering::run() {
+     initPrivates();
+     flow(fit->second.blocks.front().label, 0);
+     b_->finish();
++    if (o_.relaxedF16 && stage_ == vpir::Stage::Fragment) {
++        vpir::RelaxedStats rs = vpir::demoteRelaxed(out_, relaxed_);
++        gRelaxedDecorated += rs.decorated, gRelaxedDemoted += rs.demoted, gRelaxedExcluded += rs.excluded;
++    }
+ 
+     // Buffers never stored to are read-only; storage textures keep the access their decorations
+     // gave.
+@@ -3364,6 +3405,10 @@ void Lowering::run() {
+ 
+ }  // namespace
+ 
++RelaxedF16Totals relaxedF16Totals() {
++    return {gRelaxedDecorated.load(), gRelaxedDemoted.load(), gRelaxedExcluded.load()};
++}
++
+ bool lower(const SpirvModule& m, const SpirvLowerOptions& options, vpir::Module& out, SpirvInterface& iface,
+            std::string& error) {
+     iface = SpirvInterface{};
+diff --git a/gpu/shader/spirv/tests/asm/relaxed_f16.frag.spvasm b/gpu/shader/spirv/tests/asm/relaxed_f16.frag.spvasm
+new file mode 100644
+index 0000000..966082b
+--- /dev/null
++++ b/gpu/shader/spirv/tests/asm/relaxed_f16.frag.spvasm
+@@ -0,0 +1,57 @@
++OpCapability Shader
++OpMemoryModel Logical GLSL450
++OpEntryPoint Fragment %main "main" %uv %col %out
++OpExecutionMode %main OriginUpperLeft
++OpDecorate %uv Location 0
++OpDecorate %col Location 1
++OpDecorate %out Location 0
++OpDecorate %tex DescriptorSet 0
++OpDecorate %tex Binding 1
++OpDecorate %smp DescriptorSet 0
++OpDecorate %smp Binding 2
++OpDecorate %a RelaxedPrecision
++OpDecorate %u2 RelaxedPrecision
++OpDecorate %d RelaxedPrecision
++OpDecorate %r RelaxedPrecision
++%void = OpTypeVoid
++%fn = OpTypeFunction %void
++%float = OpTypeFloat 32
++%v2 = OpTypeVector %float 2
++%v4 = OpTypeVector %float 4
++%bool = OpTypeBool
++%img = OpTypeImage %float 2D 0 0 0 1 0
++%simg = OpTypeSampledImage %img
++%sampler = OpTypeSampler
++%pimg = OpTypePointer UniformConstant %img
++%psmp = OpTypePointer UniformConstant %sampler
++%tex = OpVariable %pimg UniformConstant
++%smp = OpVariable %psmp UniformConstant
++%pin4 = OpTypePointer Input %v4
++%pin2 = OpTypePointer Input %v2
++%pout4 = OpTypePointer Output %v4
++%col = OpVariable %pin4 Input
++%uv = OpVariable %pin2 Input
++%out = OpVariable %pout4 Output
++%f05 = OpConstant %float 0.5
++%main = OpFunction %void 0 %fn
++%l = OpLabel
++%c = OpLoad %v4 %col
++%a = OpFMul %v4 %c %c
++%u = OpLoad %v2 %uv
++%u2 = OpFMul %v2 %u %u
++%ux = OpCompositeExtract %float %u 0
++%d = OpFMul %float %ux %ux
++%k = OpFOrdLessThan %bool %d %f05
++OpSelectionMerge %m None
++OpBranchConditional %k %kill %m
++%kill = OpLabel
++OpKill
++%m = OpLabel
++%t = OpLoad %img %tex
++%s = OpLoad %sampler %smp
++%si = OpSampledImage %simg %t %s
++%tx = OpImageSampleImplicitLod %v4 %si %u2
++%r = OpFAdd %v4 %a %tx
++OpStore %out %r
++OpReturn
++OpFunctionEnd
+diff --git a/gpu/shader/spirv/tests/asm/relaxed_f16_b.frag.spvasm b/gpu/shader/spirv/tests/asm/relaxed_f16_b.frag.spvasm
+new file mode 100644
+index 0000000..fa0859a
+--- /dev/null
++++ b/gpu/shader/spirv/tests/asm/relaxed_f16_b.frag.spvasm
+@@ -0,0 +1,65 @@
++OpCapability Shader
++%glsl = OpExtInstImport "GLSL.std.450"
++OpMemoryModel Logical GLSL450
++OpEntryPoint Fragment %main "main" %uv %col %out
++OpExecutionMode %main OriginUpperLeft
++OpDecorate %uv Location 0
++OpDecorate %col Location 1
++OpDecorate %out Location 0
++OpDecorate %tex DescriptorSet 0
++OpDecorate %tex Binding 1
++OpDecorate %smp DescriptorSet 0
++OpDecorate %smp Binding 2
++OpDecorate %dn RelaxedPrecision
++OpDecorate %ln RelaxedPrecision
++OpDecorate %ds RelaxedPrecision
++OpDecorate %tm RelaxedPrecision
++OpDecorate %e RelaxedPrecision
++OpDecorate %sel RelaxedPrecision
++%void = OpTypeVoid
++%fn = OpTypeFunction %void
++%float = OpTypeFloat 32
++%v2 = OpTypeVector %float 2
++%v4 = OpTypeVector %float 4
++%bool = OpTypeBool
++%img = OpTypeImage %float 2D 0 0 0 1 0
++%simg = OpTypeSampledImage %img
++%sampler = OpTypeSampler
++%pimg = OpTypePointer UniformConstant %img
++%psmp = OpTypePointer UniformConstant %sampler
++%tex = OpVariable %pimg UniformConstant
++%smp = OpVariable %psmp UniformConstant
++%pin4 = OpTypePointer Input %v4
++%pin2 = OpTypePointer Input %v2
++%pout4 = OpTypePointer Output %v4
++%col = OpVariable %pin4 Input
++%uv = OpVariable %pin2 Input
++%out = OpVariable %pout4 Output
++%f05 = OpConstant %float 0.5
++%tiny = OpConstant %float 1.0e-6
++%main = OpFunction %void 0 %fn
++%l = OpLabel
++%c = OpLoad %v4 %col
++%dn = OpDot %float %c %c
++%ln = OpExtInst %float %glsl 66 %c
++%u = OpLoad %v2 %uv
++%t = OpLoad %img %tex
++%s = OpLoad %sampler %smp
++%si = OpSampledImage %simg %t %s
++%tx = OpImageSampleImplicitLod %v4 %si %u
++%ds = OpDot %float %tx %tx
++%tm = OpFMul %float %ds %tiny
++%e = OpFAdd %float %ds %ds
++%ux = OpCompositeExtract %float %u 0
++%kb = OpFOrdLessThan %bool %ux %f05
++OpSelectionMerge %m None
++OpBranchConditional %kb %then %m
++%then = OpLabel
++OpBranch %m
++%m = OpLabel
++%ks = OpFOrdLessThan %bool %ds %f05
++%sel = OpSelect %float %ks %e %ds
++%o = OpCompositeConstruct %v4 %sel %dn %ln %tm
++OpStore %out %o
++OpReturn
++OpFunctionEnd
+diff --git a/gpu/shader/spirv/tests/asm/spvasm.py b/gpu/shader/spirv/tests/asm/spvasm.py
+index 6a3787e..789f8fc 100644
+--- a/gpu/shader/spirv/tests/asm/spvasm.py
++++ b/gpu/shader/spirv/tests/asm/spvasm.py
+@@ -9,11 +9,11 @@ OPS = {'OpCapability':17,'OpExtInstImport':11,'OpMemoryModel':14,'OpEntryPoint':
+ 'OpImageSampleDrefExplicitLod':90,'OpImageFetch':95,'OpImage':100,'OpCompositeConstruct':80,'OpCompositeExtract':81,
+ 'OpFAdd':129,'OpFMul':133,'OpVectorTimesScalar':142,'OpMatrixTimesVector':145,'OpKill':252,'OpBranch':249,
+ 'OpBranchConditional':250,'OpSelectionMerge':247,'OpFOrdLessThan':184,'OpExtInst':12,'OpDPdx':207,'OpName':5,
+-'OpConvertFToS':110,'OpImageWrite':99,'OpExecutionModeId':331,'OpBitcast':124,'OpIAdd':128,'OpLoopMerge':246,'OpSLessThan':177,'OpPhi':245}
++'OpConvertFToS':110,'OpImageWrite':99,'OpExecutionModeId':331,'OpBitcast':124,'OpIAdd':128,'OpLoopMerge':246,'OpSLessThan':177,'OpPhi':245,'OpDot':148,'OpSelect':169}
+ NAMES = {'Shader':1,'Logical':0,'GLSL450':1,'Vertex':0,'Fragment':4,'GLCompute':5,'OriginUpperLeft':7,
+ 'Input':1,'Output':3,'Uniform':2,'UniformConstant':0,'Function':7,'PushConstant':9,
+ 'Location':30,'BuiltIn':11,'Block':2,'Offset':35,'DescriptorSet':34,'Binding':33,'Invariant':18,'Flat':14,
+-'Position':0,'ClipDistance':3,'FragCoord':15,'None':0,'2D':1,'ClipDistanceCap':32,'ArrayStride':6,'RowMajor':4,'ColMajor':5,'MatrixStride':7}
++'Position':0,'ClipDistance':3,'FragCoord':15,'None':0,'2D':1,'ClipDistanceCap':32,'ArrayStride':6,'RowMajor':4,'ColMajor':5,'MatrixStride':7,'RelaxedPrecision':0}
+ def asm(text):
+     ids = {}; nxt = [1]
+     def idof(n):
+diff --git a/gpu/shader/spirv/tests/relaxed_f16.frag.spv b/gpu/shader/spirv/tests/relaxed_f16.frag.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..df7f667cf8a867ff2e4264de26f27f4840988f1c
+GIT binary patch
+literal 868
+zcmYk)xlTht3<c03VM*8$2wTFI1uA-kgn*Ko25L$Q_y-F9i9Z7&khtgNMT#ZIzSno2
+zJ)Sfhla*2y3OlcUOW7)oirFm9ic#&9R#{AxzdpabDKz2~_--<_e5~AuQ9Fq<m=30a
+zotdvM1&`xQ9UjGJ`sL*Fby!`W`+QwrCT~sCDsRu_t99PXskP*zXx9_vd&xHvhw=UN
+z-%NykAMVuH+&f{riT%>fuBJM3&f5$h=DXV|&<%2~mpIJ#c4{#m-mS6vbzQdu2CKU>
+zqu)!^!(8xwjm-@oB-**U^YpMYFul9YFul9cTqJY%emr(}nb)u*T4rb8IXy_ciB^xp
+zxU(P8!rlYNY0PyL*OLbJPB{J$PS4{SCsaC|H^lSL=<MEq2XDr&bUsaFKk215jN{BH
+z|IPGroO$eh6t`p8-p6q}ehll)CUF}4Q#kiJi{s7yUUU9e?yGj2S?m$_m!4Pge+{!8
+ATmS$7
+
+literal 0
+HcmV?d00001
+
+diff --git a/gpu/shader/spirv/tests/relaxed_f16_b.frag.spv b/gpu/shader/spirv/tests/relaxed_f16_b.frag.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..916215b411c0712b719142e91434fc6eaa3c89ac
+GIT binary patch
+literal 1032
+zcmYk4%PvDv6o$8=E~PD{Ro7PCC5?e15hNy^7!V0#iHQLdUci7S@Dkp@#B;eM65n^a
+zPjXiBcdh?lYwxwr+U?J^hC=8I+II3A!bHd=N+IME-#xoLYd=2Sws$)_mJ~yOQt7Eu
+z7!CvY9Js%^doW>EZ4i`U=4cYSsOA=dCbv%RU2@N4^Lh9((9Fx5Ag%Y_Y+i2Oo?W^P
+z<2B=vUYNwAnYfUN$1?GFj4Rw$ByMs?32$5_F5?@Z##|G4xqao6k^6m9s1<yj38td%
+z{8>x+9QRI>ux^%fReXc{YOz>dJ`=h5!<ctBn%um*(5$cH?crSV*~pz+K8N>h%zNH?
+zXZMWUdh;o_-nUZQChxb;1MDQ_3y{zK*Ulc5?#$h2?(iGtJ0Ee@o=d=fZ`691@1`ck
+zcy%@3&;F-C-Lt*<dvnO$PZPKcx%*iL?&6BO-E9k4qkfHM{}rI#0O<_=N7ThjoXh`;
+zy5II3HUBee;v#CR#0{W*p!xo5K;1okvAK1;_RE~+Hh`MDG5*1)T%X>vNo+6gd5^pC
+ezp9?ja?Tg~U0cAM`*eTKe@t)R&fFgxJplh0a43xc
+
+literal 0
+HcmV?d00001
+
+diff --git a/gpu/shader/spirv/tests/spirv_tests.cpp b/gpu/shader/spirv/tests/spirv_tests.cpp
+index c911d17..5dd97af 100644
+--- a/gpu/shader/spirv/tests/spirv_tests.cpp
++++ b/gpu/shader/spirv/tests/spirv_tests.cpp
+@@ -7,6 +7,7 @@
+ #include <cstring>
+ #include <map>
+ #include <set>
++#include <sstream>
+ #include <fstream>
+ #include <string>
+ #include <vector>
+@@ -365,6 +366,99 @@ void correctness(const std::string& dir, const std::string&) {
+     }
+ }
+ 
++// RelaxedPrecision (SpirvLowerOptions::relaxedF16; tests/asm/relaxed_f16.frag.spvasm): four decorated ops. The
++// multiply a (vec4) and the add r reach the colour output; the multiply u2 (vec2) is the sample coordinate and
++// the multiply d (scalar) decides a discard: those two must stay f32.
++void relaxedF16(const std::string& dir, const std::string&) {
++    std::printf("[relaxed_f16]\n");
++    spirv::SpirvLowerOptions f;
++    f.entry = "main", f.stage = vpir::Stage::Fragment;
++    f.layout = {bind(0, 1, vpgpu::BindKind::Texture, 0), bind(0, 2, vpgpu::BindKind::Sampler, 0)};
++    const std::string path = dir + "/relaxed_f16.frag.spv";
++    {  // off: the shader is f32 throughout
++        Result r = run(path, f);
++        CHECK(r.ok && r.msl.source.find("half") == std::string::npos);
++    }
++    f.relaxedF16 = true;
++    const spirv::RelaxedF16Totals before = spirv::relaxedF16Totals();
++    Result r = run(path, f);
++    CHECK(r.ok);
++    if (!r.ok) return;
++    const spirv::RelaxedF16Totals t = spirv::relaxedF16Totals();
++    CHECK(t.decorated - before.decorated == 4 && t.demoted - before.demoted == 2 && t.excluded - before.excluded == 2);
++    CHECK(r.msl.source.find("half4") != std::string::npos);
++    int mulHalf4 = 0, addHalf4 = 0, mulF32 = 0, samples = 0;
++    auto walk = [&](const vpir::Block& b, auto&& self) -> void {
++        for (const vpir::Node& n : b) {
++            const vpir::Inst& in = n.inst;
++            if (n.kind == vpir::NodeKind::Inst) {
++                const bool h4 = in.type == vpir::Type(vpir::Scalar::F16, 4);
++                if (in.op == vpir::Op::Mul && h4) ++mulHalf4;
++                if (in.op == vpir::Op::Add && h4) ++addHalf4;
++                if (in.op == vpir::Op::Mul && in.type.scalar == vpir::Scalar::F32 && in.type.width < 4) ++mulF32;
++                if (in.op == vpir::Op::ImageSample) {
++                    ++samples;
++                    CHECK(r.module.functions[0].typeOf(in.args[0]) == vpir::Type(vpir::Scalar::F32, 2));
++                }
++            }
++            self(n.body, self);
++            self(n.elseBody, self);
++        }
++    };
++    walk(r.module.functions[0].body, walk);
++    CHECK(mulHalf4 == 1 && addHalf4 == 1 && mulF32 == 2 && samples == 1);
++
++    // tests/asm/relaxed_f16_b.frag.spvasm, six decorated ops: dot and length of an interpolant (unbounded: stay
++    // f32), dot of a texture result (bounded: f16), a multiply by 1e-6 (not a normal half: stays f32), and an add and
++    // a select of f16 values, the add read after an if (a variable between blocks).
++    const spirv::RelaxedF16Totals before2 = spirv::relaxedF16Totals();
++    Result b = run(dir + "/relaxed_f16_b.frag.spv", f);
++    CHECK(b.ok);
++    if (!b.ok) return;
++    const spirv::RelaxedF16Totals t2 = spirv::relaxedF16Totals();
++    CHECK(t2.decorated - before2.decorated == 6 && t2.demoted - before2.demoted == 3 && t2.excluded - before2.excluded == 3);
++    int dotH = 0, dotF = 0, lenH = 0, lenF = 0, mulH = 0, mulF = 0, selH = 0, addH = 0;
++    auto walk2 = [&](const vpir::Block& blk, auto&& self) -> void {
++        for (const vpir::Node& n : blk) {
++            const vpir::Inst& in = n.inst;
++            if (n.kind == vpir::NodeKind::Inst) {
++                const bool h = in.type.scalar == vpir::Scalar::F16, fl = in.type.scalar == vpir::Scalar::F32;
++                if (in.op == vpir::Op::Dot) ++(h ? dotH : dotF);
++                if (in.op == vpir::Op::Length) ++(h ? lenH : lenF);
++                if (in.op == vpir::Op::Mul) mulH += h, mulF += fl;
++                if (in.op == vpir::Op::Select && h) ++selH;
++                if (in.op == vpir::Op::Add && h) ++addH;
++            }
++            self(n.body, self);
++            self(n.elseBody, self);
++        }
++    };
++    walk2(b.module.functions[0].body, walk2);
++    CHECK(dotH == 1 && dotF == 1 && lenH == 0 && lenF == 1 && mulH == 0 && mulF == 1 && selH == 1 && addH == 1);
++    // The MSL types agree: a variable is only assigned a value of its own type, a select picks between operands
++    // of the select's type.
++    std::map<std::string, std::string> ty;
++    std::istringstream is(b.msl.source);
++    int stores = 0, halfSelects = 0, bad = 0;
++    for (std::string line; std::getline(is, line);) {
++        std::istringstream ls(line);
++        std::vector<std::string> tok;
++        for (std::string x; ls >> x;) tok.push_back(x);
++        auto bare = [](std::string x) { while (!x.empty() && (x.back() == ';' || x.back() == ',')) x.pop_back(); return x; };
++        if (tok.size() >= 2 && tok[1].starts_with("l") && tok[1].ends_with("{};")) ty[tok[1].substr(0, tok[1].size() - 3)] = tok[0];
++        else if (tok.size() >= 4 && tok[0] == "const") ty[tok[2]] = tok[1];
++        if (tok.size() == 3 && tok[0].starts_with("l") && tok[1] == "=" && ty.count(tok[0]) && ty.count(bare(tok[2]))) {
++            ++stores;
++            bad += ty[tok[0]] != ty[bare(tok[2])];
++        }
++        if (tok.size() == 9 && tok[0] == "const" && tok[5] == "?" && tok[7] == ":") {
++            halfSelects += tok[1] == "half";
++            for (const std::string& op : {bare(tok[6]), bare(tok[8])}) bad += ty.count(op) && ty[op] != tok[1];
++        }
++    }
++    CHECK(stores >= 1 && halfSelects == 1 && bad == 0);
++}
++
+ int main(int argc, char** argv) {
+     if (argc < 4) {
+         std::fprintf(stderr, "usage: vpspirv_tests <case> <plain|opt> <tests dir>\n");
+@@ -378,6 +472,7 @@ int main(int argc, char** argv) {
+     else if (c == "motion") motion(dir, v);
+     else if (c == "amplify") amplify(dir, v);
+     else if (c == "correctness") correctness(dir, v);
++    else if (c == "relaxed_f16") relaxedF16(dir, v);
+     else {
+         std::fprintf(stderr, "unknown case %s\n", c.c_str());
+         return 2;
+diff --git a/gpu/vulkan/include/vpvk/spirv_frontend.h b/gpu/vulkan/include/vpvk/spirv_frontend.h
+index 32871f3..3e92f0e 100644
+--- a/gpu/vulkan/include/vpvk/spirv_frontend.h
++++ b/gpu/vulkan/include/vpvk/spirv_frontend.h
+@@ -99,10 +99,19 @@ struct SpirvLowerOptions {
+   // Translator modes (process-wide, VPVulkan's translatorMode(); not part of a recipe input's hash: the
+   // recipe store's translator id carries them). amplify: two-view multiview through Metal vertex
+   // amplification (see SpirvInterface::amplified). nativeFetch: half vertex attributes via half2.
++  // relaxedF16: fragment shaders compute in f16 the float ops decorated RelaxedPrecision (vpir::demoteRelaxed).
+   bool amplify = false;
+   bool nativeFetch = false;
++  bool relaxedF16 = false;
+ };
+ 
++// Process-wide totals of the relaxedF16 lowering (fragment shaders): candidate ops the shaders decorated,
++// how many were computed in f16 and how many stayed f32 because they feed something needing full precision.
++struct RelaxedF16Totals {
++  uint64_t decorated = 0, demoted = 0, excluded = 0;
++};
++RelaxedF16Totals relaxedF16Totals();
++
+ struct SpirvInterface {
+   std::vector<SpirvBinding> bindings;  // subset of options.layout the entry point uses (+ written)
+   bool usesPushConstants = false;
+diff --git a/gpu/vulkan/src/pipelines.cpp b/gpu/vulkan/src/pipelines.cpp
+index 4b39cc3..c13dbbd 100644
+--- a/gpu/vulkan/src/pipelines.cpp
++++ b/gpu/vulkan/src/pipelines.cpp
+@@ -577,6 +577,15 @@ TranslateFail lowerAndEmit(const spirv::SpirvModule& m, const spirv::SpirvLowerO
+     errors.push_back(std::move(error));
+     return TranslateFail::Lower;
+   }
++  if (opt.relaxedF16) {  // VPVK_RELAXED_F16: running totals at the first translated shader and every 200th
++    static std::atomic<uint64_t> shaders{0};
++    const uint64_t k = ++shaders;
++    if (k == 1 || k % 200 == 0) {
++      const spirv::RelaxedF16Totals t = spirv::relaxedF16Totals();
++      logf("vpvk.f16 shaders=%llu decorated=%llu demoted=%llu excluded=%llu", (unsigned long long)k,
++           (unsigned long long)t.decorated, (unsigned long long)t.demoted, (unsigned long long)t.excluded);
++    }
++  }
+   // A/B test: every vertex position [[invariant]] (depth prepass vs. LEQUAL colour pass speckles).
+   static const bool invariantAll = [] { const char* e = std::getenv("VPVK_INVARIANT_ALL"); return e && *e == '1'; }();
+   if (invariantAll && opt.stage == vpir::Stage::Vertex) mod.invariantPosition = true;
+diff --git a/gpu/vulkan/src/recipes.cpp b/gpu/vulkan/src/recipes.cpp
+index 6fcb89f..75307bb 100644
+--- a/gpu/vulkan/src/recipes.cpp
++++ b/gpu/vulkan/src/recipes.cpp
+@@ -193,9 +193,12 @@ uint32_t refreshTranslatorMode() {
+     const char* e = std::getenv(name);
+     return e && *e ? *e != '0' : def;
+   };
+-  const uint32_t m = (flag("VPVK_FETCH_NATIVE", false) ? 1u : 0u) | (flag("VPVK_AMPLIFY", false) ? 2u : 0u);
++  const char* rf = std::getenv("VPVK_RELAXED_F16");  // only "1" turns it on
++  const uint32_t m = (flag("VPVK_FETCH_NATIVE", false) ? 1u : 0u) | (flag("VPVK_AMPLIFY", false) ? 2u : 0u) |
++                     (rf && rf[0] == '1' && !rf[1] ? 4u : 0u);
+   if (gTranslatorMode.exchange(m) != m)
+-    logf("vk.translator mode=%u native_fetch=%u amplify=%u id=%u", m, m & 1, (m >> 1) & 1, kTranslatorVersion | m << 16);
++    logf("vk.translator mode=%u native_fetch=%u amplify=%u relaxed_f16=%u id=%u", m, m & 1, (m >> 1) & 1, (m >> 2) & 1,
++         kTranslatorVersion | m << 16);
+   return m;
+ }
+ 
+@@ -210,6 +213,7 @@ void applyTranslatorMode(spirv::SpirvLowerOptions& o) {
+   const uint32_t m = translatorMode();
+   o.nativeFetch = (m & 1) != 0;
+   o.amplify = (m & 2) != 0;
++  o.relaxedF16 = (m & 4) != 0;
+ }
+ 
+ uint64_t spirvHash(const uint32_t* words, size_t count) {
+diff --git a/gpu/vulkan/src/recipes.h b/gpu/vulkan/src/recipes.h
+index c5d6f6e..0e5bb24 100644
+--- a/gpu/vulkan/src/recipes.h
++++ b/gpu/vulkan/src/recipes.h
+@@ -44,6 +44,8 @@ inline constexpr uint32_t kTranslatorVersion = 4;
+ // Translator modes, read from the environment once per process (bits; every lowering applies them):
+ //  bit 0 nativeFetch  VPVK_FETCH_NATIVE (default 0): half vertex attributes through one half2 conversion.
+ //  bit 1 amplify      VPVK_AMPLIFY (default 0): two-view multiview through Metal vertex amplification.
++//  bit 2 relaxedF16   VPVK_RELAXED_F16 (default 0, only "1" turns it on): fragment shaders compute in half the float
++//                     ops decorated RelaxedPrecision (vpir::demoteRelaxed).
+ uint32_t translatorMode();
+ // Re-reads the environment (the host may set it after an earlier prewarm in the same process): called where a
+ // device or a prewarm starts, so the mode is fixed for its lifetime. Returns the mode.
+-- 
+2.43.0
+

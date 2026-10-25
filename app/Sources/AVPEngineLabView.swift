@@ -191,6 +191,14 @@ struct AVPEngineLabView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                     Text(AVPL("Por defecto: activado", "Default: on")).font(.footnote).foregroundStyle(.secondary)
                 }
+                VStack(alignment: .leading, spacing: 6) {
+                    Toggle(AVPL("Precisión media en shaders (experimental, requiere reiniciar)",
+                                "Half precision in shaders (experimental, needs a restart)"), isOn: $s.labRelaxedF16)
+                    Text(AVPL("Precisión media en shaders (como en Quest): calcula en 16 bits lo que el juego marca como apto. Puede ganar GPU; si ves bandas o manchas, apágalo.",
+                              "Half precision in shaders (as on Quest): computes in 16 bits what the game marks as safe. It may save GPU time; if you see banding or blotches, turn it off."))
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Text(AVPL("Por defecto: apagado", "Default: off")).font(.footnote).foregroundStyle(.secondary)
+                }
             } header: {
                 Text(AVPL("Requieren reiniciar el juego", "Need a game restart"))
             } footer: {
