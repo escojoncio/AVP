@@ -9,7 +9,10 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
 
 ## Últimos hechos
 - Bitácora compactada: detalle de mediciones en `notas/rendimiento.md`, mecanismos B46–B59 en `notas/builds.md`.
-- Logs_Alyx_48 recibido: foveado ON/OFF ≈ mismo framerate (33 fps). En análisis.
+- Logs_Alyx_48 (no es A/B limpio: ON = modo high/90 Hz → 45 fijos; OFF = auto/100 Hz → 33): foveado SÍ baja GPU juego
+  3–7 ms (mapa físico 1120x1088 = 37 %) y compositor 5,8–7,8 → 3,4–4,1. 33 fps = umbral del regulador: vuelve a 50 solo
+  si `game + 0,667·comp < 17 ms` (`klvr_platform_klepton.c:281,324-326`); OFF 18,6–28 ms, ON calma ~14–15,8.
+  Bug: sin foveado el RCAS se aplica al ojo entero (`KleptonCompositor.swift:1515`, rect ilimitado) → +2,4 ms comp.
 - B59: RCAS «Nitidez del centro» solo en la zona de tasa completa (compositor). Sin validar.
 - B58: `0041` logs `vk.fail`, `console-previous.log`, altura real por detección de suelo. Sin validar.
 - B57: alivio de memoria + `[mem] breakdown`; Logs_47: 14 min sin cierre, sin fuga.
