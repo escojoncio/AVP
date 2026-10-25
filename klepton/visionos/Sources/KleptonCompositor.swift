@@ -672,6 +672,15 @@ final class KleptonCompositor {
     private let cmdLock = NSLock()
     private var cmdCompleted = 0
     private var cmdError: Error?
+    // GPU time (GPUEndTime - GPUStartTime) of the compositor's command buffers per new picture: the eye prep, the wide
+    // view and the composite itself, one line a second: `[cp] gpu p50/p95/max`. Written from the completion handlers
+    // under cmdLock. Indexed by CpGpuKind.rawValue.
+    private enum CpGpuKind: Int, CaseIterable {
+        case prep, wide, composite
+        var label: String { ["prep", "wide", "composite"][rawValue] }
+    }
+    private var cpGpuMs: [[Double]] = [[], [], []]
+    private var cpGpuWindowStart = CFAbsoluteTimeGetCurrent()
     // Every composite command buffer that came back with an error (not only the first): build 12
     // hung the GPU from the guest's queue and only one "InnocentVictim" was ever printed here, so
     // whether the compositor's own work kept running afterwards could not be read. Counted under
@@ -1477,7 +1486,7 @@ final class KleptonCompositor {
     /// from the preset: the map is separable, so each axis is sampled through the middle of the other (256 steps) and
     /// the longest run with physical/screen slope >= 0.99 is the zone; its ends are mapped to physical texels
     /// (`physicalCoordinates`, top-left origin like the texture). The shader fades the weight to 0 over a few texels
-    /// inside the rect. No map at all (foveation off): the whole eye, an unbounded rect. A map whose zone cannot be
+    /// inside the rect. No map at all (foveation off): the central `sharpCentreFraction` of the eye. A map whose zone cannot be
     /// measured: nil, and the pass is skipped (never sharpen what cannot be bounded). The zone is a rectangle that
     /// holds the round sharp zone, so its corners can reach outside the circle the composite shows at full rate.
     /// Cached per slot: the map pointer changes when the foveation settings do (kl_vrr_reload).
@@ -1512,7 +1521,13 @@ final class KleptonCompositor {
             NSLog("%@", "[cp] centre sharpness: full-rate zone of the \(src.width)x\(src.height) eye image (map layers \(rm.layerCount), "
                   + "screen \(rm.screenSize.width)x\(rm.screenSize.height)): " + (c.zones != nil ? desc : "NOT measurable, pass skipped"))
         } else {
-            c.zones = [SIMD4<Float>](repeating: SIMD4<Float>(-1e6, -1e6, 1e6, 1e6), count: n)   // no foveation: all of it
+            // No foveation: the whole eye is full rate, and sharpening all of it cost more than twice the foveated zone
+            // (4.3 vs 1.9 ms GPU, measured). Only the central `sharpCentreFraction` of each axis, faded at its border
+            // like a measured zone.
+            let m = Self.sharpCentreFraction
+            let z = SIMD4<Float>(Float(src.width) * (0.5 - m / 2), Float(src.height) * (0.5 - m / 2),
+                                 Float(src.width) * (0.5 + m / 2), Float(src.height) * (0.5 + m / 2))
+            c.zones = [SIMD4<Float>](repeating: z, count: n)
         }
         sharpZoneCache[slot] = c
         return c.zones
@@ -1554,7 +1569,8 @@ final class KleptonCompositor {
     /// a perceptual space (square root of linear), as FSR does. Strength: the launcher's «Nitidez del centro»
     /// (`centerSharp`, 0...1 -> `sharpStops`) or the legacy KL_EYE_SHARPEN stops, which wins. Only inside the full-rate
     /// zone (`sharpZones`). The output keeps the eye image's size, format and array length, so the unwarp grid, the
-    /// slices and flipY the composite applies to it are unchanged. Returns `src` if anything is missing.
+    /// slices and flipY the composite applies to it are unchanged. Returns `src` if anything is missing. Runs only for the
+    /// legacy KL_EYE_SHARPEN or with KL_CP_SHARP_FUSED=0; the launcher's strength is otherwise fused into the composite.
     private func sharpenedEye(_ src: MTLTexture, slot: Int, bottomUp: Bool, cmd: MTLCommandBuffer) -> MTLTexture {
         let strength = Self.centerSharp
         let live: Float? = strength > 0 ? Self.sharpStops(strength) : nil
@@ -3096,6 +3112,7 @@ final class KleptonCompositor {
             }
             if n <= 12 { NSLog("[cp] cmdbuf #\(n) COMPLETED" + (b.error != nil ? " err=\(b.error!)" : "")) }
             if first { NSLog("[cp] composite command buffer error: \(b.error!)") }
+            self.noteCompositeGpu(b, .composite)
         }
         cmd.commit()
         cmdCommitted += 1
@@ -3203,8 +3220,13 @@ final class KleptonCompositor {
         roundEdge = max(0.05, min(1, edge))
         NSLog("[cp] round sharp zone \(roundFovea ? "on" : "off"): \(Int(roundDegrees)) deg, periphery \(Int(roundEdge * 100)) %")
     }
-    /// «Nitidez del centro» (KL_CP_SHARP 0..1; AVPSettings.centerSharpness): RCAS on the full-rate zone of each eye image
-    /// (`sharpenedEye`), 0 = pass skipped. Live through `setCenterSharpness`; read per frame from here, never getenv.
+    /// «Nitidez del centro» (KL_CP_SHARP 0..1; AVPSettings.centerSharpness): RCAS on the full-rate zone of each eye image,
+    /// 0 = off. Fused into the composite's eye sample (kl_rcas, `rcas_con`/`rcas_rect`) unless KL_CP_SHARP_FUSED=0, which
+    /// keeps the separate pass (`sharpenedEye`) for an A/B. Live through `setCenterSharpness`; read per frame from here,
+    /// never getenv.
+    private static let sharpFused: Bool = envStr("KL_CP_SHARP_FUSED") != "0"
+    /// Foveation off: the share of each axis of the eye the sharpening covers, centred (`sharpZones`).
+    private static let sharpCentreFraction: Float = 0.45
     nonisolated(unsafe) static var centerSharp: Float = {
         let v = getenv("KL_CP_SHARP").flatMap { Float(String(cString: $0)) } ?? 0
         return max(0, min(1, v))
@@ -3215,7 +3237,7 @@ final class KleptonCompositor {
     static func setCenterSharpness(_ s: Float) {
         centerSharp = (max(0, min(1, s)) * 20).rounded() / 20   // the 5 % step: 0 is exactly 0 (pass skipped)
         NSLog("%@", "[cp] centre sharpness (RCAS) \(centerSharp > 0 ? "on" : "off"): \(Int((centerSharp * 100).rounded())) %"
-              + (centerSharp > 0 ? ", RCAS stops \(sharpStops(centerSharp))" : ""))
+              + (centerSharp > 0 ? ", RCAS stops \(sharpStops(centerSharp)), \(sharpFused ? "fused into the composite" : "separate pass")" : ""))
     }
     static func setPeripheryRecon(on: Bool, percent: Float, sharpness: Float) {
         reconOn = on
@@ -3828,7 +3850,10 @@ final class KleptonCompositor {
         let rawBind0 = sources.first.flatMap { $0 } ?? sources.compactMap { $0 }.first
         let rawBind1 = (sources.count > 1 ? sources[1] : nil) ?? rawBind0
         var bind0 = rawBind0, bind1 = rawBind1
-        if eyeMipsOn || eyeFXScale > 0 || eyeSharpen != nil || Self.centerSharp > 0 || eyeFXAA, let r0 = rawBind0, let r1 = rawBind1, let q = queue {
+        // The centre sharpness is fused into the composite (rcas_con below) unless KL_CP_SHARP_FUSED=0 (A/B); the legacy
+        // KL_EYE_SHARPEN keeps its own pass either way.
+        let sharpPass = eyeSharpen != nil || (!Self.sharpFused && Self.centerSharp > 0)
+        if eyeMipsOn || eyeFXScale > 0 || sharpPass || eyeFXAA, let r0 = rawBind0, let r1 = rawBind1, let q = queue {
             let c0 = CACurrentMediaTime()
             let serial = UInt64(kl_vulkan_frame_serial())
             var m0 = r0, m1 = r1
@@ -3847,7 +3872,7 @@ final class KleptonCompositor {
                     m0 = fxaaEye(f0, slot: 0, cmd: pcmd)
                     m1 = f1 === f0 ? m0 : fxaaEye(f1, slot: 1, cmd: pcmd)
                 }
-                if eyeSharpen != nil || Self.centerSharp > 0, sharpenActive() {
+                if sharpPass, sharpenActive() {
                     let s0 = m0, s1 = m1
                     // Bottom-up eye image (GL guest): the view's flip_y is 0 (kl_glfb_eye_mtl_origin_top_left false).
                     let bu0 = uniforms.first.map { $0.flip_y == 0 } ?? false
@@ -3865,6 +3890,7 @@ final class KleptonCompositor {
                     guard let self else { return }
                     let g = (cb.gpuEndTime - cb.gpuStartTime) * 1000
                     self.prepLock.lock(); self.prepStats.gpu += g; self.prepStats.gpuN += 1; self.prepLock.unlock()
+                    self.noteCompositeGpu(cb, .prep)
                 }
                 pcmd.commit()           // ahead of `cmd` on the same queue, so it runs first
                 prepSerial = serial
@@ -4123,6 +4149,39 @@ final class KleptonCompositor {
                     }
                 }
             }
+            // Centre sharpness fused into the eye sample (kl_rcas): the con of the launcher's strength (read per frame, so
+            // a change from the pause applies on the next composite) and, per view, the sharpening zone of the texture
+            // the view samples (bind0/bind1, whatever VPKTAA or the prep made of it, so RCAS stays after TAA as the
+            // separate pass was) as a fraction of that texture. A zone that cannot be bounded leaves the view unsharpened.
+            if probePipeline == nil, Self.sharpFused, eyeSharpen == nil, Self.centerSharp > 0 {
+                let con = exp2f(-Self.sharpStops(Self.centerSharp))
+                var zoneFailed = false
+                for n in uniforms.indices where uniforms[n].visible != 0 {
+                    let tex = n == 0 ? bind0 : bind1
+                    guard let zones = sharpZones(for: tex, slot: n == 0 ? 0 : 1, bottomUp: uniforms[n].flip_y == 0) else {
+                        zoneFailed = true
+                        continue
+                    }
+                    let z = zones[min(Int(uniforms[n].slice), zones.count - 1)]
+                    let w = Float(tex.width), h = Float(tex.height)
+                    uniforms[n].rcas_con = con
+                    uniforms[n].rcas_rect = (z.x / w, z.y / h, z.z / w, z.w / h)
+                }
+                if zoneFailed && !sharpZoneFailLogged {
+                    sharpZoneFailLogged = true
+                    NSLog("[cp] centre sharpness skipped: the full-rate zone of the foveated eye image could not be measured")
+                }
+                if !loggedSharpen, uniforms.contains(where: { $0.rcas_con > 0 }) {
+                    loggedSharpen = true
+                    let zs = uniforms.indices.filter { uniforms[$0].rcas_con > 0 }.map { n -> String in
+                        let r = uniforms[n].rcas_rect
+                        return String(format: "view %ld: %.3f,%.3f-%.3f,%.3f", n, r.0, r.1, r.2, r.3)
+                    }
+                    NSLog("%@", "[cp] centre sharpness (RCAS) fused into the composite, first run: strength "
+                          + "\(Int((Self.centerSharp * 100).rounded())) %, RCAS stops \(Self.sharpStops(Self.centerSharp)), eye "
+                          + "\(bind0.width)x\(bind0.height), zone as fractions of the eye (x0,y0-x1,y1): " + zs.joined(separator: " | "))
+                }
+            }
             let useDepth = depthTex[0] != nil || depthTex[1] != nil
             enc.setRenderPipelineState(probePipeline ?? (useDepth ? depthPipeline! : pipeline))
             if let depthState { enc.setDepthStencilState(depthState) }
@@ -4160,6 +4219,34 @@ final class KleptonCompositor {
         // its menu correctly, which is an instrument contradicting the display.
         if visible > 0 { return visible }
         return panels > 0 ? viewIndices.count : 0
+    }
+
+    /// GPU time of one command buffer of the compositor (called from its completion handler); once a second prints
+    /// p50/p95/max of each kind seen in the window.
+    private func noteCompositeGpu(_ b: MTLCommandBuffer, _ kind: CpGpuKind) {
+        let ms = (b.gpuEndTime - b.gpuStartTime) * 1000
+        guard b.gpuStartTime > 0, ms > 0, ms < 1000 else { return }
+        var windows: [[Double]] = []
+        cmdLock.lock()
+        cpGpuMs[kind.rawValue].append(ms)
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - cpGpuWindowStart >= 1 {
+            windows = cpGpuMs.map { $0.sorted() }
+            for i in cpGpuMs.indices { cpGpuMs[i].removeAll(keepingCapacity: true) }
+            cpGpuWindowStart = now
+        }
+        cmdLock.unlock()
+        guard !windows.isEmpty else { return }
+        var parts: [String] = []
+        for k in CpGpuKind.allCases {
+            let w = windows[k.rawValue]
+            guard !w.isEmpty else { continue }
+            let p95 = w[min(w.count - 1, Int(Double(w.count) * 0.95))]
+            parts.append(String(format: "%@ %.2f/%.2f/%.2f ms (%ld cmdbufs)", k.label, w[w.count / 2], p95, w[w.count - 1], w.count))
+        }
+        let rcas = Self.centerSharp > 0 || eyeSharpen != nil
+            ? ((Self.sharpFused && eyeSharpen == nil) ? "fused" : "separate pass") : "off"
+        NSLog("%@", "[cp] gpu p50/p95/max: " + parts.joined(separator: " | ") + " | rcas " + rcas)
     }
 
     /// The round sharp zone's wide view: each visible eye's picture box-filtered to the periphery's density
@@ -4301,7 +4388,10 @@ final class KleptonCompositor {
                 }
             }
         }
-        wcmd?.commit()
+        if let w = wcmd {
+            w.addCompletedHandler { [weak self] b in self?.noteCompositeGpu(b, .wide) }
+            w.commit()
+        }
         return wt
     }
 

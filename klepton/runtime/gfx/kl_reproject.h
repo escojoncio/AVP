@@ -186,14 +186,21 @@ typedef struct {
     // as it is; outside it the "wide view" bound at fragment texture(4) — the same picture box-filtered once per
     // guest frame to the periphery's density, slice `fov_slice` — with P.T.'s soft edge (the sharp picture faded
     // out with a smoothstep over the outer `fov_fade` of the radius). kl_reproject_build leaves it off. Scalars
-    // for the layout reason the chroma block gives; the pad keeps the size a 16-byte multiple (288), which is what
-    // the MSL struct rounds to as an array element.
+    // for the layout reason the chroma block gives.
     uint32_t      fov_on;
     float         fov_lift;
     float         fov_radius;
     float         fov_fade;
     uint32_t      fov_slice;
-    float         fov_pad[3];
+    // ---- centre sharpness (RCAS fused into the eye sample; kl_rcas) -----------------------------------------------
+    // rcas_con > 0 = sharpen the eye picture in the rectangle `rcas_rect` (x0, y0, x1, y1), normalised 0..1 over the
+    // eye texture in its own memory layout (top-left origin; the guest's foveated PHYSICAL layout, where the zone is
+    // the map's full-rate run), with a 12-texel fade to nothing at its border. rcas_con = exp2(-stops), FSR1's RCAS
+    // attenuation. kl_reproject_build leaves it off (0). Scalars for the layout reason the chroma block gives; the pad
+    // keeps the size a 16-byte multiple (304), which is what the MSL struct rounds to as an array element.
+    float         rcas_con;
+    float         rcas_rect[4];
+    float         rcas_pad[2];
 } kl_reproject_uniforms;
 
 // The blit's uniforms — buffer(0) of its FRAGMENT stage. It carried a bare

@@ -205,7 +205,9 @@ static const char kl_msl_reproject[] =
 "    float    fovRadius;  // its radius, a tangent\n"
 "    float    fovFade;    // the soft edge, a fraction of the radius\n"
 "    uint     fovSlice;   // the wide view's slice for this eye (texture(4))\n"
-"    float    fovPad[3];\n"
+"    float    rcasCon;    // RCAS fused into the eye sample (kl_rcas): exp2(-stops), 0 = off\n"
+"    float    rcasRect[4]; // its zone, 0..1 over the eye texture (x0, y0, x1, y1)\n"
+"    float    rcasPad[2];\n"
 "};\n"
 "\n"
 // The sRGB EOTF, piecewise as the spec has it rather than a 2.2 power. The
@@ -261,7 +263,8 @@ static const char kl_msl_reproject[] =
 "              uint reconOn [[flat]]; float3 reconK [[flat]];\n"
 // The round sharp zone: this pixel's point in the guest's tangent plane (x right, y up; linear on the quad, so the
 // interpolation is exact), its place in the wide view (top-down rows), and the circle (lift, radius, fade, slice).
-"              float2 ftan; float2 wuv; uint fovOn [[flat]]; float4 fovP [[flat]]; };\n"
+"              float2 ftan; float2 wuv; uint fovOn [[flat]]; float4 fovP [[flat]];\n"
+"              float rcasCon [[flat]]; float4 rcasRect [[flat]]; };\n"
 "\n"
 // One place, so a rung of the probe ladder cannot disagree with the real pass
 // about which eye it is looking at — which is the failure this whole file keeps
@@ -359,6 +362,50 @@ static const char kl_msl_reproject[] =
 "    return kl_eye_sample_fw(t0, t1, samp, uv, slice, srgbDecode, src, reconOn, k, fwidth(uv));\n"
 "}\n"
 "\n"
+// ---- centre sharpness: RCAS fused into the eye sample -----------------------------------------------------------
+//
+// RCAS (Robust Contrast Adaptive Sharpening, FSR 1/2): the 5-tap cross in a gamma-2.0 perceptual space with FSR's
+// bounded lobe, as KleptonCompositor.sharpenedEye did in a pass of its own (KL_CP_SHARP_FUSED=0 keeps that pass for
+// an A/B). The taps are bilinear reads of the eye texture one TEXEL of it apart, so it costs only where the picture
+// is sampled anyway and needs no intermediate texture or command buffer. The weight is 1 deep inside `rect` (x0, y0,
+// x1, y1, normalised over the eye texture in its own memory layout, from KleptonCompositor.sharpZones) and fades to 0
+// over 12 texels to its border; outside it the caller's sample stands and no tap is read. `uv` is the texture's own
+// coordinate (the vertex stage has already applied flipY). The taps use the implicit LOD of the surrounding quad:
+// inside the zone the eye is magnified (LOD 0), and where a quad straddles the zone's border the weight is ~0.
+// The centre is not clamped to 0..1 (an HDR eye keeps its values: with the centre above 1 the lobe is 0 and the
+// result is the centre itself).
+"static float3 kl_rcas_tap(texture2d_array<float> t0, texture2d_array<float> t1,\n"
+"                          sampler samp, float2 uv, uint slice, uint srgbDecode, uint src)\n"
+"{\n"
+"    float3 c = kl_eye_sample2(t0, t1, samp, uv, slice, srgbDecode, src).rgb;\n"
+"    return sqrt(saturate(c));\n"
+"}\n"
+"\n"
+"static float3 kl_rcas(texture2d_array<float> t0, texture2d_array<float> t1,\n"
+"                      sampler samp, float2 uv, float3 centre, float con, float4 rect,\n"
+"                      uint slice, uint srgbDecode, uint src)\n"
+"{\n"
+"    float2 sz = src == 0u ? float2(float(t0.get_width()), float(t0.get_height()))\n"
+"                          : float2(float(t1.get_width()), float(t1.get_height()));\n"
+"    float2 tp = uv * sz;\n"
+"    float2 inLo = tp - rect.xy * sz, inHi = rect.zw * sz - tp;\n"
+"    float wgt = saturate(min(min(inLo.x, inHi.x), min(inLo.y, inHi.y)) / 12.0);\n"
+"    if (wgt <= 0.0) return centre;\n"
+"    float2 px = 1.0 / sz;\n"
+"    float3 bN = kl_rcas_tap(t0, t1, samp, uv + float2(0.0, -px.y), slice, srgbDecode, src);\n"
+"    float3 dW = kl_rcas_tap(t0, t1, samp, uv + float2(-px.x, 0.0), slice, srgbDecode, src);\n"
+"    float3 fE = kl_rcas_tap(t0, t1, samp, uv + float2(px.x, 0.0), slice, srgbDecode, src);\n"
+"    float3 hS = kl_rcas_tap(t0, t1, samp, uv + float2(0.0, px.y), slice, srgbDecode, src);\n"
+"    float3 e = sqrt(max(centre, 0.0));\n"
+"    float3 mn = min(min(bN, dW), min(fE, hS)), mx = max(max(bN, dW), max(fE, hS));\n"
+"    float3 hitMin = min(mn, e) / (4.0 * max(mx, float3(1.0e-4)));\n"
+"    float3 hitMax = (1.0 - max(mx, e)) / min(4.0 * mn - 4.0, float3(-1.0e-4));\n"
+"    float3 l = max(-hitMin, hitMax);\n"
+"    float lobe = max(-0.1875, min(max(l.r, max(l.g, l.b)), 0.0)) * con * wgt;\n"
+"    float3 s = max((lobe * (bN + dW + fE + hS) + e) / (4.0 * lobe + 1.0), float3(0.0));\n"
+"    return s * s;\n"
+"}\n"
+"\n"
 // ---- the round sharp zone (KleptonCompositor roundFovea) -------------------------------------------------------
 //
 // PTVisionPro's composition, which the user tested and wants: the eye's sharp centre is an inset CIRCLE over a
@@ -377,16 +424,24 @@ static const char kl_msl_reproject[] =
 "static float4 kl_eye_sample_round(texture2d_array<float> t0, texture2d_array<float> t1,\n"
 "                                  texture2d_array<float> wide, sampler samp, float2 uv, uint slice,\n"
 "                                  uint srgbDecode, uint src, uint reconOn, float3 k,\n"
-"                                  float2 ftan, float2 wuv, uint fovOn, float4 fovP)\n"
+"                                  float2 ftan, float2 wuv, uint fovOn, float4 fovP,\n"
+"                                  float rcasCon, float4 rcasRect)\n"
 "{\n"
 "    float2 fw = fwidth(uv);\n"
 "    float2 fww = fwidth(wuv);\n"
-"    if (fovOn == 0u) return kl_eye_sample_fw(t0, t1, samp, uv, slice, srgbDecode, src, reconOn, k, fw);\n"
+"    if (fovOn == 0u) {\n"
+"        float4 c = kl_eye_sample_fw(t0, t1, samp, uv, slice, srgbDecode, src, reconOn, k, fw);\n"
+"        if (rcasCon > 0.0) c.rgb = kl_rcas(t0, t1, samp, uv, c.rgb, rcasCon, rcasRect, slice, srgbDecode, src);\n"
+"        return c;\n"
+"    }\n"
 "    float r = length(ftan - float2(0.0, fovP.x)) / max(fovP.y, 1.0e-4);\n"
 "    float f = max(fovP.z, 1.0e-3);\n"
 "    float a = 1.0 - smoothstep(1.0 - f, 1.0, r);\n"
 "    float4 sharp = float4(0.0), outer = float4(0.0);\n"
-"    if (a > 0.0) sharp = kl_eye_sample2(t0, t1, samp, uv, slice, srgbDecode, src);\n"
+"    if (a > 0.0) {\n"
+"        sharp = kl_eye_sample2(t0, t1, samp, uv, slice, srgbDecode, src);\n"
+"        if (rcasCon > 0.0) sharp.rgb = kl_rcas(t0, t1, samp, uv, sharp.rgb, rcasCon, rcasRect, slice, srgbDecode, src);\n"
+"    }\n"
 "    if (a < 1.0) {\n"
 "        uint ws = uint(fovP.w + 0.5);\n"
 "        float2 dw = fww * float2(float(wide.get_width()), float(wide.get_height()));\n"
@@ -536,6 +591,8 @@ static const char kl_msl_reproject[] =
 "    o.wuv = float2(c.x, 1.0 - c.y);   // the wide view's rows run top-down (kl_wide_v)\n"
 "    o.fovOn = u.fovOn;\n"
 "    o.fovP = float4(u.fovLift, u.fovRadius, u.fovFade, float(u.fovSlice));\n"
+"    o.rcasCon = u.rcasCon;\n"
+"    o.rcasRect = float4(u.rcasRect[0], u.rcasRect[1], u.rcasRect[2], u.rcasRect[3]);\n"
 "    // Same mapping as the plain blit below, and for the same reason. Derived\n"
 "    // in the viewer against a frame known to be the right way up — do not\n"
 "    // re-derive it from first principles about GL's origin, because ANGLE's\n"
@@ -580,7 +637,7 @@ static const char kl_msl_reproject[] =
 "{\n"
 "    KLDepthOut o;\n"
 "    float4 c = kl_eye_sample_round(tex, tex1, wide, samp, in.uv, in.slice, in.srgb, in.src, in.reconOn, in.reconK,\n"
-"                                   in.ftan, in.wuv, in.fovOn, in.fovP);\n"
+"                                   in.ftan, in.wuv, in.fovOn, in.fovP, in.rcasCon, in.rcasRect);\n"
 "    if (in.fadeOn != 0u) c.rgb = c.rgb * in.fadeS + in.fadeO;\n"
 "    o.color = kl_chroma_apply(c, in.chromaOn, in.chromaKey, in.chromaRange);\n"
 "    float3 p = in.qpos;\n"
@@ -603,7 +660,7 @@ static const char kl_msl_reproject[] =
 "                               sampler samp [[sampler(0)]])\n"
 "{\n"
 "    float4 c = kl_eye_sample_round(tex, tex1, wide, samp, in.uv, in.slice, in.srgb, in.src, in.reconOn, in.reconK,\n"
-"                                   in.ftan, in.wuv, in.fovOn, in.fovP);\n"
+"                                   in.ftan, in.wuv, in.fovOn, in.fovP, in.rcasCon, in.rcasRect);\n"
 "    if (in.fadeOn != 0u) c.rgb = c.rgb * in.fadeS + in.fadeO;\n"
 // The matte is applied HERE and in no probe below. A rung of the probe ladder
 // exists to answer "is the picture arriving", and one that could also be
@@ -732,6 +789,7 @@ static const char kl_msl_reproject[] =
 "    o.fadeOn = 0u; o.fadeS = float3(1.0); o.fadeO = float3(0.0);\n"
 "    o.reconOn = 0u; o.reconK = float3(0.0, 0.0, 1.0);\n"
 "    o.ftan = float2(0.0); o.wuv = float2(0.0); o.fovOn = 0u; o.fovP = float4(0.0, 1.0, 0.15, 0.0);\n"
+"    o.rcasCon = 0.0; o.rcasRect = float4(0.0);\n"
 "    return o;\n"
 "}\n"
 "\n"
@@ -1110,7 +1168,9 @@ kl_reproject_uniforms kl_reproject_build(const kl_ovrp_render_pose *rendered, in
     u.fov_radius = 1.0f;
     u.fov_fade = 0.15f;
     u.fov_slice = 0;
-    u.fov_pad[0] = u.fov_pad[1] = u.fov_pad[2] = 0.0f;
+    u.rcas_con = 0.0f;                    // centre sharpness: the compositor turns it on per view
+    u.rcas_rect[0] = u.rcas_rect[1] = u.rcas_rect[2] = u.rcas_rect[3] = 0.0f;
+    u.rcas_pad[0] = u.rcas_pad[1] = 0.0f;
     // Which grid block this eye reads. `eye` and `slice` are not the same
     // number and neither could stand in for this one: an Array-layout guest has
     // slice == eye, a Stereo-layout one has two textures and slice 0 for both,
