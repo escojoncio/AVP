@@ -43,6 +43,9 @@ int kl_abtest_hud(char *buf, int n);
 // at start, then kl_engine_set_opts, the test's while it runs and its verdict after). Always 0 when a compositor path that reads the whole eye is on.
 int kl_abtest_eye_trim(void);
 void kl_abtest_note_trim(void);   // the OpenVR shim trimmed one eye copy (the test's counter)
+// 1 when a compositor path that reads the whole eye image is on (VPKTAA / eye FX): the trim cannot act. Known once the first eye
+// copy asked (0 before). Any thread.
+int kl_abtest_eye_trim_blocked(void);
 
 // AVP's "Laboratorio del motor" (kl_gpu_time.m). The mask has one bit per switch: 0 VPKEngine producer-only fence waits, 2 eye-copy
 // trim (host), 3 gather copies, 4 fuse clears, 5 state elision (bits 3-5: VPKEngine 0043-0046). Bit 1 (clear skip) is
@@ -54,14 +57,18 @@ void kl_abtest_note_trim(void);   // the OpenVR shim trimmed one eye copy (the t
 void kl_engine_set_opts(uint32_t mask);
 uint32_t kl_engine_get_opts(void);
 int kl_engine_available(void);
-// The A/B test on demand, at any time outside a load (KL_ABTEST=1 is only the automatic start at boot). The request is
-// taken by the next guest frame, so with the game paused the test starts when it resumes (4 s later, 3 s after a load).
+// The A/B test on demand, at any time outside a load (KL_ABTEST=1 is only the automatic start at boot). Only the switches are
+// measured (no census, no knockout, ~50 s). The request is taken by the next guest frame, so with the game paused the test
+// starts when it resumes (4 s later, 3 s after a load; a new pause while it waits restarts the 4 s).
 // Returns 1 requested, 0 a test is already running or waiting, -1 the engine has no switches. Any thread.
 int kl_abtest_start(void);
+// Aborts a requested or running test at any phase (taken by the next guest frame; the phase reads IDLE at once) and puts the
+// mask in force before it back. Any thread.
+void kl_abtest_cancel(void);
 #define KL_ABTEST_IDLE 0
 #define KL_ABTEST_WAIT 1      // requested: waiting for frames / the end of a load
 #define KL_ABTEST_CENSUS 2    // 1/3
-#define KL_ABTEST_OPTS 3      // 2/3: the switches
+#define KL_ABTEST_OPTS 3      // the switches (2/3 of the boot test; all of an on-demand one)
 #define KL_ABTEST_KNOCK 4     // 3/3: the shaders
 #define KL_ABTEST_DONE 5
 #define KL_ABTEST_FAILED 6
@@ -69,7 +76,7 @@ int kl_abtest_start(void);
 int kl_abtest_phase(void);
 int kl_abtest_seconds_left(void);      // estimate for the phases above (0 when none)
 unsigned kl_abtest_result_serial(void);   // +1 each time a test ends DONE (0 = none yet)
-uint32_t kl_abtest_result_mask(void);     // the winner: the bits that SAVE (valid once the serial moved)
+uint32_t kl_abtest_result_mask(void);     // the winner: mask at the start + SAVES - WORSE/BREAKS (valid once the serial moved)
 #define KL_ABV_NONE 0         // not measured
 #define KL_ABV_SAVES 1
 #define KL_ABV_NO_EFFECT 2

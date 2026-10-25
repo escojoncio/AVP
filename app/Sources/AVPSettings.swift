@@ -144,6 +144,18 @@ final class AVPSettings: ObservableObject {
     @Published var labStateElide: Bool { didSet { labChanged() } }
     private var labBulk = false
     private var labAdoptedSerial: UInt32 = 0
+    private var labWatcher: Timer?
+    /// «Capturas de diagnóstico» as of the last launch (KL_CAPTURE, set by writeConfig): with them on each capture stalls
+    /// the game ~250 ms, which would land in the lab's test, so the test is not offered.
+    private(set) var capturesAtLaunch = false
+    /// A test that ends while the game runs leaves its winner in the engine: this saves it as the lab's switches within a
+    /// second (adoptLabResult is a cheap atomic read when nothing ended). Started once, by writeConfig.
+    private func startLabWatcher() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.labWatcher == nil else { return }
+            self.labWatcher = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.adoptLabResult() }
+        }
+    }
     /// The lab's mask as kl_engine_set_opts takes it.
     var labMask: UInt32 {
         var m: UInt32 = 0
@@ -655,6 +667,8 @@ final class AVPSettings: ObservableObject {
         }
 
         kl_engine_set_opts(labMask)   // the engine takes it at the first guest frame (the environment above already carries it)
+        capturesAtLaunch = diagCaptures
+        startLabWatcher()
         // The compositor's statics are read from the environment once per process: a second game start in the same
         // app session (after Salir) must see this launch's values.
         KleptonCompositor.reconRef = max(0.25, min(2, Float(eye.width) / Float(Self.nativeEye.width)))

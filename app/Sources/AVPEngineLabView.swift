@@ -10,6 +10,7 @@ struct AVPEngineLabView: View {
     @State private var phase: Int32 = 0
     @State private var left: Int32 = 0
     @State private var available = false
+    @State private var trimBlocked = false
     @State private var asked: String?
     private let timer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
@@ -66,6 +67,8 @@ struct AVPEngineLabView: View {
 
     /// The last test's verdict for one switch (only once a test has ended).
     private func resultText(_ bit: Int32) -> String? {
+        // The trim cannot act while the compositor reads the whole eye image (VPKTAA / eye effects).
+        if bit == 2 && trimBlocked { return AVPL("No actúa con VPKTAA activo", "Does not act with VPKTAA on") }
         guard phase == KL_ABTEST_DONE else { return nil }
         var gpu = 0.0, cpu = 0.0
         let v = kl_abtest_result(bit, &gpu, &cpu)
@@ -92,20 +95,20 @@ struct AVPEngineLabView: View {
                        "Ready. Press “Back to the game”: the test starts after 4 s; stand still.")
                 : AVPL("Empieza en ~\(secs) s · quédate quieto", "Starts in ~\(secs) s · stand still")
         case KL_ABTEST_CENSUS:
-            return AVPL("Paso 1/3: midiendo shaders · faltan ~\(secs) s · quédate quieto",
-                        "Step 1/3: measuring shaders · ~\(secs) s left · stand still")
+            return AVPL("Midiendo shaders · faltan ~\(secs) s · quédate quieto",
+                        "Measuring shaders · ~\(secs) s left · stand still")
         case KL_ABTEST_OPTS:
-            return AVPL("Paso 2/3: probando los interruptores · faltan ~\(secs) s · quédate quieto",
-                        "Step 2/3: testing the switches · ~\(secs) s left · stand still")
+            return AVPL("Probando los interruptores · faltan ~\(secs) s · quédate quieto",
+                        "Testing the switches · ~\(secs) s left · stand still")
         case KL_ABTEST_KNOCK:
-            return AVPL("Paso 3/3: midiendo shaders uno a uno · faltan ~\(secs) s · quédate quieto",
-                        "Step 3/3: measuring shaders one by one · ~\(secs) s left · stand still")
+            return AVPL("Midiendo shaders uno a uno · faltan ~\(secs) s · quédate quieto",
+                        "Measuring shaders one by one · ~\(secs) s left · stand still")
         case KL_ABTEST_PAUSED:
             return AVPL("En pausa (carga o juego detenido): se reanuda solo al volver al juego.",
                         "Paused (a load or the game held): it resumes by itself when you are back in the game.")
         case KL_ABTEST_DONE:
-            return AVPL("Test terminado: se han aplicado solo los interruptores que ahorran.",
-                        "Test finished: only the switches that save have been applied.")
+            return AVPL("Test terminado: se han activado los que ahorran y apagado los que empeoran.",
+                        "Test finished: the switches that save are on and those that make things worse are off.")
         case KL_ABTEST_FAILED:
             return AVPL("El test no se pudo hacer (mira los registros).", "The test could not run (see the logs).")
         default:
@@ -120,6 +123,7 @@ struct AVPEngineLabView: View {
         phase = kl_abtest_phase()
         left = kl_abtest_seconds_left()
         available = kl_engine_available() != 0
+        trimBlocked = kl_abtest_eye_trim_blocked() != 0
         if phase == KL_ABTEST_DONE { s.adoptLabResult() }
     }
 
@@ -161,8 +165,21 @@ struct AVPEngineLabView: View {
                 } label: {
                     Label(AVPL("Probar todo automáticamente", "Test everything automatically"), systemImage: "wand.and.stars")
                 }
-                .disabled(!model.paused || running || !available)
+                .disabled(!model.paused || running || !available || s.capturesAtLaunch)
+                if running {
+                    Button(role: .destructive) {
+                        kl_abtest_cancel()
+                        refresh()
+                    } label: {
+                        Label(AVPL("Cancelar prueba", "Cancel test"), systemImage: "xmark.circle")
+                    }
+                }
                 Text(statusText).font(.footnote)
+                if s.capturesAtLaunch {
+                    Text(AVPL("No disponible con «Capturas de diagnóstico» activadas: cada captura detiene el juego ~250 ms y falsearía las medidas. Apágalas en Ajustes y reinicia el juego.",
+                              "Not available with “Diagnostic captures” on: each capture stalls the game ~250 ms and would skew the measurements. Turn them off in Settings and restart the game."))
+                        .font(.footnote).foregroundStyle(.orange)
+                }
                 if let asked { Text(asked).font(.footnote).foregroundStyle(.orange) }
                 if model.paused && !available {
                     Text(AVPL("El motor cargado no ofrece los interruptores (o aún no ha arrancado).",
@@ -176,8 +193,8 @@ struct AVPEngineLabView: View {
             } header: {
                 Text(AVPL("Prueba automática", "Automatic test"))
             } footer: {
-                Text(AVPL("Quédate quieto ~2 min en un sitio representativo; al terminar se aplican solo los que ahorran. Se mide con el juego en marcha: pulsa el botón y vuelve al juego.",
-                          "Stand still for ~2 min in a representative spot; when it ends only the switches that save are applied. It is measured with the game running: press the button and go back to the game."))
+                Text(AVPL("Quédate quieto ~1 min en un sitio representativo; al terminar se activan los que ahorran y se apagan los que empeoran (los demás se quedan como estaban). Se mide con el juego en marcha: pulsa el botón y vuelve al juego.",
+                          "Stand still for ~1 min in a representative spot; when it ends the switches that save are turned on and those that make things worse are turned off (the others stay as they were). It is measured with the game running: press the button and go back to the game."))
             }
         }
         .navigationTitle(AVPL("Laboratorio del motor", "Engine lab"))
