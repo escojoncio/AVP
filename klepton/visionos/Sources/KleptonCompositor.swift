@@ -371,13 +371,25 @@ final class KleptonCompositor {
     /// composite.
     private var widePipeline: MTLRenderPipelineState?
     private var wideTex: MTLTexture?
-    private var wideKey: [String] = ["", ""]
+    private struct WideKey: Equatable {
+        var picture: UInt64
+        var noRecord: Bool              // no frame record: `picture` is the composite's own count, so never reused
+        var src: ObjectIdentifier
+        var slice: UInt32, flipY: UInt32, gridEye: UInt32
+        var grid: ObjectIdentifier
+        var taps: UInt32
+    }
+    private struct WideReconKey: Equatable {
+        var wide: WideKey
+        var strength: Float, sharp: Float, ref: Float
+    }
+    private var wideKey: [WideKey?] = [nil, nil]
     /// Build 41: the wide view's periphery reconstruction, precomputed at 3x its size once per guest picture
     /// (kl_widerecon_f) and read by the composite with one tap. KL_CP_WIDE_RECON=0 = per pixel in the composite.
     nonisolated(unsafe) static var wideReconOn: Bool = (getenv("KL_CP_WIDE_RECON").map { String(cString: $0) } ?? "1") != "0"
     private var wideReconPipeline: MTLRenderPipelineState?
     private var wideReconTex: MTLTexture?
-    private var wideReconKey: [String] = ["", ""]
+    private var wideReconKey: [WideReconKey?] = [nil, nil]
     private var wideReconUsable = false
     private var loggedWideRecon = false
     private var loggedRound = ""
@@ -4016,15 +4028,21 @@ final class KleptonCompositor {
             // Keyed on the values rather than a bare `once`: the interesting case is
             // the one where they CHANGE (a stage re-created, a swapchain rebuilt),
             // and a first-frame-only line is exactly what would miss it.
-            let shape = viewIndices.map { vi -> String in
+            // Compared as values (tangents to the 3 decimals the line prints); the text is built only when it changes.
+            let shape = viewIndices.map { vi -> EyeShape in
                 let u = uniforms[viewIndices.firstIndex(of: vi)!]
-                return String(format: "v%d slice=%u tan(l%.3f r%.3f t%.3f b%.3f) vis=%u flip=%u",
-                              vi, u.slice, u.tangents.x, u.tangents.y, u.tangents.z,
-                              u.tangents.w, u.visible, u.flip_y)
-            }.joined(separator: " | ")
+                return EyeShape(vi: vi, slice: u.slice,
+                                tan: SIMD4<Int32>(u.tangents * 1000, rounding: .toNearestOrEven),
+                                visible: u.visible, flip: u.flip_y)
+            }
             if shape != lastEyeShape {
                 lastEyeShape = shape
-                NSLog("[cp] eye placement: \(shape) | rec=\(haveRendered ? "yes" : "no") "
+                let text = shape.map { s in
+                    String(format: "v%d slice=%u tan(l%.3f r%.3f t%.3f b%.3f) vis=%u flip=%u",
+                           s.vi, s.slice, Float(s.tan.x) / 1000, Float(s.tan.y) / 1000, Float(s.tan.z) / 1000,
+                           Float(s.tan.w) / 1000, s.visible, s.flip)
+                }.joined(separator: " | ")
+                NSLog("[cp] eye placement: \(text) | rec=\(haveRendered ? "yes" : "no") "
                       + "layered=\(layered) stage=\(stage)")
             }
 
@@ -4279,19 +4297,19 @@ final class KleptonCompositor {
             d.storageMode = .private
             wideTex = device.makeTexture(descriptor: d)
             wideTex?.label = "klepton wide view"
-            wideKey = ["", ""]
+            wideKey = [nil, nil]
             if wideTex == nil { NSLog("[cp] the wide view (\(ww)x\(wh)x2) could not be allocated"); return nil }
         }
         guard let wt = wideTex else { return nil }
         // What the guest picture is; with no frame record nothing identifies it, so it is rebuilt every time.
-        let picture = haveRendered ? String(Self.pictureId(stage, UInt64(rendered.serial))) : "?\(cmdCommitted)"
+        let picture = haveRendered ? Self.pictureId(stage, UInt64(rendered.serial)) : UInt64(cmdCommitted)
         var wcmd: MTLCommandBuffer? = nil
         for (n, vi) in viewIndices.enumerated() where vi >= 0 && vi < 2 && n < uniforms.count {
             let u = uniforms[n]
             guard u.visible != 0 else { continue }
             let src = n == 0 ? bind0 : bind1
-            let key = "\(picture)|\(ObjectIdentifier(src).hashValue)|\(u.slice)|\(u.flip_y)|\(u.grid_eye)|"
-                + "\(ObjectIdentifier(grid).hashValue)|\(taps)"
+            let key = WideKey(picture: picture, noRecord: !haveRendered, src: ObjectIdentifier(src), slice: u.slice,
+                              flipY: u.flip_y, gridEye: u.grid_eye, grid: ObjectIdentifier(grid), taps: taps)
             if key == wideKey[vi] { continue }
             if wcmd == nil {
                 wcmd = q.makeCommandBuffer()
@@ -4306,7 +4324,8 @@ final class KleptonCompositor {
             pass.colorAttachments[0].storeAction = .store
             guard let e = c.makeRenderCommandEncoder(descriptor: pass) else {
                 // Whatever was encoded still runs; nothing counts as built, so the next composite tries again.
-                wideKey = ["", ""]
+                wideKey = [nil, nil]
+                c.addCompletedHandler { [weak self] b in self?.noteCompositeGpu(b, .wide) }
                 c.commit()
                 return nil
             }
@@ -4349,15 +4368,15 @@ final class KleptonCompositor {
                 d.storageMode = .private
                 wideReconTex = device.makeTexture(descriptor: d)
                 wideReconTex?.label = "klepton wide view reconstructed"
-                wideReconKey = ["", ""]
+                wideReconKey = [nil, nil]
             }
             if allRecon, let rt = wideReconTex {
                 var ok = true
                 for (n, vi) in viewIndices.enumerated() where vi >= 0 && vi < 2 && n < uniforms.count {
                     let u = uniforms[n]
                     guard u.visible != 0 else { continue }
-                    let key = wideKey[vi] + "|\(u.recon_strength)|\(u.recon_sharp)|\(u.recon_ref)"
-                    if wideKey[vi].isEmpty { ok = false; break }
+                    guard let wk = wideKey[vi] else { ok = false; break }
+                    let key = WideReconKey(wide: wk, strength: u.recon_strength, sharp: u.recon_sharp, ref: u.recon_ref)
                     if key == wideReconKey[vi] { continue }
                     if wcmd == nil {
                         wcmd = q.makeCommandBuffer()
@@ -4370,7 +4389,7 @@ final class KleptonCompositor {
                     pass.colorAttachments[0].slice = vi
                     pass.colorAttachments[0].loadAction = .dontCare   // the triangle covers the whole target
                     pass.colorAttachments[0].storeAction = .store
-                    guard let e = c.makeRenderCommandEncoder(descriptor: pass) else { wideReconKey = ["", ""]; ok = false; break }
+                    guard let e = c.makeRenderCommandEncoder(descriptor: pass) else { wideReconKey = [nil, nil]; ok = false; break }
                     e.label = "klepton wide view reconstruction eye \(vi)"
                     var p = (UInt32(vi), u.recon_strength, u.recon_sharp, u.recon_ref)   // KLWideRecon in kl_reproject.c
                     e.setRenderPipelineState(rp)
@@ -5344,7 +5363,14 @@ final class KleptonCompositor {
     private var loggedEyeTextures = false
     /// The last per-eye placement described by `[cp] eye placement`, so the line
     /// is printed when it CHANGES rather than only on the first frame.
-    private var lastEyeShape = ""
+    private struct EyeShape: Equatable {
+        var vi: Int
+        var slice: UInt32
+        var tan: SIMD4<Int32>      // tangents x 1000, rounded
+        var visible: UInt32
+        var flip: UInt32
+    }
+    private var lastEyeShape: [EyeShape] = []
     /// KL_CP_EYE=<0|1>, the binocular/temporal split. See encodeViews.
     private static let onlyEye: Int? = {
         guard let e = ProcessInfo.processInfo.environment["KL_CP_EYE"],
