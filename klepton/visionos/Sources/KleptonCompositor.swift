@@ -725,10 +725,17 @@ final class KleptonCompositor {
     // every composite failed, CompositorServices got no frames and visionOS ended the app. Raised in
     // the completion handler (under cmdLock), consumed on the render thread: a fresh queue (bounded).
     private var queueRefused = false
-    private var healthyRun = 0          // under cmdLock: composite buffers in a row without an error
+    // Same, for a timeout (2) or notPermitted (7): the queue is replaced but the rebuild budget is not spent, so a lone
+    // timeout cannot end the app.
+    private var queueRefusedSoft = false
+    private var lastLimitedRebuild = 0.0    // render thread: while gpuUnjudged, or for a timeout / notPermitted, at most one rebuild per second
+    private var healthyRun = 0         // under cmdLock: composite buffers in a row without an error
     private var queueHealthy = false    // under cmdLock: `healthyRun` reached 120 -> the rebuild count starts over
     private var queueRebuilds = 0
-    private var retiredQueues: [MTLCommandQueue] = []   // kept alive: kl_gpu_time knows queues by address
+    // Kept alive: kl_gpu_time knows queues by address (its table is append-only), so a freed address could be reused by
+    // another queue and take this role. Only the last `maxRetiredQueues` are kept; in-flight buffers retain their queue.
+    private var retiredQueues: [MTLCommandQueue] = []
+    private static let maxRetiredQueues = 8
     // Eye picture probe: every `Self.eyeProbeEvery` composites with a picture, a handful of
     // pixels of each texture the composite samples (and of the guest's own eye image when VPKTAA
     // replaces it) are blitted to a shared buffer in a command buffer of their own and printed when
@@ -2669,9 +2676,16 @@ final class KleptonCompositor {
         // takes the GPU away in the background and every buffer then fails): those signals are dropped, and the app
         // is never closed from here (keepGuestOnSpaceLoss keeps the game for "Volver al juego").
         let gpuUnjudged = Self.gpuUnjudged
+        let nowT = CFAbsoluteTimeGetCurrent()
         cmdLock.lock()
-        let refused = queueRefused
-        queueRefused = false
+        var refused = queueRefused || queueRefusedSoft
+        let spendsBudget = queueRefused
+        if refused && (gpuUnjudged || !spendsBudget) && nowT - lastLimitedRebuild < 1 {
+            refused = false   // the flags stay up: tried again once the second has passed
+        } else {
+            queueRefused = false
+            queueRefusedSoft = false
+        }
         let lostSignal = gpuLostSignal && !gpuUnjudged
         if gpuUnjudged { gpuLostSignal = false }
         let healthy = queueHealthy
@@ -2680,9 +2694,14 @@ final class KleptonCompositor {
         // 120 healthy buffers in a row: the old errors are history, the rebuild budget starts over.
         if healthy { queueRebuilds = 0 }
         var lostWhy: String? = lostSignal ? "a composite command buffer ended with \"device removed\"" : nil
-        if refused, queueRebuilds < 64, let dev = queue?.device, let q = dev.makeCommandQueue() {
-            if !gpuUnjudged { queueRebuilds += 1 }   // the budget is not spent while the GPU is not ours to judge
-            if let old = queue { retiredQueues.append(old) }
+        if refused, !spendsBudget || queueRebuilds < 64, let dev = queue?.device, let q = dev.makeCommandQueue() {
+            // The budget is not spent while the GPU is not ours to judge, nor by a timeout / notPermitted.
+            if !gpuUnjudged && spendsBudget { queueRebuilds += 1 }
+            if gpuUnjudged || !spendsBudget { lastLimitedRebuild = nowT }
+            if let old = queue {
+                retiredQueues.append(old)
+                if retiredQueues.count > Self.maxRetiredQueues { retiredQueues.removeFirst() }
+            }
             q.label = "klepton.compositor.r\(queueRebuilds)"
             queue = q
             kl_gpu_time_watch_compositor(Unmanaged.passUnretained(q).toOpaque())
@@ -2889,7 +2908,8 @@ final class KleptonCompositor {
                 NSLog(String(format: "[cp] stale -> backfill: guest serial %llu frozen for %.1f s "
                                      + "(%ld panel frames), its last picture is no longer reprojected (#%ld)",
                              UInt64(frameValue), frozenFor, staleInARow, staleHideCount))
-            } else if loggedGuestEnd {
+            } else if loggedGuestEnd && Self.staleHideSeconds > 0 && staleInARow >= 8 && frozenFor >= Self.staleHideSeconds {
+                // only the guest end released it: not a pause, a load or a new serial
                 NSLog("[cp] stale hide released: the guest thread ended, its last picture is shown again (freeze #\(staleHideCount))")
             } else {
                 NSLog("[cp] fresh again: guest serial \(frameValue) (freeze #\(staleHideCount))")
@@ -3212,7 +3232,12 @@ final class KleptonCompositor {
                 if (e as NSError).domain == MTLCommandBufferErrorDomain && (e as NSError).code == 11 { self.gpuLostSignal = true }
                 // Our own fault/hang, or the refusal that follows it: the queue is spent. An innocent
                 // victim of someone else's hang leaves it usable.
-                if !d.contains("InnocentVictim") && !d.contains("victim of GPU") { self.queueRefused = true }
+                // timeout (2) / notPermitted (7): the queue is replaced without spending the rebuild budget. Literal codes.
+                if !d.contains("InnocentVictim") && !d.contains("victim of GPU") {
+                    let ns = e as NSError
+                    if ns.domain == MTLCommandBufferErrorDomain && (ns.code == 2 || ns.code == 7) { self.queueRefusedSoft = true }
+                    else { self.queueRefused = true }
+                }
                 if d != self.cmdErrorLast && self.cmdErrorKinds < 16 {
                     self.cmdErrorLast = d
                     self.cmdErrorKinds += 1

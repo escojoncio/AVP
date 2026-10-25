@@ -2989,10 +2989,10 @@ int kl_abtest_start(void) {
     return 1;
 }
 void kl_abtest_cancel(void) {
-    atomic_store(&g_ab_start_req, 0);
-    const int ph = atomic_load(&g_ab_phase);
-    if (ph == KL_ABTEST_WAIT || (ph >= KL_ABTEST_CENSUS && ph <= KL_ABTEST_KNOCK) || ph == KL_ABTEST_PAUSED)
-        atomic_store(&g_ab_cancel_req, 1);
+    if (atomic_exchange(&g_ab_start_req, 0)) return;   // a start ab_tick had not taken yet: it never begins
+    // Nothing pending: either a test is running, or ab_tick took the start just now and has not published its phase
+    // yet. Ask for the cancel in both cases (ab_tick takes it before the start; with nothing running it does nothing).
+    atomic_store(&g_ab_cancel_req, 1);
 }
 int kl_abtest_phase(void) {
     if (atomic_load(&g_ab_cancel_req)) return KL_ABTEST_IDLE;

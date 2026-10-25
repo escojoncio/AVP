@@ -71,8 +71,8 @@ struct AVPSettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                hint("Conjunto de ajustes de imagen ya probado para cada visor. Tócalo solo si quieres volver a los valores buenos tras experimentar. Si cambias a mano cualquier ajuste de imagen o de rendimiento, pasa solo a Personalizado. Recomendado: el que corresponde a tu visor (M2 o M5). Se aplica al arrancar el juego.",
-                     "A set of picture settings already tested for each headset. Touch it only to go back to the good values after experimenting. If you change any picture or performance setting by hand, it switches to Custom by itself. Recommended: the one for your headset (M2 or M5). Applied at game start.")
+                hint("Conjunto de ajustes de imagen recomendado. M5 usa por ahora los mismos valores que M2 (sin medir en un M5). Tócalo solo si quieres volver a los valores buenos tras experimentar. Si cambias a mano un ajuste de imagen (no Fotogramas, Mostrar FPS ni Nitidez del centro), pasa a Personalizado. Recomendado: el que corresponde a tu visor (M2 o M5). Se aplica al arrancar el juego.",
+                     "Recommended set of picture settings. M5 uses the same values as M2 for now (not measured on an M5). Touch it only to go back to the good values after experimenting. If you change a picture setting by hand (not Frame rate, Show FPS or Centre sharpness), it switches to Custom. Recommended: the one for your headset (M2 or M5). Applied at game start.")
             }
             VStack(alignment: .leading, spacing: 4) {
                 Stepper(AVPL("Resolución: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) por ojo)",
@@ -94,8 +94,8 @@ struct AVPSettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                hint("Suaviza los bordes dentados de los objetos. x4 se ve más suave; x2 es más ligero. Sin MSAA (Off) el foveado no se aplica. Recomendado: x4. Se aplica al arrancar el juego.",
-                     "Smooths the jagged edges of objects. x4 looks smoother; x2 is lighter. Without MSAA (Off) foveation is not applied. Recommended: x4. Applied at game start.")
+                hint("Suaviza los bordes dentados de los objetos. x4 se ve más suave; x2 es más ligero. Recomendado: x4. Se aplica al arrancar el juego.",
+                     "Smooths the jagged edges of objects. x4 looks smoother; x2 is lighter. Recommended: x4. Applied at game start.")
             }
             if s.msaa == 0 {
                 Text(AVPL("Sin MSAA no se aplica el foveado.", "Without MSAA foveation is not applied."))
@@ -160,8 +160,8 @@ struct AVPSettingsView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Toggle(AVPL("Foveado (centro nítido, bordes a menos resolución)", "Foveation (sharp centre, lower-resolution edges)"),
                        isOn: $s.foveationOn)
-                hint("Dibuja a resolución completa solo el centro, donde miras, y los bordes con menos: es la mayor ganancia de rendimiento. Sin foveado toda la imagen se dibuja a resolución completa y va mucho más lento. Recomendado: activado. Se aplica al arrancar el juego.",
-                     "Draws only the centre, where you look, at full resolution and the edges at less: the biggest performance gain. Without foveation the whole picture is drawn at full resolution and runs much slower. Recommended: on. Applied at game start.")
+                hint("Dibuja a resolución completa solo el centro, donde miras, y los bordes con menos: ahorra unos 3–7 ms por imagen (de ~23 en zonas pesadas). Sin foveado toda la imagen se dibuja a resolución completa. Recomendado: activado. Se aplica al arrancar el juego.",
+                     "Draws only the centre, where you look, at full resolution and the edges at less: saves about 3–7 ms per frame (out of ~23 in heavy areas). Without foveation the whole picture is drawn at full resolution. Recommended: on. Applied at game start.")
             }
             if s.foveationOn {
                 VStack(alignment: .leading, spacing: 4) {

@@ -229,11 +229,15 @@ extern int kl_vk_native_wsi;
 static void *mvk_sym(const char *n) { return g_mvk ? dlsym(g_mvk, n) : NULL; }
 
 // VPVulkan: the image is the eye layer's (the compositor reads its MTLTexture): never memoryless/deferred.
+static int (*g_mark_eye)(void *);
+static pthread_once_t g_mark_eye_once = PTHREAD_ONCE_INIT;
+static void klvk_mark_eye_resolve(void) {
+    g_mark_eye = (int (*)(void *))mvk_sym("vpvk_mark_eye_image");
+    if (!g_mark_eye && g_mvk) fprintf(stderr, "  [vk] VPVulkan loaded but vpvk_mark_eye_image is missing: eye images are not marked\n");
+}
 static void klvk_mark_eye_image(VkImage img) {
-    static int resolved;
-    static int (*mark)(void *);
-    if (!resolved) { resolved = 1; mark = (int (*)(void *))mvk_sym("vpvk_mark_eye_image"); }
-    if (mark && img) mark((void *)img);
+    pthread_once(&g_mark_eye_once, klvk_mark_eye_resolve);
+    if (g_mark_eye && img) g_mark_eye((void *)img);
 }
 
 static void vk_init(void) {
