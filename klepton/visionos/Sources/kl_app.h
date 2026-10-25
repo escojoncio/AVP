@@ -231,6 +231,8 @@ int kl_app_prewarm_alyx(const char *resources, const char *game, const char *dyl
 // The compositor's count of pictures reused in a row (0 when a new one arrives): after KL_STALL_DUMP_S seconds of
 // it, every thread's frames go to the log once (and again 10 s later), to show where a stuck guest waits.
 void kl_guest_stall_check(unsigned stale);
+// 1 while the game shows its loading grid (start-up until the first fade out, every level load); klvr_platform_klepton.c.
+int kl_guest_loading(void);
 
 // What this process was given, written at launch to <container>/klepton-memprobe.txt (and stdout): the memory it may
 // use (os_proc_available_memory), whether the signature carries the two memory entitlements (embedded.mobileprovision),

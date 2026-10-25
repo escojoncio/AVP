@@ -822,7 +822,12 @@ void klvr_plat_frame_closed(void) {
 }
 // kl_gpu_time.m: per-pass profiling windows timed from each scene start (KL_GPU_PASSES "g<s>").
 extern void kl_gpu_time_scene(int to_grid) __attribute__((weak));
+// The grid is up from start-up until the first FadeGrid(out) and across every level load (Source 2 fades to it
+// before loading): the compositor does not treat a silent guest as frozen meanwhile (kl_guest_loading).
+static _Atomic int g_scene_grid = 1;
+int kl_guest_loading(void) { return atomic_load(&g_scene_grid); }
 void klvr_plat_scene_fade(int to_grid) {
+    atomic_store(&g_scene_grid, to_grid ? 1 : 0);
     if (kl_gpu_time_scene) kl_gpu_time_scene(to_grid);
 }
 // KLVR_GPU_MS_SCALE multiplies it: a Mac stands in for a slower GPU, to check

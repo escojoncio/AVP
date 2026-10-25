@@ -429,13 +429,14 @@ final class KleptonCompositor {
     // Frozen-guest policy (ported from VisionQuestPro): the guest's serial has not moved for `staleHideSeconds` of wall
     // clock, so the picture on screen is an old frame reprojected against a pose that keeps getting older. From there
     // the composite shows what it shows when there is no guest frame yet (the cleared drawable: no eye, no overlays)
-    // until a new serial arrives. 0 turns it off. `[cp] stale -> backfill` / `[cp] fresh again`.
-    private static let staleHideSeconds = Double(klEnvFloat("KL_CP_STALE_HIDE_S", 3.0))
+    // until a new serial arrives (not while the game loads: kl_guest_loading). 0 turns it off. `[cp] stale -> backfill` / `[cp] fresh again`.
+    private static let staleHideSeconds = Double(klEnvFloat("KL_CP_STALE_HIDE_S", 10.0))
     private var staleHide = false
     private var lastFreshTime = CFAbsoluteTimeGetCurrent()
     private var staleHideCount = 0
     // GPU lost (ported from VisionQuestPro, compositor side only): the composite's own queue is dead (a command buffer
-    // came back "device removed", or the queue is refused and cannot be replaced any more). Sticky: black on every
+    // came back "device removed", or 64 hard-refusal queue rebuilds within 10 s; timeouts and "not permitted" never
+    // count, nothing is judged while the space is lost / paused). Sticky: black on every
     // path, then the app ends cleanly (Lifecycle.quit: caches flushed, logs written) after `gpuLostQuitDelay` s of
     // black frames. `gpuLostSignal` is raised by the completion handler under cmdLock; `gpuLost` is render thread only.
     private static let gpuLostQuitDelay = 1.0
@@ -721,7 +722,13 @@ final class KleptonCompositor {
     // every composite failed, CompositorServices got no frames and visionOS ended the app. Raised in
     // the completion handler (under cmdLock), consumed on the render thread: a fresh queue (bounded).
     private var queueRefused = false
+    // Of those refusals, the ones that are not a timeout (2) or "not permitted" (7: the GPU taken away while the app is
+    // backgrounded / the space is lost). Only these count towards GPU lost.
+    private var queueRefusedHard = false
+    private var healthyRun = 0          // under cmdLock: composite buffers in a row without an error
+    private var queueHealthy = false    // under cmdLock: `healthyRun` reached 120 -> the rebuild count starts over
     private var queueRebuilds = 0
+    private var hardRebuildTimes: [Double] = []   // render thread: when each hard-refusal rebuild happened
     private var retiredQueues: [MTLCommandQueue] = []   // kept alive: kl_gpu_time knows queues by address
     // Eye picture probe: every `Self.eyeProbeEvery` composites with a picture, a handful of
     // pixels of each texture the composite samples (and of the guest's own eye image when VPKTAA
@@ -2261,6 +2268,8 @@ final class KleptonCompositor {
                 NSLog("[cp] layer paused at iteration \(iterations) — waiting")
                 layerRenderer.waitUntilRunning()
                 NSLog("[cp] layer running again")
+                // Buffers that failed while the layer was paused (the system took the GPU away) say nothing about the GPU now.
+                cmdLock.lock(); gpuLostSignal = false; queueRefusedHard = false; cmdLock.unlock()
                 // ...and the audio, which does NOT come back on its own.
                 //
                 // This transition is the immersive space being temporarily
@@ -2657,11 +2666,22 @@ final class KleptonCompositor {
         // frame must be submitted with a presented drawable (log 19: a queried, updated and abandoned frame aborts
         // the next queryNextFrame). A missing pipeline is not one of these: encodeViews presents a cleared drawable
         // without it.
+        // Never judge the GPU while it is not ours to judge: space lost, game paused, no immersive space (the system
+        // takes the GPU away in the background and every buffer then fails): those signals are dropped, and the app
+        // is never closed from here (keepGuestOnSpaceLoss keeps the game for "Volver al juego").
+        let gpuUnjudged = Lifecycle.spaceLost || Lifecycle.gamePaused || !Lifecycle.immersiveOpen
         cmdLock.lock()
         let refused = queueRefused
+        let refusedHard = queueRefusedHard
         queueRefused = false
-        let lostSignal = gpuLostSignal
+        queueRefusedHard = false
+        let lostSignal = gpuLostSignal && !gpuUnjudged
+        if gpuUnjudged { gpuLostSignal = false }
+        let healthy = queueHealthy
+        queueHealthy = false
         cmdLock.unlock()
+        // 120 healthy buffers in a row: the old errors are history, the rebuild budget starts over.
+        if healthy { queueRebuilds = 0; hardRebuildTimes.removeAll() }
         var lostWhy: String? = lostSignal ? "a composite command buffer ended with \"device removed\"" : nil
         if refused, queueRebuilds < 64, let dev = queue?.device, let q = dev.makeCommandQueue() {
             queueRebuilds += 1
@@ -2670,8 +2690,15 @@ final class KleptonCompositor {
             queue = q
             kl_gpu_time_watch_compositor(Unmanaged.passUnretained(q).toOpaque())
             NSLog("[cp] queue replaced after a GPU error on the old one (n=\(queueRebuilds))")
-        } else if refused {
-            lostWhy = lostWhy ?? "the composite queue is refused and cannot be replaced (\(queueRebuilds) rebuilds)"
+            // A dead GPU refuses every new queue at once: 64 hard-refusal rebuilds inside 10 s.
+            if refusedHard && !gpuUnjudged {
+                let now = CFAbsoluteTimeGetCurrent()
+                hardRebuildTimes.append(now)
+                hardRebuildTimes.removeAll { now - $0 > 10 }
+                if hardRebuildTimes.count >= 64 {
+                    lostWhy = lostWhy ?? "the composite queue was refused and replaced \(hardRebuildTimes.count) times in 10 s"
+                }
+            }
         }
         // GPU lost: sticky. From here every frame is still queried and presented, but black (hideGuest); after
         // `gpuLostQuitDelay` s the app ends cleanly.
@@ -2680,10 +2707,16 @@ final class KleptonCompositor {
             gpuLostAt = CFAbsoluteTimeGetCurrent()
             NSLog("[cp] GPU LOST (\(why)) — the compositor shows black from now on and the app is closed")
         }
-        if gpuLost, !gpuLostQuitting, CFAbsoluteTimeGetCurrent() - gpuLostAt >= Self.gpuLostQuitDelay {
+        if gpuLost, !gpuLostQuitting, !gpuUnjudged, CFAbsoluteTimeGetCurrent() - gpuLostAt >= Self.gpuLostQuitDelay {
             gpuLostQuitting = true
             NSLog("[cp] GPU LOST: ending the app (the GPU reset; open the game again)")
-            Task { @MainActor in Lifecycle.quit() }
+            Task { @MainActor in Lifecycle.quit("after the GPU was lost") }
+            // Safety net: a flush on a dead GPU can hang, and the main actor may be busy. This thread does not wait for either.
+            DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+                NSLog("[cp] GPU LOST: the clean exit did not finish in 3 s — _exit(0)")
+                fflush(nil)
+                _exit(0)
+            }
         }
         guard let cmd = queue?.makeCommandBuffer() else {
             bailNoPipeline += 1
@@ -2840,6 +2873,37 @@ final class KleptonCompositor {
         let glFence = kl_glfb_gpu_fence_value()
         lastGlFenceSeen = glFence; lastProjLayersSeen = projLayerCount
         let frameValue = glFence != 0 ? glFence : kl_vulkan_frame_serial()
+        if frameValue != 0 && frameValue == lastGuestFrame {
+            staleInARow += 1
+        } else {
+            staleInARow = 0
+            lastGuestFrame = frameValue
+            lastFreshTime = CFAbsoluteTimeGetCurrent()
+        }
+        if frameValue != 0 { kl_guest_stall_check(UInt32(staleInARow)) }
+        // Wall clock, not a frame count: the panel period changes (half rate, 90/100/120 Hz, skipped refreshes) and
+        // `staleInARow` alone would mean different times. The count only guards against a first frame after a long
+        // stall of this very thread. The frame is still queried, composed and presented (black): nothing is abandoned.
+        // Not frozen: a guest held on purpose (AVP pause menu) or loading a level (Source 2 fades to the grid first,
+        // kl_guest_loading): the clock restarts meanwhile, so the hide only starts `staleHideSeconds` after that ends.
+        // A guest whose thread ended keeps the old behaviour (its last picture, reprojected).
+        if Lifecycle.gamePaused || kl_guest_loading() != 0 { lastFreshTime = CFAbsoluteTimeGetCurrent() }
+        let frozenFor = CFAbsoluteTimeGetCurrent() - lastFreshTime
+        let frozen = Self.staleHideSeconds > 0 && !loggedGuestEnd && staleInARow >= 8 && frozenFor >= Self.staleHideSeconds
+        if frozen != staleHide {
+            staleHide = frozen
+            if frozen {
+                staleHideCount += 1
+                NSLog(String(format: "[cp] stale -> backfill: guest serial %llu frozen for %.1f s "
+                                     + "(%ld panel frames), its last picture is no longer reprojected (#%ld)",
+                             UInt64(frameValue), frozenFor, staleInARow, staleHideCount))
+            } else {
+                NSLog("[cp] fresh again: guest serial \(frameValue) (freeze #\(staleHideCount))")
+            }
+        }
+        // Decided BEFORE the fence below: a hidden guest's fence is not waited on (the wait could never complete if its
+        // GPU is gone, and nothing of it is drawn).
+        if hideGuest { projLayerCount = 0 }
         // KL_CP_NOFENCE=1 skips the wait. A composite command buffer that waits
         // on an event value the guest's queue never signals is COMMITTED and
         // never EXECUTES: the drawable is presented, every counter here looks
@@ -2871,11 +2935,11 @@ final class KleptonCompositor {
         let outstanding = cmdCommitted - doneNow
         let haveGuestContent = projLayerCount > 0
         taaWait = nil
-        if let ev = guestFrameEvent, glFence != 0, !noFence,
+        if let ev = guestFrameEvent, glFence != 0, !noFence, !hideGuest,
            haveGuestContent, outstanding <= maxFenceBacklog {
             cmd.encodeWaitForEvent(ev, value: glFence)
             taaWait = (ev, glFence)
-        } else if glFence != 0 && !noFence && (!haveGuestContent || outstanding > maxFenceBacklog) {
+        } else if glFence != 0 && !noFence && !hideGuest && (!haveGuestContent || outstanding > maxFenceBacklog) {
             fenceBacklogSkips += 1
             if !warnedFenceBacklog {
                 warnedFenceBacklog = true
@@ -2888,33 +2952,6 @@ final class KleptonCompositor {
                       + "Further skips silenced.")
             }
         }
-        if frameValue != 0 && frameValue == lastGuestFrame {
-            staleInARow += 1
-        } else {
-            staleInARow = 0
-            lastGuestFrame = frameValue
-            lastFreshTime = CFAbsoluteTimeGetCurrent()
-        }
-        if frameValue != 0 { kl_guest_stall_check(UInt32(staleInARow)) }
-        // Wall clock, not a frame count: the panel period changes (half rate, 90/100/120 Hz, skipped refreshes) and
-        // `staleInARow` alone would mean different times. The count only guards against a first frame after a long
-        // stall of this very thread. The frame is still queried, composed and presented (black): nothing is abandoned.
-        // A guest held on purpose (AVP pause menu) is not frozen: the clock restarts while paused.
-        if Lifecycle.gamePaused { lastFreshTime = CFAbsoluteTimeGetCurrent() }
-        let frozenFor = CFAbsoluteTimeGetCurrent() - lastFreshTime
-        let frozen = Self.staleHideSeconds > 0 && staleInARow >= 8 && frozenFor >= Self.staleHideSeconds
-        if frozen != staleHide {
-            staleHide = frozen
-            if frozen {
-                staleHideCount += 1
-                NSLog(String(format: "[cp] stale -> backfill: guest serial %llu frozen for %.1f s "
-                                     + "(%ld panel frames), its last picture is no longer reprojected (#%ld)",
-                             UInt64(frameValue), frozenFor, staleInARow, staleHideCount))
-            } else {
-                NSLog("[cp] fresh again: guest serial \(frameValue) (freeze #\(staleHideCount))")
-            }
-        }
-        if hideGuest { projLayerCount = 0 }
 
         // The pose the picture will be *shown* at, as freshly predicted as we
         // can make it: re-queried here rather than reused from updatePoses,
@@ -3171,6 +3208,7 @@ final class KleptonCompositor {
             let n = self.cmdCompleted
             let first = self.cmdError == nil && b.error != nil
             if first { self.cmdError = b.error }
+            if b.error == nil { self.healthyRun += 1; if self.healthyRun >= 120 { self.queueHealthy = true } } else { self.healthyRun = 0 }
             var newKind: String? = nil
             if let e = b.error {
                 self.cmdErrors += 1
@@ -3180,7 +3218,11 @@ final class KleptonCompositor {
                 if (e as NSError).domain == MTLCommandBufferErrorDomain && (e as NSError).code == 11 { self.gpuLostSignal = true }
                 // Our own fault/hang, or the refusal that follows it: the queue is spent. An innocent
                 // victim of someone else's hang leaves it usable.
-                if !d.contains("InnocentVictim") && !d.contains("victim of GPU") { self.queueRefused = true }
+                if !d.contains("InnocentVictim") && !d.contains("victim of GPU") {
+                    self.queueRefused = true
+                    let code = (e as NSError).code
+                    if code != 2 && code != 7 { self.queueRefusedHard = true }
+                }
                 if d != self.cmdErrorLast && self.cmdErrorKinds < 16 {
                     self.cmdErrorLast = d
                     self.cmdErrorKinds += 1
@@ -3655,8 +3697,13 @@ final class KleptonCompositor {
                                  cmd: MTLCommandBuffer, stage: Int, completeStage: Int,
                                  rendered: kl_ovrp_render_pose, haveRendered: Bool,
                                  originFromHead: simd_float4x4) -> Int {
-        prepareTAA(cmd: cmd, stage: stage, completeStage: completeStage,
-                   rendered: rendered, haveRendered: haveRendered)
+        if hideGuest {
+            taaOut.removeAll(keepingCapacity: true)   // nothing of the guest is drawn: no resolve is submitted or picked up
+            taaPose = nil
+        } else {
+            prepareTAA(cmd: cmd, stage: stage, completeStage: completeStage,
+                       rendered: rendered, haveRendered: haveRendered)
+        }
         // KL_CP_AMPLIFY=0 — back to ONE RENDER PASS PER EYE, selecting the
         // slice on the attachment, with no rate map and no amplification.
         //
