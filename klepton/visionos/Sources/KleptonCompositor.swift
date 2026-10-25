@@ -435,8 +435,9 @@ final class KleptonCompositor {
     private var lastFreshTime = CFAbsoluteTimeGetCurrent()
     private var staleHideCount = 0
     // GPU lost (ported from VisionQuestPro, compositor side only): the composite's own queue is dead (a command buffer
-    // came back "device removed", or 64 hard-refusal queue rebuilds within 10 s; timeouts and "not permitted" never
-    // count, nothing is judged while the space is lost / paused). Sticky: black on every
+    // came back "device removed", or the queue is refused and cannot be replaced any more: the rebuild budget of 64 is
+    // spent; 120 healthy buffers in a row give it back, and nothing is judged while the space is lost / paused).
+    // Sticky: black on every
     // path, then the app ends cleanly (Lifecycle.quit: caches flushed, logs written) after `gpuLostQuitDelay` s of
     // black frames. `gpuLostSignal` is raised by the completion handler under cmdLock; `gpuLost` is render thread only.
     private static let gpuLostQuitDelay = 1.0
@@ -444,6 +445,8 @@ final class KleptonCompositor {
     private var gpuLost = false
     private var gpuLostAt = 0.0
     private var gpuLostQuitting = false
+    /// Never judge (or close the app over) the GPU while it is not ours: space lost, game paused, no immersive space.
+    private static var gpuUnjudged: Bool { Lifecycle.spaceLost || Lifecycle.gamePaused || !Lifecycle.immersiveOpen }
     /// What no eye and no overlay is drawn for: a frozen guest or a lost GPU.
     private var hideGuest: Bool { staleHide || gpuLost }
 
@@ -722,13 +725,9 @@ final class KleptonCompositor {
     // every composite failed, CompositorServices got no frames and visionOS ended the app. Raised in
     // the completion handler (under cmdLock), consumed on the render thread: a fresh queue (bounded).
     private var queueRefused = false
-    // Of those refusals, the ones that are not a timeout (2) or "not permitted" (7: the GPU taken away while the app is
-    // backgrounded / the space is lost). Only these count towards GPU lost.
-    private var queueRefusedHard = false
     private var healthyRun = 0          // under cmdLock: composite buffers in a row without an error
     private var queueHealthy = false    // under cmdLock: `healthyRun` reached 120 -> the rebuild count starts over
     private var queueRebuilds = 0
-    private var hardRebuildTimes: [Double] = []   // render thread: when each hard-refusal rebuild happened
     private var retiredQueues: [MTLCommandQueue] = []   // kept alive: kl_gpu_time knows queues by address
     // Eye picture probe: every `Self.eyeProbeEvery` composites with a picture, a handful of
     // pixels of each texture the composite samples (and of the guest's own eye image when VPKTAA
@@ -2269,7 +2268,7 @@ final class KleptonCompositor {
                 layerRenderer.waitUntilRunning()
                 NSLog("[cp] layer running again")
                 // Buffers that failed while the layer was paused (the system took the GPU away) say nothing about the GPU now.
-                cmdLock.lock(); gpuLostSignal = false; queueRefusedHard = false; cmdLock.unlock()
+                cmdLock.lock(); gpuLostSignal = false; cmdLock.unlock()
                 // ...and the audio, which does NOT come back on its own.
                 //
                 // This transition is the immersive space being temporarily
@@ -2669,36 +2668,27 @@ final class KleptonCompositor {
         // Never judge the GPU while it is not ours to judge: space lost, game paused, no immersive space (the system
         // takes the GPU away in the background and every buffer then fails): those signals are dropped, and the app
         // is never closed from here (keepGuestOnSpaceLoss keeps the game for "Volver al juego").
-        let gpuUnjudged = Lifecycle.spaceLost || Lifecycle.gamePaused || !Lifecycle.immersiveOpen
+        let gpuUnjudged = Self.gpuUnjudged
         cmdLock.lock()
         let refused = queueRefused
-        let refusedHard = queueRefusedHard
         queueRefused = false
-        queueRefusedHard = false
         let lostSignal = gpuLostSignal && !gpuUnjudged
         if gpuUnjudged { gpuLostSignal = false }
         let healthy = queueHealthy
         queueHealthy = false
         cmdLock.unlock()
         // 120 healthy buffers in a row: the old errors are history, the rebuild budget starts over.
-        if healthy { queueRebuilds = 0; hardRebuildTimes.removeAll() }
+        if healthy { queueRebuilds = 0 }
         var lostWhy: String? = lostSignal ? "a composite command buffer ended with \"device removed\"" : nil
         if refused, queueRebuilds < 64, let dev = queue?.device, let q = dev.makeCommandQueue() {
-            queueRebuilds += 1
+            if !gpuUnjudged { queueRebuilds += 1 }   // the budget is not spent while the GPU is not ours to judge
             if let old = queue { retiredQueues.append(old) }
             q.label = "klepton.compositor.r\(queueRebuilds)"
             queue = q
             kl_gpu_time_watch_compositor(Unmanaged.passUnretained(q).toOpaque())
             NSLog("[cp] queue replaced after a GPU error on the old one (n=\(queueRebuilds))")
-            // A dead GPU refuses every new queue at once: 64 hard-refusal rebuilds inside 10 s.
-            if refusedHard && !gpuUnjudged {
-                let now = CFAbsoluteTimeGetCurrent()
-                hardRebuildTimes.append(now)
-                hardRebuildTimes.removeAll { now - $0 > 10 }
-                if hardRebuildTimes.count >= 64 {
-                    lostWhy = lostWhy ?? "the composite queue was refused and replaced \(hardRebuildTimes.count) times in 10 s"
-                }
-            }
+        } else if refused && !gpuUnjudged {
+            lostWhy = lostWhy ?? "the composite queue is refused and cannot be replaced (\(queueRebuilds) rebuilds)"
         }
         // GPU lost: sticky. From here every frame is still queried and presented, but black (hideGuest); after
         // `gpuLostQuitDelay` s the app ends cleanly.
@@ -2712,7 +2702,9 @@ final class KleptonCompositor {
             NSLog("[cp] GPU LOST: ending the app (the GPU reset; open the game again)")
             Task { @MainActor in Lifecycle.quit("after the GPU was lost") }
             // Safety net: a flush on a dead GPU can hang, and the main actor may be busy. This thread does not wait for either.
+            // Re-checked when it fires: not while the space is lost / the game paused.
             DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+                guard !Self.gpuUnjudged else { return }
                 NSLog("[cp] GPU LOST: the clean exit did not finish in 3 s — _exit(0)")
                 fflush(nil)
                 _exit(0)
@@ -2897,6 +2889,8 @@ final class KleptonCompositor {
                 NSLog(String(format: "[cp] stale -> backfill: guest serial %llu frozen for %.1f s "
                                      + "(%ld panel frames), its last picture is no longer reprojected (#%ld)",
                              UInt64(frameValue), frozenFor, staleInARow, staleHideCount))
+            } else if loggedGuestEnd {
+                NSLog("[cp] stale hide released: the guest thread ended, its last picture is shown again (freeze #\(staleHideCount))")
             } else {
                 NSLog("[cp] fresh again: guest serial \(frameValue) (freeze #\(staleHideCount))")
             }
@@ -3218,11 +3212,7 @@ final class KleptonCompositor {
                 if (e as NSError).domain == MTLCommandBufferErrorDomain && (e as NSError).code == 11 { self.gpuLostSignal = true }
                 // Our own fault/hang, or the refusal that follows it: the queue is spent. An innocent
                 // victim of someone else's hang leaves it usable.
-                if !d.contains("InnocentVictim") && !d.contains("victim of GPU") {
-                    self.queueRefused = true
-                    let code = (e as NSError).code
-                    if code != 2 && code != 7 { self.queueRefusedHard = true }
-                }
+                if !d.contains("InnocentVictim") && !d.contains("victim of GPU") { self.queueRefused = true }
                 if d != self.cmdErrorLast && self.cmdErrorKinds < 16 {
                     self.cmdErrorLast = d
                     self.cmdErrorKinds += 1
