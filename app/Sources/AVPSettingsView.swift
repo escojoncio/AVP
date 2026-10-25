@@ -17,6 +17,7 @@ struct AVPSettingsView: View {
     @State private var fozResult: String?
     @State private var confirmQuarantine = false
     @State private var quarantined = AVPPipelineCache.quarantineCount()
+    @State private var diagnosticsOpen = false
 
     private func pct(_ v: Double) -> String { "\(Int((v * 100).rounded())) %" }
 
@@ -24,14 +25,14 @@ struct AVPSettingsView: View {
         NavigationStack {
             Form {
                 picture
-                foveationSection
-                textures
+                performance
                 gameSection
                 engineLabLink
-                diagnostics
+                resetSection
                 certificateSection
                 accountSection
                 logsSection
+                diagnostics
             }
             .navigationTitle(AVPL("Ajustes", "Settings"))
             .toolbar { Button(AVPL("Hecho", "Done")) { dismiss() } }
@@ -49,6 +50,14 @@ struct AVPSettingsView: View {
     // Build 32: one screen anyone can read. What a run showed to be the only sane value is no longer a setting
     // (AVPSettings: gpuQueueDepth, composeNewOnly, guestHz, roundSharpZone, msaaOnTile; dynamic resolution, the
     // texture pool are gone). Build 53: picture presets M2/M5/Personalizado.
+    // Every option carries its own grey help line (hint): what it does, when to touch it, the recommended value.
+
+    /// The grey help line under an option.
+    private func hint(_ es: String, _ en: String) -> some View {
+        Text(AVPL(es, en))
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+    }
 
     private var picture: some View {
         Section {
@@ -62,59 +71,52 @@ struct AVPSettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
+                hint("Conjunto de ajustes de imagen ya probado para cada visor. Tócalo solo si quieres volver a los valores buenos tras experimentar. Si cambias a mano cualquier ajuste de imagen o de rendimiento, pasa solo a Personalizado. Recomendado: el que corresponde a tu visor (M2 o M5). Se aplica al arrancar el juego.",
+                     "A set of picture settings already tested for each headset. Touch it only to go back to the good values after experimenting. If you change any picture or performance setting by hand, it switches to Custom by itself. Recommended: the one for your headset (M2 or M5). Applied at game start.")
             }
-            Stepper(AVPL("Resolución: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) por ojo)",
-                         "Resolution: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) per eye)"),
-                    value: $s.renderPercent, in: 50...130, step: 5)
+            VStack(alignment: .leading, spacing: 4) {
+                Stepper(AVPL("Resolución: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) por ojo)",
+                             "Resolution: \(Int(s.renderPercent)) % (\(eye.width)×\(eye.height) per eye)"),
+                        value: $s.renderPercent, in: 50...130, step: 5)
+                hint("Cuántos píxeles dibuja el juego en cada ojo; 100 % es lo que pide el Vision Pro (3072×2464 por ojo). Más = más nítido pero más pesado. Bájala si ves tirones; súbela si te sobra rendimiento. Recomendado: 70 % (lo que ponen los presets). Se aplica al arrancar el juego.",
+                     "How many pixels the game draws in each eye; 100 % is what Vision Pro asks for (3072×2464 per eye). More = sharper but heavier. Lower it if you see hitches; raise it if you have performance to spare. Recommended: 70 % (what the presets set). Applied at game start.")
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Stepper(AVPL("Nitidez del centro: \(pct(s.centerSharpness))", "Centre sharpness: \(pct(s.centerSharpness))"),
+                        value: $s.centerSharpness, in: 0...1, step: 0.05)
+                hint("Afila la imagen solo en la zona nítida del centro, sin halos; los bordes no se afilan. Súbela si la imagen se ve algo blanda; bájala si ves demasiado contraste. 0 % lo desactiva. Recomendado: 50 %. Se aplica en vivo.",
+                     "Sharpens the picture only in the sharp centre zone, without halos; the edges are not sharpened. Raise it if the picture looks soft; lower it if you see too much contrast. 0 % turns it off. Recommended: 50 %. Applied live.")
+            }
             VStack(alignment: .leading, spacing: 6) {
-                Text(AVPL("Fotogramas (al arrancar el juego)", "Frame rate (at game start)"))
-                Picker(AVPL("Fotogramas (al arrancar el juego)", "Frame rate (at game start)"), selection: $s.frameRate) {
-                    Text("Auto").tag(AVPSettings.FrameRate.auto)
-                    Text(AVPL("45/50 fps", "45/50 fps")).tag(AVPSettings.FrameRate.high)
-                    Text(AVPL("30/33 fps", "30/33 fps")).tag(AVPSettings.FrameRate.steady)
+                Text(AVPL("Antialiasing (MSAA)", "Antialiasing (MSAA)"))
+                Picker(AVPL("Antialiasing (MSAA)", "Antialiasing (MSAA)"), selection: $s.msaa) {
+                    Text("Off").tag(0); Text("x2").tag(2); Text("x4").tag(4)
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
+                hint("Suaviza los bordes dentados de los objetos. x4 se ve más suave; x2 es más ligero. Sin MSAA (Off) el foveado no se aplica. Recomendado: x4. Se aplica al arrancar el juego.",
+                     "Smooths the jagged edges of objects. x4 looks smoother; x2 is lighter. Without MSAA (Off) foveation is not applied. Recommended: x4. Applied at game start.")
             }
-            Toggle(AVPL("Mostrar FPS", "Show FPS"), isOn: $s.showFps)
-        } header: {
-            Text(AVPL("Imagen", "Picture"))
-        } footer: {
-            Text(AVPL("Preset: M2 y M5 aplican los valores probados para cada visor; si tocas cualquier ajuste de imagen pasa a Personalizado. Resolución: 100 % = lo que pide el Vision Pro (3072×2464 por ojo); menos resolución = más margen de GPU. Fotogramas: el visor muestra siempre 90 Hz (100 Hz con luz artificial) y reproyecta cada imagen del juego con el movimiento de tu cabeza; esto elige cuántas imágenes nuevas hace el juego. Auto: 45/50 cuando la GPU llega y 30/33 cuando no. 45/50: siempre alto, las imágenes que lleguen tarde se reproyectan (más fluido, algún tirón). 30/33: siempre estable (cada imagen se muestra 3 veces a 90/100 Hz). Al arrancar el juego.",
-                      "Preset: M2 and M5 apply the values tested for each headset; changing any picture setting switches to Custom. Resolution: 100 % = what Vision Pro asks for (3072×2464 per eye); lower = more GPU headroom. Frame rate: the headset always shows 90 Hz (100 Hz under artificial light) and reprojects each game picture with your head motion; this picks how many new pictures the game makes. Auto: 45/50 when the GPU keeps up, else 30/33. 45/50: always high, late pictures are reprojected (smoother, some hitches). 30/33: always steady (each picture shown 3 times at 90/100 Hz). At game start."))
-        }
-    }
-
-    private var foveationSection: some View {
-        Section {
-            Toggle(AVPL("Foveado (centro nítido, bordes a menos resolución)", "Foveation (sharp centre, lower-resolution edges)"),
-                   isOn: $s.foveationOn)
-            if s.foveationOn {
-                Stepper(AVPL("Zona nítida: \(Int(s.wideDegrees))°", "Sharp zone: \(Int(s.wideDegrees))°"),
-                        value: $s.wideDegrees, in: 30...70, step: 5)
-                Stepper(AVPL("Calidad de los bordes: \(pct(s.periphery))", "Edge quality: \(pct(s.periphery))"),
-                        value: $s.periphery, in: AVPSettings.peripheryRange, step: 0.05)
-                Toggle(AVPL("Suavizar los bordes (VPKTAA)", "Smooth the edges (VPKTAA)"), isOn: $s.vpktaa)
-                if s.vpktaa {
-                    Stepper(AVPL("Intensidad: \(Int(s.vpktaaPercent)) %", "Strength: \(Int(s.vpktaaPercent)) %"),
-                            value: $s.vpktaaPercent, in: 0...100, step: 5)
-                    Stepper(AVPL("Nitidez: \(pct(s.vpktaaSharpness))", "Sharpness: \(pct(s.vpktaaSharpness))"),
-                            value: $s.vpktaaSharpness, in: 0...1, step: 0.05)
+            if s.msaa == 0 {
+                Text(AVPL("Sin MSAA no se aplica el foveado.", "Without MSAA foveation is not applied."))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(AVPL("Oclusión ambiental (SSAO)", "Ambient occlusion (SSAO)"), isOn: $s.ssao)
+                hint("Añade sombras suaves en esquinas y juntas, lo que da más sensación de volumen. Cuesta algo de GPU. Recomendado: activada; apágala solo si necesitas más rendimiento. Se aplica al arrancar el juego.",
+                     "Adds soft shadows in corners and joints, giving more sense of volume. Costs some GPU. Recommended: on; turn it off only if you need more performance. Applied at game start.")
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text(AVPL("Filtrado anisotrópico", "Anisotropic filtering"))
+                Picker(AVPL("Filtrado anisotrópico", "Anisotropic filtering"), selection: $s.anisotropy) {
+                    Text("Off").tag(0); Text("x2").tag(2); Text("x4").tag(4); Text("x8").tag(8); Text("x16").tag(16)
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                hint("Mantiene nítidas las texturas que ves de lado (suelos, paredes). Cuesta poco rendimiento. Recomendado: x16. Se aplica al arrancar el juego.",
+                     "Keeps textures seen at an angle (floors, walls) sharp. Costs little performance. Recommended: x16. Applied at game start.")
             }
-        } header: {
-            Text(AVPL("Foveado", "Foveation"))
-        } footer: {
-            Text(s.foveationOn
-                 ? AVPL("Zona nítida redonda (como en P.T.) a resolución completa, 10° por debajo de la mirada; fuera de ella los bordes se dibujan a la calidad elegida (10 % = máximo rendimiento; 65 % para un M5). La zona nítida y el foveado sí/no se aplican al arrancar; la calidad de los bordes y el suavizado, en vivo desde la pausa. El juego siempre usa MSAA 4x.",
-                        "Round sharp zone (as in P.T.) at full resolution, 10° below the gaze; outside it the edges are drawn at the chosen quality (10 % = most performance; 65 % for an M5). The sharp zone and foveation on/off apply at game start; edge quality and smoothing live from the pause menu. The game always uses 4x MSAA.")
-                 : AVPL("Sin foveado toda la imagen se dibuja a resolución completa: mucho más lento. Al arrancar el juego.",
-                        "Without foveation the whole picture is drawn at full resolution: much slower. At game start."))
-        }
-    }
-
-    private var textures: some View {
-        Section {
             VStack(alignment: .leading, spacing: 6) {
                 Text(AVPL("Tamaño máximo de textura", "Maximum texture size"))
                 Picker(AVPL("Tamaño máximo de textura", "Maximum texture size"), selection: $s.textureCap) {
@@ -124,50 +126,89 @@ struct AVPSettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-            }
-            VStack(alignment: .leading, spacing: 6) {
-                Text(AVPL("Filtrado anisotrópico", "Anisotropic filtering"))
-                Picker(AVPL("Filtrado anisotrópico", "Anisotropic filtering"), selection: $s.anisotropy) {
-                    Text("Off").tag(0); Text("x2").tag(2); Text("x4").tag(4); Text("x8").tag(8); Text("x16").tag(16)
+                hint("Límite de resolución de las texturas del juego: más grande = más detalle pero mucha más memoria. Recomendado: 2048 (lo probado). Se aplica al arrancar el juego.",
+                     "Resolution limit of the game's textures: larger = more detail but much more memory. Recommended: 2048 (the tested value). Applied at game start.")
+                if s.textureCap == 4096 {
+                    hint("4096 necesita más memoria de la que tiene el visor (~3,3 GB): puede haber texturas que aparecen tarde.",
+                         "4096 needs more memory than the headset has (~3.3 GB): textures may pop in late.")
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
             }
-            Toggle(AVPL("Oclusión ambiental (SSAO)", "Ambient occlusion (SSAO)"), isOn: $s.ssao)
-            VStack(alignment: .leading, spacing: 6) {
-                Text(AVPL("Antialiasing (MSAA)", "Antialiasing (MSAA)"))
-                Picker(AVPL("Antialiasing (MSAA)", "Antialiasing (MSAA)"), selection: $s.msaa) {
-                    Text("Off").tag(0); Text("x2").tag(2); Text("x4").tag(4)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-            }
-            if s.msaa == 0 {
-                Text(AVPL("Sin MSAA no se aplica el foveado.", "Without MSAA foveation is not applied."))
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-            Stepper(AVPL("Nitidez del centro: \(pct(s.centerSharpness))", "Centre sharpness: \(pct(s.centerSharpness))"),
-                    value: $s.centerSharpness, in: 0...1, step: 0.05)
-            Text(AVPL("Afila solo la zona nítida (RCAS, sin halos); la periferia no se afila. 0 % lo desactiva. Se aplica en vivo.",
-                      "Sharpens only the sharp zone (RCAS, no halos); the periphery is not sharpened. 0 % turns it off. Applied live."))
-                .font(.footnote)
-                .foregroundStyle(.secondary)
         } header: {
-            Text(AVPL("Texturas y efectos", "Textures and effects"))
-        } footer: {
-            Text(s.textureCap == 4096
-                 ? AVPL("4096 necesita más memoria de la que tiene el visor (~3,3 GB): puede haber texturas que aparecen tarde. 2048 es lo probado. Al arrancar el juego.",
-                        "4096 needs more memory than the headset has (~3.3 GB): textures may pop in late. 2048 is the tested value. At game start.")
-                 : AVPL("2048 es lo probado. Anisotrópico: nitidez de las texturas vistas en ángulo (suelos, paredes). SSAO: sombras de contacto en esquinas y juntas. MSAA: suaviza los bordes dentados (x4 más suave, x2 más barato); sin MSAA no se aplica el foveado. Al arrancar el juego.",
-                        "2048 is the tested value. Anisotropic: sharpness of textures seen at an angle (floors, walls). SSAO: contact shadows in corners and joints. MSAA: smooths jagged edges (x4 smoother, x2 cheaper); without MSAA foveation is not applied. At game start."))
+            Text(AVPL("Imagen", "Picture"))
+        }
+    }
+
+    private var performance: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(AVPL("Fotogramas (al arrancar el juego)", "Frame rate (at game start)"))
+                Picker(AVPL("Fotogramas (al arrancar el juego)", "Frame rate (at game start)"), selection: $s.frameRate) {
+                    Text("Auto").tag(AVPSettings.FrameRate.auto)
+                    Text(AVPL("45/50 fps", "45/50 fps")).tag(AVPSettings.FrameRate.high)
+                    Text(AVPL("30/33 fps", "30/33 fps")).tag(AVPSettings.FrameRate.steady)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                hint("Cuántas imágenes nuevas hace el juego por segundo; el visor siempre muestra 90 Hz (100 Hz con luz artificial) y ajusta cada imagen a tu cabeza. Auto: 45/50 cuando la GPU llega y 30/33 cuando no. 45/50: siempre alto (más fluido, algún tirón). 30/33: siempre estable. Recomendado: Auto. Se aplica al arrancar el juego.",
+                     "How many new pictures the game makes per second; the headset always shows 90 Hz (100 Hz under artificial light) and adjusts each picture to your head. Auto: 45/50 when the GPU keeps up, else 30/33. 45/50: always high (smoother, some hitches). 30/33: always steady. Recommended: Auto. Applied at game start.")
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(AVPL("Mostrar FPS", "Show FPS"), isOn: $s.showFps)
+                hint("Muestra un contador de fotogramas por segundo. Actívalo para comprobar el efecto de cambiar la resolución o el foveado. Recomendado: desactivado.",
+                     "Shows a frames-per-second counter. Turn it on to check the effect of changing resolution or foveation. Recommended: off.")
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(AVPL("Foveado (centro nítido, bordes a menos resolución)", "Foveation (sharp centre, lower-resolution edges)"),
+                       isOn: $s.foveationOn)
+                hint("Dibuja a resolución completa solo el centro, donde miras, y los bordes con menos: es la mayor ganancia de rendimiento. Sin foveado toda la imagen se dibuja a resolución completa y va mucho más lento. Recomendado: activado. Se aplica al arrancar el juego.",
+                     "Draws only the centre, where you look, at full resolution and the edges at less: the biggest performance gain. Without foveation the whole picture is drawn at full resolution and runs much slower. Recommended: on. Applied at game start.")
+            }
+            if s.foveationOn {
+                VStack(alignment: .leading, spacing: 4) {
+                    Stepper(AVPL("Zona nítida: \(Int(s.wideDegrees))°", "Sharp zone: \(Int(s.wideDegrees))°"),
+                            value: $s.wideDegrees, in: 30...70, step: 5)
+                    hint("Anchura de la zona central redonda a resolución completa (algo por debajo de la mirada). Más grande = más nítido pero más lento. Recomendado: 70° (lo que ponen los presets). Se aplica al arrancar el juego.",
+                         "Width of the round central zone at full resolution (a little below the gaze). Larger = sharper but slower. Recommended: 70° (what the presets set). Applied at game start.")
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Stepper(AVPL("Calidad de los bordes: \(pct(s.periphery))", "Edge quality: \(pct(s.periphery))"),
+                            value: $s.periphery, in: AVPSettings.peripheryRange, step: 0.05)
+                    hint("Resolución a la que se dibujan los bordes. 10 % es lo más rápido; sube hasta 65 % si notas los bordes borrosos y te sobra rendimiento (sobre todo en un M5). Recomendado: 10 %. Se aplica en vivo desde la pausa.",
+                         "Resolution the edges are drawn at. 10 % is the fastest; raise it up to 65 % if the edges look blurry and you have performance to spare (mostly on an M5). Recommended: 10 %. Applied live from the pause menu.")
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle(AVPL("Suavizar los bordes (VPKTAA)", "Smooth the edges (VPKTAA)"), isOn: $s.vpktaa)
+                    hint("Reconstruye y suaviza los bordes que se dibujan a menos resolución para que no se vean pixelados. Recomendado: activado. Se aplica en vivo desde la pausa.",
+                         "Reconstructs and smooths the edges drawn at lower resolution so they do not look pixelated. Recommended: on. Applied live from the pause menu.")
+                }
+                if s.vpktaa {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Stepper(AVPL("Intensidad: \(Int(s.vpktaaPercent)) %", "Strength: \(Int(s.vpktaaPercent)) %"),
+                                value: $s.vpktaaPercent, in: 0...100, step: 5)
+                        hint("Cuánto suavizado se aplica a los bordes. Recomendado: 100 %.",
+                             "How much smoothing is applied to the edges. Recommended: 100 %.")
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Stepper(AVPL("Nitidez: \(pct(s.vpktaaSharpness))", "Sharpness: \(pct(s.vpktaaSharpness))"),
+                                value: $s.vpktaaSharpness, in: 0...1, step: 0.05)
+                        hint("Cuánta definición conserva el suavizado de los bordes: más = más nítido, menos = más suave. Recomendado: 100 %.",
+                             "How much definition the edge smoothing keeps: more = sharper, less = softer. Recommended: 100 %.")
+                    }
+                }
+            }
+        } header: {
+            Text(AVPL("Rendimiento", "Performance"))
         }
     }
 
     private var gameSection: some View {
         Section {
-            Toggle(AVPL("Idioma del sistema si el juego lo tiene (si no, inglés)", "System language if the game has it (else English)"),
-                   isOn: $s.systemLanguage)
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(AVPL("Idioma del sistema si el juego lo tiene (si no, inglés)", "System language if the game has it (else English)"),
+                       isOn: $s.systemLanguage)
+                hint("Pone el juego en el idioma de tu visor si el juego lo tiene; si no, en inglés. Las voces siempre están en inglés. Recomendado: activado. Se aplica al arrancar el juego.",
+                     "Puts the game in your headset's language if the game has it; otherwise English. Voices are always English. Recommended: on. Applied at game start.")
+            }
             VStack(alignment: .leading, spacing: 6) {
                 Text(AVPL("Movimiento (jugador nuevo)", "Movement (new player)"))
                 Picker(AVPL("Movimiento (jugador nuevo)", "Movement (new player)"), selection: $s.movement) {
@@ -177,6 +218,8 @@ struct AVPSettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
+                hint("Cómo te desplazas. Teletransporte: saltas al punto que señalas (el más cómodo si te mareas). Cabeza: avanzas hacia donde miras. Mano: avanzas hacia donde apunta el mando. Solo se aplica mientras el juego no tenga opciones guardadas; después se cambia dentro del juego. Recomendado: Mano.",
+                     "How you move. Teleport: you jump to the point you aim at (the most comfortable if you get motion sick). Head: you move where you look. Hand: you move where the controller points. It only applies until the game has saved options; after that, change it inside the game. Recommended: Hand.")
             }
             VStack(alignment: .leading, spacing: 6) {
                 Text(AVPL("Subtítulos", "Subtitles"))
@@ -188,6 +231,8 @@ struct AVPSettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
+                hint("Dónde se ven los subtítulos. Abajo: donde los pone el juego; las otras opciones los suben. Cámbialo si te cuesta leerlos. Recomendado: A la vista. Se aplica al arrancar el juego.",
+                     "Where the subtitles appear. Bottom: where the game puts them; the other options raise them. Change it if they are hard to read. Recommended: Eye level. Applied at game start.")
             }
             VStack(alignment: .leading, spacing: 6) {
                 Text(AVPL("Tamaño de subtítulos", "Subtitle size"))
@@ -198,23 +243,37 @@ struct AVPSettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
+                hint("Tamaño de la letra de los subtítulos. Grande puede llenar la vista con las líneas largas. Recomendado: Pequeño (o Medio si no los lees bien). Se aplica al arrancar el juego.",
+                     "Subtitle text size. Large can fill the view with long lines. Recommended: Small (or Medium if you cannot read them well). Applied at game start.")
             }
             VStack(alignment: .leading, spacing: 4) {
                 Toggle(AVPL("Altura real (detecta el suelo)", "Real height (detects the floor)"), isOn: $s.realFloor)
-                Text(AVPL("El visor mide el suelo de tu habitación y tu altura sobre él cada pocos segundos, sentado o de pie, para que la altura de Alyx sea la tuya. La altura del jugador pasa a ser un ajuste fino. Pide permiso de detección del entorno la primera vez.",
-                          "The headset measures your room's floor and your height above it every few seconds, seated or standing, so Alyx's height matches yours. Player height becomes a fine adjustment. Asks for the surroundings-sensing permission once."))
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                hint("El visor mide el suelo de tu habitación y tu altura sobre él cada pocos segundos, sentado o de pie, para que la altura de Alyx sea la tuya. La altura del jugador pasa a ser un ajuste fino. Pide permiso de detección del entorno la primera vez. Recomendado: activado.",
+                     "The headset measures your room's floor and your height above it every few seconds, seated or standing, so Alyx's height matches yours. Player height becomes a fine adjustment. Asks for the surroundings-sensing permission once. Recommended: on.")
             }
-            Stepper(AVPL("Altura del jugador: \(Int(s.heightOffsetCm)) cm", "Player height: \(Int(s.heightOffsetCm)) cm"),
-                    value: $s.heightOffsetCm, in: -60...30, step: 5)
-            Toggle(AVPL("Sincronizar partidas con Steam Cloud", "Sync saves with Steam Cloud"), isOn: $s.cloudSync)
-            Toggle(AVPL("Dedos reales (seguimiento de manos del visor)", "Real fingers (the headset's hand tracking)"), isOn: $s.handFingers)
+            VStack(alignment: .leading, spacing: 4) {
+                Stepper(AVPL("Altura del jugador: \(Int(s.heightOffsetCm)) cm", "Player height: \(Int(s.heightOffsetCm)) cm"),
+                        value: $s.heightOffsetCm, in: -60...30, step: 5)
+                hint("Ajuste fino de la altura de Alyx. Negativo = Alyx más baja (jugando sentado, o si el suelo del juego queda demasiado lejos de las manos); positivo = más alta. Recomendado: 0 cm. Se aplica en vivo desde la pausa.",
+                     "Fine adjustment of Alyx's height. Negative = Alyx lower (playing seated, or when the game's floor sits too far from your hands); positive = taller. Recommended: 0 cm. Applied live from the pause menu.")
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(AVPL("Sincronizar partidas con Steam Cloud", "Sync saves with Steam Cloud"), isOn: $s.cloudSync)
+                hint("Guarda tus partidas en tu cuenta de Steam y recupera las de otros dispositivos. Apágalo solo si no quieres que se sincronicen. Recomendado: activado.",
+                     "Stores your saves in your Steam account and fetches those from other devices. Turn it off only if you do not want them synced. Recommended: on.")
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(AVPL("Dedos reales (seguimiento de manos del visor)", "Real fingers (the headset's hand tracking)"), isOn: $s.handFingers)
+                hint("Los dedos del jugador siguen a tus dedos de verdad (como con los mandos Index de Valve) cuando el visor ve la mano; pide permiso de seguimiento de manos la primera vez. Con un mando Sense en la mano el visor NO da el seguimiento de esa mano (medido): solo actúa con las manos libres. Recomendado: activado. Se aplica al arrancar el juego.",
+                     "The player's fingers follow your own (as with Valve's Index controllers) when the headset sees the hand; asks for the hand-tracking permission once. With a Sense controller in the hand the headset does NOT track that hand (measured): it only acts with free hands. Recommended: on. Applied at game start.")
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(AVPL("Manos adelantadas al centro de cada imagen", "Hands predicted to the middle of each picture"), isOn: $s.handHoldPredict)
+                hint("Cada imagen del juego se ve 2 o 3 refrescos; las manos se colocan donde estarán a mitad de ese tiempo para que vayan menos por detrás de las tuyas. Recomendado: activado.",
+                     "Each game picture is shown for 2 or 3 refreshes; the hands are placed where they will be halfway through, so they trail yours less. Recommended: on.")
+            }
         } header: {
-            Text(AVPL("Juego", "Game"))
-        } footer: {
-            Text(AVPL("Las voces siempre en inglés. El movimiento solo se aplica mientras el juego no tenga opciones guardadas. Subtítulos: el juego los pone abajo; las otras opciones los suben. Altura del jugador: negativo = Alyx más baja (jugando sentado, o si el suelo del juego queda demasiado lejos de las manos); se aplica en vivo desde la pausa. Dedos reales: los dedos del jugador siguen a tus dedos de verdad (como con los mandos Index de Valve) cuando el visor ve la mano; pide permiso de seguimiento de manos la primera vez. Con un mando Sense en la mano el visor NO da el seguimiento de esa mano (medido): solo actúa con las manos libres. Al arrancar el juego.",
-                      "Voices are always English. Movement only applies until the game has saved options. Subtitles: the game puts them low; the other options raise them. Player height: negative = Alyx lower (playing seated, or when the game's floor sits too far from your hands); applies live from the pause menu. Real fingers: the player's fingers follow your own (as with Valve's Index controllers) when the headset sees the hand; asks for the hand-tracking permission once. With a Sense controller in the hand the headset does NOT track that hand (measured): it only acts with free hands. At game start."))
+            Text(AVPL("Juego y controles", "Game and controls"))
         }
     }
 
@@ -226,46 +285,63 @@ struct AVPSettingsView: View {
                 Label(AVPL("Laboratorio del motor", "Engine lab"), systemImage: "testtube.2")
             }
         } footer: {
-            Text(AVPL("Optimizaciones del motor gráfico que se activan una a una (o con una prueba automática) y se aplican en vivo.",
-                      "Graphics engine optimisations that you switch on one by one (or with an automatic test), applied live."))
+            Text(AVPL("Optimizaciones del motor gráfico que se activan una a una (o con una prueba automática) y se aplican en vivo. Es opcional y avanzado: no hace falta tocarlo, los valores por defecto son los recomendados.",
+                      "Graphics engine optimisations that you switch on one by one (or with an automatic test), applied live. Optional and advanced: you do not need to touch it, the defaults are the recommended values."))
+        }
+    }
+
+    private var resetSection: some View {
+        Section {
+            Button(AVPL("Restablecer todos los ajustes", "Reset all settings"), role: .destructive) { s.resetToDefaults() }
+        } footer: {
+            Text(AVPL("Devuelve los ajustes de esta pantalla a sus valores originales. Úsalo si has tocado cosas y el juego va peor. No toca la carpeta AVP ni el certificado.",
+                      "Puts the settings of this screen back to their original values. Use it if you changed things and the game got worse. It does not touch the AVP folder or the certificate."))
         }
     }
 
     private var diagnostics: some View {
         Section {
-            Toggle(AVPL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $s.diagCaptures)
-            Toggle(AVPL("Medir el tiempo de GPU por pase", "Per-pass GPU timing"), isOn: $s.gpuPassProfiling)
-            Toggle(AVPL("Occlusion culling medido (consultas de GPU)", "Measured occlusion culling (GPU queries)"), isOn: $s.occlusionQueries)
-            VStack(alignment: .leading, spacing: 4) {
-                Toggle(AVPL("Manos adelantadas al centro de cada imagen", "Hands predicted to the middle of each picture"), isOn: $s.handHoldPredict)
-                Text(AVPL("Cada imagen del juego se ve 2 o 3 refrescos; las manos se colocan donde estarán a mitad de ese tiempo para que vayan menos por detrás de las tuyas.",
-                          "Each game picture is shown for 2 or 3 refreshes; the hands are placed where they will be halfway through, so they trail yours less."))
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-            Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
-                   role: .destructive) { confirmQuarantine = true }
-                .disabled(quarantined == 0)
-                .confirmationDialog(AVPL("¿Restablecer los \(quarantined) pipelines en cuarentena?",
-                                         "Reset the \(quarantined) quarantined pipelines?"),
-                                    isPresented: $confirmQuarantine, titleVisibility: .visible) {
-                    Button(AVPL("Restablecer", "Reset"), role: .destructive) {
-                        AVPPipelineCache.resetQuarantine()
-                        quarantined = AVPPipelineCache.quarantineCount()
-                    }
-                    Button(AVPL("Cancelar", "Cancel"), role: .cancel) {}
-                } message: {
-                    Text(AVPL("VPKEngine volverá a dibujarlos en el próximo arranque. Si alguno vuelve a colgar la GPU, "
-                              + "entrará otra vez en cuarentena.",
-                              "VPKEngine draws them again at the next launch. One that hangs the GPU again goes back into quarantine."))
+            DisclosureGroup(AVPL("Diagnóstico (solo si te lo piden)", "Diagnostics (only when asked)"), isExpanded: $diagnosticsOpen) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle(AVPL("Capturas de diagnóstico", "Diagnostic captures"), isOn: $s.diagCaptures)
+                    hint("Guarda imágenes de los ojos y un volcado pase a pase en Logs Alyx; con ellas activas, L3 + R3 a la vez guarda el fallo que estés viendo. Cada captura detiene el juego un instante. Recomendado: desactivado (solo si te lo piden). Se aplica al arrancar el juego.",
+                         "Saves eye pictures and a pass-by-pass dump in Logs Alyx; with them on, L3 + R3 together saves the glitch you are seeing. Each capture stalls the game for an instant. Recommended: off (only when asked). Applied at game start.")
                 }
-                .onAppear { quarantined = AVPPipelineCache.quarantineCount() }
-            Button(AVPL("Restablecer todos los ajustes", "Reset all settings"), role: .destructive) { s.resetToDefaults() }
-        } header: {
-            Text(AVPL("Diagnóstico (solo si te lo piden)", "Diagnostics (only when asked)"))
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle(AVPL("Medir el tiempo de GPU por pase", "Per-pass GPU timing"), isOn: $s.gpuPassProfiling)
+                    hint("Anota en el registro cuánto tarda la GPU en cada pase de dibujo. Sirve para buscar qué ralentiza el juego y cuesta algo de rendimiento. Recomendado: desactivado (solo si te lo piden). Se aplica al arrancar el juego.",
+                         "Writes to the log how long the GPU takes in each draw pass. It is for finding what slows the game down and costs some performance. Recommended: off (only when asked). Applied at game start.")
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle(AVPL("Occlusion culling medido (consultas de GPU)", "Measured occlusion culling (GPU queries)"), isOn: $s.occlusionQueries)
+                    hint("El juego deja de dibujar lo que la GPU comprueba que queda oculto tras otros objetos (menos carga). Apagado, todo cuenta como visible. Apágalo solo si ves objetos que desaparecen o parpadean. Recomendado: activado.",
+                         "The game stops drawing what the GPU finds hidden behind other objects (less load). Off, everything counts as visible. Turn it off only if you see objects vanishing or flickering. Recommended: on.")
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
+                           role: .destructive) { confirmQuarantine = true }
+                        .disabled(quarantined == 0)
+                        .confirmationDialog(AVPL("¿Restablecer los \(quarantined) pipelines en cuarentena?",
+                                                 "Reset the \(quarantined) quarantined pipelines?"),
+                                            isPresented: $confirmQuarantine, titleVisibility: .visible) {
+                            Button(AVPL("Restablecer", "Reset"), role: .destructive) {
+                                AVPPipelineCache.resetQuarantine()
+                                quarantined = AVPPipelineCache.quarantineCount()
+                            }
+                            Button(AVPL("Cancelar", "Cancel"), role: .cancel) {}
+                        } message: {
+                            Text(AVPL("VPKEngine volverá a dibujarlos en el próximo arranque. Si alguno vuelve a colgar la GPU, "
+                                      + "entrará otra vez en cuarentena.",
+                                      "VPKEngine draws them again at the next launch. One that hangs the GPU again goes back into quarantine."))
+                        }
+                        .onAppear { quarantined = AVPPipelineCache.quarantineCount() }
+                    hint("Si un efecto o un objeto dejó de dibujarse porque colgó la GPU una vez, el motor lo aparta (cuarentena). Este botón le da otra oportunidad en el próximo arranque. El número es cuántos hay apartados; con 0 no hace nada.",
+                         "If an effect or object stopped being drawn because it hung the GPU once, the engine sets it aside (quarantine). This button gives it another chance at the next launch. The number is how many are set aside; with 0 it does nothing.")
+                }
+            }
         } footer: {
-            Text(AVPL("Déjalo como está salvo que se te pida para un registro. Capturas: imágenes de los ojos y un volcado pase a pase en Logs Alyx; con ellas activas, L3 + R3 a la vez guarda el fallo que estés viendo. Medir GPU: escribe los tiempos en el registro, cuesta algo de rendimiento. Orden por recursos: menos esperas en la GPU; si ves geometría que explota, apágalo. Amplificación de vértices: los dos ojos en una sola pasada de geometría (menos tiempo de GPU); si ves algo raro en un ojo, apágalo. Todo al arrancar el juego. Arranque anticipado: el juego prepara el siguiente frame mientras la GPU acaba el actual (apagado = como antes, la GPU espera ~5 ms en cada frame). Frecuencia al juego: Alyx avanza su reloj y fija su tick con este número. Automática = el ritmo real (50, o 33 en zonas densas; 50 durante las cargas). Las fijas son solo para pruebas: 90 va a cámara lenta (requiere reiniciar el juego).",
-                      "Leave it as it is unless asked for a log. Captures: eye pictures and a pass-by-pass dump in Logs Alyx; with them on, L3 + R3 together saves the glitch you are seeing. GPU timing: writes the timings to the log, costs some performance. Ordering by resources: fewer GPU waits; if geometry explodes, turn it off. Vertex amplification: both eyes in one geometry pass (less GPU time); if one eye looks wrong, turn it off. All at game start. Running start: the game builds the next frame while the GPU finishes the current one (off = as before, the GPU waits ~5 ms every frame). Refresh rate told to the game: Alyx steps its clock and fixes its tick from this number. Automatic = the real pace (50, or 33 in dense areas; 50 during loads). The fixed ones are tests only: 90 runs in slow motion (game restart)."))
+            Text(AVPL("Déjalo como está salvo que se te pida para un registro.",
+                      "Leave it as it is unless you are asked for a log."))
         }
     }
 
