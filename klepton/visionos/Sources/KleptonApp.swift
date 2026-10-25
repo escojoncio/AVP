@@ -139,6 +139,9 @@ enum Lifecycle {
     static var spaceLost = false
     /// Mirror of AVPModel.paused readable outside the main actor (scenePhaseChanged).
     static var gamePaused = false
+    /// The background pause is what held the guest (not the user's pause): only then is it released on return
+    /// (phase .active). The compositor treats it like a pause (no stale hide).
+    static var pausedByBackground = false
     /// Read by the compositor's render thread when its loop ends: keep (hold) the guest instead of stopping it.
     static var keepGuestOnSpaceLoss: Bool {
         #if KL_ALYX_LAUNCHER
@@ -256,6 +259,12 @@ enum Lifecycle {
         // platform lies about.
         if phase == .active { kl_audio_resume() }
         #if KL_ALYX_LAUNCHER
+        // Back from the background (only on .active, not .inactive): the guest is released — but only if the
+        // background pause held it (a game the user paused stays paused).
+        if phase == .active, pausedByBackground {
+            pausedByBackground = false
+            if !gamePaused { kl_guest_set_paused(0); NSLog("[app] foreground again — game resumed") }
+        }
         // Back from Home with the game paused and its space gone: bring the launcher (with "Volver al juego") up.
         if phase == .active, spaceLost, let open = reopenLauncher {
             Task { @MainActor in open(id: AVPMainWindow.id) }
@@ -265,6 +274,13 @@ enum Lifecycle {
         // Dismissing the launcher window while the game's space runs must not kill the game.
         // If the space really is gone too, immersiveEnded() makes the exit decision.
         if immersiveOpen {
+            #if KL_ALYX_LAUNCHER
+            // The guest is held in the background (the compositor keeps presenting).
+            if gameStarted, !gamePaused {
+                kl_guest_set_paused(1)
+                pausedByBackground = true
+            }
+            #endif
             NSLog("[app] backgrounded with the immersive space open — staying alive")
             return
         }

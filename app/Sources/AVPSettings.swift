@@ -142,6 +142,15 @@ final class AVPSettings: ObservableObject {
     @Published var labGatherCopies: Bool { didSet { labChanged() } }
     @Published var labFuseClears: Bool { didSet { labChanged() } }
     @Published var labStateElide: Bool { didSet { labChanged() } }
+    /// Lab, live: RCAS of «Nitidez del centro» fused into the compositor's pass (on, as before) or in a pass of its own
+    /// (off, for comparing the compositor's cost in `[cp] gpu composite`). Not an engine bit: it goes straight to
+    /// KleptonCompositor.setSharpFused and the compositor latches it once per composed frame.
+    @Published var labSharpFused: Bool { didSet { save(); if !loading { KleptonCompositor.setSharpFused(labSharpFused) } } }
+    /// Lab, read at launch only (restart the game): VPKEngine's Metal binary archive of compiled shaders (writeConfig →
+    /// AVPPipelineCache.configure; off by default: opening one costs ~30x its file size in memory) and the elision of
+    /// MSAA stores nobody reads (VPVK_MSAA_DEAD_STORE, on by default).
+    @Published var labArchive: Bool { didSet { save() } }
+    @Published var labMsaaDeadStore: Bool { didSet { save() } }
     private var labBulk = false
     private var labAdoptedSerial: UInt32 = 0
     private var labWatcher: Timer?
@@ -180,10 +189,11 @@ final class AVPSettings: ObservableObject {
     }
     /// «Restaurar valores por defecto» of the lab: everything off but the eye trim.
     func resetLab() {
-        for k in ["producerWaits", "eyeTrim", "gatherCopies", "fuseClears", "stateElide"] {
+        for k in ["producerWaits", "eyeTrim", "gatherCopies", "fuseClears", "stateElide", "sharpFused", "binaryArchive", "msaaDeadStore"] {
             UserDefaults.standard.removeObject(forKey: "avp.lab.\(k)")
         }
         setLabMask(4)
+        labSharpFused = true; labArchive = false; labMsaaDeadStore = true
         AVPLog.log("Laboratorio del motor: valores por defecto")
     }
     /// A test that ended while the game ran left its winner in the engine: take it as the saved switches (once per test).
@@ -286,6 +296,9 @@ final class AVPSettings: ObservableObject {
         labGatherCopies = d.object(forKey: "avp.lab.gatherCopies") as? Bool ?? false
         labFuseClears = d.object(forKey: "avp.lab.fuseClears") as? Bool ?? false
         labStateElide = d.object(forKey: "avp.lab.stateElide") as? Bool ?? false
+        labSharpFused = d.object(forKey: "avp.lab.sharpFused") as? Bool ?? true
+        labArchive = d.object(forKey: "avp.lab.binaryArchive") as? Bool ?? false
+        labMsaaDeadStore = d.object(forKey: "avp.lab.msaaDeadStore") as? Bool ?? true
         labAdoptedSerial = UInt32(kl_abtest_result_serial())   // a test of an earlier game start (none) is not adopted
         subtitleSize = SubtitleSize(rawValue: d.object(forKey: "avp.subSize") as? Int ?? 0) ?? .small
         subtitleFoveation = d.object(forKey: "avp.subFov") as? Bool ?? true
@@ -333,6 +346,9 @@ final class AVPSettings: ObservableObject {
         d.set(labGatherCopies, forKey: "avp.lab.gatherCopies")
         d.set(labFuseClears, forKey: "avp.lab.fuseClears")
         d.set(labStateElide, forKey: "avp.lab.stateElide")
+        d.set(labSharpFused, forKey: "avp.lab.sharpFused")
+        d.set(labArchive, forKey: "avp.lab.binaryArchive")
+        d.set(labMsaaDeadStore, forKey: "avp.lab.msaaDeadStore")
         d.set(preset.rawValue, forKey: "avp.preset")
         d.set(Self.schema, forKey: "avp.schema")
         d.set(subtitleSize.rawValue, forKey: "avp.subSize")
@@ -354,6 +370,7 @@ final class AVPSettings: ObservableObject {
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
         reportedHz = fresh.reportedHz; runningStart = fresh.runningStart; abTest = fresh.abTest
         setLabMask(fresh.labMask)
+        labSharpFused = fresh.labSharpFused; labArchive = fresh.labArchive; labMsaaDeadStore = fresh.labMsaaDeadStore
         preset = fresh.preset
         AVPLog.log("Ajustes: valores por defecto")
     }
@@ -603,8 +620,8 @@ final class AVPSettings: ObservableObject {
             // encoder); gpu.enc detail (tile=/mem= per attachment, VPKEngine 0035) every 3000 core frames (~20 s).
             ("VP_EXCL_TIMING", gpuPassProfiling ? "1" : "0"),
             ("VP_FRAME_DETAIL", "3000"),
-            // Elisión de stores MSAA muertos, VPKEngine 0051; quitar si hay frames corruptos.
-            ("VPVK_MSAA_DEAD_STORE", "1"),
+            // Elisión de stores MSAA muertos, VPKEngine 0051; on by default, the lab's switch turns it off (corrupt frames).
+            ("VPVK_MSAA_DEAD_STORE", labMsaaDeadStore ? "1" : "0"),
         ]
         // VPKTAA inputs not usable yet (build 17 log): VPKEngine's motion vectors are all zero (its "eye frame"
         // restarts at every depth-clearing multiview pass, 4-7 per game frame, so no draw ever finds last frame's
@@ -658,11 +675,11 @@ final class AVPSettings: ObservableObject {
             // The engine configuration the hang quarantine is valid for (AVPPipelineCache: quarantine.key). The values
             // are read back from the env so the signature cannot drift from what VPKEngine actually gets.
             let sigKeys = ["VPVK_AMPLIFY", "VPVK_FETCH_NATIVE", "VP_CB_ORDER", "KL_VRR", "KL_VRR_PHYS", "VPVK_FORCE_1X",
-                           "VPVK_MOTION", "VP_FRAMES_IN_FLIGHT", "VP_MSAA_TILE"]
+                           "VPVK_MOTION", "VP_FRAMES_IN_FLIGHT", "VP_MSAA_TILE", "VPVK_MSAA_DEAD_STORE"]
             let signature = sigKeys.map { k in "\(k)=\(env.last { $0.0 == k }?.1 ?? "-")" }.joined(separator: "|")
                 + "|msaa=\(gameMSAA)"
             let cache = AVPPipelineCache.configure(data: p.dataDir, pipelines: p.pipelines, engine: "vpkengine",
-                                                   engineSignature: signature)
+                                                   engineSignature: signature, archive: labArchive)
             env.append(("VP_PIPELINE_CACHE_DIR", cache.dir.path))
             if cache.archiveOff { env.append(("VP_PIPELINE_ARCHIVE", "0")) }
             env.append(("KL_VK_FOZ_GAME_REPLAY", cache.warm ? "0" : "1"))
@@ -677,6 +694,7 @@ final class AVPSettings: ObservableObject {
         KleptonCompositor.setPeripheryRecon(on: reconActive, percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
         KleptonCompositor.skipSameEnabled = Self.composeNewOnly
         KleptonCompositor.setCenterSharpness(Float(centerSharpness))
+        KleptonCompositor.setSharpFused(labSharpFused)
         // Round sharp zone (P.T.'s circle) over the wide map: its degrees are the map's (KL_VRR_WIDE_DEG above).
         KleptonCompositor.setRoundFovea(on: foveationUsable && Self.roundSharpZone, degrees: Float(wideDegrees.rounded()),
                                         edge: Float(periphery))

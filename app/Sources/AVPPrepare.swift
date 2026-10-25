@@ -519,18 +519,25 @@ enum AVPPipelineCache {
     /// Decided at writeConfig (before the prewarm), read by AVPPrepare.prewarm.
     nonisolated(unsafe) static var current: State?
 
-    static func configure(data: URL, pipelines: URL, engine: String, engineSignature: String = "") -> State {
+    static func configure(data: URL, pipelines: URL, engine: String, engineSignature: String = "", archive: Bool = false) -> State {
         let fm = FileManager.default
         let dir = data.appendingPathComponent("vpcache", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let stamp = dir.appendingPathComponent("warm.stamp")
-        // Metal binary archives are off for good: opening one cost ~30x its file size in memory (build 14:
-        // pipelines-4.metalar, 95 MB on disk -> +4.4 GB), and saving them re-compiles every pipeline serially
-        // (minutes). The OS shader cache keeps compiled shaders between launches by itself. Old files are removed.
-        let archiveOff = true
-        for f in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
-        where f.hasSuffix(".metalar") || f == "pipelines.count" || f.hasPrefix("archive.") {
-            try? fm.removeItem(at: dir.appendingPathComponent(f))
+        // Metal binary archives are off unless the lab's switch (`archive`) asks for them: opening one cost ~30x its file
+        // size in memory (build 14: pipelines-4.metalar, 95 MB on disk -> +4.4 GB), and saving them re-compiles every
+        // pipeline serially (minutes). The OS shader cache keeps compiled shaders between launches by itself. With the
+        // switch off, old files are removed; with it on they stay, unless two runs in a row died inside the archive code
+        // (checkArchiveInflight → archive.off: off again until the switch is turned off and on).
+        var archiveOff = true
+        if archive {
+            checkArchiveInflight(dir: dir)
+            archiveOff = fm.fileExists(atPath: dir.appendingPathComponent("archive.off").path)
+        } else {
+            for f in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+            where f.hasSuffix(".metalar") || f == "pipelines.count" || f.hasPrefix("archive.") {
+                try? fm.removeItem(at: dir.appendingPathComponent(f))
+            }
         }
         let driver = AVPLaunch.driverPath.flatMap { digest($0) } ?? "?"
         let list = (try? String(contentsOf: pipelines.deletingLastPathComponent().appendingPathComponent("pipelines.stamp"),

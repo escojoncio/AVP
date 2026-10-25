@@ -6154,17 +6154,24 @@ static void klvk_cap_heaps(VkPhysicalDeviceMemoryProperties *m, void *pnext) {
                 uint64_t live = atomic_load(&g_vk_live), avail = klvk_os_avail();
                 uint64_t rsv = (uint64_t)reserve << 20;
                 uint64_t budget = live + (avail > rsv ? avail - rsv : 0);
-                if (cap > 0 && budget > ((uint64_t)cap << 20)) budget = (uint64_t)cap << 20;
+                const char *why = "the OS figure (live + available - reserve)";
+                if (cap > 0 && budget > ((uint64_t)cap << 20)) { budget = (uint64_t)cap << 20; why = "KL_VK_HEAP_MB"; }
+                uint64_t heap_mb = 0;
                 for (uint32_t i = 0; i < m->memoryHeapCount; i++) {
                     if (!(m->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
-                    if (avail) bp->heapBudget[i] = budget < m->memoryHeaps[i].size ? budget : m->memoryHeaps[i].size;
+                    if (!heap_mb) heap_mb = m->memoryHeaps[i].size >> 20;
+                    if (avail) {
+                        if (budget < m->memoryHeaps[i].size) bp->heapBudget[i] = budget;
+                        else { bp->heapBudget[i] = m->memoryHeaps[i].size; why = "the advertised heap size"; }
+                    }
                     bp->heapUsage[i] = live;
                 }
                 static unsigned n;
                 if (n++ % 600 == 0)
                     fprintf(stderr, "[vkmem] budget from the OS: %llu MB available to the process, %llu MB held by the "
-                            "game -> budget %llu MB (query %u)\n", (unsigned long long)(avail >> 20),
-                            (unsigned long long)(live >> 20), (unsigned long long)(bp->heapBudget[0] >> 20), n);
+                            "game -> budget %llu MB (query %u; heap %llu MB, reserve %ld MB, limited by %s)\n",
+                            (unsigned long long)(avail >> 20), (unsigned long long)(live >> 20),
+                            (unsigned long long)(bp->heapBudget[0] >> 20), n, (unsigned long long)heap_mb, reserve, why);
             }
         // The heap sizes themselves still take KL_VK_HEAP_MB below; the budget is already answered.
         if (cap > 0)

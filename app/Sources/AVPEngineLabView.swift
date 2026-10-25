@@ -152,6 +152,52 @@ struct AVPEngineLabView: View {
                           "They apply live, without restarting the game, and are saved. The first four belong to the graphics engine; they only change how work is sent to the GPU, not what is drawn."))
             }
             Section {
+                VStack(alignment: .leading, spacing: 6) {
+                    Toggle(AVPL("Nitidez del centro fusionada en la composición", "Centre sharpness fused into the composite"),
+                           isOn: $s.labSharpFused).disabled(running)
+                    Text(AVPL("Activado (fusionada): la nitidez del centro se calcula dentro del pase que compone la imagen; un pase menos por ojo. Apagado (pase aparte): como antes, con un pase propio; sirve para comparar el coste del compositor en el registro «[cp] gpu composite». Solo actúa si «Nitidez del centro» (Ajustes) es mayor que 0.",
+                              "On (fused): the centre sharpening is computed inside the pass that composes the picture; one pass less per eye. Off (separate pass): as before, with a pass of its own; it lets you compare the compositor's cost in the “[cp] gpu composite” log line. It only acts if “Centre sharpness” (Settings) is above 0."))
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Text(AVPL("Ahora: \(s.labSharpFused ? "fusionada" : "pase aparte") · Por defecto: fusionada",
+                              "Now: \(s.labSharpFused ? "fused" : "separate pass") · Default: fused"))
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+            } header: {
+                Text(AVPL("Compositor (en vivo)", "Compositor (live)"))
+            } footer: {
+                Text(AVPL("Se aplica al instante, sin reiniciar el juego, y se guarda. No cambia lo que se ve, solo cuánto cuesta.",
+                          "It applies at once, without restarting the game, and is saved. It does not change what you see, only what it costs."))
+            }
+            Section {
+                VStack(alignment: .leading, spacing: 6) {
+                    Toggle(AVPL("Archivo de shaders compilados (requiere reiniciar el juego)",
+                                "Compiled shader archive (needs a game restart)"), isOn: $s.labArchive)
+                    Text(AVPL("Guarda los shaders compilados para arrancar ~15 s antes; usa más memoria. El primer arranque con él activado tarda más (guarda los shaders compilados). Se apaga solo tras 2 cierres dentro del archivo.",
+                              "Saves the compiled shaders so the game starts ~15 s sooner; it uses more memory. The first launch with it on takes longer (it saves the compiled shaders). It turns itself off after 2 crashes inside the archive."))
+                        .font(.footnote).foregroundStyle(.secondary)
+                    if s.labArchive,
+                       FileManager.default.fileExists(atPath: AVPPipelineCache.cacheDir.appendingPathComponent("archive.off").path) {
+                        Text(AVPL("Desactivado tras 2 cierres; apágalo y vuelve a encenderlo para rearmar",
+                                  "Disabled after 2 crashes; turn it off and on again to re-arm"))
+                            .font(.footnote).foregroundStyle(.orange)
+                    }
+                    Text(AVPL("Por defecto: apagado", "Default: off")).font(.footnote).foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Toggle(AVPL("Ahorro de memoria MSAA (experimental, requiere reiniciar)",
+                                "MSAA memory saving (experimental, needs a restart)"), isOn: $s.labMsaaDeadStore)
+                    Text(AVPL("Omite guardados de MSAA que nadie lee; si ves un parpadeo o un frame corrupto, apágalo.",
+                              "Skips MSAA saves that nobody reads; if you see flicker or a corrupt frame, turn it off."))
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Text(AVPL("Por defecto: activado", "Default: on")).font(.footnote).foregroundStyle(.secondary)
+                }
+            } header: {
+                Text(AVPL("Requieren reiniciar el juego", "Need a game restart"))
+            } footer: {
+                Text(AVPL("Estos cambios se guardan ahora pero no hacen nada hasta que cierres el juego (Salir) y lo abras de nuevo.",
+                          "These changes are saved now but do nothing until you quit the game (Exit) and open it again."))
+            }
+            Section {
                 Button {
                     let r = kl_abtest_start()
                     if r > 0 {

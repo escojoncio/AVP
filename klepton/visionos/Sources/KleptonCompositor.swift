@@ -713,6 +713,10 @@ final class KleptonCompositor {
     // view too: one line a second, `[cp] gpu p50/p95/max`. Written from the completion handler under cmdLock.
     private var cpGpuMs: [Double] = []
     private var cpGpuWindowStart = CFAbsoluteTimeGetCurrent()
+    // The RCAS mode the window above was measured in: a change of mode starts a new window, so p50/p95 never mix modes.
+    private var cpGpuMode = ""
+    // `sharpFused` as it stood when the frame being composed began (renderFrame): the whole frame uses this one value.
+    private var sharpFusedFrame = true
     // Every composite command buffer that came back with an error (not only the first): build 12
     // hung the GPU from the guest's queue and only one "InnocentVictim" was ever printed here, so
     // whether the compositor's own work kept running afterwards could not be read. Counted under
@@ -2734,6 +2738,7 @@ final class KleptonCompositor {
             Thread.sleep(forTimeInterval: 0.005)   // nothing was queried: do not spin
             return 0
         }
+        sharpFusedFrame = Self.sharpFused   // latched: a switch from the lab lands on the next composed frame
 
         guard let frame = layerRenderer.queryNextFrame() else { bailNoFrame += 1; return 0 }
         frame.startUpdate()
@@ -2897,8 +2902,9 @@ final class KleptonCompositor {
         // stall of this very thread. The frame is still queried, composed and presented (black): nothing is abandoned.
         // Not frozen: a guest held on purpose (AVP pause menu) or loading a level (Source 2 fades to the grid first,
         // kl_guest_loading): the clock restarts meanwhile, so the hide only starts `staleHideSeconds` after that ends.
+        // Held by the background pause counts as a pause (Lifecycle.pausedByBackground).
         // A guest whose thread ended keeps the old behaviour (its last picture, reprojected).
-        if Lifecycle.gamePaused || kl_guest_loading() != 0 { lastFreshTime = CFAbsoluteTimeGetCurrent() }
+        if Lifecycle.gamePaused || Lifecycle.pausedByBackground || kl_guest_loading() != 0 { lastFreshTime = CFAbsoluteTimeGetCurrent() }
         let frozenFor = CFAbsoluteTimeGetCurrent() - lastFreshTime
         let frozen = Self.staleHideSeconds > 0 && !loggedGuestEnd && staleInARow >= 8 && frozenFor >= Self.staleHideSeconds
         if frozen != staleHide {
@@ -3215,6 +3221,8 @@ final class KleptonCompositor {
         // here. Counted, with the first error printed, because "committed but
         // never completed" is otherwise indistinguishable from "completed and
         // drew black".
+        let rcasMode = Self.centerSharp > 0 || eyeSharpen != nil
+            ? ((sharpFusedFrame && eyeSharpen == nil) ? "fused" : "separate pass") : "off"
         cmd.addCompletedHandler { [weak self] b in
             guard let self else { return }
             self.cmdLock.lock()
@@ -3251,7 +3259,7 @@ final class KleptonCompositor {
             }
             if n <= 12 { NSLog("[cp] cmdbuf #\(n) COMPLETED" + (b.error != nil ? " err=\(b.error!)" : "")) }
             if first { NSLog("[cp] composite command buffer error: \(b.error!)") }
-            self.noteCompositeGpu(b)
+            self.noteCompositeGpu(b, rcas: rcasMode)
         }
         cmd.commit()
         cmdCommitted += 1
@@ -3360,8 +3368,15 @@ final class KleptonCompositor {
         NSLog("[cp] round sharp zone \(roundFovea ? "on" : "off"): \(Int(roundDegrees)) deg, periphery \(Int(roundEdge * 100)) %")
     }
     /// RCAS on the centre is fused into the composite's eye sample (kl_rcas, `rcas_con`/`rcas_rect`) unless
-    /// KL_CP_SHARP_FUSED=0, which keeps the separate pass (`sharpenedEye`) for an A/B.
-    private static let sharpFused: Bool = envStr("KL_CP_SHARP_FUSED") != "0"
+    /// KL_CP_SHARP_FUSED=0, which keeps the separate pass (`sharpenedEye`) for an A/B. Live from the lab
+    /// (`setSharpFused`); a composed frame reads it once (`sharpFusedFrame`). Both paths need nothing built in advance
+    /// (the pass's pipeline and textures are made on first use), so the switch can fall at any frame.
+    nonisolated(unsafe) static var sharpFused: Bool = envStr("KL_CP_SHARP_FUSED") != "0"
+    static func setSharpFused(_ on: Bool) {
+        guard on != sharpFused else { return }
+        sharpFused = on
+        NSLog("%@", "[cp] centre sharpness (RCAS) mode: \(on ? "fused into the composite" : "separate pass")")
+    }
     /// Foveation off: the share of each axis of the eye the sharpening covers, centred (`sharpZones`). The fractions the
     /// foveated eye measures: 882/2016 wide and 861/1632 high.
     private static let sharpCentreFraction = SIMD2<Float>(882.0 / 2016.0, 861.0 / 1632.0)
@@ -4012,7 +4027,7 @@ final class KleptonCompositor {
         var bind0 = rawBind0, bind1 = rawBind1
         // The centre sharpness is fused into the composite (rcas_con below) unless KL_CP_SHARP_FUSED=0 (A/B); the legacy
         // KL_EYE_SHARPEN keeps its own pass either way.
-        let sharpPass = eyeSharpen != nil || (!Self.sharpFused && Self.centerSharp > 0)
+        let sharpPass = eyeSharpen != nil || (!sharpFusedFrame && Self.centerSharp > 0)
         if eyeMipsOn || eyeFXScale > 0 || sharpPass || eyeFXAA, let r0 = rawBind0, let r1 = rawBind1 {
             let c0 = CACurrentMediaTime()
             let serial = UInt64(kl_vulkan_frame_serial())
@@ -4322,7 +4337,7 @@ final class KleptonCompositor {
             // a change from the pause applies on the next composite) and, per view, the sharpening zone of the texture
             // the view samples (bind0/bind1, whatever VPKTAA or the prep made of it, so RCAS stays after TAA as the
             // separate pass was) as a fraction of that texture. A zone that cannot be bounded leaves the view unsharpened.
-            if probePipeline == nil, Self.sharpFused, eyeSharpen == nil, Self.centerSharp > 0 {
+            if probePipeline == nil, sharpFusedFrame, eyeSharpen == nil, Self.centerSharp > 0 {
                 let con = exp2f(-Self.sharpStops(Self.centerSharp))
                 var zoneFailed = false
                 for n in uniforms.indices where uniforms[n].visible != 0 {
@@ -4398,11 +4413,16 @@ final class KleptonCompositor {
 
     /// GPU time of the composite's command buffer (called from its completion handler); once a second prints
     /// p50/p95/max of the window.
-    private func noteCompositeGpu(_ b: MTLCommandBuffer) {
+    private func noteCompositeGpu(_ b: MTLCommandBuffer, rcas: String) {
         let ms = (b.gpuEndTime - b.gpuStartTime) * 1000
         guard b.gpuStartTime > 0, ms > 0, ms < 1000 else { return }
         var window: [Double] = []
         cmdLock.lock()
+        if rcas != cpGpuMode {   // the RCAS mode changed: a new window, so the two modes' samples are never mixed
+            cpGpuMode = rcas
+            cpGpuMs.removeAll(keepingCapacity: true)
+            cpGpuWindowStart = CFAbsoluteTimeGetCurrent()
+        }
         cpGpuMs.append(ms)
         let now = CFAbsoluteTimeGetCurrent()
         if now - cpGpuWindowStart >= 1 {
@@ -4413,8 +4433,6 @@ final class KleptonCompositor {
         cmdLock.unlock()
         guard !window.isEmpty else { return }
         let p95 = window[min(window.count - 1, Int(Double(window.count) * 0.95))]
-        let rcas = Self.centerSharp > 0 || eyeSharpen != nil
-            ? ((Self.sharpFused && eyeSharpen == nil) ? "fused" : "separate pass") : "off"
         NSLog("%@", String(format: "[cp] gpu composite (prep + wide view + composite) p50/p95/max: %.2f/%.2f/%.2f ms (%ld cmdbufs)",
                            window[window.count / 2], p95, window[window.count - 1], window.count) + " | rcas " + rcas)
     }
