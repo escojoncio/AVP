@@ -4,10 +4,10 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` + `vpkengine-patches/` 0011–0041; parche nuevo = `00NN-*.patch` con
 `git format-patch` sobre ref+parches; CI `scripts/apply-vpkengine-patches.sh`). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B61**, lanzada).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B61**, compilada OK).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
-## Últimos hechos (B61 lanzada, sin validar en el visor)
+## Últimos hechos (B61 compilada OK en CI, sin validar en el visor)
 - B61 VPKEngine 0051 (= main `454f7cc`): elisión de stores MSAA muertos (`VPVK_MSAA_DEAD_STORE=1`); `gpu.frame stores_elided=
   elide_miss=`, `gpu.msaa elide_miss`, `msaa_materialized ... load= store=`. Port: `Use::firstAttach` añadido al árbol AVP.
 - B61 Laboratorio: «Nitidez en la composición» fusionada/pase aparte EN CALIENTE (`KleptonCompositor.setSharpFused`, latch
