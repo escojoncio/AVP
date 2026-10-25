@@ -2899,6 +2899,8 @@ final class KleptonCompositor {
         // Wall clock, not a frame count: the panel period changes (half rate, 90/100/120 Hz, skipped refreshes) and
         // `staleInARow` alone would mean different times. The count only guards against a first frame after a long
         // stall of this very thread. The frame is still queried, composed and presented (black): nothing is abandoned.
+        // A guest held on purpose (AVP pause menu) is not frozen: the clock restarts while paused.
+        if Lifecycle.gamePaused { lastFreshTime = CFAbsoluteTimeGetCurrent() }
         let frozenFor = CFAbsoluteTimeGetCurrent() - lastFreshTime
         let frozen = Self.staleHideSeconds > 0 && staleInARow >= 8 && frozenFor >= Self.staleHideSeconds
         if frozen != staleHide {
