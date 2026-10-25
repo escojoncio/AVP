@@ -1931,26 +1931,37 @@ static void watch(void *mtl_queue, int role) {
 //             not while a [passes] window is open
 //   census    3 s: which pipelines the real frames encode. Candidates: present in >= 80 % of those frames, the 20
 //             non-compute and the 6 compute ones with the most draws
-//   opts      3 rounds x 4 masks (OFF, ALL, ALL without each bit), round r in an order rotated by r so drift spreads
+//   opts      3 rounds x 7 masks (OFF, ALL, ALL without each bit), round r in an order rotated by r so drift spreads
 //             over the configs; 0.6 s to settle, 1.6 s measured. Bits: 0 producer-only fence waits (VPKEngine), 2 eye-copy
-//             trim (klvr_vk_submit.cpp, kl_abtest_eye_trim). Bit 1 (depth-clear skip) is never set (test v3)
+//             trim (klvr_vk_submit.cpp, kl_abtest_eye_trim), 3 gather copies, 4 fuse clears, 5 state elision (VPKEngine
+//             0043-0046; the engine gets mask & 0x39). Bit 1 (depth-clear skip) is never set (test v3). Each window also
+//             takes the median CPU ms of encoding per submit (opt_counters2 [0]/[1], per frame by delta): bit 5 saves CPU, not GPU
 //   knockout  the default mask; each candidate's draws skipped (0.4 s settle, 1.6 s measured) between baselines (first,
 //             after every 5 candidates, last): the saving is the baselines' median interpolated at the candidate minus its own
-//   verdict   per bit SAVES / NO EFFECT / WORSE / INACTIVE / BREAKS; the bits that save stay on for the session
+//   verdict   per bit SAVES / NO EFFECT / WORSE / INACTIVE / BREAKS; the mask applied is the bits that SAVE only (the
+//             winner), kept for the session and handed to the host (kl_abtest_result_mask)
+// Started at boot (KL_ABTEST=1: waits for the menu) or on demand (kl_abtest_start, from the "Laboratorio del motor": 4 s
+// after the next guest frame, outside loads). A gap of more than 1.5 s between guest frames (the game was paused) discards
+// the step like a load does.
 // Test v3: the metric is the guest frame's EXCLUSIVE GPU time median (stable at 19.6-19.9 ms over Logs_Alyx_36's
 // windows); the UNION span (busy[0]) is bimodal by phase against the compositor (~20.3 / ~22.4 ms) and gave false
 // knockout savings, so it is only logged beside it (and decides a window with fewer than 8 exclusive frames). A load
 // during a step pauses the test (everything back to legacy); the step is measured again once the scene has been shown
 // for 3 s. The [passes] windows do not open while the test measures (their timestamps would perturb it).
-enum { kAbMaxFrames = 512, kAbCfgs = 4, kAbRounds = 3, kAbCandMax = 26, kAbCensusMax = 4096, kAbBaseMax = 16, kAbStepsMax = 40 };
+enum { kAbMaxFrames = 512, kAbCfgs = 7, kAbRounds = 3, kAbCandMax = 26, kAbCensusMax = 4096, kAbBaseMax = 16, kAbStepsMax = 40 };
 enum { kAbOff, kAbWait, kAbCensus, kAbOpts, kAbKnock, kAbDone, kAbFailed };
 // Test v3 (Logs_Alyx_36): bit 1 (redundant depth-clear skip) is out of the test and of every mask applied: WORSE by
-// 2.5 ms of union span with no change in exclusive time. Configs: OFF, ALL (bits 0 + 2), ALL minus bit 0, ALL minus bit 2.
-static const unsigned k_ab_mask[kAbCfgs] = { 0, 5, 4, 1 };
-static const char *const k_ab_cfg[kAbCfgs] = { "OFF", "ALL", "ALL-prodwait", "ALL-eyetrim" };
-static const int k_ab_tbit[2] = { 0, 2 };   // the bits tested; bit k_ab_tbit[j] is off in config 2 + j
-static const char *const k_ab_bit[3] = { "producer-only fence waits (bit0)", "redundant depth-clear skip (bit1)",
-                                         "eye-copy trim (bit2)" };
+// 2.5 ms of union span with no change in exclusive time. Configs: OFF, ALL (bits 0, 2, 3, 4, 5), ALL minus each bit.
+#define KL_ENG_BITS 0x3Du      // the bits the lab knows: 0, 2, 3, 4, 5 (never 1)
+#define KL_ENG_ENGINE 0x39u    // the ones VPKEngine gets (bit 2 is the host's eye-copy trim)
+enum { kAbTBits = 5 };
+static const unsigned k_ab_mask[kAbCfgs] = { 0, 0x3D, 0x3C, 0x39, 0x35, 0x2D, 0x1D };
+static const char *const k_ab_cfg[kAbCfgs] = { "OFF", "ALL", "ALL-prodwait", "ALL-eyetrim", "ALL-gather", "ALL-fuseclears",
+                                               "ALL-stateelide" };
+static const int k_ab_tbit[kAbTBits] = { 0, 2, 3, 4, 5 };   // the bits tested; bit k_ab_tbit[j] is off in config 2 + j
+static const char *const k_ab_bit[6] = { "producer-only fence waits (bit0)", "redundant depth-clear skip (bit1)",
+                                         "eye-copy trim (bit2)", "gather copies (bit3)", "fuse clears (bit4)",
+                                         "state elision (bit5)" };
 typedef struct {
     double t0, m_t0;               // window start (settling), measurement start (0 = still settling)
     double settle, measure;
@@ -1961,6 +1972,10 @@ typedef struct {
     double sum, excl_sum;
     unsigned excl_n;               // entries in xs
     uint64_t c0[9];                // vpgpu_metal2_opt_counters at the measurement start
+    uint64_t d0[16];               // vpgpu_metal2_opt_counters2 then, and at the latest frame (e_last): the encoding CPU
+    uint64_t e_last[16];
+    float es[kAbMaxFrames];        // encoding ms per submit of each guest frame (delta [0] / delta [1])
+    unsigned es_n;
     uint32_t h0;                   // GPU hangs then
     uint32_t hb;                   // GPU hangs at the window's start (settle included)
     unsigned tr0;                  // eye-copy trims then
@@ -1974,11 +1989,21 @@ typedef struct {
     // exclusive mean (-1 = never accounted), fps = guest fps.
     double med, umed, mean, excl, fps;
     uint64_t dc[9];                // counter deltas
+    uint64_t dc2[16];              // opt_counters2 deltas ([3] elided, [6] gathered, [9] clears fused ...)
+    double emed;                   // median encoding CPU ms per submit (-1: counters2 missing or < 8 samples)
     uint32_t hangs;
     unsigned trims;
 } ab_result;
 static int g_ab_env;                          // KL_ABTEST=1 (ab_env)
-static _Atomic int g_ab_trim_flag;            // bit 2 of the mask in force: the eye copies read it per submit
+static _Atomic int g_ab_trim_flag;            // bit 2 of the mask in force: the eye copies read it per submit (eng_boot sets it)
+static _Atomic unsigned g_engine_mask;        // the mask in force, KL_ENG_BITS (kl_engine_set_opts; the test's winner after it)
+static _Atomic int g_eng_pending;             // a mask the engine has not taken yet (eng_sync, game thread)
+static _Atomic int g_ab_start_req;            // kl_abtest_start: taken by the next ab_tick
+static _Atomic int g_ab_used;                 // an on-demand test was requested: its HUD line shows without KL_ABTEST=1
+static _Atomic int g_ab_phase, g_ab_left;     // KL_ABTEST_* and the seconds left, for the host's UI (ab_publish)
+static _Atomic unsigned g_ab_serial;          // tests that ended DONE
+static os_unfair_lock g_ab_res_lk = OS_UNFAIR_LOCK_INIT;
+static struct { int valid; int cls[6]; double gpu[6], cpu[6]; unsigned mask; } g_ab_res;   // the last verdict (under the lock)
 static _Atomic unsigned g_ab_trims;           // eye copies trimmed (kl_abtest_note_trim)
 static _Atomic int g_ab_loading;              // the grid is shown: a load is on
 static _Atomic unsigned g_ab_loads, g_ab_shows;   // grid fade-ins (load starts) and fade-outs (scenes shown)
@@ -1988,6 +2013,7 @@ static double g_ab_hud_until;                 // done/failed: the line goes away
 static void (*ab_set_opts)(uint32_t);
 static void (*ab_set_knock)(uint64_t);
 static void (*ab_counters)(uint64_t *);
+static void (*ab_counters2)(uint64_t *);                   // 0042, optional: no encoding CPU without it
 static uint64_t (*ab_census)(int);
 static int (*ab_census_get)(uint64_t *, uint64_t *, uint64_t *, uint8_t *, char (*)[48], int);
 static uint32_t (*ab_hangs)(void);
@@ -2000,6 +2026,9 @@ static struct {
     double menu_since;                        // wait: since when the real frames look like the menu (0 = not yet)
     int menu_said, menu_low;                  // menu_low: consecutive frames under 50 encoders
     unsigned seen_loads, seen_shows;
+    int hot;                                  // started on demand (kl_abtest_start): no 25 s / menu wait
+    double last_tick;                         // the previous guest frame's time (a gap = the game was paused)
+    unsigned final_mask;                      // the winner (the bits that SAVE): set by the verdict
     uint32_t last_fed;                        // the newest final frame already fed to a window
     ab_window w;
     int step;                                 // opts: 0..11; knockout: index into steps
@@ -2012,9 +2041,9 @@ static struct {
     ab_result knock[kAbCandMax], base[kAbBaseMax];
     double save[kAbCandMax], usave[kAbCandMax];   // knockout savings: exclusive (ranks), union (logged beside it)
     int save_ok[kAbCandMax];
-    // The default mask (VPVK_RUNTIME_OPTS & 1, | 4 with KL_EYE_TRIM=1; bit 1 never since test v3): what the session runs without the test, and
-    // what the census, the knockout, pauses and a failed test run at. The optimisations' verdict (printed when that
-    // phase ends) adds the bits that SAVE and drops those that are WORSE or BREAK.
+    // The default mask (the mask in force when the test starts: the saved lab switches, else VPVK_RUNTIME_OPTS & 0x39 |
+    // 4 with KL_EYE_TRIM=1; bit 1 never): what the census, pauses and a failed test run at. The optimisations' verdict
+    // (printed when that phase ends) makes the winner (save_bits) the new def_mask, which the knockout then runs at.
     unsigned def_mask, save_bits, bad_bits;
     int verdict_done;
 } g_ab;
@@ -2067,15 +2096,25 @@ static void ab_hud(const char *fmt, ...) {
     memcpy(g_ab_hud_text, t, sizeof t);
     os_unfair_lock_unlock(&g_ab_hud_lk);
 }
+// The mask before the host says anything: VPVK_RUNTIME_OPTS & 0x39 (the engine reads the same variable at start) and
+// bit 2 from KL_EYE_TRIM=1. kl_engine_set_opts runs it first, so the environment never overwrites the host's mask.
+static void eng_boot(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *o = getenv("VPVK_RUNTIME_OPTS"), *t = getenv("KL_EYE_TRIM");
+        unsigned m = (o && *o ? (unsigned)(strtoul(o, NULL, 0) & KL_ENG_ENGINE) : 0u) | (t && *t == '1' ? 4u : 0u);
+        atomic_store(&g_engine_mask, m);
+        atomic_store(&g_ab_trim_flag, (m & 4u) ? 1 : 0);
+    });
+}
 static int ab_env(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         const char *e = getenv("KL_ABTEST");
         g_ab_env = e && *e == '1';
         if (g_ab_env) {
-            const char *o = getenv("VPVK_RUNTIME_OPTS"), *t = getenv("KL_EYE_TRIM");
-            g_ab.def_mask = (o && *o ? (unsigned)(strtoul(o, NULL, 0) & 1u) : 0u) | (t && *t == '1' ? 4u : 0u);
-            atomic_store(&g_ab_trim_flag, (g_ab.def_mask & 4u) ? 1 : 0);   // bit 2 as the default until the test runs
+            eng_boot();
+            g_ab.def_mask = atomic_load(&g_engine_mask);   // bit 2 as the default until the test runs
             g_ab.state = kAbWait;
             ab_hud("TEST: esperando al menú (tras el logo de Valve) · quédate quieto");
             ab_out("[abtest] automatic A/B test on (KL_ABTEST=1): starts 25 s after the first frame, outside loads\n");
@@ -2083,8 +2122,7 @@ static int ab_env(void) {
     });
     return g_ab_env;
 }
-static void ab_scene(int to_grid) {
-    if (!ab_env()) return;
+static void ab_scene(int to_grid) {   // always counted: an on-demand test needs the loads too
     if (to_grid) {
         if (!atomic_exchange(&g_ab_loading, 1)) atomic_fetch_add(&g_ab_loads, 1u);
     } else {
@@ -2103,6 +2141,7 @@ int kl_abtest_eye_trim(void) {
     // margin of the trim covers.
     static dispatch_once_t once;
     static int unsafe, env_trim;
+    eng_boot();
     dispatch_once(&once, ^{
         const char *why = ab_env_is("KL_EYE_MIPS", "1") ? "KL_EYE_MIPS" : ab_env_is("KL_EYE_FXAA", "1") ? "KL_EYE_FXAA"
                         : ab_env_is("KL_EYE_SHARPEN", NULL) ? "KL_EYE_SHARPEN" : ab_env_is("KL_EYE_FX", NULL) ? "KL_EYE_FX"
@@ -2115,11 +2154,11 @@ int kl_abtest_eye_trim(void) {
             ab_out("[abtest] eye-copy trim on (KL_EYE_TRIM=1)\n");
     });
     if (unsafe) return 0;
-    return ab_env() ? atomic_load(&g_ab_trim_flag) : env_trim;
+    return atomic_load(&g_ab_trim_flag);   // KL_EYE_TRIM at start, then the lab's bit 2 / the test's
 }
 void kl_abtest_note_trim(void) { atomic_fetch_add(&g_ab_trims, 1u); }
 int kl_abtest_hud(char *buf, int n) {
-    if (!ab_env()) return 0;
+    if (!ab_env() && !atomic_load(&g_ab_used)) return 0;
     int shown = 1;
     os_unfair_lock_lock(&g_ab_hud_lk);
     if (g_ab_hud_until > 0 && CACurrentMediaTime() >= g_ab_hud_until) shown = 0;
@@ -2141,6 +2180,7 @@ static int ab_resolve(void) {
     ab_set_opts = (void (*)(uint32_t))dlsym(s, "vpgpu_metal2_set_opts");
     ab_set_knock = (void (*)(uint64_t))dlsym(s, "vpgpu_metal2_set_knockout");
     ab_counters = (void (*)(uint64_t *))dlsym(s, "vpgpu_metal2_opt_counters");
+    ab_counters2 = (void (*)(uint64_t *))dlsym(s, "vpgpu_metal2_opt_counters2");
     ab_census = (uint64_t (*)(int))dlsym(s, "vpgpu_metal2_census");
     ab_census_get = (int (*)(uint64_t *, uint64_t *, uint64_t *, uint8_t *, char (*)[48], int))dlsym(s, "vpgpu_metal2_census_get");
     ab_hangs = (uint32_t (*)(void))dlsym(s, "vpgpu_metal2_gpu_hangs");
@@ -2154,11 +2194,12 @@ static int ab_resolve(void) {
         return 0;
     }
     if (!ab_hangs) ab_out("[abtest] no vpgpu_metal2_gpu_hangs: BREAKS cannot be detected\n");
+    if (!ab_counters2) ab_out("[abtest] no vpgpu_metal2_opt_counters2 (patch 0042 missing): no encoding CPU, bits 3-5 cannot be seen acting\n");
     return 1;
 }
-// Bits 0-1 to VPKEngine, bit 2 to the eye copies.
+// Bits 0, 3, 4, 5 to VPKEngine, bit 2 to the eye copies.
 static void ab_apply(unsigned mask) {
-    if (ab_set_opts) ab_set_opts(mask & 1u);   // bit 1 (clear skip) never: out since test v3
+    if (ab_set_opts) ab_set_opts(mask & KL_ENG_ENGINE);   // bit 1 (clear skip) never: out since test v3
     atomic_store(&g_ab_trim_flag, (mask & 4u) ? 1 : 0);
 }
 static int ab_active(void) { return g_ab.state == kAbCensus || g_ab.state == kAbOpts || g_ab.state == kAbKnock; }
@@ -2200,10 +2241,15 @@ static void ab_counters_now(uint64_t c[9]) {
     if (ab_counters) ab_counters(c);
 }
 
+static void ab_counters2_now(uint64_t c[16]) {
+    memset(c, 0, 16 * sizeof c[0]);
+    if (ab_counters2) ab_counters2(c);
+}
+
 static void ab_win_begin(double now, double settle, double measure) {
     ab_window *w = &g_ab.w;
     w->t0 = now; w->m_t0 = 0; w->settle = settle; w->measure = measure;
-    w->first_frame = 0; w->ends = 0; w->n = 0;
+    w->first_frame = 0; w->ends = 0; w->n = 0; w->es_n = 0;
     w->sum = 0; w->excl_sum = 0; w->excl_n = 0;
     w->hb = ab_hangs ? ab_hangs() : 0;
 }
@@ -2216,11 +2262,20 @@ static int ab_win_tick(double now, uint32_t frame, uint32_t f, double uni, doubl
         w->m_t0 = now;
         w->first_frame = frame;
         ab_counters_now(w->c0);
+        ab_counters2_now(w->d0);
+        memcpy(w->e_last, w->d0, sizeof w->d0);
         w->h0 = ab_hangs ? ab_hangs() : 0;
         w->tr0 = atomic_load(&g_ab_trims);
         return 0;
     }
     w->ends++;
+    if (ab_counters2) {   // encoding CPU of the submits since the last guest frame (ns / submits), one sample per frame
+        uint64_t c2[16];
+        ab_counters2_now(c2);
+        if (c2[1] > w->e_last[1] && c2[0] >= w->e_last[0] && w->es_n < kAbMaxFrames)
+            w->es[w->es_n++] = (float)((double)(c2[0] - w->e_last[0]) / (double)(c2[1] - w->e_last[1]) / 1e6);
+        w->e_last[0] = c2[0]; w->e_last[1] = c2[1];
+    }
     if (f && f >= w->first_frame && w->n < kAbMaxFrames) {
         w->ms[w->n++] = (float)uni;
         w->sum += uni;
@@ -2251,9 +2306,17 @@ static int ab_win_tick(double now, uint32_t frame, uint32_t f, double uni, doubl
         r->med = r->umed;
         r->valid = 0;
     }
-    uint64_t c1[9];
+    r->emed = -1;
+    if (w->es_n >= 8) {
+        memcpy(tmp, w->es, w->es_n * sizeof tmp[0]);
+        qsort(tmp, w->es_n, sizeof tmp[0], ab_cmpf);
+        r->emed = w->es_n % 2 ? tmp[w->es_n / 2] : 0.5 * ((double)tmp[w->es_n / 2 - 1] + tmp[w->es_n / 2]);
+    }
+    uint64_t c1[9], d1[16];
     ab_counters_now(c1);
+    ab_counters2_now(d1);
     for (int k = 0; k < 9; k++) r->dc[k] = c1[k] - w->c0[k];
+    for (int k = 0; k < 16; k++) r->dc2[k] = d1[k] - w->d0[k];
     r->hangs = (ab_hangs ? ab_hangs() : 0) - w->h0;
     r->trims = atomic_load(&g_ab_trims) - w->tr0;
     return 1;
@@ -2284,6 +2347,7 @@ static int ab_left(double now) {
 }
 // The HUD line of the phase in hand, with the time left (every frame while the test measures).
 static void ab_hud_progress(double now) {
+    if (ab_active()) atomic_store(&g_ab_left, ab_left(now));
     if (g_ab.state == kAbCensus) {
         ab_hud("TEST 1/3: midiendo shaders · faltan ~%d s · no te muevas", ab_left(now));
     } else if (g_ab.state == kAbOpts) {
@@ -2343,12 +2407,12 @@ static void ab_step_begin(double now) {
         ab_knock_window_begin(now);
     }
 }
-static void ab_pause(void) {
+static void ab_pause(const char *why) {
     g_ab.paused = 1;
     ab_set_knock(0);
     ab_apply(g_ab.def_mask);
     if (g_ab.state == kAbCensus) (void)ab_census(0);
-    ab_out("[abtest] a load started: step discarded, the test resumes 3 s after the scene is shown\n");
+    ab_out("[abtest] %s: step discarded, the test resumes 3 s after the scene is shown\n", why);
     ab_hud("TEST en pausa (cargando)");
 }
 
@@ -2413,12 +2477,14 @@ static void ab_opts_tick(double now, uint32_t frame, uint32_t f, double uni, dou
     int s = g_ab.step, r = s / kAbCfgs, cfg = (r + s % kAbCfgs) % kAbCfgs;
     g_ab.opt[r][cfg] = res;
     const uint64_t *d = res.dc;
-    ab_out("[abtest] window r=%d cfg=%s mask=%u frames=%u (excl %u) excl med %.2f mean %.2f | union med %.2f mean %.2f%s | fps %.1f "
-            "prodcb %llu/%llu fencewaits/cb %.1f clears %llu/%llu trims %u indirect calls %llu encoded %llu real %llu hangs %u%s\n",
+    ab_out("[abtest] window r=%d cfg=%s mask=%u frames=%u (excl %u) excl med %.2f mean %.2f | union med %.2f mean %.2f%s | enc med %.2f ms | fps %.1f "
+            "prodcb %llu/%llu fencewaits/cb %.1f clears %llu/%llu trims %u gathered %llu clearFused %llu stateElided %llu "
+            "indirect calls %llu encoded %llu real %llu hangs %u%s\n",
             r, k_ab_cfg[cfg], k_ab_mask[cfg], res.n, res.xn, res.fallback ? -1.0 : res.med, res.excl, res.umed, res.mean,
-            res.fallback ? " (FALLBACK: < 8 frames with exclusive time; not used)" : "", res.fps, (unsigned long long)d[1],
+            res.fallback ? " (FALLBACK: < 8 frames with exclusive time; not used)" : "", res.emed, res.fps, (unsigned long long)d[1],
             (unsigned long long)d[0], d[0] ? (double)d[2] / (double)d[0] : 0.0, (unsigned long long)d[4],
-            (unsigned long long)d[3], res.trims, (unsigned long long)d[6], (unsigned long long)d[7],
+            (unsigned long long)d[3], res.trims, (unsigned long long)res.dc2[6], (unsigned long long)res.dc2[9],
+            (unsigned long long)res.dc2[3], (unsigned long long)d[6], (unsigned long long)d[7],
             (unsigned long long)d[8], res.hangs, res.valid ? "" : " (too few frames: not used)");
     if (++g_ab.step < kAbRounds * kAbCfgs) { ab_opt_window_begin(now); return; }
     ab_opts_verdict();   // now, so a user who quits during the knockout still leaves it in the log
@@ -2482,7 +2548,7 @@ static void ab_knock_tick(double now, uint32_t frame, uint32_t f, double uni, do
 }
 
 // The optimisations' verdict (printed as soon as their phase ends): noise, one line per bit, ALL vs OFF, indirect-count
-// draws, and the mask the session will get (default + SAVES - WORSE/BREAKS: g_ab.save_bits / bad_bits).
+// draws, and the mask the session will get (the bits that SAVE: g_ab.save_bits / bad_bits, g_ab.final_mask).
 static void ab_opts_verdict(void) {
     g_ab.verdict_done = 1;
     // Noise: a robust sigma of one window's median from the pairwise differences between rounds of the same config,
@@ -2504,42 +2570,60 @@ static void ab_opts_verdict(void) {
             "with every round > 0; WORSE = gain < -%.2f ms with every round < 0\n", noise, sigma, npd, 2 * noise, 2 * noise);
     ab_out("[abtest] VERDICT %s: not tested since test v3 (Logs_Alyx_36: WORSE by 2.5 ms of union, exclusive unchanged); never applied\n",
            k_ab_bit[1]);
-    for (int j = 0; j < 2; j++) {
+    os_unfair_lock_lock(&g_ab_res_lk);
+    memset(&g_ab_res, 0, sizeof g_ab_res);
+    os_unfair_lock_unlock(&g_ab_res_lk);
+    int cls_of[6] = { 0 };
+    double gpu_of[6] = { 0 }, cpu_of[6] = { 0 };
+    for (int j = 0; j < kAbTBits; j++) {
         const int b = k_ab_tbit[j], cb = 2 + j;   // the bit and the config without it
-        double g[kAbRounds], gc[kAbRounds];
-        int ng = 0;
-        for (int r = 0; r < kAbRounds; r++)
+        double g[kAbRounds], gc[kAbRounds], ce[kAbRounds], cec[kAbRounds];
+        int ng = 0, ncpu = 0;
+        for (int r = 0; r < kAbRounds; r++) {
             if (g_ab.opt[r][1].valid && g_ab.opt[r][cb].valid) g[ng++] = g_ab.opt[r][cb].med - g_ab.opt[r][1].med;
+            // Encoding CPU (ms per submit): the config without the bit minus ALL, positive = the bit saves CPU.
+            if (g_ab.opt[r][1].emed >= 0 && g_ab.opt[r][cb].emed >= 0) ce[ncpu++] = g_ab.opt[r][cb].emed - g_ab.opt[r][1].emed;
+        }
         memcpy(gc, g, sizeof gc);
-        double gain = ng ? ab_median(gc, ng) : 0;
-        int allpos = ng > 0, allneg = ng > 0;
+        memcpy(cec, ce, sizeof cec);
+        double gain = ng ? ab_median(gc, ng) : 0, cgain = ncpu ? ab_median(cec, ncpu) : 0;
+        int allpos = ng > 0, allneg = ng > 0, callpos = ncpu > 0;
         for (int k = 0; k < ng; k++) { if (!(g[k] > 0)) allpos = 0; if (!(g[k] < 0)) allneg = 0; }
+        for (int k = 0; k < ncpu; k++) if (!(ce[k] > 0)) callpos = 0;
         uint64_t acted = 0;
         unsigned hang_on = 0, hang_off = 0;
         for (int r = 0; r < kAbRounds; r++)
             for (int c = 0; c < kAbCfgs; c++) {
                 const ab_result *x = &g_ab.opt[r][c];
                 if ((k_ab_mask[c] >> b) & 1u) {
-                    acted += b == 0 ? x->dc[1] : b == 1 ? x->dc[4] : x->trims;
+                    acted += b == 0 ? x->dc[1] : b == 2 ? x->trims : b == 3 ? x->dc2[6] : b == 4 ? x->dc2[9] : x->dc2[3];
                     hang_on += x->hangs;
                 } else hang_off += x->hangs;
             }
         const char *cls;
+        int code;
         // BREAKS: some window with the bit on hung and no window with it off did (= the bit was on in every window that hung).
-        if (hang_on > 0 && hang_off == 0) { cls = "BREAKS"; g_ab.bad_bits |= 1u << b; }
-        else if (!acted) cls = "INACTIVE";
-        else if (!ng) cls = "UNMEASURED";
-        else if (gain > 2 * noise && gain > 0.25 && allpos) { cls = "SAVES"; g_ab.save_bits |= 1u << b; }
-        else if (gain < -2 * noise && allneg) { cls = "WORSE"; g_ab.bad_bits |= 1u << b; }
-        else cls = "NO EFFECT";
-        char per[96];
-        int u = 0;
-        per[0] = 0;
+        if (hang_on > 0 && hang_off == 0) { cls = "BREAKS"; code = KL_ABV_BREAKS; g_ab.bad_bits |= 1u << b; }
+        else if (!acted) { cls = "INACTIVE"; code = KL_ABV_INACTIVE; }
+        // Bit 5 saves CPU, not GPU: SAVES when the encoding CPU drops >= 0.3 ms in every round without the GPU getting worse.
+        else if (b == 5 && ncpu && callpos && cgain >= 0.30 && (!ng || gain >= -noise)) {
+            cls = "SAVES"; code = KL_ABV_SAVES; g_ab.save_bits |= 1u << b;
+        }
+        else if (!ng && !(b == 5 && ncpu)) { cls = "UNMEASURED"; code = KL_ABV_NONE; }
+        else if (gain > 2 * noise && gain > 0.25 && allpos) { cls = "SAVES"; code = KL_ABV_SAVES; g_ab.save_bits |= 1u << b; }
+        else if (gain < -2 * noise && allneg) { cls = "WORSE"; code = KL_ABV_WORSE; g_ab.bad_bits |= 1u << b; }
+        else { cls = "NO EFFECT"; code = KL_ABV_NO_EFFECT; }
+        cls_of[b] = code; gpu_of[b] = gain; cpu_of[b] = cgain;
+        char per[96], cper[96];
+        int u = 0, cu = 0;
+        per[0] = 0; cper[0] = 0;
         for (int k = 0; k < ng && u < (int)sizeof per - 12; k++) u += snprintf(per + u, sizeof per - u, " %.2f", g[k]);
-        ab_out("[abtest] VERDICT %s: %s, gain %.2f ms (per round:%s); acted %llu (%s); hangs with it %u, without %u\n",
-                k_ab_bit[b], cls, gain, ng ? per : " none", (unsigned long long)acted,
-                b == 0 ? "command buffers with producer waits" : b == 1 ? "depth clears skipped" : "eye copies trimmed",
-                hang_on, hang_off);
+        for (int k = 0; k < ncpu && cu < (int)sizeof cper - 12; k++) cu += snprintf(cper + cu, sizeof cper - cu, " %.2f", ce[k]);
+        ab_out("[abtest] VERDICT %s: %s, gain %.2f ms (per round:%s); encoding CPU gain %.2f ms/submit (per round:%s); acted %llu (%s); "
+                "hangs with it %u, without %u\n",
+                k_ab_bit[b], cls, gain, ng ? per : " none", cgain, ncpu ? cper : " none", (unsigned long long)acted,
+                b == 0 ? "command buffers with producer waits" : b == 2 ? "eye copies trimmed" : b == 3 ? "copies gathered"
+                : b == 4 ? "clears fused" : "state sets elided", hang_on, hang_off);
     }
     {
         double t[kAbRounds], off[kAbRounds], all[kAbRounds];
@@ -2576,13 +2660,20 @@ static void ab_opts_verdict(void) {
                     "counters per frame: indirect-count over-encoding %.0f %%\n", (double)calls / ends, (double)enc / ends,
                     (double)real / ends, real ? 100.0 * ((double)enc - (double)real) / (double)real : 0.0);
     }
-    unsigned m = (g_ab.def_mask | g_ab.save_bits) & ~g_ab.bad_bits & ~2u;
-    ab_out("[abtest] VERDICT mask after the test: %u (default %u, + SAVES %u, - WORSE/BREAKS %u)\n", m, g_ab.def_mask,
+    // The winner: only the bits that SAVE (never bit 1). The knockout, its pauses and the end run at it.
+    g_ab.final_mask = g_ab.save_bits & KL_ENG_BITS & ~g_ab.bad_bits;
+    ab_out("[abtest] VERDICT mask after the test: %u (was %u; SAVES %u, WORSE/BREAKS %u)\n", g_ab.final_mask, g_ab.def_mask,
             g_ab.save_bits, g_ab.bad_bits);
+    g_ab.def_mask = g_ab.final_mask;
+    os_unfair_lock_lock(&g_ab_res_lk);
+    for (int b = 0; b < 6; b++) { g_ab_res.cls[b] = cls_of[b]; g_ab_res.gpu[b] = gpu_of[b]; g_ab_res.cpu[b] = cpu_of[b]; }
+    g_ab_res.mask = g_ab.final_mask;
+    g_ab_res.valid = 1;
+    os_unfair_lock_unlock(&g_ab_res_lk);
 }
 
 // The end: the knockout's summary, each candidate's description (0039), the MSL of the top savers, then the final
-// mask (default + SAVES - WORSE/BREAKS), applied for the rest of the session.
+// mask (the bits that SAVE), applied for the rest of the session.
 static void ab_finish(double now) {
     if (!g_ab.verdict_done) ab_opts_verdict();
     int idx[kAbCandMax], ni = 0;
@@ -2631,20 +2722,25 @@ static void ab_finish(double now) {
                         ab_dump_msl(g_ab.cand[i].key, dir), dir);
         }
     }
-    unsigned final_mask = (g_ab.def_mask | g_ab.save_bits) & ~g_ab.bad_bits & ~2u;
+    const unsigned final_mask = g_ab.final_mask;   // the bits that SAVE (bit 1 never): the winner
     ab_apply(final_mask);
-    ab_out("[abtest] final mask %u:%s%s%s%s (default %u + SAVES %u - WORSE/BREAKS %u; kept for the session); the test took "
-            "%.0f s\n", final_mask, final_mask & 1u ? " producer-waits" : "", final_mask & 2u ? " clear-skip" : "",
-            final_mask & 4u ? " eye-trim" : "", final_mask ? "" : " none (legacy)", g_ab.def_mask, g_ab.save_bits, g_ab.bad_bits,
+    atomic_store(&g_engine_mask, final_mask);      // what the host reads back and saves (kl_abtest_result_mask)
+    atomic_store(&g_eng_pending, 0);
+    ab_out("[abtest] final mask %u:%s%s%s%s%s%s (SAVES %u, WORSE/BREAKS %u; kept for the session); the test took "
+            "%.0f s\n", final_mask, final_mask & 1u ? " producer-waits" : "", final_mask & 4u ? " eye-trim" : "",
+            final_mask & 8u ? " gather-copies" : "", final_mask & 16u ? " fuse-clears" : "",
+            final_mask & 32u ? " state-elide" : "", final_mask ? "" : " none (legacy)", g_ab.save_bits, g_ab.bad_bits,
             g_ab.t_start ? now - g_ab.t_start : 0.0);
     g_ab.state = kAbDone;
+    atomic_fetch_add(&g_ab_serial, 1u);
     ab_sync();
     ab_hud("TEST TERMINADO ✓ ya puedes salir y mandar los logs");
     ab_hud_expire(now);
 }
 static void ab_fail(double now, const char *why) {
     g_ab.state = kAbFailed;
-    ab_apply(g_ab.def_mask);   // without the engine's switches only bit 2 takes; the engine keeps VPVK_RUNTIME_OPTS
+    ab_apply(atomic_load(&g_engine_mask));   // without the engine's switches only bit 2 takes; the engine keeps VPVK_RUNTIME_OPTS
+    atomic_store(&g_eng_pending, 1);         // eng_sync hands the host's mask to the engine as soon as it can
     ab_out("[abtest] test not run: %s\n", why);
     ab_sync();
     ab_hud("TEST no disponible (mira el log)");
@@ -2653,10 +2749,36 @@ static void ab_fail(double now, const char *why) {
 
 // Game thread, every guest frame (kl_gpu_time_frame_end): `frame` is the frame just opened; timing = 0 while no
 // command buffer is timed (the -commit hook is not installed: KL_GPU_TIME=0, or no guest queue watched yet).
-static void ab_tick(uint32_t frame, int timing) {
-    if (!ab_env() || g_ab.state == kAbDone || g_ab.state == kAbFailed) return;
+// An on-demand test (kl_abtest_start), taken on the game thread: from idle, done or failed. One that waits or measures
+// is left alone. Everything of the previous test goes (its verdict too), except the loads already seen.
+static void ab_hot_begin(double now) {
+    if (g_ab.state == kAbWait || ab_active()) return;
+    const uint32_t lf = g_ab.last_fed;
+    memset(&g_ab, 0, sizeof g_ab);
+    g_ab.last_fed = lf;
+    g_ab.seen_loads = atomic_load(&g_ab_loads);
+    g_ab.seen_shows = atomic_load(&g_ab_shows);
+    g_ab.hot = 1;
+    g_ab.t_first = now;
+    g_ab.def_mask = atomic_load(&g_engine_mask);
+    g_ab.state = kAbWait;
+    os_unfair_lock_lock(&g_ab_hud_lk);
+    g_ab_hud_until = 0;
+    os_unfair_lock_unlock(&g_ab_hud_lk);
+    os_unfair_lock_lock(&g_ab_res_lk);
+    g_ab_res.valid = 0;
+    os_unfair_lock_unlock(&g_ab_res_lk);
+    ab_hud("TEST: empieza en 4 s · quédate quieto mirando al frente");
+    ab_out("[abtest] on-demand test requested (Laboratorio del motor): starts 4 s after this frame, outside loads\n");
+}
+static void ab_tick_inner(uint32_t frame, int timing) {
+    ab_env();
+    if (atomic_exchange(&g_ab_start_req, 0)) ab_hot_begin(CACurrentMediaTime());
+    if (g_ab.state == kAbOff || g_ab.state == kAbDone || g_ab.state == kAbFailed) return;
     double now = CACurrentMediaTime();
     if (!g_ab.t_first) g_ab.t_first = now;
+    const double last_tick = g_ab.last_tick;
+    g_ab.last_tick = now;
     if (!timing) {
         // Nothing can be measured without GPU timing: give it 40 s (the guest's queue is watched at its first submit).
         if (now - g_ab.t_first >= 40.0) {
@@ -2664,16 +2786,23 @@ static void ab_tick(uint32_t frame, int timing) {
             ab_fail(now, e && *e == '0' ? "GPU timing is off (KL_GPU_TIME=0)"
                                         : "no GPU timing 40 s after the first frame (the guest's Metal queue was never watched)");
         } else if (g_ab.state == kAbWait) {
-            double left = g_ab.t_first + 25.0 - now;
+            double left = g_ab.t_first + (g_ab.hot ? 4.0 : 25.0) - now;
             ab_hud("TEST: empieza en %d s · quédate quieto mirando al frente", left > 0 ? (int)ceil(left) : 0);
         }
+        return;
+    }
+    // Guest frames stopped for a while (the game was paused: the lab's test is started from the pause menu): the step
+    // in hand spans the pause, so it is discarded like a load's.
+    if (ab_active() && !g_ab.paused && last_tick && now - last_tick > 1.5) {
+        g_ab.resume_at = now + 3.0;
+        ab_pause("the guest frames stopped (the game was paused)");
         return;
     }
     unsigned loads = atomic_load(&g_ab_loads), shows = atomic_load(&g_ab_shows);
     if (shows != g_ab.seen_shows) { g_ab.seen_shows = shows; g_ab.resume_at = now + 3.0; g_ab.menu_since = 0; }
     if (loads != g_ab.seen_loads) {
         g_ab.seen_loads = loads;
-        if (ab_active() && !g_ab.paused) ab_pause();
+        if (ab_active() && !g_ab.paused) ab_pause("a load started");
     }
     int loading = atomic_load(&g_ab_loading);
     // The newest final frame, fed once.
@@ -2682,11 +2811,13 @@ static void ab_tick(uint32_t frame, int timing) {
     if (f && f > g_ab.last_fed) g_ab.last_fed = f;
     else f = 0;
     if (g_ab.state == kAbWait) {
-        double start = g_ab.t_first + 25.0;
+        double start = g_ab.t_first + (g_ab.hot ? 4.0 : 25.0);   // on demand: 4 s after the first frame since the request
         if (g_ab.resume_at > start) start = g_ab.resume_at;
+        atomic_store(&g_ab_left, start > now ? (int)ceil(start - now) : 0);
         if (loading) { g_ab.menu_since = 0; ab_hud("TEST en pausa (cargando)"); return; }
         if (now < start || (g_prof > 0 && g_prof_from != UINT32_MAX)) {
-            ab_hud("TEST: esperando al menú (tras el logo de Valve) · quédate quieto");
+            if (g_ab.hot) ab_hud("TEST: empieza en %d s · quédate quieto mirando al frente", start > now ? (int)ceil(start - now) : 0);
+            else ab_hud("TEST: esperando al menú (tras el logo de Valve) · quédate quieto");
             return;
         }
         // Not during Valve's logo: Alyx shows it for ~15-25 s after the first picture with ~28 encoders a frame; the menu
@@ -2701,7 +2832,7 @@ static void ab_tick(uint32_t frame, int timing) {
             last_enc = (uint32_t (*)(void))dlsym(h ? h : RTLD_DEFAULT, "vpgpu_metal2_last_real_encoders");
             if (!last_enc) ab_out("[abtest] no vpgpu_metal2_last_real_encoders: the menu is not waited for\n");
         }
-        if (last_enc) {
+        if (last_enc && !g_ab.hot) {   // on demand: the player chose the place, no menu to wait for
             const uint32_t enc = last_enc();
             if (enc >= 50) {
                 g_ab.menu_low = 0;
@@ -2728,9 +2859,10 @@ static void ab_tick(uint32_t frame, int timing) {
             return;
         }
         g_ab.t_start = now;
-        ab_out("[abtest] starting %.1f s after the first frame; default mask %u (VPVK_RUNTIME_OPTS & 1%s): the census, "
-                "the knockout and pauses run at it; details/MSL dumps %s/%s\n", now - g_ab.t_first, g_ab.def_mask,
-                g_ab.def_mask & 4u ? ", KL_EYE_TRIM" : "", ab_census_detail ? "yes" : "no", ab_dump_msl ? "yes" : "no");
+        g_ab.def_mask = atomic_load(&g_engine_mask);   // the mask in force now (the lab's saved switches, else the environment's)
+        ab_out("[abtest] starting %.1f s after the %s; default mask %u (bits 0/3/4/5 to the engine, 2 = eye trim): the census "
+                "and pauses run at it; details/MSL dumps %s/%s\n", now - g_ab.t_first, g_ab.hot ? "request" : "first frame",
+                g_ab.def_mask, ab_census_detail ? "yes" : "no", ab_dump_msl ? "yes" : "no");
         ab_census_begin(now);
         return;
     }
@@ -2747,6 +2879,86 @@ static void ab_tick(uint32_t frame, int timing) {
     if (ab_active() && !g_ab.paused) ab_hud_progress(now);   // the time left, every frame
 }
 
+// The phase for the host's UI (kl_abtest_phase): the state machine's, KL_ABTEST_PAUSED while a step is discarded.
+static void ab_publish(void) {
+    const int p = g_ab.paused && ab_active() ? KL_ABTEST_PAUSED : g_ab.state;
+    atomic_store(&g_ab_phase, p);
+    if (!ab_active() && g_ab.state != kAbWait) atomic_store(&g_ab_left, 0);
+}
+static void ab_tick(uint32_t frame, int timing) {
+    ab_tick_inner(frame, timing);
+    ab_publish();
+}
+
+// ---- The engine lab's API (AVP "Laboratorio del motor"): the switches in force, and the A/B test on demand ---------
+static _Atomic int g_eng_avail = -1;   // the loaded VPKEngine has vpgpu_metal2_set_opts: -1 not known yet, 0 no, 1 yes (game thread)
+static void *eng_sym(const char *name) {   // game thread only: getenv races with the host's setenv elsewhere
+    const char *path = getenv("KL_MVK_DYLIB");
+    void *h = path && *path ? dlopen(path, RTLD_NOW | RTLD_NOLOAD) : NULL;
+    void *r = dlsym(h ? h : RTLD_DEFAULT, name);
+    if (h) dlclose(h);
+    return r;
+}
+// Every guest frame (kl_gpu_time_frame_end): a mask the host set goes to the engine here, never while the test drives it.
+static void eng_sync(void) {
+    int avail = atomic_load(&g_eng_avail);
+    if (avail == 0) return;
+    if (avail < 0) {   // the engine may load after the first frames: look for ~600 frames, then give up
+        static unsigned tries;
+        void *p = eng_sym("vpgpu_metal2_set_opts");
+        if (!p) {
+            if (++tries >= 600) atomic_store(&g_eng_avail, 0);
+            return;
+        }
+        ab_set_opts = (void (*)(uint32_t))p;
+        atomic_store(&g_eng_avail, 1);
+    }
+    if (ab_active()) return;
+    if (atomic_exchange(&g_eng_pending, 0) && ab_set_opts) ab_set_opts(atomic_load(&g_engine_mask) & KL_ENG_ENGINE);
+}
+void kl_engine_set_opts(uint32_t mask) {
+    eng_boot();
+    const unsigned m = mask & KL_ENG_BITS;   // bit 1 (clear skip) and any unknown bit never
+    atomic_store(&g_engine_mask, m);
+    const int ph = atomic_load(&g_ab_phase);
+    if ((ph >= KL_ABTEST_CENSUS && ph <= KL_ABTEST_KNOCK) || ph == KL_ABTEST_PAUSED) return;   // the test's winner replaces it
+    atomic_store(&g_ab_trim_flag, (m & 4u) ? 1 : 0);
+    atomic_store(&g_eng_pending, 1);
+}
+uint32_t kl_engine_get_opts(void) {
+    eng_boot();
+    return atomic_load(&g_engine_mask);
+}
+int kl_engine_available(void) { return atomic_load(&g_eng_avail) > 0; }
+int kl_abtest_start(void) {
+    const int ph = atomic_load(&g_ab_phase);
+    if (ph == KL_ABTEST_WAIT || (ph >= KL_ABTEST_CENSUS && ph <= KL_ABTEST_KNOCK) || ph == KL_ABTEST_PAUSED
+        || atomic_load(&g_ab_start_req)) return 0;
+    if (atomic_load(&g_eng_avail) == 0) return -1;
+    atomic_store(&g_ab_used, 1);
+    atomic_store(&g_ab_start_req, 1);
+    return 1;
+}
+int kl_abtest_phase(void) { return atomic_load(&g_ab_start_req) ? KL_ABTEST_WAIT : atomic_load(&g_ab_phase); }
+int kl_abtest_seconds_left(void) { return atomic_load(&g_ab_left); }
+unsigned kl_abtest_result_serial(void) { return atomic_load(&g_ab_serial); }
+uint32_t kl_abtest_result_mask(void) {
+    os_unfair_lock_lock(&g_ab_res_lk);
+    const uint32_t m = g_ab_res.valid ? g_ab_res.mask : atomic_load(&g_engine_mask);
+    os_unfair_lock_unlock(&g_ab_res_lk);
+    return m;
+}
+int kl_abtest_result(int bit, double *gpu_ms, double *cpu_ms) {
+    int c = 0;
+    double g = 0, u = 0;
+    os_unfair_lock_lock(&g_ab_res_lk);
+    if (g_ab_res.valid && bit >= 0 && bit < 6) { c = g_ab_res.cls[bit]; g = g_ab_res.gpu[bit]; u = g_ab_res.cpu[bit]; }
+    os_unfair_lock_unlock(&g_ab_res_lk);
+    if (gpu_ms) *gpu_ms = g;
+    if (cpu_ms) *cpu_ms = u;
+    return c;
+}
+
 unsigned kl_gpu_time_frame(void) { return g_commit ? g_frame : 0; }
 void kl_gpu_time_watch(void *mtl_queue) { watch(mtl_queue, 0); }
 void kl_gpu_time_watch_compositor(void *mtl_queue) { watch(mtl_queue, 1); }
@@ -2758,6 +2970,7 @@ void kl_gpu_time_frame_end(void) {
     uint32_t frame = g_frame;
     int on = g_commit != NULL;
     os_unfair_lock_unlock(&g_lk);
+    eng_sync();               // the engine lab: a mask the host set (kl_engine_set_opts) reaches VPKEngine at this frame
     if (!on) { ab_tick(frame, 0); return; }   // KL_ABTEST: fails after 40 s without GPU timing instead of waiting forever
     if (g_prof > 0) {
         prof_report(frame);   // closes the active window once its frames are final

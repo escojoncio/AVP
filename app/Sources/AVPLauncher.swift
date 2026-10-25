@@ -430,6 +430,7 @@ struct AVPPausedView: View {
     @ObservedObject private var model = AVPModel.shared
     @Environment(\.dismissWindow) private var dismissWindow
     @State private var showSettings = false
+    @State private var showLab = false
     @State private var resuming = false
 
     var body: some View {
@@ -459,6 +460,10 @@ struct AVPPausedView: View {
                         Label(AVPL("Ajustes", "Settings"), systemImage: "gearshape")
                     }
                     .buttonStyle(AVPPillButtonStyle(prominent: false))
+                    Button { showLab = true } label: {
+                        Label(AVPL("Laboratorio del motor", "Engine lab"), systemImage: "testtube.2")
+                    }
+                    .buttonStyle(AVPPillButtonStyle(prominent: false))
                     Button(role: .destructive) { Lifecycle.quit() } label: {
                         Label(AVPL("Salir del juego", "Quit the game"), systemImage: "xmark.circle")
                     }
@@ -478,9 +483,10 @@ struct AVPPausedView: View {
             }
         }
         .ignoresSafeArea()
-        .onAppear { model.setBatteryPolling(true) }
+        .onAppear { model.setBatteryPolling(true); AVPSettings.shared.adoptLabResult() }
         .onDisappear { model.setBatteryPolling(false) }
         .sheet(isPresented: $showSettings) { AVPSettingsView() }
+        .sheet(isPresented: $showLab) { AVPEngineLabSheet() }
     }
 }
 

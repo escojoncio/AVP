@@ -27,6 +27,7 @@ struct AVPSettingsView: View {
                 foveationSection
                 textures
                 gameSection
+                engineLabLink
                 diagnostics
                 certificateSection
                 accountSection
@@ -214,6 +215,19 @@ struct AVPSettingsView: View {
         } footer: {
             Text(AVPL("Las voces siempre en inglés. El movimiento solo se aplica mientras el juego no tenga opciones guardadas. Subtítulos: el juego los pone abajo; las otras opciones los suben. Altura del jugador: negativo = Alyx más baja (jugando sentado, o si el suelo del juego queda demasiado lejos de las manos); se aplica en vivo desde la pausa. Dedos reales: los dedos del jugador siguen a tus dedos de verdad (como con los mandos Index de Valve) cuando el visor ve la mano; pide permiso de seguimiento de manos la primera vez. Con un mando Sense en la mano el visor NO da el seguimiento de esa mano (medido): solo actúa con las manos libres. Al arrancar el juego.",
                       "Voices are always English. Movement only applies until the game has saved options. Subtitles: the game puts them low; the other options raise them. Player height: negative = Alyx lower (playing seated, or when the game's floor sits too far from your hands); applies live from the pause menu. Real fingers: the player's fingers follow your own (as with Valve's Index controllers) when the headset sees the hand; asks for the hand-tracking permission once. With a Sense controller in the hand the headset does NOT track that hand (measured): it only acts with free hands. At game start."))
+        }
+    }
+
+    private var engineLabLink: some View {
+        Section {
+            NavigationLink {
+                AVPEngineLabView()
+            } label: {
+                Label(AVPL("Laboratorio del motor", "Engine lab"), systemImage: "testtube.2")
+            }
+        } footer: {
+            Text(AVPL("Optimizaciones del motor gráfico que se activan una a una (o con una prueba automática) y se aplican en vivo.",
+                      "Graphics engine optimisations that you switch on one by one (or with an automatic test), applied live."))
         }
     }
 
