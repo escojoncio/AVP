@@ -603,6 +603,8 @@ final class AVPSettings: ObservableObject {
             // encoder); gpu.enc detail (tile=/mem= per attachment, VPKEngine 0035) every 3000 core frames (~20 s).
             ("VP_EXCL_TIMING", gpuPassProfiling ? "1" : "0"),
             ("VP_FRAME_DETAIL", "3000"),
+            // Elisión de stores MSAA muertos, VPKEngine 0051; quitar si hay frames corruptos.
+            ("VPVK_MSAA_DEAD_STORE", "1"),
         ]
         // VPKTAA inputs not usable yet (build 17 log): VPKEngine's motion vectors are all zero (its "eye frame"
         // restarts at every depth-clearing multiview pass, 4-7 per game frame, so no draw ever finds last frame's
