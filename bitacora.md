@@ -17,6 +17,9 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
 - B61 segundo plano (`KleptonApp.swift`): `.background` con inmersivo → `kl_guest_set_paused(1)` (`Lifecycle.pausedByBackground`),
   reanuda solo en `.active` si no lo pausó el usuario; compositor sigue presentando (regla watchdog); stale-hide no salta.
 - B61 `kl_vulkan.c`: log `[vkmem]` dice qué limita (OS / `KL_VK_HEAP_MB` / heap anunciado). Valores sin cambio.
+- Reparto real B61 (ventanas estables `[passes]` busy≈suma by-kind, sin idle oculto): fov ON busy 21,5 ms = scene-msaa 16,6
+  (vtx 4,0/frag 12,6; 2112x1728 s4 ld2 st2+r, z f260 s4) + eye-1x 3,4 + blit 1,0; fov OFF busy 30 = scene-msaa 23,7 (frag 19,2).
+  W1–W3 son carga, no usar. `gpu.time` = juego+compositor con EMA (`klvr_compositor.cpp:761-770`, unverified).
 - Logs B61 A/B foveado (misma zona): OFF `gpu.time` p50 22,97/p90 26,0 ms; ON (luego OFF en vivo, mezclado) p50 17,60/p90
   21,1; W1 scene-msaa 5,29→3,79, eye-1x 2,50→1,90; regulador 33 en ambos (>17 ms). `gpu.time` sin timestamp ni estado fov.
 - Logs B61 (Logs_Alyx_3): `gpu.time` p50 17,75 ms (B60 17,02; sin mejora), regulador 33 fps; `msaa_materialized` 252 (B60 286)
