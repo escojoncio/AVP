@@ -4,10 +4,10 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` + `vpkengine-patches/` 0011–0041; parche nuevo = `00NN-*.patch` con
 `git format-patch` sobre ref+parches; CI `scripts/apply-vpkengine-patches.sh`). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B59**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B60**, compilada OK).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
-## Últimos hechos (B60 en rama `wip-compositor`, revisado, SIN COMPILAR; build en espera de orden del usuario)
+## Últimos hechos (B60 compilada OK en CI, sin validar en el visor)
 - Compositor (`KleptonCompositor.swift`, `kl_reproject.c/.h`): RCAS fusionado en el fragmento de composición (zona de
   tasa completa; sin mapa 882/2016 × 861/1632; `KL_CP_SHARP_FUSED=0` = pase aparte); 1 command buffer por imagen nueva
   (prep+wide+composite en `cmd`, tras el wait del guest); vista ancha y recon en 1 pase de 2 instancias; log
@@ -31,10 +31,10 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   desde B17, MSAA 4x, amplificación de vértices, occlusion culling medido, `VP_CB_ORDER=2`; foveado VRR (periferia 10 %,
   VPKTAA en periferia; post NO foveado); compositor skip-same; regulador 50/33 (100 Hz) o 45/30 (90 Hz) con tiempo de
   GPU exclusivo; reloj del juego `klvr_game_hz`; OpenVR cabeza + 2 Sense, dedos, altura, subtítulos, idioma, pausa.
-- Pendiente de validar: B58 (altura real, `vk.fail`), B59/B60 (RCAS fusionado sin costura; compila en CI).
+- Pendiente de validar: B58 (altura real, `vk.fail`), B59/B60 (RCAS fusionado sin costura).
 - B60 al validar: `[cp] gpu`, `gpu.frame enc_ms/wait_ms`, `gpu.mem_tex` (msaa_memoryless, ledger),
   `what=msaa_materialized why=`, `memoryless_banned`, `[abtest]` del Laboratorio; preguntar fallos visuales por bit.
-- Riesgos B60 sin verificar: .mm de 0046/0049/0050 nunca compilados; `vpvk_mark_eye_image` vía dlsym.
+- Riesgos B60 sin verificar en visor: 0046/0049/0050 (Metal), `vpvk_mark_eye_image` vía dlsym. Parches 0047–0050 se conservan (los reutiliza VisionQuestPro).
 - Problema abierto: zona pesada juego ~23 ms > umbral (17 ms a 100 Hz, 18,9 a 90 Hz); térmico.
 
 ## Decisiones vigentes
@@ -46,7 +46,6 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
 - `Window(id:)` mata el launcher → `WindowGroup`. `KL_VRR_PHYS=1` rompe la imagen. Ojos sin copia parpadea.
 - Nunca abandonar un frame tras `queryNextFrame`. Todo frame consultado a CompositorServices se presenta.
 
-- Esperar al usuario antes de lanzar la build B60 (integrar antes el MSAA final que indique).
 - Bits del motor: 1 PROHIBIDO; 3/4/5 OFF hasta A/B en visor; HUD/Laboratorio decide.
 
 ## Ficheros en juego
