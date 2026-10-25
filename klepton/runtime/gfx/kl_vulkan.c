@@ -228,6 +228,18 @@ extern int kl_vk_native_wsi;
 
 static void *mvk_sym(const char *n) { return g_mvk ? dlsym(g_mvk, n) : NULL; }
 
+// VPVulkan: the image is the eye layer's (the compositor reads its MTLTexture): never memoryless/deferred.
+static int (*g_mark_eye)(void *);
+static pthread_once_t g_mark_eye_once = PTHREAD_ONCE_INIT;
+static void klvk_mark_eye_resolve(void) {
+    g_mark_eye = (int (*)(void *))mvk_sym("vpvk_mark_eye_image");
+    if (!g_mark_eye && g_mvk) fprintf(stderr, "  [vk] VPVulkan loaded but vpvk_mark_eye_image is missing: eye images are not marked\n");
+}
+static void klvk_mark_eye_image(VkImage img) {
+    pthread_once(&g_mark_eye_once, klvk_mark_eye_resolve);
+    if (g_mark_eye && img) g_mark_eye((void *)img);
+}
+
 static void vk_init(void) {
     if (g_init_done) return;
     g_init_done = 1;
@@ -2337,6 +2349,7 @@ unsigned long long kl_vulkan_layer_image(int layer_key, int stage, int eye,
                        : (eye ? "eye 1 BLUE" : "eye 0 GREEN"));
     }
 
+    if (is_eye) klvk_mark_eye_image(img);
     slot->img = img;
     slot->mem = mem;
     slot->w = w;
@@ -3481,6 +3494,7 @@ int kl_vulkan_eye_publish_guest(int stage, int eye, unsigned long long vk_image,
     pthread_mutex_lock(&g_eye_guest_mu);
     void *tex = g_eye_guest[stage][eye].img == img ? g_eye_guest[stage][eye].tex : NULL;
     if (!tex) {
+        klvk_mark_eye_image(img);
         tex = eye_mtl_texture(d, img);
         if (!tex) { pthread_mutex_unlock(&g_eye_guest_mu); return 0; }
         kl_mtl_retain(tex);

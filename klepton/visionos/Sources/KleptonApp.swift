@@ -179,8 +179,12 @@ enum Lifecycle {
     }
 
     /// Pause menu "Salir del juego": save VPKEngine's caches and the settings, flush the logs, end the process.
-    @MainActor static func quit() {
-        NSLog("[app] quit from the pause menu")
+    /// Set by the first quit: a second one (the pause menu and a lost GPU at once) must not flush twice.
+    nonisolated(unsafe) private static var quitting = false
+    @MainActor static func quit(_ why: String = "from the pause menu") {
+        guard !quitting else { return }
+        quitting = true
+        NSLog("[app] quit \(why)")
         if let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "vpvk_flush_caches") {
             typealias Flush = @convention(c) () -> Void
             unsafeBitCast(sym, to: Flush.self)()

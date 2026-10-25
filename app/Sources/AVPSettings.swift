@@ -133,6 +133,68 @@ final class AVPSettings: ObservableObject {
     /// each heavy shader is left out once; what saves stays on for the session and everything goes to the log. While on,
     /// the compositor's diagnostic captures stop after guest frame 120 (each stalls ~250 ms).
     @Published var abTest: Bool { didSet { save() } }
+    /// «Laboratorio del motor» (AVPEngineLabView; keys avp.lab.*): one switch per engine optimisation, all OFF by default
+    /// except the eye-copy trim (what the app ran before the lab). They go to kl_gpu_time.m (kl_engine_set_opts) at launch
+    /// and live; bit 1 (clear skip) does not exist here. The bits: 0 producer-only waits, 2 eye trim, 3 gather copies,
+    /// 4 fuse clears, 5 state elision.
+    @Published var labProducerWaits: Bool { didSet { labChanged() } }
+    @Published var labEyeTrim: Bool { didSet { labChanged() } }
+    @Published var labGatherCopies: Bool { didSet { labChanged() } }
+    @Published var labFuseClears: Bool { didSet { labChanged() } }
+    @Published var labStateElide: Bool { didSet { labChanged() } }
+    private var labBulk = false
+    private var labAdoptedSerial: UInt32 = 0
+    private var labWatcher: Timer?
+    /// «Capturas de diagnóstico» as of the last launch (KL_CAPTURE, set by writeConfig): with them on each capture stalls
+    /// the game ~250 ms, which would land in the lab's test, so the test is not offered.
+    private(set) var capturesAtLaunch = false
+    /// A test that ends while the game runs leaves its winner in the engine: this saves it as the lab's switches within a
+    /// second (adoptLabResult is a cheap atomic read when nothing ended). Started once, by writeConfig.
+    private func startLabWatcher() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.labWatcher == nil else { return }
+            self.labWatcher = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.adoptLabResult() }
+        }
+    }
+    /// The lab's mask as kl_engine_set_opts takes it.
+    var labMask: UInt32 {
+        var m: UInt32 = 0
+        if labProducerWaits { m |= 1 }
+        if labEyeTrim { m |= 4 }
+        if labGatherCopies { m |= 8 }
+        if labFuseClears { m |= 16 }
+        if labStateElide { m |= 32 }
+        return m
+    }
+    private func labChanged() {
+        save()
+        if !loading && !labBulk { kl_engine_set_opts(labMask) }
+    }
+    /// Sets the five switches from a mask (a test's winner) and pushes it once.
+    func setLabMask(_ m: UInt32) {
+        labBulk = true
+        labProducerWaits = m & 1 != 0; labEyeTrim = m & 4 != 0; labGatherCopies = m & 8 != 0
+        labFuseClears = m & 16 != 0; labStateElide = m & 32 != 0
+        labBulk = false
+        labChanged()
+    }
+    /// «Restaurar valores por defecto» of the lab: everything off but the eye trim.
+    func resetLab() {
+        for k in ["producerWaits", "eyeTrim", "gatherCopies", "fuseClears", "stateElide"] {
+            UserDefaults.standard.removeObject(forKey: "avp.lab.\(k)")
+        }
+        setLabMask(4)
+        AVPLog.log("Laboratorio del motor: valores por defecto")
+    }
+    /// A test that ended while the game ran left its winner in the engine: take it as the saved switches (once per test).
+    func adoptLabResult() {
+        let serial = UInt32(kl_abtest_result_serial())
+        guard serial != labAdoptedSerial else { return }
+        labAdoptedSerial = serial
+        guard serial != 0 else { return }
+        setLabMask(kl_abtest_result_mask())
+        AVPLog.log("Laboratorio del motor: el test terminó, máscara aplicada \(labMask)")
+    }
     /// Build 53: settings layout version. Older saved settings are wiped once so every validated value is the default
     /// (the options left out of the menu keep their default for good).
     static let schema = 53
@@ -219,6 +281,12 @@ final class AVPSettings: ObservableObject {
         reportedHz = ReportedHz(rawValue: d.object(forKey: "avp.reportHz") as? Int ?? 0) ?? .measured
         runningStart = d.object(forKey: "avp.runStart") as? Bool ?? true
         abTest = d.object(forKey: "avp.abTest") as? Bool ?? false
+        labProducerWaits = d.object(forKey: "avp.lab.producerWaits") as? Bool ?? false
+        labEyeTrim = d.object(forKey: "avp.lab.eyeTrim") as? Bool ?? true
+        labGatherCopies = d.object(forKey: "avp.lab.gatherCopies") as? Bool ?? false
+        labFuseClears = d.object(forKey: "avp.lab.fuseClears") as? Bool ?? false
+        labStateElide = d.object(forKey: "avp.lab.stateElide") as? Bool ?? false
+        labAdoptedSerial = UInt32(kl_abtest_result_serial())   // a test of an earlier game start (none) is not adopted
         subtitleSize = SubtitleSize(rawValue: d.object(forKey: "avp.subSize") as? Int ?? 0) ?? .small
         subtitleFoveation = d.object(forKey: "avp.subFov") as? Bool ?? true
         loading = false
@@ -260,6 +328,11 @@ final class AVPSettings: ObservableObject {
         d.set(reportedHz.rawValue, forKey: "avp.reportHz")
         d.set(runningStart, forKey: "avp.runStart")
         d.set(abTest, forKey: "avp.abTest")
+        d.set(labProducerWaits, forKey: "avp.lab.producerWaits")
+        d.set(labEyeTrim, forKey: "avp.lab.eyeTrim")
+        d.set(labGatherCopies, forKey: "avp.lab.gatherCopies")
+        d.set(labFuseClears, forKey: "avp.lab.fuseClears")
+        d.set(labStateElide, forKey: "avp.lab.stateElide")
         d.set(preset.rawValue, forKey: "avp.preset")
         d.set(Self.schema, forKey: "avp.schema")
         d.set(subtitleSize.rawValue, forKey: "avp.subSize")
@@ -280,6 +353,7 @@ final class AVPSettings: ObservableObject {
         postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
         reportedHz = fresh.reportedHz; runningStart = fresh.runningStart; abTest = fresh.abTest
+        setLabMask(fresh.labMask)
         preset = fresh.preset
         AVPLog.log("Ajustes: valores por defecto")
     }
@@ -464,7 +538,8 @@ final class AVPSettings: ObservableObject {
             ("KL_GUEST_PACE_LEAD_MS", runningStart ? "9" : "0"),
             // B51: eye copies trimmed to the foveation map's physical area by default (A/B: +0.4-1.1 ms in all 6 rounds of
             // Logs_Alyx_36 and 2_14, under the noise threshold but never negative).
-            ("KL_EYE_TRIM", "1"),
+            // Lab (avp.lab.*): the eye trim switch (on unless the player turned it off there).
+            ("KL_EYE_TRIM", labEyeTrim ? "1" : "0"),
             ("KL_ABTEST", abTest ? "1" : "0"),
             // Klepton's encoder merging is MoltenVK's (MSAA scene chunks). VPKEngine merges same-target passes in its
             // own frame compiler, and now that its queue is watched those hooks would hold its encoders open across
@@ -520,10 +595,10 @@ final class AVPSettings: ObservableObject {
             // Build 31: MSAA scene targets resolve from tile instead of storing every sample (VPKEngine 0034).
             ("VP_MSAA_TILE", Self.msaaOnTile ? "1" : "0"),
             ("VP_CB_ORDER", trackedOrder ? "2" : "1"),
-            // VPKEngine 0038/0039 runtime opts at start: bit 0 producer-only fence waits (Logs_Alyx_35: -1.5 ms in the menu at 80 %).
-            // B52: off again. No measurable gain on the exclusive GPU time (Logs_Alyx_36/2_14: ~0.2 ms), and late shadows
-            // in a level (Logs_Alyx_38) are the symptom a missed ordering would give.
-            ("VPVK_RUNTIME_OPTS", "0"),
+            // VPKEngine runtime opts at start, from the lab's switches (bits 0, 3, 4, 5; never bit 1, the clear skip).
+            // All off by default (B52: producer-only waits gave ~0.2 ms and late shadows were suspected, later found to be
+            // the game's); the same mask is also handed to kl_gpu_time.m below and live from the lab.
+            ("VPVK_RUNTIME_OPTS", String(labMask & 0x39)),
             // Build 32: exclusive per-encoder timing only with the per-pass profiling (it costs sample buffers on every
             // encoder); gpu.enc detail (tile=/mem= per attachment, VPKEngine 0035) every 3000 core frames (~20 s).
             ("VP_EXCL_TIMING", gpuPassProfiling ? "1" : "0"),
@@ -591,6 +666,9 @@ final class AVPSettings: ObservableObject {
             env.append(("KL_VK_FOZ_GAME_REPLAY", cache.warm ? "0" : "1"))
         }
 
+        kl_engine_set_opts(labMask)   // the engine takes it at the first guest frame (the environment above already carries it)
+        capturesAtLaunch = diagCaptures
+        startLabWatcher()
         // The compositor's statics are read from the environment once per process: a second game start in the same
         // app session (after Salir) must see this launch's values.
         KleptonCompositor.reconRef = max(0.25, min(2, Float(eye.width) / Float(Self.nativeEye.width)))
@@ -728,7 +806,9 @@ end, nil)
             KleptonCompositor.setRoundFovea(on: Self.roundSharpZone, degrees: nil, edge: Float(periphery))
         }
         applyToVPKEngine()
-        AVPLog.log("Ajustes en vivo: foveado \(foveationOn) periferia \(Int((periphery * 100).rounded())) %, VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % nitidez \(vpktaaSharpness), nitidez del centro \(Int((centerSharpness * 100).rounded())) %, FPS \(showFps), altura \(Int(heightOffsetCm)) cm, altura real \(realFloor)")
+        adoptLabResult()   // a test that finished while playing wins over the saved switches
+        kl_engine_set_opts(labMask)
+        AVPLog.log("Ajustes en vivo: foveado \(foveationOn) periferia \(Int((periphery * 100).rounded())) %, VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % nitidez \(vpktaaSharpness), nitidez del centro \(Int((centerSharpness * 100).rounded())) %, FPS \(showFps), altura \(Int(heightOffsetCm)) cm, altura real \(realFloor), laboratorio \(labMask)")
     }
 
     func applyToVPKEngine() {
