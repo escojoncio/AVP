@@ -36,3 +36,22 @@
 - `avp.schema` = 53 (borra `avp.*` una vez salvo claves guardadas). Presets M2/M5/Personalizado (M2: 70 %, tex 2048,
   foveado 70°/10 %, VPKTAA 100 %/1.0, aniso 16, MSAA 4, SSAO). MSAA No/x2/x4; sin MSAA no hay foveado
   (`foveationUsable`). MoltenVK solo fallback automático. Selectores segmentados con título visible.
+
+## B60 (detalle movido de la bitácora)
+- Compositor (`KleptonCompositor.swift`, `kl_reproject.c/.h`): RCAS fusionado en el fragmento de composición (zona de
+  tasa completa; sin mapa 882/2016 × 861/1632; `KL_CP_SHARP_FUSED=0` = pase aparte); 1 command buffer por imagen nueva
+  (prep+wide+composite en `cmd`, tras el wait del guest); vista ancha y recon en 1 pase de 2 instancias; log
+  `[cp] gpu composite p50/p95/max`; GPU perdida (código 11 o cola no sustituible juzgada → negro + `Lifecycle.quit(why)`
+  + `_exit` a 3 s; códigos 2/7 sin gastar presupuesto; 1 rebuild/s limitado; `retiredQueues` ≤ 8); guest congelado
+  > `KL_CP_STALE_HIDE_S` (10 s) → negro, nunca en carga (`kl_guest_loading()` = FadeGrid) ni pausa.
+- VPKEngine 0042–0046 (bits en caliente, OFF por defecto): 0042 `enc_ms`/`wait_ms`/`opt_counters2[16]`/`reorderable`;
+  0043 bit4 fuse clears; 0044 genMips declara la cadena (fix); 0045 bit3 gather copies; 0046 bit5 state elide (CPU).
+- VPKEngine 0047–0050: port a mano del MSAA memoryless de upstream (9f5867b, sobre fb5829a/662a70b): todo attachment
+  diferido/memoryless, materializa al Load/Store/Sample (`gpu.metal.info what=msaa_materialized why=`), ban por encoder
+  culpable, HeavyGeometry (`VPVK_TILE_MAX_DRAWS`/`_VERTICES`) conserva Resolve de 0034, `vpvk_mark_eye_image`.
+  `kl_vulkan.c` marca el ojo persistente (alloc + publish). `KL_VK_MSAA_STORE` no está activo en Alyx.
+- App: «Laboratorio del motor» (`AVPEngineLabView.swift`, `avp.lab.*`): toggles en caliente bits 0/2/3/4/5, «Probar todo»
+  (A/B en caliente ~50 s, `kl_abtest_start/cancel`, final = inicio + SAVES − WORSE/BREAKS); textos claros en todos los
+  ajustes, Diagnóstico plegado.
+- Logs_Alyx_48: foveado baja GPU juego 3–7 ms y compositor ~2,4 ms; fps cuantizados (100 Hz: 50/33; 90 Hz: 45/30;
+  visionOS elige Hz, sin API). Zona pesada juego ~23 ms.

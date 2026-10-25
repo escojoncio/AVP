@@ -4,30 +4,24 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` + `vpkengine-patches/` 0011–0041; parche nuevo = `00NN-*.patch` con
 `git format-patch` sobre ref+parches; CI `scripts/apply-vpkengine-patches.sh`). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B60**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B61**, lanzada).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
-## Últimos hechos (B60 compilada OK en CI, sin validar en el visor)
-- 2026-10-25: `.claude/agents/coder.md`: maxTurns → 70
-- 2026-10-25: `CLAUDE.md` línea 1: regla de cumplir siempre el rol asignado.
-- 2026-10-25: `CLAUDE.md` (Sub-agent setup): coder maxTurns 40 → 70.
-- Compositor (`KleptonCompositor.swift`, `kl_reproject.c/.h`): RCAS fusionado en el fragmento de composición (zona de
-  tasa completa; sin mapa 882/2016 × 861/1632; `KL_CP_SHARP_FUSED=0` = pase aparte); 1 command buffer por imagen nueva
-  (prep+wide+composite en `cmd`, tras el wait del guest); vista ancha y recon en 1 pase de 2 instancias; log
-  `[cp] gpu composite p50/p95/max`; GPU perdida (código 11 o cola no sustituible juzgada → negro + `Lifecycle.quit(why)`
-  + `_exit` a 3 s; códigos 2/7 sin gastar presupuesto; 1 rebuild/s limitado; `retiredQueues` ≤ 8); guest congelado
-  > `KL_CP_STALE_HIDE_S` (10 s) → negro, nunca en carga (`kl_guest_loading()` = FadeGrid) ni pausa.
-- VPKEngine 0042–0046 (bits en caliente, OFF por defecto): 0042 `enc_ms`/`wait_ms`/`opt_counters2[16]`/`reorderable`;
-  0043 bit4 fuse clears; 0044 genMips declara la cadena (fix); 0045 bit3 gather copies; 0046 bit5 state elide (CPU).
-- VPKEngine 0047–0050: port a mano del MSAA memoryless de upstream (9f5867b, sobre fb5829a/662a70b): todo attachment
-  diferido/memoryless, materializa al Load/Store/Sample (`gpu.metal.info what=msaa_materialized why=`), ban por encoder
-  culpable, HeavyGeometry (`VPVK_TILE_MAX_DRAWS`/`_VERTICES`) conserva Resolve de 0034, `vpvk_mark_eye_image`.
-  `kl_vulkan.c` marca el ojo persistente (alloc + publish). `KL_VK_MSAA_STORE` no está activo en Alyx.
-- App: «Laboratorio del motor» (`AVPEngineLabView.swift`, `avp.lab.*`): toggles en caliente bits 0/2/3/4/5, «Probar todo»
-  (A/B en caliente ~50 s, `kl_abtest_start/cancel`, final = inicio + SAVES − WORSE/BREAKS); textos claros en todos los
-  ajustes, Diagnóstico plegado.
-- Logs_Alyx_48: foveado baja GPU juego 3–7 ms y compositor ~2,4 ms; fps cuantizados (100 Hz: 50/33; 90 Hz: 45/30;
-  visionOS elige Hz, sin API). Zona pesada juego ~23 ms.
+## Últimos hechos (B61 lanzada, sin validar en el visor)
+- B61 VPKEngine 0051 (= main `454f7cc`): elisión de stores MSAA muertos (`VPVK_MSAA_DEAD_STORE=1`); `gpu.frame stores_elided=
+  elide_miss=`, `gpu.msaa elide_miss`, `msaa_materialized ... load= store=`. Port: `Use::firstAttach` añadido al árbol AVP.
+- B61 Laboratorio: «Nitidez en la composición» fusionada/pase aparte EN CALIENTE (`KleptonCompositor.setSharpFused`, latch
+  `sharpFusedFrame` por frame, ventana p50 de `[cp] gpu composite` se reinicia al cambiar, `avp.lab.sharpFused`); sección
+  «Requieren reiniciar»: `avp.lab.binaryArchive` (def. OFF; ON = sin `VP_PIPELINE_ARCHIVE=0`, no borra `.metalar`,
+  `checkArchiveInflight` → `archive.off` tras 2 cierres) y `avp.lab.msaaDeadStore` (def. ON, en `sigKeys`).
+- B61 segundo plano (`KleptonApp.swift`): `.background` con inmersivo → `kl_guest_set_paused(1)` (`Lifecycle.pausedByBackground`),
+  reanuda solo en `.active` si no lo pausó el usuario; compositor sigue presentando (regla watchdog); stale-hide no salta.
+- B61 `kl_vulkan.c`: log `[vkmem]` dice qué limita (OS / `KL_VK_HEAP_MB` / heap anunciado). Valores sin cambio.
+- Logs B60: memoryless activo pero 286 `msaa_materialized why=None` (= store del cliente); footprint 5,9 GB con 2,2 GB libres
+  (límite real ~8,1 GB; los 6144 MB = heap fijo de VPVulkan `physical_device.cpp:152`, no limita: Metal usó ~3 GB); GPU juego
+  20,7–22,6 ms; compositor 5–9 ms (antes 2,4–6: posible regresión del RCAS fusionado, unverified); A/B Lab: ALL −1,78 ms,
+  ningún bit > umbral; 14 `gpu.err code 7` + 34 `gpu.hang.enc` tras `scene phase -> background`.
+- B60 y anteriores: `notas/builds.md` (sección B60).
 
 ## Estado actual
 - 100 % funcional (visor): Steam (login+Guard, Cloud), firma, 90 libs, prewarm ~4150 pipelines; VPKEngine 0 cuelgues
@@ -35,6 +29,9 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   VPKTAA en periferia; post NO foveado); compositor skip-same; regulador 50/33 (100 Hz) o 45/30 (90 Hz) con tiempo de
   GPU exclusivo; reloj del juego `klvr_game_hz`; OpenVR cabeza + 2 Sense, dedos, altura, subtítulos, idioma, pausa.
 - Pendiente de validar: B58 (altura real, `vk.fail`), B59/B60 (RCAS fusionado sin costura).
+- B61 al validar: `stores_elided`/`elide_miss` y `msaa_materialized` (¿baja de 286?, ¿frames corruptos?); `[cp] gpu composite`
+  fusionada vs pase aparte (misma zona); arranque y footprint con archivo ON vs OFF; volver de segundo plano sin
+  `gpu.err code 7` del guest ni flash negro; si visionOS mata la app en fondo (unverified).
 - B60 al validar: `[cp] gpu`, `gpu.frame enc_ms/wait_ms`, `gpu.mem_tex` (msaa_memoryless, ledger),
   `what=msaa_materialized why=`, `memoryless_banned`, `[abtest]` del Laboratorio; preguntar fallos visuales por bit.
 - Riesgos B60 sin verificar en visor: 0046/0049/0050 (Metal), `vpvk_mark_eye_image` vía dlsym. Parches 0047–0050 se conservan (los reutiliza VisionQuestPro).
