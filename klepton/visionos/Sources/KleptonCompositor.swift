@@ -6276,7 +6276,7 @@ final class KleptonCompositor {
             }
             // Every drawable the frame carries, not just the one measured from:
             // a frame that leaves one unpresented is a frame half-written.
-            for d in all { clearAndPresent(d, cmd: cmd) }
+            for d in all { clearAndPresent(d, cmd: pcmd) }
             pcmd.commit()
             // Only after a drawable was actually presented: ending a
             // submission on the no-drawable path is an abort.
