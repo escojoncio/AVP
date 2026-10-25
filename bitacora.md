@@ -17,6 +17,8 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
 - B61 segundo plano (`KleptonApp.swift`): `.background` con inmersivo → `kl_guest_set_paused(1)` (`Lifecycle.pausedByBackground`),
   reanuda solo en `.active` si no lo pausó el usuario; compositor sigue presentando (regla watchdog); stale-hide no salta.
 - B61 `kl_vulkan.c`: log `[vkmem]` dice qué limita (OS / `KL_VK_HEAP_MB` / heap anunciado). Valores sin cambio.
+- Logs B61 A/B foveado (misma zona): OFF `gpu.time` p50 22,97/p90 26,0 ms; ON (luego OFF en vivo, mezclado) p50 17,60/p90
+  21,1; W1 scene-msaa 5,29→3,79, eye-1x 2,50→1,90; regulador 33 en ambos (>17 ms). `gpu.time` sin timestamp ni estado fov.
 - Logs B61 (Logs_Alyx_3): `gpu.time` p50 17,75 ms (B60 17,02; sin mejora), regulador 33 fps; `msaa_materialized` 252 (B60 286)
   pero NO aparece ningún `stores_elided`/`elide_miss` → 0051 sin efecto visible o sin log (unverified); compositor p50 6,4 ms
   (rcas fused); RAM pico 5,6 GB, mín. libre 2,6 GB, 0 avisos; archivo ON: `archive_memory` +378 MB, 1 `archive_save
