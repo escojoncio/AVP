@@ -1,0 +1,376 @@
+From 0cdf7fdea2a8a304d761b1449852cf29dbe50896 Mon Sep 17 00:00:00 2001
+From: VPK <noreply@example.invalid>
+Date: Sun, 25 Oct 2026 18:19:07 +0000
+Subject: [PATCH 42/46] 0042: diagnosticos de coste (enc_ms, opt_counters2,
+ reorderable)
+
+Device::submit cronometra Backend::submit (FrameReport::cpuEncodeMs, enc_ms= en gpu.frame).
+Nueva export vpgpu_metal2_opt_counters2(uint64_t[16]) sin tocar la de 9 palabras; contador
+fallbackAll en el fallback waitProducers->waitFrontier. CompileStats::reorderable (gpu.cut):
+cortes AttachmentChange en los que un pase podria unirse a uno de los 8 encoders render
+anteriores; solo cuenta.
+---
+ gpu/core/include/vpgpu/core/backend.h         |  4 ++
+ gpu/core/include/vpgpu/core/diagnostics.h     |  2 +
+ gpu/core/include/vpgpu/core/frame_compiler.h  |  7 +++
+ gpu/core/src/device.cpp                       |  6 +++
+ gpu/core/src/diagnostics.cpp                  |  3 +-
+ gpu/core/src/frame_compiler.cpp               | 37 +++++++++++++++-
+ gpu/core/tests/core_tests.cpp                 | 41 +++++++++++++++++
+ .../include/vpgpu/metal2/metal_backend.h      |  2 +
+ gpu/metal2/src/metal_backend.mm               | 44 ++++++++++++++++++-
+ 9 files changed, 142 insertions(+), 4 deletions(-)
+
+diff --git a/gpu/core/include/vpgpu/core/backend.h b/gpu/core/include/vpgpu/core/backend.h
+index 18b55ee..1e0ed2f 100644
+--- a/gpu/core/include/vpgpu/core/backend.h
++++ b/gpu/core/include/vpgpu/core/backend.h
+@@ -48,6 +48,10 @@ class Backend {
+   // Every frame with an index below this one has finished on the GPU (completion handlers ran).
+   // Backends that execute nothing report everything finished.
+   virtual uint64_t completedFrames() const { return ~uint64_t(0); }
++
++  // Milliseconds the latest submit() spent blocked on something other than encoding (waiting for a free frame
++  // slot): Device reports the rest as enc_ms. Read on the submitting thread right after submit().
++  virtual double lastSubmitWaitMs() const { return 0; }
+ };
+ 
+ // Records every call as a text line; executes nothing.
+diff --git a/gpu/core/include/vpgpu/core/diagnostics.h b/gpu/core/include/vpgpu/core/diagnostics.h
+index cf63db5..365ba06 100644
+--- a/gpu/core/include/vpgpu/core/diagnostics.h
++++ b/gpu/core/include/vpgpu/core/diagnostics.h
+@@ -23,6 +23,8 @@ struct FrameReport {
+   CompileStats compile;
+   PipelineStats pipelines;
+   double cpuCompileMs = 0;  // time spent in compileFrame
++  double cpuEncodeMs = 0;   // time spent in Backend::submit encoding (without the wait below)
++  double cpuWaitMs = 0;     // time Backend::submit spent blocked waiting for a free frame slot
+   GpuTimings gpu;           // empty until the backend reports this frame
+ };
+ 
+diff --git a/gpu/core/include/vpgpu/core/frame_compiler.h b/gpu/core/include/vpgpu/core/frame_compiler.h
+index f5ea53f..5dc6597 100644
+--- a/gpu/core/include/vpgpu/core/frame_compiler.h
++++ b/gpu/core/include/vpgpu/core/frame_compiler.h
+@@ -121,6 +121,11 @@ struct CompileStats {
+   // MSAA textures read (sampled, copied, loaded) in this frame before any encoder rendered them in it:
+   // their contents come from an earlier submit, which msaaResolveOnTile may have left on tile.
+   uint32_t msaaStaleReads = 0;
++  // Diagnostic (patch 0042): AttachmentChange cuts where one of the last 8 render encoders has this pass's
++  // targets, nothing after it touches what the pass touches, and the pass could join it (no clear of a slot
++  // it holds, no feedback): the pass could have moved up into it. Only counted, the schedule is unchanged.
++  uint32_t reorderable = 0;
++  bool reorderableMeasured = false;  // CompileOptions::countReorderable was on (reorderable is 0 otherwise)
+ };
+ 
+ // A draw by position: Frame::commands()[command] is a RenderPass, draws[draw] the draw.
+@@ -177,6 +182,8 @@ struct CompileOptions {
+   // far. Hazards a later barrier "covers" are NOT dropped in this mode: that barrier waited on its own producers
+   // only, so it orders nothing else (no transitivity through it), and every hazard names its producer.
+   bool producerWaits = false;
++  // Fill CompileStats::reorderable (a walk over the last encoders at every AttachmentChange cut): sampled frames only.
++  bool countReorderable = false;
+ };
+ 
+ class ResourceTable;
+diff --git a/gpu/core/src/device.cpp b/gpu/core/src/device.cpp
+index a55b16b..0b6b7af 100644
+--- a/gpu/core/src/device.cpp
++++ b/gpu/core/src/device.cpp
+@@ -70,6 +70,7 @@ FrameReport Device::submit(const Frame& frame) {
+   const auto start = std::chrono::steady_clock::now();
+   std::unique_lock resLock(resMutex_);
+   CompileOptions opts = compileOptions_;
++  opts.countReorderable = index % 90 == 0;  // a diagnostic with a cost: the sampled frames only
+   opts.producerWaits = (gRuntimeOpts.load(std::memory_order_relaxed) & kOptProducerWaits) != 0;
+   const CompiledFrame compiled = compileFrame(frame, &resources_, opts);
+   resLock.unlock();
+@@ -110,10 +111,15 @@ FrameReport Device::submit(const Frame& frame) {
+       }
+     }
+   }
++  const auto encStart = std::chrono::steady_clock::now();
+   backend_.submit(index, frame, compiled);
++  const double submitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - encStart).count();
++  const double waitMs = std::min(backend_.lastSubmitWaitMs(), submitMs);
+ 
+   FrameReport report = makeReport(index, frame, compiled);
+   report.cpuCompileMs = ms;
++  report.cpuEncodeMs = submitMs - waitMs;
++  report.cpuWaitMs = waitMs;
+   report.pipelines = pipelines_.takeFrameStats();
+   // Per-frame summaries: every frame for the first 300, then 1 in 90 (or when pipelines were
+   // compiled) — three log lines per frame on the render thread was itself a stutter source.
+diff --git a/gpu/core/src/diagnostics.cpp b/gpu/core/src/diagnostics.cpp
+index a339628..f5c8f22 100644
+--- a/gpu/core/src/diagnostics.cpp
++++ b/gpu/core/src/diagnostics.cpp
+@@ -62,7 +62,7 @@ std::vector<std::string> formatReport(const FrameReport& r) {
+   if (r.compile.storesKept) kv(l, " stores_kept=%u", r.compile.storesKept);
+   if (r.compile.msaaStaleReads) kv(l, " msaa_stale=%u", r.compile.msaaStaleReads);
+   if (r.compile.badFetch) kv(l, " bad_fetch=%u", r.compile.badFetch);
+-  kv(l, " cpu_ms=%.3f", r.cpuCompileMs);
++  kv(l, " cpu_ms=%.3f enc_ms=%.3f wait_ms=%.3f", r.cpuCompileMs, r.cpuEncodeMs, r.cpuWaitMs);
+   if (r.gpu.frameMs > 0) kv(l, " gpu_ms=%.3f", r.gpu.frameMs);
+   lines.push_back(std::move(l));
+ 
+@@ -70,6 +70,7 @@ std::vector<std::string> formatReport(const FrameReport& r) {
+   kv(l, " f=%llu", (unsigned long long)r.frame);
+   for (int i = 0; i < static_cast<int>(CutReason::Count); ++i)
+     kv(l, " %s=%u", toString(static_cast<CutReason>(i)), r.compile.cuts[i]);
++  if (r.compile.reorderableMeasured) kv(l, " reorderable=%u", r.compile.reorderable);
+   lines.push_back(std::move(l));
+ 
+   const PipelineStats& p = r.pipelines;
+diff --git a/gpu/core/src/frame_compiler.cpp b/gpu/core/src/frame_compiler.cpp
+index 7d35ca6..af93940 100644
+--- a/gpu/core/src/frame_compiler.cpp
++++ b/gpu/core/src/frame_compiler.cpp
+@@ -86,6 +86,20 @@ bool conflicts(const AccessList& a, const AccessIndex& b) {
+   return false;
+ }
+ 
++// Any overlap with a write on one side, attachments included (conflicts() leaves out attachment-vs-attachment:
++// inside one encoder the rasterizer orders them; between encoders, or against work not yet in one, they are
++// ordered by program order only).
++bool touches(const AccessList& a, const AccessIndex& b) {
++  for (const Tagged& x : a) {
++    const auto& map = x.access.write ? b.byResource : b.writesByResource;
++    auto it = map.find(resourceKey(x.access.range));
++    if (it == map.end()) continue;
++    for (uint32_t i : it->second)
++      if (x.access.range.overlaps(b.list[i].access.range)) return true;
++  }
++  return false;
++}
++
+ void append(AccessList& to, const AccessList& from) { to.insert(to.end(), from.begin(), from.end()); }
+ 
+ // Folds accesses that are the same in everything but their stages (many draws of one pass bind the
+@@ -285,7 +299,7 @@ class Scheduler {
+       // attachment), which a framebuffer-fetch pipeline does anyway.
+       const bool same = r.pass.sameTargets(need);
+       const bool joinable = same || (fetchesOpen && res_ && compatible(r.pass, need, *res_));
+-      if (!joinable) reason = CutReason::AttachmentChange;
++      if (!joinable) reason = CutReason::AttachmentChange, countReorderable(desc, need, acc);
+       else if (!same && colorBytes(r.pass, need, *res_) > options_.tileBytesPerPixel) reason = CutReason::TileBudget;
+       else if (clearsExisting(r.pass, desc)) reason = CutReason::ClearLoad;
+       else if (conflicts(acc, acc_[open_])) reason = CutReason::Feedback;
+@@ -296,6 +310,7 @@ class Scheduler {
+       reason = CutReason::FrameStart;
+     } else if (!lastRender_.sameTargets(need)) {
+       reason = CutReason::AttachmentChange;
++      countReorderable(desc, need, acc);
+     } else {
+       reason = clears(desc) ? CutReason::ClearLoad : CutReason::ComputeBetween;
+     }
+@@ -333,6 +348,25 @@ class Scheduler {
+   void finish() { closeRender(); }
+ 
+  private:
++  // CompileStats::reorderable. Walks back from the newest encoder: the pass can only move up past encoders it
++  // does not touch (and past the copies sunk after the open encoder).
++  void countReorderable(const RenderPassDesc& desc, const RenderPassDesc& need, const AccessList& acc) {
++    if (!options_.countReorderable) return;
++    if (touches(acc, sunkAcc_)) return;
++    int renders = 0;
++    for (int e = static_cast<int>(out_.encoders.size()) - 1; e >= 0 && renders < 8; --e) {
++      const Encoder& en = out_.encoders[e];
++      if (en.kind == Encoder::Kind::Render) {
++        ++renders;
++        if (en.pass.sameTargets(need)) {
++          if (!clearsExisting(en.pass, desc) && !conflicts(acc, acc_[e])) ++out_.stats.reorderable;
++          return;
++        }
++      }
++      if (touches(acc, acc_[e])) return;
++    }
++  }
++
+   // Brings texture range `r` in at colour `slot` of `need` for a fetch. Refused (the read is then a
+   // bad fetch) when compatible() rejects it against what `need` already holds (slot taken, texture
+   // in another slot, other size or sample count), it would exceed the tile budget, or there is no
+@@ -652,6 +686,7 @@ CompiledFrame compileFrame(const Frame& frame, const ResourceTable* resources, c
+   CompiledFrame out;
+   const auto& cmds = frame.commands();
+   out.stats.commands = static_cast<uint32_t>(cmds.size());
++  out.stats.reorderableMeasured = options.countReorderable;
+   std::vector<AccessList> accesses(cmds.size());
+   Scheduler scheduler(out, resources, options);
+   for (uint32_t i = 0; i < cmds.size(); ++i) {
+diff --git a/gpu/core/tests/core_tests.cpp b/gpu/core/tests/core_tests.cpp
+index 435db82..24e722f 100644
+--- a/gpu/core/tests/core_tests.cpp
++++ b/gpu/core/tests/core_tests.cpp
+@@ -430,6 +430,38 @@ void testCuts() {
+   CHECK_EQ(cuts(cg, CutReason::CopyWork), 1u);
+   CHECK_EQ(cuts(cg, CutReason::FrameStart), 1u);
+ 
++  // reorderable (diagnostic): the third pass has the first one's targets and touches nothing the second does.
++  const TextureId ra = s.rt(), rb = s.rt();
++  CompileOptions measure;
++  measure.countReorderable = true;
++  {
++    Frame r;
++    Scene::passWithDraw(r, Scene::pass(ra));
++    Scene::passWithDraw(r, Scene::pass(rb));
++    Scene::passWithDraw(r, Scene::pass(ra));
++    const CompiledFrame cr = compileFrame(r, &s.res, measure);
++    CHECK_EQ(cr.encoders.size(), size_t{3});
++    CHECK_EQ(cr.stats.reorderable, 1u);
++    CHECK_EQ(compileFrame(r, &s.res).stats.reorderable, 0u);  // not measured by default: no cost, no count
++    CHECK(!compileFrame(r, &s.res).stats.reorderableMeasured && cr.stats.reorderableMeasured);  // the second pass found nothing to join, the third could join the first
++  }
++  {  // the pass in between writes what the third reads (it samples ra's neighbour): no move, nothing counted
++    Frame r;
++    Scene::passWithDraw(r, Scene::pass(ra));
++    Scene::passWithDraw(r, Scene::pass(rb), {Scene::sample(ra)});
++    Scene::passWithDraw(r, Scene::pass(ra));
++    const CompiledFrame cr = compileFrame(r, &s.res, measure);
++    CHECK_EQ(cr.encoders.size(), size_t{3});
++    CHECK_EQ(cr.stats.reorderable, 0u);
++  }
++  {  // the pass clears a slot the older encoder holds: it could not join it anyway
++    Frame r;
++    Scene::passWithDraw(r, Scene::pass(ra));
++    Scene::passWithDraw(r, Scene::pass(rb));
++    Scene::passWithDraw(r, Scene::pass(ra, {}, LoadAction::Clear));
++    CHECK_EQ(compileFrame(r, &s.res, measure).stats.reorderable, 0u);
++  }
++
+   // Commands on destroyed resources are dropped, not encoded.
+   Frame h;
+   const TextureId gone = s.rt();
+@@ -452,11 +484,17 @@ void testDiagnostics() {
+   const CompiledFrame cf = compileFrame(f);
+   FrameReport r = makeReport(7, f, cf);
+   r.gpu.frameMs = 1.5;
++  r.cpuEncodeMs = 0.25;
+   const auto lines = formatReport(r);
+   CHECK_EQ(lines.size(), size_t{2});
+   CHECK(lines[0].starts_with("gpu.frame f=7 enc=2 render=2 compute=0 naive=2 "));
+   CHECK(lines[0].find(" barriers=1 ") != std::string::npos && lines[0].find(" raw=1 ") != std::string::npos);
+   CHECK(lines[0].find(" gpu_ms=1.500") != std::string::npos);
++  CHECK(lines[0].find(" enc_ms=0.250 wait_ms=0.000") != std::string::npos);
++  CHECK(lines[1].find("reorderable") == std::string::npos);  // only on sampled frames
++  CompileOptions measure;
++  measure.countReorderable = true;
++  CHECK(formatReport(makeReport(7, f, compileFrame(f, nullptr, measure)))[1].find(" reorderable=0") != std::string::npos);
+   CHECK(lines[1].find(" FrameStart=1 AttachmentChange=1 ") != std::string::npos);
+   const auto enc = formatEncoders(7, f, cf);
+   CHECK_EQ(enc.size(), size_t{2});
+@@ -535,6 +573,9 @@ void testDevice() {
+   log.clear();
+   const FrameReport r = dev.submit(f);
+   CHECK_EQ(r.encoders, 1u);
++  CHECK(r.cpuEncodeMs >= 0 && r.cpuWaitMs == 0 && log[0].find(" enc_ms=") != std::string::npos &&
++        log[0].find(" wait_ms=") != std::string::npos);
++  CHECK(log[1].find("reorderable=") != std::string::npos);  // frame 0 is a sampled one
+   CHECK(log.size() == 4 && log[0].starts_with("gpu.frame f=0") && log[2].starts_with("gpu.enc") &&
+         log[3].starts_with("gpu.time f=0"));
+   dev.destroy(b);
+diff --git a/gpu/metal2/include/vpgpu/metal2/metal_backend.h b/gpu/metal2/include/vpgpu/metal2/metal_backend.h
+index 26d7736..c35bbfb 100644
+--- a/gpu/metal2/include/vpgpu/metal2/metal_backend.h
++++ b/gpu/metal2/include/vpgpu/metal2/metal_backend.h
+@@ -132,6 +132,8 @@ class MetalBackend final : public Backend {
+   bool takeTimings(uint64_t& frameIndex, GpuTimings& out) override;
+   // Frames below this index finished on the GPU (their completion handlers ran).
+   uint64_t completedFrames() const override;
++  // The time the latest submit() waited for a free frame slot (see Backend::lastSubmitWaitMs).
++  double lastSubmitWaitMs() const override;
+ 
+   // Blocks until every submitted frame has finished on the GPU.
+   void waitIdle();
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 12f1b49..8efcb7a 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -77,6 +77,11 @@ std::atomic<uint32_t> gLastRealEncoders{0};
+ std::atomic<int64_t> gLastRealMs{0};
+ std::atomic<uint64_t> gIndirectCountDraws{0}, gIndirectEncoded{0}, gIndirectReal{0};  // indirect-count draws
+ std::atomic<uint64_t> gOptCbs{0}, gProdCbs{0}, gFenceWaits{0}, gClearCandidates{0}, gClearSkipped{0}, gKnocked{0};
++// Patch 0042 (vpgpu_metal2_opt_counters2): cumulative, read as deltas. gEncodeNs is the time inside MetalBackend::submit
++// (without the frame-slot wait, which gWaitNs counts apart). The rest are filled by the patches that introduce them.
++std::atomic<uint64_t> gWaitNs{0}, gLastWaitNs{0};  // frame-slot wait inside submit: total, and the latest submit's
++std::atomic<uint64_t> gEncodeNs{0}, gSubmits{0}, gDraws{0}, gStateElided{0}, gTableFast{0}, gTableSlow{0}, gCopiesGathered{0},
++    gComputeEncoders{0}, gClearOnly{0}, gClearFused{0}, gFlushConflict{0}, gFlushPartial{0}, gFlushEnd{0}, gFallbackAll{0};
+ // Pipeline census (vpgpu_metal2_census_*): per pipeline key, in how many real frames (the big command buffer:
+ // 8+ encoders, a layered pass) it was encoded and how many draws/dispatches it had there.
+ struct CensusEntry {
+@@ -2095,7 +2100,13 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     done.push_back({frameIndex, {}});
+     return;
+   }
+-  dispatch_semaphore_wait(inFlight, DISPATCH_TIME_FOREVER);
++  {
++    const auto w0 = std::chrono::steady_clock::now();
++    dispatch_semaphore_wait(inFlight, DISPATCH_TIME_FOREVER);
++    const auto w = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w0).count());
++    gLastWaitNs.store(w, std::memory_order_relaxed);
++    gWaitNs.fetch_add(w, std::memory_order_relaxed);
++  }
+   if (queueRefused.exchange(false) && queueRebuilds < 64) {
+     // A fresh queue (fences only order work inside one queue: the frontier's go with the old one,
+     // and those a hung command buffer was to update never signal). The generation moves first: an
+@@ -2565,7 +2576,10 @@ void MetalBackend::Impl::submit(uint64_t frameIndex, const Frame& frame, const C
+     // A producer that encoded no Metal encoder (refused sampled blits, an encoder error) has no fence to stand
+     // for the producers IT ordered after: fall back to everything unordered (own fences stay in the frontier).
+     for (uint32_t pe : prods)
+-      if (pe >= encFences.size() || encFences[pe].empty()) return waitFrontier(before);
++      if (pe >= encFences.size() || encFences[pe].empty()) {
++        gFallbackAll.fetch_add(1, std::memory_order_relaxed);
++        return waitFrontier(before);
++      }
+     for (uint32_t pe : prods)
+       for (id<MTLFence> f : encFences[pe]) waitOne(f, before);
+     bool foreign = false;
+@@ -4341,11 +4355,25 @@ bool MetalBackend::compilePipeline(const PipelineState& s, std::string& error) {
+ 
+ void MetalBackend::submit(uint64_t frameIndex, const Frame& frame, const CompiledFrame& compiled) {
+   if (!ok()) return;
++  const auto t0 = std::chrono::steady_clock::now();
++  gLastWaitNs.store(0, std::memory_order_relaxed);
+   @autoreleasepool {
+     impl_->submit(frameIndex, frame, compiled);
+   }
++  const uint64_t totalNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
++  const uint64_t waitNs = std::min(gLastWaitNs.load(std::memory_order_relaxed), totalNs);
++  gEncodeNs.fetch_add(totalNs - waitNs, std::memory_order_relaxed);
++  gSubmits.fetch_add(1, std::memory_order_relaxed);
++  uint64_t draws = 0, computeEnc = 0;
++  for (const Command& c : frame.commands())
++    if (const auto* rp = std::get_if<RenderPass>(&c)) draws += rp->draws.size();
++  for (const Encoder& e : compiled.encoders) computeEnc += e.kind == Encoder::Kind::Compute;
++  gDraws.fetch_add(draws, std::memory_order_relaxed);
++  gComputeEncoders.fetch_add(computeEnc, std::memory_order_relaxed);
+ }
+ 
++double MetalBackend::lastSubmitWaitMs() const { return double(gLastWaitNs.load(std::memory_order_relaxed)) / 1e6; }
++
+ bool MetalBackend::takeTimings(uint64_t& frameIndex, GpuTimings& out) {
+   std::lock_guard lock(impl_->doneMutex);
+   if (impl_->done.empty()) return false;
+@@ -5044,6 +5072,18 @@ extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_opt_counters
+   out[3] = gClearCandidates.load(), out[4] = gClearSkipped.load(), out[5] = gKnocked.load();
+   out[6] = gIndirectCountDraws.load(), out[7] = gIndirectEncoded.load(), out[8] = gIndirectReal.load();
+ }
++// Patch 0042: the 9 words above plus the encoding cost, in out[16]: [0] ns inside MetalBackend::submit, [1] submits,
++// [2] draws recorded, [3] state sets elided, [4] argument-table fast path, [5] slow path, [6] copies gathered,
++// [7] compute encoders, [8] clear-only passes deferred, [9] of them fused into a later pass, [10..12] clears
++// materialised because of a conflict / a partial overlap / the end of the frame, [13] waitProducers fallbacks to
++// everything unordered (a producer without a fence), [14] ns blocked waiting for a free frame slot, [15] 0. Words not yet filled by a patch read 0.
++extern "C" __attribute__((visibility("default"))) void vpgpu_metal2_opt_counters2(uint64_t out[16]) {
++  using namespace vpgpu::metal2;
++  out[0] = gEncodeNs.load(), out[1] = gSubmits.load(), out[2] = gDraws.load(), out[3] = gStateElided.load();
++  out[4] = gTableFast.load(), out[5] = gTableSlow.load(), out[6] = gCopiesGathered.load(), out[7] = gComputeEncoders.load();
++  out[8] = gClearOnly.load(), out[9] = gClearFused.load(), out[10] = gFlushConflict.load(), out[11] = gFlushPartial.load();
++  out[12] = gFlushEnd.load(), out[13] = gFallbackAll.load(), out[14] = gWaitNs.load(), out[15] = 0;
++}
+ // 0039: one census pipeline described (shader ids, target, work per frame); 0 when unknown.
+ extern "C" __attribute__((visibility("default"))) int vpgpu_metal2_census_detail(uint64_t key, char* out, int n) {
+   using namespace vpgpu::metal2;
+-- 
+2.43.0
+

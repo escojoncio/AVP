@@ -1,0 +1,743 @@
+From ae7dc7d3ded139f370e79534661a00148f1a4e95 Mon Sep 17 00:00:00 2001
+From: VPK <noreply@example.invalid>
+Date: Sun, 25 Oct 2026 18:24:03 +0000
+Subject: [PATCH 43/46] 0043: kOptFuseClears (bit 4): un pase solo-clear pasa a
+ ser la load action del siguiente
+
+CompileOptions::fuseClears (Device::submit lo lee de gRuntimeOpts & kOptFuseClears, por submit).
+El Scheduler retiene los pases solo-clear (sin draws, un attachment, Clear+Store, mip entera,
+1x, no transient) en vez de abrirles encoder; el primer comando que los toca (touches, sin la
+excepcion attachment-vs-attachment) los fusiona (mismo target, Load, mip entera, sin otro acceso)
+o los materializa antes de ese comando. Contadores clearOnly/clearFused/flush* en CompileStats,
+gpu.frame y opt_counters2. Enum RuntimeOpt: kOptGatherCopies, kOptFuseClears, kOptStateElide.
+Tests: grupo clearfuse, y el fuzz con ORACULO DE ORDEN (fusion OFF y ON).
+---
+ gpu/core/CMakeLists.txt                      |   2 +-
+ gpu/core/include/vpgpu/core/frame_compiler.h |  13 +
+ gpu/core/src/device.cpp                      |   4 +-
+ gpu/core/src/diagnostics.cpp                 |   3 +
+ gpu/core/src/frame_compiler.cpp              | 145 +++++++-
+ gpu/core/tests/core_tests.cpp                | 363 ++++++++++++++++++-
+ gpu/metal2/src/metal_backend.mm              |   6 +
+ 7 files changed, 527 insertions(+), 9 deletions(-)
+
+diff --git a/gpu/core/CMakeLists.txt b/gpu/core/CMakeLists.txt
+index 518adf5..3f2b73f 100644
+--- a/gpu/core/CMakeLists.txt
++++ b/gpu/core/CMakeLists.txt
+@@ -21,7 +21,7 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
+     target_compile_options(vpgpu_core_tests PRIVATE -Wall -Wextra)
+   endif()
+   # One CTest entry per test case so failures are reported by name.
+-  foreach(t resources commands merge copies hazards subresources cuts diagnostics pipelines device tile bindings astro fuzz)
++  foreach(t resources commands merge copies hazards subresources cuts diagnostics pipelines device tile bindings astro fuzz producers clearfuse)
+     add_test(NAME gpu_core.${t} COMMAND vpgpu_core_tests ${t})
+   endforeach()
+ endif()
+diff --git a/gpu/core/include/vpgpu/core/frame_compiler.h b/gpu/core/include/vpgpu/core/frame_compiler.h
+index 5dc6597..8ad9388 100644
+--- a/gpu/core/include/vpgpu/core/frame_compiler.h
++++ b/gpu/core/include/vpgpu/core/frame_compiler.h
+@@ -63,6 +63,9 @@ struct Barrier {
+ enum RuntimeOpt : uint32_t {
+   kOptProducerWaits = 1u << 0,  // a barrier waits only on the encoders that produced what it orders
+   kOptClearSkip = 1u << 1,      // a draw-less clear of a depth texture already cleared to that value is skipped
++  kOptGatherCopies = 1u << 3,   // (bit 2 is not assigned)
++  kOptFuseClears = 1u << 4,     // CompileOptions::fuseClears: a clear-only pass becomes the load action of the next pass on it
++  kOptStateElide = 1u << 5,
+ };
+ extern std::atomic<uint32_t> gRuntimeOpts;
+ 
+@@ -126,6 +129,10 @@ struct CompileStats {
+   // it holds, no feedback): the pass could have moved up into it. Only counted, the schedule is unchanged.
+   uint32_t reorderable = 0;
+   bool reorderableMeasured = false;  // CompileOptions::countReorderable was on (reorderable is 0 otherwise)
++  // CompileOptions::fuseClears: clear-only passes deferred, of them fused into the load action of a later
++  // pass, and the others materialised as an encoder of their own because a later command conflicted with them
++  // (flushConflict), overlapped them only partly (flushPartial) or the frame ended (flushEnd).
++  uint32_t clearOnly = 0, clearFused = 0, flushConflict = 0, flushPartial = 0, flushEnd = 0;
+ };
+ 
+ // A draw by position: Frame::commands()[command] is a RenderPass, draws[draw] the draw.
+@@ -184,6 +191,12 @@ struct CompileOptions {
+   bool producerWaits = false;
+   // Fill CompileStats::reorderable (a walk over the last encoders at every AttachmentChange cut): sampled frames only.
+   bool countReorderable = false;
++  // A clear-only pass (no draws, one attachment, Clear + Store, whole mip, 1x, not transient) does not open an
++  // encoder: it waits until a command touches what it clears. A pass that attaches the same target with Load
++  // over the whole mip and touches it in no other way takes the clear as its own load action (one encoder
++  // fewer, the clear is free on the tile); any other command that touches it first makes it an encoder of its
++  // own, as without the option, ahead of that command. Needs the resource table.
++  bool fuseClears = false;
+ };
+ 
+ class ResourceTable;
+diff --git a/gpu/core/src/device.cpp b/gpu/core/src/device.cpp
+index 0b6b7af..7411d91 100644
+--- a/gpu/core/src/device.cpp
++++ b/gpu/core/src/device.cpp
+@@ -71,7 +71,9 @@ FrameReport Device::submit(const Frame& frame) {
+   std::unique_lock resLock(resMutex_);
+   CompileOptions opts = compileOptions_;
+   opts.countReorderable = index % 90 == 0;  // a diagnostic with a cost: the sampled frames only
+-  opts.producerWaits = (gRuntimeOpts.load(std::memory_order_relaxed) & kOptProducerWaits) != 0;
++  const uint32_t rtOpts = gRuntimeOpts.load(std::memory_order_relaxed);
++  opts.producerWaits = (rtOpts & kOptProducerWaits) != 0;
++  opts.fuseClears = (rtOpts & kOptFuseClears) != 0;
+   const CompiledFrame compiled = compileFrame(frame, &resources_, opts);
+   resLock.unlock();
+   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+diff --git a/gpu/core/src/diagnostics.cpp b/gpu/core/src/diagnostics.cpp
+index f5c8f22..34af10f 100644
+--- a/gpu/core/src/diagnostics.cpp
++++ b/gpu/core/src/diagnostics.cpp
+@@ -62,6 +62,9 @@ std::vector<std::string> formatReport(const FrameReport& r) {
+   if (r.compile.storesKept) kv(l, " stores_kept=%u", r.compile.storesKept);
+   if (r.compile.msaaStaleReads) kv(l, " msaa_stale=%u", r.compile.msaaStaleReads);
+   if (r.compile.badFetch) kv(l, " bad_fetch=%u", r.compile.badFetch);
++  if (r.compile.clearOnly)
++    kv(l, " clear_only=%u clear_fused=%u flush_conflict=%u flush_partial=%u flush_end=%u", r.compile.clearOnly,
++       r.compile.clearFused, r.compile.flushConflict, r.compile.flushPartial, r.compile.flushEnd);
+   kv(l, " cpu_ms=%.3f enc_ms=%.3f wait_ms=%.3f", r.cpuCompileMs, r.cpuEncodeMs, r.cpuWaitMs);
+   if (r.gpu.frameMs > 0) kv(l, " gpu_ms=%.3f", r.gpu.frameMs);
+   lines.push_back(std::move(l));
+diff --git a/gpu/core/src/frame_compiler.cpp b/gpu/core/src/frame_compiler.cpp
+index af93940..089e1da 100644
+--- a/gpu/core/src/frame_compiler.cpp
++++ b/gpu/core/src/frame_compiler.cpp
+@@ -251,7 +251,57 @@ class Scheduler {
+   // `acc` is updated in place: pixel-local reads that cannot be served from the tile lose their
+   // attachment tag; they are reported as bad fetches and their draws listed in badDraws.
+   void renderPass(uint32_t i, const RenderPass& rp, AccessList& acc) {
+-    const RenderPassDesc& desc = rp.desc;
++    if (!options_.fuseClears) return place(i, rp, rp.desc, acc);
++    // Pending clears this pass touches: fused into its load actions, or else materialised first.
++    RenderPassDesc fused = rp.desc;
++    std::vector<uint32_t> fusedCmds;
++    if (!pending_.empty() && touches(acc, pendingAcc_)) {
++      for (size_t k = 0; k < pending_.size();) {
++        PendingClear& pc = pending_[k];
++        if (!touches(acc, pc.idx)) {
++          ++k;
++          continue;
++        }
++        const Fit fit = classify(pc, rp.desc, acc);
++        if (fit == Fit::Fuse) {
++          const int slot = slotOf(rp.desc, pc.target.texture);
++          (slot == kDepthSlot ? fused.depth : fused.colors[slot]).load = LoadAction::Clear;
++          (slot == kDepthSlot ? fused.depth : fused.colors[slot]).clear = pc.target.clear;
++          fusedCmds.push_back(pc.cmd);
++          ++out_.stats.clearFused;
++        } else {
++          ++(fit == Fit::Partial ? out_.stats.flushPartial : out_.stats.flushConflict);
++          materialize(pc);
++        }
++        pending_.erase(pending_.begin() + static_cast<std::ptrdiff_t>(k));
++      }
++      rebuildPending();
++    }
++    if (fusedCmds.empty() && deferrable(rp)) {
++      PendingClear pc;
++      pc.cmd = i;
++      pc.rp = &rp;
++      pc.acc = acc;
++      pc.idx.append(acc);
++      forEachSlot(rp.desc, [&](const Attachment& a, int) {
++        if (a.texture) pc.target = a;
++      });
++      pendingAcc_.append(acc);
++      pending_.push_back(std::move(pc));
++      ++out_.stats.clearOnly;
++      return;
++    }
++    place(i, rp, fused, acc);
++    if (fusedCmds.empty()) return;
++    // The fused clears are part of this encoder, ahead of the pass: barriers and the backend's per-command
++    // bookkeeping see their writes.
++    Encoder& e = out_.encoders[open_];
++    e.commands.insert(e.commands.end() - 1, fusedCmds.begin(), fusedCmds.end());
++    e.passes += static_cast<uint32_t>(fusedCmds.size());
++  }
++
++  // Schedules one pass; `desc` is its attachment set (rp.desc, or that with pending clears fused into the loads).
++  void place(uint32_t i, const RenderPass& rp, const RenderPassDesc& desc, AccessList& acc) {
+     // Pixel-local reads are always served as colour attachments of the encoder, at the slot the
+     // texture was last rendered through (see fetchIndex). If the texture is not one of this pass's
+     // own attachments it is added: merged into the encoder that holds it, or else loaded.
+@@ -320,6 +370,7 @@ class Scheduler {
+   }
+ 
+   void copy(uint32_t i, AccessList acc) {
++    flushTouched(acc);
+     if (open_ < 0) return computeWork(i, CutReason::CopyWork, std::move(acc));
+     if (conflicts(acc, acc_[open_]) || conflicts(acc, sunkAcc_)) {
+       sunk_.push_back(i);
+@@ -341,13 +392,101 @@ class Scheduler {
+   }
+ 
+   void dispatch(uint32_t i, AccessList acc) {
++    flushTouched(acc);
+     closeRender();
+     computeWork(i, CutReason::ComputeWork, std::move(acc));
+   }
+ 
+-  void finish() { closeRender(); }
++  void finish() {
++    for (PendingClear& pc : pending_) {
++      ++out_.stats.flushEnd;
++      materialize(pc);
++    }
++    pending_.clear();
++    pendingAcc_.clear();
++    closeRender();
++  }
+ 
+  private:
++  // A clear-only pass held back by CompileOptions::fuseClears.
++  struct PendingClear {
++    uint32_t cmd = 0;
++    const RenderPass* rp = nullptr;
++    AccessList acc;
++    AccessIndex idx;
++    Attachment target;  // its only attachment
++  };
++  enum class Fit { Fuse, Partial, Conflict };
++
++  // Pass `rp` touches the clear's target: can the clear become the load action of rp's attachment? Only if rp
++  // attaches that very target with Load, over the whole mip and the same layers (the clear covers the whole
++  // mip), and nothing else of rp touches it.
++  Fit classify(const PendingClear& pc, const RenderPassDesc& desc, const AccessList& acc) const {
++    const int slot = slotOf(desc, pc.target.texture);
++    if (slot < 0) return Fit::Conflict;
++    const Attachment& a = slot == kDepthSlot ? desc.depth : desc.colors[slot];
++    if (!a.sameTarget(pc.target) || a.load != LoadAction::Load) return Fit::Conflict;
++    if (desc.layerCount != pc.rp->desc.layerCount || !coversMip(desc, a)) return Fit::Partial;
++    const ResourceRange& cleared = pc.acc.front().access.range;
++    int own = 0;
++    for (const Tagged& t : acc) {
++      const ResourceRange& r = t.access.range;
++      if (!r.overlaps(cleared)) continue;
++      // The attachment's own write, once: any other access (a sample, a fetch, a resolve into it) is a use.
++      const bool mine = t.attachment && t.access.write && !t.access.pixelLocal && r.contains(cleared) && cleared.contains(r);
++      if (!mine || own++) return Fit::Partial;
++    }
++    return own == 1 ? Fit::Fuse : Fit::Partial;
++  }
++
++  // The render area of `desc` covers the whole mip of attachment `a` (0 x 0: the attachments' size).
++  bool coversMip(const RenderPassDesc& desc, const Attachment& a) const {
++    const TextureDesc* d = res_->get(a.texture);
++    if (!d) return false;
++    return (!desc.renderWidth && !desc.renderHeight) ||
++           (desc.renderWidth >= std::max(1u, d->width >> a.mip) && desc.renderHeight >= std::max(1u, d->height >> a.mip));
++  }
++
++  // A pass to hold back: no draws, one attachment, Clear + Store, no resolve, over the whole mip of a 1x texture
++  // that is not transient (the backend may allocate a transient one without memory, which a clear must not touch).
++  bool deferrable(const RenderPass& rp) const {
++    if (!res_ || !rp.draws.empty()) return false;
++    const Attachment* only = nullptr;
++    int n = 0;
++    forEachSlot(rp.desc, [&](const Attachment& a, int) {
++      if (a.texture) only = &a, ++n;
++    });
++    if (n != 1 || only->load != LoadAction::Clear || only->store != StoreAction::Store || only->resolve) return false;
++    const TextureDesc* d = res_->get(only->texture);
++    return d && d->samples == 1 && !d->transient && coversMip(rp.desc, *only);
++  }
++
++  // The clear becomes an encoder of its own, exactly as it would have been scheduled where it was recorded.
++  void materialize(PendingClear& pc) {
++    AccessList acc = pc.acc;
++    place(pc.cmd, *pc.rp, pc.rp->desc, acc);
++  }
++
++  void rebuildPending() {
++    pendingAcc_.clear();
++    for (const PendingClear& pc : pending_) pendingAcc_.append(pc.acc);
++  }
++
++  // Materialises the pending clears that a command touches (its program order after them is kept).
++  void flushTouched(const AccessList& acc) {
++    if (pending_.empty() || !touches(acc, pendingAcc_)) return;
++    for (size_t k = 0; k < pending_.size();) {
++      if (!touches(acc, pending_[k].idx)) {
++        ++k;
++        continue;
++      }
++      ++out_.stats.flushConflict;
++      materialize(pending_[k]);
++      pending_.erase(pending_.begin() + static_cast<std::ptrdiff_t>(k));
++    }
++    rebuildPending();
++  }
++
+   // CompileStats::reorderable. Walks back from the newest encoder: the pass can only move up past encoders it
+   // does not touch (and past the copies sunk after the open encoder).
+   void countReorderable(const RenderPassDesc& desc, const RenderPassDesc& need, const AccessList& acc) {
+@@ -474,6 +613,8 @@ class Scheduler {
+   AccessIndex sunkAcc_;
+   RenderPassDesc lastRender_;
+   bool haveLastRender_ = false;
++  std::vector<PendingClear> pending_;  // CompileOptions::fuseClears, in program order
++  AccessIndex pendingAcc_;             // their accesses
+ };
+ 
+ // Phase 2: walk the final order and place barriers only for real hazards.
+diff --git a/gpu/core/tests/core_tests.cpp b/gpu/core/tests/core_tests.cpp
+index 24e722f..d2fbbe5 100644
+--- a/gpu/core/tests/core_tests.cpp
++++ b/gpu/core/tests/core_tests.cpp
+@@ -88,6 +88,51 @@ struct Scene {
+ uint32_t cuts(const CompiledFrame& c, CutReason r) { return c.stats.cuts[static_cast<int>(r)]; }
+ uint32_t hazards(const CompiledFrame& c, HazardKind k) { return c.stats.hazards[static_cast<int>(k)]; }
+ 
++// Everything a command touches, as declared (no compiler involved).
++std::vector<Access> accessesOfCommand(const Command& c) {
++  std::vector<Access> v;
++  if (const auto* rp = std::get_if<RenderPass>(&c)) {
++    v = attachmentAccesses(rp->desc);
++    for (const Draw& d : rp->draws)
++      for (const Access& a : drawAccesses(d)) v.push_back(a);
++  } else if (const auto* d = std::get_if<Dispatch>(&c)) {
++    v = d->bindings;
++    if (d->indirect) v.push_back(read(ResourceRange::bytes(d->indirect->buffer, d->indirect->offset, 12), stage::compute));
++  } else {
++    v = copyAccesses(std::get<Copy>(c));
++  }
++  return v;
++}
++
++// ORDER ORACLE: every command is scheduled exactly once, and every pair of commands in conflict (overlapping
++// ranges, a write on one side; attachments and pixel-local reads included) keeps its program order: position is
++// (encoder, index in Encoder::commands). Returns the violations.
++uint32_t orderViolations(const Frame& f, const CompiledFrame& cf) {
++  const auto& cmds = f.commands();
++  std::vector<std::pair<uint32_t, uint32_t>> pos(cmds.size(), {UINT32_MAX, 0});
++  uint32_t bad = 0;
++  for (uint32_t e = 0; e < cf.encoders.size(); ++e)
++    for (uint32_t k = 0; k < cf.encoders[e].commands.size(); ++k) {
++      auto& p = pos[cf.encoders[e].commands[k]];
++      bad += p.first != UINT32_MAX;  // scheduled twice
++      p = {e, k};
++    }
++  std::vector<std::vector<Access>> acc;
++  for (const Command& c : cmds) acc.push_back(accessesOfCommand(c));
++  for (uint32_t i = 0; i < cmds.size(); ++i) {
++    bad += pos[i].first == UINT32_MAX;  // never scheduled (these frames reference only live resources)
++    for (uint32_t j = i + 1; j < cmds.size(); ++j) {
++      if (pos[i].first == UINT32_MAX || pos[j].first == UINT32_MAX || pos[i] < pos[j]) continue;
++      bool conflict = false;
++      for (const Access& a : acc[i])
++        for (const Access& b : acc[j])
++          conflict = conflict || (a.range.kind != ResourceRange::Kind::Sampler && (a.write || b.write) && a.range.overlaps(b.range));
++      bad += conflict;
++    }
++  }
++  return bad;
++}
++
+ // ---------------------------------------------------------------------------------------------
+ 
+ void testResources() {
+@@ -953,6 +998,13 @@ void testProducerWaits() {
+         RenderPassDesc pd;
+         pd.colors[0].texture = tex[R(3)];
+         pd.colors[0].load = LoadAction(R(3));
++        if (!R(3)) {  // a clear-only pass first (fused into this pass when the option is on)
++          RenderPassDesc cd;
++          cd.colors[0] = pd.colors[0];
++          cd.colors[0].load = LoadAction::Clear;
++          f.clear(cd);
++          pd.colors[0].load = LoadAction::Load;
++        }
+         if (R(2)) pd.depth = {tex[3], 0, 0, LoadAction(R(3)), StoreAction::Store, {}, {}, 0, 0};
+         std::vector<Access> b;
+         for (int n = R(3); n > 0; --n) {
+@@ -968,6 +1020,7 @@ void testProducerWaits() {
+     }
+     CompileOptions po;
+     po.producerWaits = true;
++    po.fuseClears = it & 1;  // barriers and producers must also see the clears fused into an encoder
+     const CompiledFrame cf = compileFrame(f, &s.res, po);
+     barriersLegacy += uint32_t(compileFrame(f, &s.res).barriers.size());
+     barriersProd += uint32_t(cf.barriers.size());
+@@ -1038,6 +1091,258 @@ void testProducerWaits() {
+   CHECK_EQ(violations, 0u);
+ }
+ 
++// CompileOptions::fuseClears (kOptFuseClears): a clear-only pass waits for the next pass on its target.
++void testClearFuse() {
++  Scene s;
++  CompileOptions on;
++  on.fuseClears = true;
++  const TextureId c = s.rt(), d = s.depthRt(), other = s.rt();
++  const BufferId buf = s.buf();
++  auto clearPass = [](TextureId t, float v, bool depth = false) {
++    RenderPassDesc p;
++    Attachment& a = depth ? p.depth : p.colors[0];
++    a.texture = t;
++    a.load = LoadAction::Clear;
++    a.clear.color = {v, v, v, 1};
++    a.clear.depth = v;
++    return p;
++  };
++  auto loadPass = [](TextureId col, TextureId dep = {}) { return Scene::pass(col, dep); };
++  auto sameSchedule = [](const CompiledFrame& a, const CompiledFrame& b) {
++    if (a.encoders.size() != b.encoders.size() || a.barriers.size() != b.barriers.size()) return false;
++    for (size_t e = 0; e < a.encoders.size(); ++e) {
++      const Encoder &x = a.encoders[e], &y = b.encoders[e];
++      if (x.kind != y.kind || x.reason != y.reason || x.commands != y.commands || x.passes != y.passes ||
++          !x.pass.sameTargets(y.pass))
++        return false;
++      for (int k = 0; k <= kMaxColorAttachments; ++k) {
++        const Attachment &p = k == kDepthSlot ? x.pass.depth : x.pass.colors[k], &q = k == kDepthSlot ? y.pass.depth : y.pass.colors[k];
++        if (p.load != q.load || p.store != q.store || p.clear.color != q.clear.color || p.clear.depth != q.clear.depth) return false;
++      }
++    }
++    return true;
++  };
++  {  // colour clear + depth clear + one pass loading both: one encoder, both loads are clears
++    Frame f;
++    f.clear(clearPass(c, 0.25f));
++    f.clear(clearPass(d, 0.5f, true));
++    Scene::passWithDraw(f, loadPass(c, d));
++    CHECK_EQ(compileFrame(f, &s.res).encoders.size(), size_t{3});  // without the option: one encoder each
++    const CompiledFrame cf = compileFrame(f, &s.res, on);
++    CHECK_EQ(cf.encoders.size(), size_t{1});
++    const Encoder& e = cf.encoders[0];
++    CHECK(e.pass.colors[0].load == LoadAction::Clear && e.pass.colors[0].clear.color[0] == 0.25f);
++    CHECK(e.pass.depth.load == LoadAction::Clear && e.pass.depth.clear.depth == 0.5f);
++    CHECK(e.commands == (std::vector<uint32_t>{0, 1, 2}));
++    CHECK_EQ(e.passes, 3u);
++    CHECK_EQ(cf.stats.clearOnly, 2u);
++    CHECK_EQ(cf.stats.clearFused, 2u);
++    CHECK_EQ(cf.stats.flushConflict + cf.stats.flushPartial + cf.stats.flushEnd, 0u);
++    CHECK(cf.barriers.empty());
++    CHECK_EQ(orderViolations(f, cf), 0u);
++  }
++  {  // clear, an independent dispatch, the pass: the clear waits behind the dispatch
++    Frame f;
++    f.clear(clearPass(c, 1.0f));
++    f.dispatch(Scene::compute({write(ResourceRange::bytes(buf, 0, 256), stage::compute)}));
++    Scene::passWithDraw(f, loadPass(c));
++    CHECK_EQ(compileFrame(f, &s.res).encoders.size(), size_t{3});
++    const CompiledFrame cf = compileFrame(f, &s.res, on);
++    CHECK_EQ(cf.encoders.size(), size_t{2});
++    CHECK(cf.encoders[0].kind == Encoder::Kind::Compute);
++    CHECK(cf.encoders[1].pass.colors[0].load == LoadAction::Clear);
++    CHECK(cf.encoders[1].commands == (std::vector<uint32_t>{0, 2}));
++    CHECK_EQ(cf.stats.clearFused, 1u);
++    CHECK_EQ(orderViolations(f, cf), 0u);
++  }
++  {  // the clear then a pass on other targets, then the pass on c: fused into the later pass
++    Frame f;
++    f.clear(clearPass(c, 1.0f));
++    Scene::passWithDraw(f, loadPass(other));
++    Scene::passWithDraw(f, loadPass(c));
++    const CompiledFrame cf = compileFrame(f, &s.res, on);
++    CHECK_EQ(cf.encoders.size(), size_t{2});
++    CHECK(cf.encoders[1].pass.colors[0].load == LoadAction::Clear);
++    CHECK_EQ(orderViolations(f, cf), 0u);
++  }
++  {  // something reads what is cleared in between: the clear is an encoder of its own, ahead of the reader
++    Frame f;
++    f.clear(clearPass(c, 1.0f));
++    Scene::passWithDraw(f, loadPass(other), {Scene::sample(c)});
++    Scene::passWithDraw(f, loadPass(c));
++    const CompiledFrame cf = compileFrame(f, &s.res, on), off = compileFrame(f, &s.res);
++    CHECK(sameSchedule(cf, off));
++    CHECK_EQ(cf.stats.clearOnly, 1u);
++    CHECK_EQ(cf.stats.flushConflict, 1u);
++    CHECK_EQ(cf.stats.clearFused, 0u);
++    CHECK_EQ(orderViolations(f, cf), 0u);
++  }
++  {  // a dispatch, a copy that touch it
++    Frame f;
++    f.clear(clearPass(c, 1.0f));
++    f.dispatch(Scene::compute({read(ResourceRange::wholeTexture(c), stage::compute)}));
++    f.clear(clearPass(other, 1.0f));
++    Copy cp;
++    cp.kind = CopyKind::TextureToTexture;
++    cp.srcTexture = {other, 0, 0, 1, 0, 0, 0, 4, 4, 1};
++    cp.dstTexture = {c, 0, 0, 1, 0, 0, 0, 4, 4, 1};
++    f.copy(cp);
++    const CompiledFrame cf = compileFrame(f, &s.res, on);
++    CHECK(sameSchedule(cf, compileFrame(f, &s.res)));
++    CHECK_EQ(cf.stats.flushConflict, 2u);
++    CHECK_EQ(orderViolations(f, cf), 0u);
++  }
++  {  // a render area smaller than the mip: not fused (the pass must clear all of what the clear cleared)
++    Frame f;
++    f.clear(clearPass(c, 1.0f));
++    auto part = loadPass(c);
++    part.renderWidth = part.renderHeight = 128;
++    Scene::passWithDraw(f, part);
++    const CompiledFrame cf = compileFrame(f, &s.res, on);
++    CHECK(sameSchedule(cf, compileFrame(f, &s.res)));
++    CHECK_EQ(cf.stats.flushPartial, 1u);
++    CHECK_EQ(cf.stats.clearFused, 0u);
++    // a render area that covers the mip is fine
++    Frame g;
++    g.clear(clearPass(c, 1.0f));
++    auto whole = loadPass(c);
++    whole.renderWidth = whole.renderHeight = 256;
++    Scene::passWithDraw(g, whole);
++    CHECK_EQ(compileFrame(g, &s.res, on).stats.clearFused, 1u);
++    // and a clear over a smaller area is not held back at all
++    Frame h;
++    auto small = clearPass(c, 1.0f);
++    small.renderWidth = small.renderHeight = 128;
++    h.clear(small);
++    Scene::passWithDraw(h, loadPass(c));
++    CHECK_EQ(compileFrame(h, &s.res, on).stats.clearOnly, 0u);
++  }
++  {  // the pass also samples the cleared texture (or fetches it): not fused
++    Frame f;
++    f.clear(clearPass(c, 1.0f));
++    Scene::passWithDraw(f, loadPass(c), {Scene::sample(c)});
++    const CompiledFrame cf = compileFrame(f, &s.res, on);
++    CHECK_EQ(cf.stats.flushPartial, 1u);
++    CHECK_EQ(cf.stats.clearFused, 0u);
++    CHECK_EQ(orderViolations(f, cf), 0u);
++  }
++  {  // a clear and a pass through views of different formats (sRGB vs UNORM) are not the same target
++    const TextureId v = s.rt(256, 1, 1, Format::RGBA8Unorm);
++    Frame f;
++    auto srgbClear = clearPass(v, 1.0f);
++    srgbClear.colors[0].viewFormat = Format::RGBA8Srgb;
++    f.clear(srgbClear);
++    Scene::passWithDraw(f, loadPass(v));  // views as the texture's own format
++    const CompiledFrame cf = compileFrame(f, &s.res, on);
++    CHECK_EQ(cf.stats.clearFused, 0u);
++    CHECK_EQ(cf.stats.flushConflict, 1u);
++    CHECK_EQ(orderViolations(f, cf), 0u);
++    Frame g;  // the same view format on both: fused
++    g.clear(srgbClear);
++    auto srgbLoad = loadPass(v);
++    srgbLoad.colors[0].viewFormat = Format::RGBA8Srgb;
++    Scene::passWithDraw(g, srgbLoad);
++    CHECK_EQ(compileFrame(g, &s.res, on).stats.clearFused, 1u);
++  }
++  {  // a copy sunk behind the open encoder, then a clear and a pass that needs the copy done first
++    Frame f;
++    Scene::passWithDraw(f, loadPass(other), {Scene::vsRead(buf, 0, 256)});
++    f.fillBuffer(Scene::span(buf, 0, 256), 7);  // conflicts with the open encoder's read: sunk behind it
++    f.clear(clearPass(other, 1.0f));
++    Scene::passWithDraw(f, loadPass(other), {Scene::vsRead(buf, 0, 256)});  // reads what the copy wrote
++    const CompiledFrame cf = compileFrame(f, &s.res, on), off = compileFrame(f, &s.res);
++    CHECK_EQ(cf.stats.copiesSunk, 1u);
++    CHECK_EQ(cf.stats.clearFused, 1u);
++    CHECK_EQ(orderViolations(f, cf), 0u);
++    CHECK_EQ(orderViolations(f, off), 0u);
++    CHECK(cf.encoders.size() <= off.encoders.size());
++  }
++  {  // a pass that loads another mip or layer of the texture does not touch the clear
++    const TextureId m = s.rt(256, 2);
++    Frame f;
++    f.clear(clearPass(m, 1.0f));
++    auto mip1 = loadPass(m);
++    mip1.colors[0].mip = 1;
++    Scene::passWithDraw(f, mip1);
++    const CompiledFrame cf = compileFrame(f, &s.res, on);
++    CHECK_EQ(cf.stats.clearFused, 0u);
++    CHECK_EQ(cf.stats.flushEnd, 1u);  // nothing touched it: it runs at the end
++    CHECK_EQ(cf.encoders.size(), size_t{2});
++    CHECK_EQ(orderViolations(f, cf), 0u);
++  }
++  {  // a pass that clears or discards the target does not take the pending clear: it is flushed first
++    Frame f;
++    f.clear(clearPass(c, 1.0f));
++    f.clear(clearPass(c, 0.0f));
++    Scene::passWithDraw(f, loadPass(c));
++    const CompiledFrame cf = compileFrame(f, &s.res, on);
++    CHECK_EQ(cf.stats.clearOnly, 2u);
++    CHECK_EQ(cf.stats.flushConflict, 1u);
++    CHECK_EQ(cf.stats.clearFused, 1u);
++    CHECK_EQ(orderViolations(f, cf), 0u);
++    CHECK(cf.encoders.back().pass.colors[0].clear.color[0] == 0.0f);
++  }
++  {  // not held back: stores other than Store, MSAA, transient, several attachments, draws
++    TextureDesc md;
++    md.format = Format::RGBA8Unorm;
++    md.width = md.height = 256;
++    md.samples = 4;
++    md.usage = usage::colorTarget;
++    const TextureId msaa = s.res.createTexture(md);
++    md.samples = 1;
++    md.transient = true;
++    const TextureId trans = s.res.createTexture(md);
++    Frame f;
++    auto dc = clearPass(c, 1.0f);
++    dc.colors[0].store = StoreAction::DontCare;
++    f.clear(dc);
++    f.clear(clearPass(msaa, 1.0f));
++    f.clear(clearPass(trans, 1.0f));
++    auto two = clearPass(c, 1.0f);
++    two.depth = {d, 0, 0, LoadAction::Clear, StoreAction::Store, {}, {}, 0, 0};
++    f.clear(two);
++    Scene::passWithDraw(f, clearPass(c, 1.0f), {});
++    CHECK_EQ(compileFrame(f, &s.res, on).stats.clearOnly, 0u);
++    CHECK_EQ(compileFrame(f, nullptr, on).stats.clearOnly, 0u);  // no resource table: sizes unknown
++  }
++  {  // the end of the frame materialises what is left
++    Frame f;
++    Scene::passWithDraw(f, loadPass(other));
++    f.clear(clearPass(c, 1.0f));
++    const CompiledFrame cf = compileFrame(f, &s.res, on);
++    CHECK(sameSchedule(cf, compileFrame(f, &s.res)));
++    CHECK_EQ(cf.stats.flushEnd, 1u);
++    CHECK_EQ(orderViolations(f, cf), 0u);
++  }
++  {  // the option off: nothing is counted, and the log line has no clear fields
++    Frame f;
++    f.clear(clearPass(c, 1.0f));
++    Scene::passWithDraw(f, loadPass(c));
++    const CompiledFrame cf = compileFrame(f, &s.res);
++    CHECK_EQ(cf.stats.clearOnly + cf.stats.clearFused + cf.stats.flushConflict + cf.stats.flushPartial + cf.stats.flushEnd, 0u);
++    CHECK(formatReport(makeReport(0, f, cf))[0].find("clear_only") == std::string::npos);
++    const CompiledFrame cn = compileFrame(f, &s.res, on);
++    CHECK(formatReport(makeReport(0, f, cn))[0].find(" clear_only=1 clear_fused=1 flush_conflict=0 flush_partial=0 flush_end=0") !=
++          std::string::npos);
++  }
++  {  // Device: the runtime bit turns it on per submit
++    NullBackend be;
++    Device dev(be, 0, [](const std::string&) {});
++    TextureDesc td;
++    td.format = Format::RGBA8Unorm;
++    td.width = td.height = 64;
++    td.usage = usage::colorTarget;
++    const TextureId t = dev.createTexture(td);
++    Frame f;
++    f.clear(clearPass(t, 1.0f));
++    Scene::passWithDraw(f, loadPass(t));
++    CHECK_EQ(dev.submit(f).compile.clearFused, 0u);
++    gRuntimeOpts.store(kOptFuseClears);
++    CHECK_EQ(dev.submit(f).compile.clearFused, 1u);
++    gRuntimeOpts.store(0);
++  }
++}
++
+ // Random frames (fixed seed) against the invariants Metal and the tile logic rely on: every render
+ // encoder has one size and sample count, no texture in two slots, tile-local slots never load nor
+ // store, released contents are not read by a later encoder, and skipped draws are exactly those
+@@ -1045,7 +1350,7 @@ void testProducerWaits() {
+ void testFuzz() {
+   std::mt19937 rng(1234);
+   auto R = [&](int n) { return int(rng() % unsigned(n)); };
+-  uint32_t violations = 0, merged = 0, bad = 0;
++  uint32_t violations = 0, merged = 0, bad = 0, fused = 0, flushed = 0;
+   for (int it = 0; it < 4000; ++it) {
+     Scene s;
+     std::vector<TextureId> tex;
+@@ -1063,7 +1368,26 @@ void testFuzz() {
+     Frame f;
+     for (int p = 2 + R(4); p > 0; --p) {
+       if (!R(10)) {
+-        f.dispatch(Scene::compute({read(ResourceRange::wholeTexture(tex[R(nt - 1)]), stage::compute)}));
++        const TextureId t = tex[R(nt - 1)];
++        f.dispatch(Scene::compute({R(3) ? read(ResourceRange::wholeTexture(t), stage::compute)
++                                        : write(ResourceRange::wholeTexture(t), stage::compute)}));
++        continue;
++      }
++      if (!R(14)) {  // texture copy: ordered against every pass and clear on either texture
++        Copy cp;
++        cp.kind = CopyKind::TextureToTexture;
++        cp.srcTexture = {tex[R(nt - 1)], 0, 0, 1, 0, 0, 0, 4, 4, 1};
++        cp.dstTexture = {tex[R(nt - 1)], 0, 0, 1, 0, 0, 0, 4, 4, 1};
++        f.copy(cp);
++        continue;
++      }
++      if (!R(9)) {  // a clear-only pass on a random texture (colour or depth)
++        RenderPassDesc cd;
++        const int k = R(nt);
++        Attachment& at = k == nt - 1 ? cd.depth : cd.colors[R(4)];
++        at = {tex[k], 0, 0, LoadAction::Clear, StoreAction::Store, {}, {}, 0, 0};
++        at.clear.color = {float(R(4)), 0, 0, 1};
++        f.clear(cd);
+         continue;
+       }
+       // A valid client pass: distinct textures of one size and sample count.
+@@ -1091,11 +1415,36 @@ void testFuzz() {
+         const TextureId t = tex[R(nt)];
+         b.push_back(R(2) ? pixelLocalRead(t) : Scene::sample(t));
+       }
++      if (!R(8)) pd.renderWidth = pd.renderHeight = 128;  // a render area: 128 is under a 256 mip, over a 128 one
++      if (!R(2)) {  // clear one attachment as a clear-only pass first, the pass then loads it: the fusion pattern
++        RenderPassDesc cd;
++        Attachment* chosen = nullptr;
++        int slot = -1;
++        for (int c = 0; c <= kMaxColorAttachments; ++c) {
++          Attachment& at = c == kDepthSlot ? pd.depth : pd.colors[c];
++          if (at.texture && (!chosen || R(2))) chosen = &at, slot = c;
++        }
++        if (chosen) {
++          Attachment& to = slot == kDepthSlot ? cd.depth : cd.colors[slot];
++          to = *chosen;
++          to.load = LoadAction::Clear, to.store = R(5) ? StoreAction::Store : StoreAction::DontCare;
++          to.clear.color = {float(R(4)), 0, 0, 1};
++          if (R(5)) chosen->load = LoadAction::Load;
++          f.clear(cd);
++        }
++      }
+       Scene::passWithDraw(f, pd, b);
+     }
+-    const CompiledFrame cf = compileFrame(f, &s.res);
++    // The same invariants with the clear fusion off and on, and the order oracle on both.
++    for (const bool fuse : {false, true}) {
++    CompileOptions co;
++    co.fuseClears = fuse;
++    const CompiledFrame cf = compileFrame(f, &s.res, co);
+     merged += cf.stats.passesMerged;
+     bad += uint32_t(cf.badDraws.size());
++    fused += cf.stats.clearFused;
++    flushed += cf.stats.flushConflict + cf.stats.flushPartial + cf.stats.flushEnd;
++    violations += orderViolations(f, cf);
+     const auto& cmds = f.commands();
+     auto touches = [&](uint32_t ci, TextureId t) {
+       bool hit = false;
+@@ -1134,10 +1483,13 @@ void testFuzz() {
+         }
+       }
+     }
++    }
+   }
+-  std::printf("  fuzz: 4000 frames, %u passes merged, %u draws skipped, %u violations\n", merged, bad, violations);
++  std::printf("  fuzz: 4000 frames x (fusion off, on), %u passes merged, %u draws skipped, %u clears fused, %u flushed, %u violations\n",
++              merged, bad, fused, flushed, violations);
+   CHECK_EQ(violations, 0u);
+   CHECK(merged > 0 && bad > 0);  // the generator reaches both paths
++  CHECK(fused > 0 && flushed > 0);
+ }
+ 
+ void testBindings() {
+@@ -1275,7 +1627,8 @@ int main(int argc, char** argv) {
+       {"copies", testCopies},       {"hazards", testHazards},   {"subresources", testSubresources},
+       {"cuts", testCuts},           {"diagnostics", testDiagnostics}, {"pipelines", testPipelines},
+       {"device", testDevice},       {"tile", testTile},         {"bindings", testBindings},
+-      {"astro", testAstroFrame},    {"fuzz", testFuzz}, {"producers", testProducerWaits}};
++      {"astro", testAstroFrame},    {"fuzz", testFuzz}, {"producers", testProducerWaits},
++      {"clearfuse", testClearFuse}};
+   bool ran = false;
+   for (const auto& [name, fn] : groups) {
+     if (argc > 1 && std::strcmp(argv[1], name) != 0) continue;
+diff --git a/gpu/metal2/src/metal_backend.mm b/gpu/metal2/src/metal_backend.mm
+index 8efcb7a..566c1fe 100644
+--- a/gpu/metal2/src/metal_backend.mm
++++ b/gpu/metal2/src/metal_backend.mm
+@@ -4370,6 +4370,12 @@ void MetalBackend::submit(uint64_t frameIndex, const Frame& frame, const Compile
+   for (const Encoder& e : compiled.encoders) computeEnc += e.kind == Encoder::Kind::Compute;
+   gDraws.fetch_add(draws, std::memory_order_relaxed);
+   gComputeEncoders.fetch_add(computeEnc, std::memory_order_relaxed);
++  // Patch 0043 (CompileOptions::fuseClears): what the frame compiler did with the clear-only passes.
++  gClearOnly.fetch_add(compiled.stats.clearOnly, std::memory_order_relaxed);
++  gClearFused.fetch_add(compiled.stats.clearFused, std::memory_order_relaxed);
++  gFlushConflict.fetch_add(compiled.stats.flushConflict, std::memory_order_relaxed);
++  gFlushPartial.fetch_add(compiled.stats.flushPartial, std::memory_order_relaxed);
++  gFlushEnd.fetch_add(compiled.stats.flushEnd, std::memory_order_relaxed);
+ }
+ 
+ double MetalBackend::lastSubmitWaitMs() const { return double(gLastWaitNs.load(std::memory_order_relaxed)) / 1e6; }
+-- 
+2.43.0
+
