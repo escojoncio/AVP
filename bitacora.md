@@ -4,10 +4,19 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` = rama `avp-port-main`, **sin parches**: `vpkengine-patches/` vacío; cambios del
 motor se hacen en VPKEngine, mapa en su bitácora). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B66**, CI OK, sin verificar en visor).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B67**, sin verificar en visor).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
+- B67 (`a20b4e4`): motor `4ce51d8` (rama `avp-port-main`; main sigue en `3f7da04`). Presupuesto de archivos corregido en motor
+  (B66 abría 29 archivos: filtro de ruido >4×bytes ignoraba el coste real ~13×; +1,2–1,4 GB) → `VP_PIPELINE_ARCHIVE_BUDGET_MB=2048`
+  (B65 usaba ~1973), orden más reciente primero. Fusión de blits sin hazard (`gpu.frame blit_barriers= blits_merged=`,
+  `VP_BLIT_MERGE=0` off). `VPVK_ZERO_NEW_IMAGES=0` (B65 no ponía a cero). Ajuste «Identidad GPU Adreno» (`reportAdreno`,
+  `VPVK_REPORT_ADRENO`): solo vendor/nombre Adreno; B65 tenía identidad Adreno completa (límites Adreno) → A/B no idéntico.
+- Logs_Alyx_6/7 (B66 frío/caliente, misma zona): juego `[gputime]` 18,8 ms = B65 (sin regresión; el «15,5» de B62 era `gpu.time`,
+  otra métrica); escena 15,9 (vtx 5,7 vs 4,1 en B65, frag 10,1 vs 11,3); compositor 5,1 (B65 8,1); pace.gov 22–24 vs need 17 →
+  33 fps. Prewarm frío 211 s (traductor nuevo), caliente 5,6 s; compilación en juego caliente 0,3 s. RAM pico 7,5 GB / avail
+  mín. 616 MB (causa: presupuesto de archivos roto, ver B67). Coste por shader ya medido antes (logs 35/36): plano, ninguno >0,8 ms.
 - Logs_Alyx_5 (B65, 2m15s a1_intro_world, térmico nominal, panel 100 Hz): `[cp] cb` OK (bad=0): comp.new(wide+recon+comp)
   ~7,5 ms, same ~7,1, black ~1,7 → los 3 pases en 1 cmdbuf, falta reparto por pase. Plan y pacer coinciden (50/33,3); gobernador
   casi siempre en 33 (avg 11–26 vs need 17). 0 `gpu.pso.miss` pese a 238 compilaciones `gpu.pso f=` (log 0053 en ruta equivocada).
