@@ -4,10 +4,21 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` = rama `avp-port-main`, **sin parches**: `vpkengine-patches/` vacío; cambios del
 motor se hacen en VPKEngine, mapa en su bitácora). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B72**, sin verificar en visor).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B73**, sin verificar en visor).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
+- B73 (`0710210`): motor `55506b0` = main (c67c604 + fd90770 VQP opt-in + `VPVK_ROBUST`/`VPVK_DUMP_MSL_FILTER`).
+  `AVPSettings.swift` ~529 `VPVK_ROBUST=0` (en `sigKeys` → cuarentena se resetea 1 vez), ~594 `VPVK_DUMP_MSL=Logs Alyx/msl`
+  + filtro 6 ids (fs 126bc47d4e6c414d, b6a4cab50a7e6885, 00f1f8923af66428 no cambian con robust=0; vs sí → no coincidirán).
+  `AVPPrepare.swift` ~532 purga única (`vpcache/robust.mode`): pipelines*.metalar/.keys, pipelines.count, recipes.bin,
+  warm.stamp; conserva pipelines.foz y klfz. `AVPLog.swift` ~30/100 `msl/*.metal` a espejo y compartir. 1.er arranque:
+  retraducción + prewarm completo. Revisar en logs: `vk.robust app= mode=0 effective=0`, `[prepare] robust mode change`,
+  `gpu.pso.miss`, ficheros en `msl/`, vtx del pase MSAA (antes 0,8–2,5 ms).
+- Logs_Alyx_15 (B72): knockout OK 48/48 (base 13,6–14,4 ms). Top d_ms: pipe5275 7,22 (vtx 2,21/frag 4,91, 33 draws),
+  pipe5349 6,83 (4,6 draws), pipe5273 2,12, 5334 1,45, 5183 1,17, resto <0,7. 5275/5349 mismo vs (17377 chars), fs
+  ~74k chars, 8 loops, discard → material principal (unverified). No aditivos. Juego no pide robustBufferAccess/robustness2
+  (el motor anunciaba y aplicaba robust siempre: `eo.robustBuffers=true`). Comp med. 2,5 ms; 0 gpu.err; 1 stall 5 s.
 - B72: motor `c67c604` (knockout por hits dominantes; B71 se quedaba 0/192 → timeout: ~7 submits por frame).
 - Logs_Alyx_14 (B71): pase MSAA principal vtx 4,85 / frag 9,44 ms (antes 5,4/10,1; ~906 draws, térmico sin aislar);
   `gpu.sec n≈238` submits/s, ~33/s con el pase dominante.
@@ -79,22 +90,6 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
     slot reuse por frame, resolve 1x→copia, indirect GPU → encoder heavy (más memoria MSAA, `heavy_indirect=` en
     `gpu.frame`), presupuesto archivo real (`gpu.pso.cache open/skipped/open_total used_mb=`), `gpu.pso.miss` en ruta real,
     `vk.perf` 1/s.
-- B65 (`3c982fc`, sin verificar en visor):
-  - `KleptonCompositor.swift`: tiempo GPU por command buffer (gpuEnd−gpuStart, completion handler), label
-    `comp.<new|same|black>(fxaa,layer,wide,recon,comp,sharp,mfx,mip)`; línea 1/s `[cp] cb n= frames= skipped= bad= <label>=<n>x<ms>`
-    (gate `KL_GPU_PASSES`/`VP_EXCL_TIMING`; `cpPassTag` ~4503, `noteCompositeCb` ~4511, handler ~3324). Desconectados sin borrar:
-    `cpProfClaim`, `cpProfAttach`, `noteCompositePasses`, `CpProfSlot`.
-  - Ritmo: quitados `KL_DISPLAY_HZ=90`/`KL_GUEST_PACE_HZ=45` (`AVPSettings.swift`). `klvr_plat_pace_base()` (`klvr_platform_klepton.c`
-    ~196); pacer `kl_app.c` ~1503/1563 usa esa base (45/30 a 90 Hz, 50/33,3 a 100 Hz) salvo `KL_GUEST_PACE_HZ` manual.
-    Panel sin medir → 90 (`pace_plan` ~184, weak `kl_guest_pace_fps`). El juego ve ya la frecuencia medida (antes 90 fijo).
-  - `VP_PIPELINE_ARCHIVE_BUDGET_MB=1280` (`AVPSettings.swift` ~571): abre pipelines-19 (+725 entradas, ~+440 MB, unverified).
-  - 0053: `gpu.pso.miss n= kind= label= key= ms=` (20 primeras compilaciones completas). 0054: tras un save bueno, un fallo de
-    `archive_save` va directo al split (2 serializaciones en vez de ~9).
-- Logs_Alyx_4 (B64, 45 s en a1_intro_world, térmico fair): 33 Hz fijo; GPU juego 17,5–19,6 + comp 5,4–7,7 ms. B64 `bad=100%`,
-  `first resolve` zeroIdx=[0,1] → MTLCounterSampleBuffer por encoder no sirve en visor. ~100 cmdbufs/s p50 1,8 ms = frames
-  black/loading; ~34/s p50 7 ms = composites nuevos. 234 compilaciones en juego (1,35 s; stalls 849/166/124 ms).
-  `archive_save` 64 entradas falla ("expecting 'fragment' stage in pipeline no. 32", empaquetador de Apple); split recupera todo.
-  Panel medido 100 Hz con juego informado 90. Steam en guest: `steamclient.so` no encontrado (logros/cloud guest off).
 - `gpu.shader.lib hit=0` en Alyx = contador sin función (índice solo de precompileDir/VisionQuestPro).
 - `prewarm=0` (`avp_config.c:42`) → no se emite `gpu.pso.recipe game hits=` → recorded.foz/recetas nunca invalidan `warm.stamp`.
 - B63 regulador (`klvr_platform_klepton.c:348`): línea `[openvr] pace.gov fallback avg= late= need= streak=` cada 10 s en fallback.
@@ -115,7 +110,7 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   Después A/B `VPVK_ASYNC_PIPELINES=0` y `VPVK_MSAA_TILE=0`.
 - VPKEngine main = `3f7da04` (fast-forward de `avp-port-main`; VisionQuestPro avisado para subir su ref). `avp-port` remoto obsoleto (base vieja).
 - Pendiente: Steam en guest (`steamclient.so` no encontrado).
-- Próximo objetivo: coste GPU del compositor 4–8 ms (B60 notó subida desde 2,4–6; posible RCAS fusionado, unverified).
+- Próximo objetivo: con `msl/*.metal` de B73, optimizar en el traductor el fs del material principal (8 loops, discard).
 - Problema abierto: zona pesada juego ~23 ms > umbral (17 ms a 100 Hz, 18,9 a 90 Hz); térmico.
 
 ## Decisiones vigentes
