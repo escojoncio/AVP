@@ -27,7 +27,6 @@ struct AVPSettingsView: View {
                 picture
                 performance
                 gameSection
-                engineLabLink
                 resetSection
                 certificateSection
                 accountSection
@@ -274,19 +273,6 @@ struct AVPSettingsView: View {
             }
         } header: {
             Text(AVPL("Juego y controles", "Game and controls"))
-        }
-    }
-
-    private var engineLabLink: some View {
-        Section {
-            NavigationLink {
-                AVPEngineLabView()
-            } label: {
-                Label(AVPL("Laboratorio del motor", "Engine lab"), systemImage: "testtube.2")
-            }
-        } footer: {
-            Text(AVPL("Optimizaciones del motor gráfico que se activan una a una (o con una prueba automática) y se aplican en vivo. Es opcional y avanzado: no hace falta tocarlo, los valores por defecto son los recomendados.",
-                      "Graphics engine optimisations that you switch on one by one (or with an automatic test), applied live. Optional and advanced: you do not need to touch it, the defaults are the recommended values."))
         }
     }
 

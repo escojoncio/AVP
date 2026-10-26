@@ -646,6 +646,13 @@ enum AVPPipelineCache {
             try? FileManager.default.removeItem(at: motionOff)
             AVPLog.log("Gráficos: vectores de movimiento de VPKTAA reactivados (se aplican en el próximo arranque)")
         }
+        // The binary archive switched off after two crashes inside it (checkArchiveInflight) is re-armed too.
+        let archiveOff = url.deletingLastPathComponent().appendingPathComponent("archive.off")
+        if FileManager.default.fileExists(atPath: archiveOff.path) {
+            try? FileManager.default.removeItem(at: archiveOff)
+            try? FileManager.default.removeItem(at: url.deletingLastPathComponent().appendingPathComponent("archive.strikes"))
+            AVPLog.log("Gráficos: archivo binario de pipelines reactivado (se aplica en el próximo arranque)")
+        }
         guard FileManager.default.fileExists(atPath: url.path) else {
             AVPLog.log("Gráficos: no hay shaders en cuarentena que restablecer")
             return

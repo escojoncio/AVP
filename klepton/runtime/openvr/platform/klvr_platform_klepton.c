@@ -341,6 +341,12 @@ static void pace_governor(void) {
         fprintf(stderr, "  [openvr] pace governor: at the %s, GPU %.2f ms per %.0f fps frame (%s; %d of %d frames late)\n",
                 g_pace_extra ? "fallback" : "base", avg, base, ne > nn / 2 ? "exclusive" : "union", nl, nn);
     }
+    // Every 10 s at the fallback: what the way back to the base is measured against (avg under need, few late frames).
+    static double said_gov;
+    if (want && g_pace_extra && now - said_gov >= 10.0) {
+        said_gov = now;
+        fprintf(stderr, "  [openvr] pace.gov fallback avg=%.2f late=%d/%d need=%.2f streak=%d/%.0f\n", avg, nl, nn, 0.85 * 1000.0 / base, good, need_s);
+    }
     if (want != g_pace_extra) {
         said_at = now;
         // Back-off: a base that fails within 20 s of coming back doubles the wait for the next try (10 -> 120 s);
