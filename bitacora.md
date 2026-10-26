@@ -4,10 +4,21 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` = rama `avp-port-main`, **sin parches**: `vpkengine-patches/` vacío; cambios del
 motor se hacen en VPKEngine, mapa en su bitácora). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B74**, sin verificar en visor).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B75**, sin verificar en visor).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
+- B75 (`6edfa37`): motor `93147c6`. Diagnóstico siempre activo: `kl_app.c` diag_tick (~933, llamada en heartbeat ~1060)
+  línea `[diag]` 10 s a stderr: `cpu proc= thr= top:` 8 hilos (delta user+sys, `[spin?]` >80 % con nombre wait/pace/
+  compositor/present), `gpu busy= idle=` (`kl_gpu_time_busy_total_ms`, -1 → n/a), `pace fb=%/% sw= late= miss=`
+  (`klvr_plat_pace_stats`), `mem foot= peak= avail_min=`, `thermal= t=`. Motor: `gpu.tex live= mb= ml= by:` cada 60 s
+  (metal_backend.mm texLive/texLine ~1802). Knockout fsr (`VP_KNOCK_FSR`, on con knock): pase extra con fs trivial
+  `vp_knock_fs` → `fsr_ms= fsr_frag=` (coste puro de fragment, misma cobertura). Filtro MSL +4 fs top B74.
+- Logs_Alyx_17 (B74, ~3 min, nominal→fair a 1,5 min): purga OK (`0->0|trl3e2: purged 25`); 20 compilaciones en juego;
+  juego 15,3–18,6 ms por ventana (sin ganancia apreciable vs B73). gpu.excl busy 538/idle 462 ms/s a 33 fps. Pase MSAA
+  13,3 ms (1013 draws, vtx 4,1/frag 9,2). Sombras (D32F 1024², fmt=-) <0,4 ms. Knock partial_frames=0: r1 pipe122
+  fs 6ff7c440c61864c0 3,8 draws d 6,77 (frag 4,74) unstable=0 → posible real (superficies grandes); r2 fs dd8a0211
+  124 draws 2,11; r3 3128e2cb 1,37. Falta ~1,5–2 ms para 50 fps estables (bajada con 2 ventanas >19,0).
 - B73 (`0710210`): motor `55506b0` = main (c67c604 + fd90770 VQP opt-in + `VPVK_ROBUST`/`VPVK_DUMP_MSL_FILTER`).
   `AVPSettings.swift` ~529 `VPVK_ROBUST=0` (en `sigKeys` → cuarentena se resetea 1 vez), ~594 `VPVK_DUMP_MSL=Logs Alyx/msl`
   + filtro 6 ids (fs 126bc47d4e6c414d, b6a4cab50a7e6885, 00f1f8923af66428 no cambian con robust=0; vs sí → no coincidirán).
@@ -27,9 +38,6 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   Real: reparto plano; top estable fs `00f1f892` (124 draws, d 2,1 ms, frag 1,5), `c02393ed` 1,7. MSL volcado de 3 fs:
   sin sample-rate, sin [[depth]], coste propio de Alyx (≈30 samples, PCF 4 taps ×3 cascadas, bucle de luces).
   Juego mediana ~16,1 ms; regulador correcto: baja con 2 ventanas >19,0 ms (0,95·20) y sube <18,4; carga real 17–19,5.
-- B72: motor `c67c604` (knockout por hits dominantes; B71 se quedaba 0/192 → timeout: ~7 submits por frame).
-- Logs_Alyx_14 (B71): pase MSAA principal vtx 4,85 / frag 9,44 ms (antes 5,4/10,1; ~906 draws, térmico sin aislar);
-  `gpu.sec n≈238` submits/s, ~33/s con el pase dominante.
 - B71: motor `ab62f5a`. B70 medía el knockout en menú/carga (arrancaba al inicio). Ahora: L3+R3 en partida con
   «Diagnóstico de coste por shader» → `vpgpu_metal2_knock_arm` (`KleptonControllers.swift stickClick` ~574, prioridad
   sobre FrameCapture); HUD de pasos head-locked capa -97 (`KleptonCompositor.swift` knockHudTick/drawKnockHud, sondeo
@@ -118,7 +126,7 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   Después A/B `VPVK_ASYNC_PIPELINES=0` y `VPVK_MSAA_TILE=0`.
 - VPKEngine main = `3f7da04` (fast-forward de `avp-port-main`; VisionQuestPro avisado para subir su ref). `avp-port` remoto obsoleto (base vieja).
 - Pendiente: Steam en guest (`steamclient.so` no encontrado).
-- Próximo objetivo: medir B74 (knockout fiable con L3+R3) vs B73 misma zona; carga 17–19,5 ms pegada a barra 19,0.
+- Próximo objetivo: B75 con L3+R3 → `fsr_ms` de fs 6ff7c440 (¿4,7 ms reales?) + MSL volcado; [diag] CPU/térmico.
 - Problema abierto: zona pesada juego ~23 ms > umbral (17 ms a 100 Hz, 18,9 a 90 Hz); térmico.
 
 ## Decisiones vigentes
