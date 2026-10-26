@@ -4,10 +4,13 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` = rama `avp-port-main`, **sin parches**: `vpkengine-patches/` vacío; cambios del
 motor se hacen en VPKEngine, mapa en su bitácora). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B71**, sin verificar en visor).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B72**, sin verificar en visor).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
+- B72: motor `c67c604` (knockout por hits dominantes; B71 se quedaba 0/192 → timeout: ~7 submits por frame).
+- Logs_Alyx_14 (B71): pase MSAA principal vtx 4,85 / frag 9,44 ms (antes 5,4/10,1; ~906 draws, térmico sin aislar);
+  `gpu.sec n≈238` submits/s, ~33/s con el pase dominante.
 - B71: motor `ab62f5a`. B70 medía el knockout en menú/carga (arrancaba al inicio). Ahora: L3+R3 en partida con
   «Diagnóstico de coste por shader» → `vpgpu_metal2_knock_arm` (`KleptonControllers.swift stickClick` ~574, prioridad
   sobre FrameCapture); HUD de pasos head-locked capa -97 (`KleptonCompositor.swift` knockHudTick/drawKnockHud, sondeo
