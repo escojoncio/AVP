@@ -15,8 +15,9 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   libre 1823 MB (B64: 5641/2550). 41 `gpu.err code=7 Insufficient_Permission (background)` al salir. Stall 5 s cargando libmeshsystem.so.
 - Migración a VPKEngine main (rama `avp-port` en VPKEngine): fase 1a `d395a50` (identidad nativa por defecto, Quest opt-in
   `vpvk_config_set_quest_identity`; VisionQuestPro ya la activa siempre, commit VQP `4088d28`, su CI fijado a `5b8432f`);
-  fase 1b escrita sin commit (separate_stencil_usage, swapchain_mutable_format, local_read, host_image_copy, EDS3 colorWriteMask,
-  memory_budget; 0007 timestamps GPU NO portado), en revisión adversarial. Mapa completo de parches: bitácora de VPKEngine.
+  fase 1b `8080760` (separate_stencil_usage, swapchain_mutable_format, local_read, host_image_copy, EDS3 colorWriteMask,
+  memory_budget, A2C→alpha 1x; todo bajo `nativeExtras()`, Quest sin coste; ctest 245/245; 0007 timestamps GPU NO portado).
+  Siguiente: fase 2. Pendiente decisión: ir directos al motor nuevo o build intermedia con motor actual. Mapa: bitácora VPKEngine.
 - B65 (`3c982fc`, sin verificar en visor):
   - `KleptonCompositor.swift`: tiempo GPU por command buffer (gpuEnd−gpuStart, completion handler), label
     `comp.<new|same|black>(fxaa,layer,wide,recon,comp,sharp,mfx,mip)`; línea 1/s `[cp] cb n= frames= skipped= bad= <label>=<n>x<ms>`
