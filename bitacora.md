@@ -15,7 +15,11 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   Log `vpvk.f16 shaders= decorated= demoted= excluded=` (1.º y cada 200); `gpu.time ... t=<ms>` (ms desde arranque).
   Lab «Requieren reiniciar»: `avp.lab.relaxedF16` (def. OFF), en `sigKeys` solo si ON. Tests Linux 144/144 (`gpu_spirv.relaxed_f16`).
   Sesión A/B (logs_A, fov OFF): `KL_DISPLAY_HZ` fuerza 90 con panel 100 Hz, invitado a 90/45 (boot:91-93,477) — revisar (unverified).
-  B62 al validar: arranque OK con ON, `vpvk.f16` demoted>0, scene-msaa frag ON vs OFF (misma zona, fov ON), bandas/manchas.
+  Logs B62 (fov ON, misma zona, W4–W10): f16 OFF busy 22,58 / scene-msaa 18,51 / frag 14,42 ms; ON 21,63 / 17,29 / 13,30
+  (−1 ms, dentro del ruido entre sesiones ~2 ms); `gpu.time` t>60 s p50 18,48→18,02, p90 21,72→20,81; regulador 33 en ambas;
+  sin manchas (usuario). `vpvk.f16` NO aparece en el log y `compiled=276` igual en ambas → no confirmado que el pase actúe.
+  RAM pico 6,1 GB, mín. libre 2,1 GB. `KL_DISPLAY_HZ=90` en ambas (unverified por qué).
+  B62 al validar (antiguo): arranque OK con ON, `vpvk.f16` demoted>0, scene-msaa frag ON vs OFF (misma zona, fov ON), bandas/manchas.
 - B61 VPKEngine 0051 (= main `454f7cc`): elisión de stores MSAA muertos (`VPVK_MSAA_DEAD_STORE=1`); `gpu.frame stores_elided=
   elide_miss=`, `gpu.msaa elide_miss`, `msaa_materialized ... load= store=`. Port: `Use::firstAttach` añadido al árbol AVP.
 - B61 Laboratorio: «Nitidez en la composición» fusionada/pase aparte EN CALIENTE (`KleptonCompositor.setSharpFused`, latch
