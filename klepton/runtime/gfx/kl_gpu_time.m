@@ -42,6 +42,7 @@
 #include <math.h>
 
 enum { kRing = 16, kMaxQueues = 96 };   // VPKEngine replaces its queue after a GPU error (up to 64): each is watched
+enum { kCxPerCb = 24, kCivMax = 128, kGiMax = 2048, kGiPer = 512 };   // compositor encoders per buffer / per frame slot; guest intervals kept / read per buffer
 // Role 0 is the guest's queue(s), role 1 our compositor's (on the device it
 // draws every panel refresh, so twice per game frame at 120 Hz; SteamVR's
 // "total render" time includes the compositor's GPU work too).
@@ -57,6 +58,11 @@ typedef struct {
     // accounted this way reports the exclusive figure; one with a miss keeps the union (excl_miss > 0).
     double excl[2];
     uint32_t excl_n[2], excl_miss[2];
+    // The compositor's exclusive encoder intervals (GPU ticks, already clipped against the previous encoder) and the
+    // ns per tick they were scaled with, kept so the guest's overlapping work can be taken out when the frame is read.
+    uint64_t civ[kCivMax][2];
+    uint32_t civ_n, civ_over;
+    double civ_nspt;
 } slot;
 
 static os_unfair_lock g_lk = OS_UNFAIR_LOCK_INIT;
@@ -82,10 +88,63 @@ static int (*g_vp_busy)(const void *, double *);
 static void (*g_vp_busy_stats)(uint64_t *, uint64_t *);
 static int g_excl_on = -1;
 static unsigned g_excl_hits[2], g_excl_misses[2];   // buffers accounted / not (per role), for the 5 s report
+
+// Overlap correction: the compositor's encoders are clipped only against each other, so one that waits or contends
+// behind the guest's concurrent GPU work counted that time again (a 0.19 ms pass read 2.7 ms under load). The guest's
+// per-encoder intervals (vpgpu_metal2_cb_busy_intervals, GPU ticks of the same device) are kept in a ring, and when a
+// frame is read the union of those overlapping each compositor encoder is taken out of it. Ticks are compared as ticks:
+// the two ns-per-tick figures must agree within 5 % (else the correction is off), which is what makes them one timeline.
+// KL_COMP_OVERLAP=0 leaves the compositor's figure as it was.
+static size_t (*g_vp_ivs)(const void *, uint64_t *, size_t, double *);
+static int g_ov_on = -1;
+static uint64_t g_gi[kGiMax][2];   // under g_lk: the guest's encoder intervals, GPU ticks; the first g_gi_n are valid
+static unsigned g_gi_head, g_gi_n;
+static uint64_t g_gi_floor;        // latest end among overwritten intervals: a compositor encoder starting before it may be uncovered
+static double g_gi_nspt;           // the guest's ns per tick (last buffer that returned intervals)
+static __thread float g_comp_raw_last;   // per thread: the compositor ms of the last frame_ms call before the correction
+
+// Ticks of [a0, a1) covered by the union of the n intervals g[i] (any order, overlaps allowed): those touching
+// [a0, a1) are clipped, sorted by start and swept. Only the first 256 of them are looked at (the rest count as uncovered).
+static uint64_t iv_covered(uint64_t a0, uint64_t a1, const uint64_t (*g)[2], unsigned n) {
+    uint64_t t[256][2];
+    unsigned k = 0;
+    for (unsigned i = 0; i < n && k < 256; i++) {
+        uint64_t s = g[i][0] > a0 ? g[i][0] : a0, e = g[i][1] < a1 ? g[i][1] : a1;
+        if (e <= s) continue;
+        unsigned j = k++;
+        while (j && t[j - 1][0] > s) { t[j][0] = t[j - 1][0]; t[j][1] = t[j - 1][1]; j--; }
+        t[j][0] = s; t[j][1] = e;
+    }
+    uint64_t cov = 0, cur = a0;
+    for (unsigned i = 0; i < k; i++) {
+        uint64_t s = t[i][0] > cur ? t[i][0] : cur;
+        if (t[i][1] > s) { cov += t[i][1] - s; cur = t[i][1]; }
+    }
+    return cov;
+}
+// Seconds of the slot's compositor encoders covered by the guest's work; 0 when the correction does not apply. Under g_lk.
+static double ov_covered(const slot *s) {
+    if (g_ov_on <= 0 || !g_gi_n || !s->civ_n || s->civ_over || s->civ_nspt <= 0 || g_gi_nspt <= 0) return 0;
+    if (fabs(s->civ_nspt / g_gi_nspt - 1.0) > 0.05) {
+        static int said;
+        if (!said++) fprintf(stderr, "[gputime] overlap off: nspt game=%.4f comp=%.4f\n", g_gi_nspt, s->civ_nspt);
+        return 0;
+    }
+    static int on_said;
+    if (!on_said++) fprintf(stderr, "[gputime] overlap on: nspt game=%.4f comp=%.4f\n", g_gi_nspt, s->civ_nspt);
+    uint64_t cov = 0;
+    for (uint32_t i = 0; i < s->civ_n; i++) {
+        if (s->civ[i][0] < g_gi_floor) return 0;   // the ring has wrapped past the start of this encoder
+        cov += iv_covered(s->civ[i][0], s->civ[i][1], (const uint64_t (*)[2])g_gi, g_gi_n);
+    }
+    return (double)cov * s->civ_nspt / 1e9;
+}
 static void excl_init(void) {
     if (g_excl_on >= 0) return;
     const char *e = getenv("KL_GPU_TIME_EXCL");
     g_excl_on = !(e && *e == '0');
+    const char *o = getenv("KL_COMP_OVERLAP");
+    g_ov_on = !(o && *o == '0');
     fprintf(stderr, "[gputime] exclusive GPU time per frame: %s\n",
             g_excl_on ? "on (the compositor's from our sample buffers; the guest's once its driver's queue is seen)"
                       : "off (KL_GPU_TIME_EXCL=0): span unions");
@@ -101,27 +160,52 @@ static void excl_vp_resolve(void) {
     void *h = path && *path ? dlopen(path, RTLD_NOW | RTLD_NOLOAD) : NULL;
     g_vp_busy = (int (*)(const void *, double *))dlsym(h ? h : RTLD_DEFAULT, "vpgpu_metal2_cb_busy_ms");
     g_vp_busy_stats = (void (*)(uint64_t *, uint64_t *))dlsym(h ? h : RTLD_DEFAULT, "vpgpu_metal2_cb_busy_stats");
+    if (g_vp_busy && g_ov_on > 0)
+        g_vp_ivs = (size_t (*)(const void *, uint64_t *, size_t, double *))dlsym(h ? h : RTLD_DEFAULT, "vpgpu_metal2_cb_busy_intervals");
     fprintf(stderr, "[gputime] the guest's exclusive GPU time: %s\n",
             g_vp_busy ? "from VPVulkan's encoder timestamps (vpgpu_metal2_cb_busy_ms)" : "unavailable (no vpgpu_metal2_cb_busy_ms: the union stands)");
+    fprintf(stderr, "[gputime] compositor overlap correction: %s\n",
+            g_vp_ivs ? "on (the guest's encoder intervals, vpgpu_metal2_cb_busy_intervals)"
+                     : g_ov_on > 0 ? "unavailable (no vpgpu_metal2_cb_busy_intervals)" : "off (KL_COMP_OVERLAP=0)");
 }
-static double cx_resolve(void *cb, double span_ms);   // the compositor's buffers (below): exclusive ms, or -1
+static double cx_resolve(void *cb, double span_ms, uint64_t (*iv)[2], int *niv, double *nspt);   // the compositor's buffers (below): exclusive ms, or -1
 
 static void on_complete(uint32_t f, int role, double start, double end, void *cb) {
     double excl = -1;
+    uint64_t gp[kGiPer][2], civ[kCxPerCb][2];   // the guest buffer's encoder intervals / the compositor buffer's, GPU ticks
+    size_t ngp = 0;
+    int ncv = 0;
+    double gnspt = 0, cnspt = 0;
     if (g_excl_on > 0 && cb) {
         if (role == 0 && g_vp_busy) {
             double ms = 0;
             int r = g_vp_busy(cb, &ms);
             if (r == 1) excl = ms / 1e3;
             else if (r == 0) excl = 0;   // completed with nothing sampled: an empty buffer
+            if (g_vp_ivs) ngp = g_vp_ivs(cb, &gp[0][0], kGiPer, &gnspt);   // right after busy_ms: the engine's ring entry is consumed
         } else if (role == 1) {
-            double ms = cx_resolve(cb, (end - start) * 1e3);
+            double ms = cx_resolve(cb, (end - start) * 1e3, civ, &ncv, &cnspt);
             if (ms >= 0) excl = ms / 1e3;
         }
     }
     os_unfair_lock_lock(&g_lk);
+    if (ngp && gnspt > 0) {
+        for (size_t i = 0; i < ngp; i++) {
+            if (gp[i][1] <= gp[i][0]) continue;
+            if (g_gi_n == kGiMax && g_gi[g_gi_head][1] > g_gi_floor) g_gi_floor = g_gi[g_gi_head][1];
+            g_gi[g_gi_head][0] = gp[i][0]; g_gi[g_gi_head][1] = gp[i][1];
+            g_gi_head = (g_gi_head + 1) % kGiMax;
+            if (g_gi_n < kGiMax) g_gi_n++;
+        }
+        g_gi_nspt = gnspt;
+    }
     slot *s = &g_slots[f % kRing];
     if (s->frame == f) {
+        if (excl >= 0 && role == 1 && ncv > 0) {
+            if (s->civ_n + (uint32_t)ncv > kCivMax) s->civ_over = 1;
+            else { memcpy(s->civ[s->civ_n], civ, ncv * sizeof civ[0]); s->civ_n += ncv; }
+            s->civ_nspt = cnspt;
+        }
         if (end > start && start > 0) {
             double from = start > s->last_end[role] ? start : s->last_end[role];
             if (end > from) s->busy[role] += end - from;
@@ -1375,7 +1459,7 @@ static unsigned g_vis_given, g_vis_seen;
 // they add past the latest end seen (the same rule as VPVulkan's and [passes]'), so a composite that ran alongside
 // the game's encoders is not charged the game's time. Its blit encoders (eye mips, captures) are not timed: a
 // compositor buffer without render encoders counts as 0. GPU ticks are calibrated against the CPU clock every 20 s.
-enum { kCxSamples = 1024, kCxCbs = 32, kCxPerCb = 24 };
+enum { kCxSamples = 1024, kCxCbs = 32 };
 static id<MTLCounterSampleBuffer> g_cx_buf;
 static int g_cx_failed;                      // no sample buffer / no stage sampling: compositor stays on the union
 static unsigned g_cx_next;                   // next free sample index (a ring: 256 encoders in flight at most)
@@ -1505,7 +1589,10 @@ static void cx_detach(MTLRenderPassDescriptor *d, int slot, unsigned i0) {
 }
 // Completed compositor buffer: its encoders' exclusive ms on the timeline; 0 for a buffer we timed nothing in,
 // -1 when a sample came back broken or the ticks are not calibrated yet (the union stands in).
-static double cx_resolve(void *cb, double span_ms) {
+// *iv gets the encoders' clipped [from, end) in GPU ticks (*niv of them, 0 unless the figure is returned) and *nspt the
+// ns per tick that scaled them, for the overlap correction.
+static double cx_resolve(void *cb, double span_ms, uint64_t (*iv)[2], int *niv, double *nspt) {
+    *niv = 0;
     if (g_cx_failed) return -1;    // the union stands in for the whole session
     if (!g_cx_buf) return 0;       // no render pass of the compositor's has opened yet: nothing to time
     uint32_t idx[kCxPerCb];
@@ -1524,6 +1611,7 @@ static double cx_resolve(void *cb, double span_ms) {
     if (tainted) return -1;
     if (!n) return 0;
     double ms = 0;
+    int m = 0;
     os_unfair_lock_lock(&g_cx_lk);
     cx_calibrate(g_cx_buf.device);
     int ok = g_cx_ns_per_tick > 0;
@@ -1542,6 +1630,7 @@ static double cx_resolve(void *cb, double span_ms) {
         uint64_t from = start > g_cx_last_end ? start : g_cx_last_end;
         double enc_ms = end > from ? (double)(end - from) * g_cx_ns_per_tick / 1e6 : 0;
         ms += enc_ms;
+        if (end > from) { iv[m][0] = from; iv[m][1] = end; m++; }
         if (sig[j] < kCxSigs) { g_cx_sigs[sig[j]].ms += enc_ms; g_cx_sigs[sig[j]].n++; }
         if (end > g_cx_last_end) g_cx_last_end = end;
     }
@@ -1556,6 +1645,7 @@ static double cx_resolve(void *cb, double span_ms) {
         ok = 0;
     }
     if (ok) g_cx_resolved++; else g_cx_bad++;
+    if (ok) { *niv = m; *nspt = g_cx_ns_per_tick; }
     os_unfair_lock_unlock(&g_cx_lk);
     return ok ? ms : -1;
 }
@@ -3038,12 +3128,12 @@ void kl_gpu_time_frame_end(void) {
     gap_tick(frame);          // B50: where the GPU idles inside a frame
     // Every few seconds: the finished frames' GPU time.
     static unsigned last_f, n;
-    static double sum, csum, worst, since;
+    static double sum, csum, craw, worst, since;
     unsigned f;
     float comp;
     float ms = kl_gpu_time_frame_ms(0, &comp, &f);
     if (f && f != last_f) {
-        last_f = f; sum += ms; csum += comp; n++; if (ms > worst) worst = ms;
+        last_f = f; sum += ms; csum += comp; craw += g_comp_raw_last; n++; if (ms > worst) worst = ms;
         if (prof_in(f)) { g_prof_union += ms; g_prof_union_n++; }   // the profiled window's own [gputime]
     }
     // KL_GPU_TIME_LOG: the report interval in seconds (default 5).
@@ -3064,12 +3154,12 @@ void kl_gpu_time_frame_end(void) {
             uint64_t vcbs = 0, vuns = 0;
             if (g_vp_busy_stats) g_vp_busy_stats(&vcbs, &vuns);
             fprintf(stderr, "[gputime] %02d:%02d:%02d GPU time per frame: game avg %.2f / worst %.2f ms, compositor avg "
-                    "%.2f ms, over %u frames; exclusive buffers game %u (missed %u), compositor %u (missed %u); "
+                    "%.2f ms (comp_raw=%.2f), over %u frames; exclusive buffers game %u (missed %u), compositor %u (missed %u); "
                     "VPVulkan accounted %llu (unsampled %llu); compositor samples %u resolved %u bad %u\n",
-                    lt.tm_hour, lt.tm_min, lt.tm_sec, sum / n, worst, csum / n, n, h0, m0, h1, m1,
+                    lt.tm_hour, lt.tm_min, lt.tm_sec, sum / n, worst, csum / n, craw / n, n, h0, m0, h1, m1,
                     (unsigned long long)vcbs, (unsigned long long)vuns, g_cx_attached, g_cx_resolved, g_cx_bad);
         }
-        sum = csum = worst = 0; n = 0; since = now;
+        sum = csum = craw = worst = 0; n = 0; since = now;
     }
 }
 
@@ -3082,6 +3172,7 @@ int kl_gpu_time_frame_exclusive(void) { return g_excl_last; }
 float kl_gpu_time_frame_ms(unsigned frames_ago, float *compositor, unsigned *frame) {
     float ms = 0, cms = 0;
     unsigned got = 0;
+    g_comp_raw_last = 0;
     os_unfair_lock_lock(&g_lk);
     for (unsigned back = 1 + frames_ago; back < kRing - 1 && back < g_frame; back++) {
         uint32_t f = g_frame - back;
@@ -3091,7 +3182,9 @@ float kl_gpu_time_frame_ms(unsigned frames_ago, float *compositor, unsigned *fra
             // Build 36: the exclusive figure when every buffer of the role was accounted, else the union.
             int ex0 = s->excl_n[0] && !s->excl_miss[0], ex1 = s->excl_n[1] && !s->excl_miss[1];
             ms = (float)((ex0 ? s->excl[0] : s->busy[0]) * 1e3);
-            cms = (float)((ex1 ? s->excl[1] : s->busy[1]) * 1e3);
+            double craw = ex1 ? s->excl[1] : s->busy[1], cov = ex1 ? ov_covered(s) : 0;   // the guest's overlap comes out of the exclusive figure only
+            g_comp_raw_last = (float)(craw * 1e3);
+            cms = (float)((cov < craw ? craw - cov : 0) * 1e3);
             g_excl_last = (ex0 ? 1 : 0) | (ex1 ? 2 : 0);
             got = f; break;
         }
