@@ -1268,7 +1268,7 @@ final class KleptonCompositor {
                 depthPipeline = try? device.makeRenderPipelineState(descriptor: desc)
                 NSLog("[cp] game-depth pipeline: " + (depthPipeline == nil ? "FAILED to link — quad depth only" : "ready"))
                 desc.fragmentFunction = reprojFn("kl_reproject_f")
-                let dd =MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: 1, height: 1, mipmapped: false)
+                let dd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: 1, height: 1, mipmapped: false)
                 dd.usage = .shaderRead
                 depthDummy = device.makeTexture(descriptor: dd)
             }
