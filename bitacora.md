@@ -8,6 +8,15 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
+- Logs_Alyx_5 (B65, 2m15s a1_intro_world, térmico nominal, panel 100 Hz): `[cp] cb` OK (bad=0): comp.new(wide+recon+comp)
+  ~7,5 ms, same ~7,1, black ~1,7 → los 3 pases en 1 cmdbuf, falta reparto por pase. Plan y pacer coinciden (50/33,3); gobernador
+  casi siempre en 33 (avg 11–26 vs need 17). 0 `gpu.pso.miss` pese a 238 compilaciones `gpu.pso f=` (log 0053 en ruta equivocada).
+  0 fallos `archive_save`. Archivo: 14 abiertos, 2 skip budget, used 1973 MB (>1280: revisar qué cuenta). RAM pico 6368 MB, mín.
+  libre 1823 MB (B64: 5641/2550). 41 `gpu.err code=7 Insufficient_Permission (background)` al salir. Stall 5 s cargando libmeshsystem.so.
+- Migración a VPKEngine main (rama `avp-port` en VPKEngine): fase 1a `d395a50` (identidad nativa por defecto, Quest opt-in
+  `vpvk_config_set_quest_identity`; VisionQuestPro ya la activa siempre, commit VQP `4088d28`, su CI fijado a `5b8432f`);
+  fase 1b escrita sin commit (separate_stencil_usage, swapchain_mutable_format, local_read, host_image_copy, EDS3 colorWriteMask,
+  memory_budget; 0007 timestamps GPU NO portado), en revisión adversarial. Mapa completo de parches: bitácora de VPKEngine.
 - B65 (`3c982fc`, sin verificar en visor):
   - `KleptonCompositor.swift`: tiempo GPU por command buffer (gpuEnd−gpuStart, completion handler), label
     `comp.<new|same|black>(fxaa,layer,wide,recon,comp,sharp,mfx,mip)`; línea 1/s `[cp] cb n= frames= skipped= bad= <label>=<n>x<ms>`
@@ -39,8 +48,13 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   desde B17, MSAA 4x, amplificación de vértices, occlusion culling medido, `VP_CB_ORDER=2`; foveado VRR (periferia 10 %,
   VPKTAA en periferia; post NO foveado); compositor skip-same; regulador 50/33 (100 Hz) o 45/30 (90 Hz) con tiempo de
   GPU exclusivo; reloj del juego `klvr_game_hz`; OpenVR cabeza + 2 Sense, dedos, altura, subtítulos, idioma, pausa.
-- B65 al validar: `[cp] cb` (qué label/pases dominan los 5–8 ms), `pace plan` 45/30 a 90 y 50/33 a 100 Hz sin pin,
-  `gpu.pso.miss` (qué pipelines faltan y por qué no están en prewarm/archivo), `archive` abiertos/skip por budget, RAM pico.
+- Siguiente build (con motor main sin parches): fase 2 VPKEngine (0022 suspend/resume, 0027 viewport_index, 0023, 0040,
+  0029/0031 CB_ORDER/AMPLIFY/FETCH_NATIVE), fase 3 (0019 presupuesto archivo — main abre todo sin presupuesto —, 0017
+  wait_compiles+VP_PIPELINE_ARCHIVE, 0015, 0018/0021/0032), de fase 4 lo que AVP usa (0036 cb_busy_ms, 0052, 0053, 0054).
+  AVP: `vpkengine.ref` → avp-port/main, `vpkengine-patches/` vacío; `vpgpu_set_background`/`vpgpu_shutdown_background` desde hilo
+  principal en transición de escena; `KL_GPU_PASSES` → un cmdbuf por pase; `gpu.pso.miss` en la ruta `gpu.pso f=`.
+  Primera build con motor nuevo: `VPVK_EXTRA_EXTENSIONS=0` (paridad con hoy) y A/B `VPVK_ASYNC_PIPELINES=0`, `VPVK_MSAA_TILE=0`.
+  Al unir avp-port a main: avisar a VisionQuestPro (suben su ref).
 - Pendiente: Steam en guest (`steamclient.so` no encontrado).
 - Próximo objetivo: coste GPU del compositor 4–8 ms (B60 notó subida desde 2,4–6; posible RCAS fusionado, unverified).
 - Riesgos B60 sin verificar en visor: 0046/0049/0050 (Metal), `vpvk_mark_eye_image` vía dlsym. Parches 0047–0050 se conservan (los reutiliza VisionQuestPro).
