@@ -299,11 +299,6 @@ struct AVPSettingsView: View {
                          "Writes to the log how long the GPU takes in each draw pass. It is for finding what slows the game down and costs some performance. Recommended: off (only when asked). Applied at game start.")
                 }
                 VStack(alignment: .leading, spacing: 4) {
-                    Toggle(AVPL("Identidad GPU Adreno", "Adreno GPU identity"), isOn: $s.reportAdreno)
-                    hint("El juego ve una GPU Adreno (como B65). Prueba A/B de rendimiento.",
-                         "The game sees an Adreno GPU (as in B65). Performance A/B test.")
-                }
-                VStack(alignment: .leading, spacing: 4) {
                     Toggle(AVPL("Occlusion culling medido (consultas de GPU)", "Measured occlusion culling (GPU queries)"), isOn: $s.occlusionQueries)
                     hint("El juego deja de dibujar lo que la GPU comprueba que queda oculto tras otros objetos (menos carga). Apagado, todo cuenta como visible. Apágalo solo si ves objetos que desaparecen o parpadean. Recomendado: activado.",
                          "The game stops drawing what the GPU finds hidden behind other objects (less load). Off, everything counts as visible. Turn it off only if you see objects vanishing or flickering. Recommended: on.")

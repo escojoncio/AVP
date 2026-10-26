@@ -79,8 +79,6 @@ final class AVPSettings: ObservableObject {
     /// Build 27: per-pass GPU timing windows (KL_GPU_PASSES, kl_gpu_time.m) + VPKEngine's exclusive per-encoder
     /// timing (VP_EXCL_TIMING). Off by default since build 32: sample buffers on 28-120 encoders per frame are not free.
     @Published var gpuPassProfiling: Bool { didSet { save() } }
-    /// The game sees an Adreno GPU, as in B65 (VPVK_REPORT_ADRENO). Performance A/B test; off by default.
-    @Published var reportAdreno: Bool { didSet { save() } }
     @Published var movement: Movement { didSet { save() } }
     @Published var subtitles: SubtitlePlacement { didSet { save() } }
     @Published var subtitleSize: SubtitleSize { didSet { save() } }
@@ -153,8 +151,8 @@ final class AVPSettings: ObservableObject {
     private static let keptKeys: Set<String> = ["avp.folderBookmark", "avp.signatureVariant", "avp.prepared"]
 
     // Fixed since build 32 (they used to be settings; every validated value is now the only value):
-    /// 12 command buffers in flight (build 24 orders them; 3 was the build-23 A/B test).
-    static let gpuQueueDepth = 12
+    /// 16 command buffers in flight (engine maximum; Source 2 submits ~7-11 command buffers per frame).
+    static let gpuQueueDepth = 16
     /// The compositor composes only new pictures (build 26/27, KL_CP_SKIP_SAME): 3.3 ms of GPU per frame, no downside.
     static let composeNewOnly = true
     /// The round sharp zone (P.T.'s circle, build 27) is the sharp zone: the rectangular one is gone.
@@ -198,7 +196,6 @@ final class AVPSettings: ObservableObject {
         trackedOrder = d.object(forKey: "avp.cbOrder2c") as? Bool ?? true
         diagCaptures = d.object(forKey: "avp.diagCaptures") as? Bool ?? false
         gpuPassProfiling = d.object(forKey: "avp.gpuPasses2") as? Bool ?? false
-        reportAdreno = d.object(forKey: "avp.reportAdreno") as? Bool ?? false
         movement = Movement(rawValue: d.object(forKey: "avp.movement") as? Int ?? 3) ?? .continuousHand
         subtitles = SubtitlePlacement(rawValue: d.object(forKey: "avp.subtitles") as? Int ?? 2) ?? .eyeLevel
         cloudSync = d.object(forKey: "avp.cloudSync") as? Bool ?? true
@@ -239,7 +236,6 @@ final class AVPSettings: ObservableObject {
         d.set(trackedOrder, forKey: "avp.cbOrder2c")
         d.set(diagCaptures, forKey: "avp.diagCaptures")
         d.set(gpuPassProfiling, forKey: "avp.gpuPasses2")
-        d.set(reportAdreno, forKey: "avp.reportAdreno")
         d.set(movement.rawValue, forKey: "avp.movement")
         d.set(subtitles.rawValue, forKey: "avp.subtitles")
         d.set(cloudSync, forKey: "avp.cloudSync")
@@ -267,7 +263,7 @@ final class AVPSettings: ObservableObject {
         foveationOn = fresh.foveationOn; wideDegrees = fresh.wideDegrees; periphery = fresh.periphery
         vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
         anisotropy = fresh.anisotropy; centerSharpness = fresh.centerSharpness; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao; msaa = fresh.msaa; frameRate = fresh.frameRate; handHoldPredict = fresh.handHoldPredict
-        trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling; reportAdreno = fresh.reportAdreno
+        trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
         postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
@@ -520,7 +516,8 @@ final class AVPSettings: ObservableObject {
             ("VPVK_MSAA_DEAD_STORE", "1"),
             // Paridad con el motor de B65: no poner a cero las imágenes nuevas.
             ("VPVK_ZERO_NEW_IMAGES", "0"),
-            ("VPVK_REPORT_ADRENO", reportAdreno ? "1" : "0"),
+            // El defecto 2 bloquea ~13 ms/frame el hilo de render del juego en vkQueueSubmit esperando a la GPU; 6 deja en vuelo un frame entero sin perder el tope de memoria (0 = sin límite).
+            ("VPVK_MAX_PENDING_CHUNKS", "6"),
         ]
         // VPKTAA inputs not usable yet (build 17 log): VPKEngine's motion vectors are all zero (its "eye frame"
         // restarts at every depth-clearing multiview pass, 4-7 per game frame, so no draw ever finds last frame's
