@@ -12,8 +12,8 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   (raw 3,7); juego med. 16,3 (7–19,9); 50 fps 17 s y caída rápida (21,09 ms, 13/14 late); variante compositor lista
   167 ms; wide par 33/s; 0 errores; RAM pico 6,2 GB. Sin API pública para elegir Hz (solo `minimumFrameRepeatCount`).
 - Archivo_12 (B69, MSAA4/65°, 5m27s): térmico nominal→fair 2:03→serious 4:38; juego sube 16,6→19,5 ms por minuto
-  (sin cambio de zona = throttling); comp 1,2 (raw 3–7); ~17 s a 50 fps, resto 33; 15 de 30 ventanas con avg<need
-  pero late>50 % (frames bimodales, unverified); 1 stall 5 s; RAM pico 6,2 GB; 0 errores.
+  (sin cambio de zona = throttling); comp 1,2 (raw 3–7); ~17 s a 50 fps, resto 33; ventanas avg 18,5–19,6 vs barra
+  18,4, distribución unimodal (sin frames alternos; pase MSAA ~965 draws, vtx 5,4/frag 10,1 ms cada frame); 1 stall 5 s.
 - Descartado quitar stencil: escena = VK 129 D24S8 (→ Metal D32FS8), stencil usado (máscara VR, separate stencil usage
   0xa3, input attachment). `GetHiddenAreaMesh` vacío a propósito (`klvr_system.cpp:97`, reproyección puede mostrar
   todo el ojo); periferia ya al 10 % por VRR → ganancia de máscara pequeña (unverified).
