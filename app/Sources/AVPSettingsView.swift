@@ -299,6 +299,11 @@ struct AVPSettingsView: View {
                          "Writes to the log how long the GPU takes in each draw pass. It is for finding what slows the game down and costs some performance. Recommended: off (only when asked). Applied at game start.")
                 }
                 VStack(alignment: .leading, spacing: 4) {
+                    Toggle(AVPL("Diagnóstico de coste por shader", "Per-shader cost diagnostic"), isOn: $s.shaderKnock)
+                    hint("Durante ~1 minuto oculta por turnos grupos de objetos para medir cuánto cuesta cada shader. Se verán parpadeos. Solo para diagnóstico. Se aplica al arrancar el juego.",
+                         "For ~1 minute it hides groups of objects in turns to measure what each shader costs. You will see flicker. For diagnostics only. Applied at game start.")
+                }
+                VStack(alignment: .leading, spacing: 4) {
                     Toggle(AVPL("Occlusion culling medido (consultas de GPU)", "Measured occlusion culling (GPU queries)"), isOn: $s.occlusionQueries)
                     hint("El juego deja de dibujar lo que la GPU comprueba que queda oculto tras otros objetos (menos carga). Apagado, todo cuenta como visible. Apágalo solo si ves objetos que desaparecen o parpadean. Recomendado: activado.",
                          "The game stops drawing what the GPU finds hidden behind other objects (less load). Off, everything counts as visible. Turn it off only if you see objects vanishing or flickering. Recommended: on.")

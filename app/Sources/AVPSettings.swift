@@ -79,6 +79,10 @@ final class AVPSettings: ObservableObject {
     /// Build 27: per-pass GPU timing windows (KL_GPU_PASSES, kl_gpu_time.m) + VPKEngine's exclusive per-encoder
     /// timing (VP_EXCL_TIMING). Off by default since build 32: sample buffers on 28-120 encoders per frame are not free.
     @Published var gpuPassProfiling: Bool { didSet { save() } }
+    /// Per-shader GPU cost ranking (VP_KNOCK=auto, VPKEngine): after ~300 frames of counting, takes turns leaving out groups
+    /// of draws of the heaviest pass and compares the pass time (needs VP_EXCL_TIMING, forced on). ~1 minute, visible
+    /// flicker; the ranking goes to the log. Off by default: diagnostics only.
+    @Published var shaderKnock: Bool { didSet { save() } }
     @Published var movement: Movement { didSet { save() } }
     @Published var subtitles: SubtitlePlacement { didSet { save() } }
     @Published var subtitleSize: SubtitleSize { didSet { save() } }
@@ -196,6 +200,7 @@ final class AVPSettings: ObservableObject {
         trackedOrder = d.object(forKey: "avp.cbOrder2c") as? Bool ?? true
         diagCaptures = d.object(forKey: "avp.diagCaptures") as? Bool ?? false
         gpuPassProfiling = d.object(forKey: "avp.gpuPasses2") as? Bool ?? false
+        shaderKnock = d.object(forKey: "avp.shaderKnock") as? Bool ?? false
         movement = Movement(rawValue: d.object(forKey: "avp.movement") as? Int ?? 3) ?? .continuousHand
         subtitles = SubtitlePlacement(rawValue: d.object(forKey: "avp.subtitles") as? Int ?? 2) ?? .eyeLevel
         cloudSync = d.object(forKey: "avp.cloudSync") as? Bool ?? true
@@ -236,6 +241,7 @@ final class AVPSettings: ObservableObject {
         d.set(trackedOrder, forKey: "avp.cbOrder2c")
         d.set(diagCaptures, forKey: "avp.diagCaptures")
         d.set(gpuPassProfiling, forKey: "avp.gpuPasses2")
+        d.set(shaderKnock, forKey: "avp.shaderKnock")
         d.set(movement.rawValue, forKey: "avp.movement")
         d.set(subtitles.rawValue, forKey: "avp.subtitles")
         d.set(cloudSync, forKey: "avp.cloudSync")
@@ -263,7 +269,7 @@ final class AVPSettings: ObservableObject {
         foveationOn = fresh.foveationOn; wideDegrees = fresh.wideDegrees; periphery = fresh.periphery
         vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
         anisotropy = fresh.anisotropy; centerSharpness = fresh.centerSharpness; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao; msaa = fresh.msaa; frameRate = fresh.frameRate; handHoldPredict = fresh.handHoldPredict
-        trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling
+        trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling; shaderKnock = fresh.shaderKnock
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
         postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
@@ -499,9 +505,9 @@ final class AVPSettings: ObservableObject {
             ("KL_VRR_SRGB_1X", "1"),   // build 42: always (B41 log: the A/B toggle left off = the B35 subtitle bug again)
             ("VPVK_OCCLUSION", occlusionQueries ? "1" : "0"),
             ("KLVR_REPORT_HZ_FIXED", reportedHz.env),
-            // Build 31: native half fetch back on, alone (B29 turned it off only because it shipped with amplification;
-            // the translator's conversion is exact). Logs 22: the scene pass is vertex-bound (vtx 11 ms).
-            ("VPVK_FETCH_NATIVE", "1"),
+            // 3 = native half fetch + native unorm/snorm unpack (mask: 1 half, 2 unpack). Build 31 had native half fetch
+            // alone (the translator's conversion is exact); logs 22: the scene pass is vertex-bound (vtx 11 ms).
+            ("VPVK_FETCH_NATIVE", "3"),
             // Build 31: MSAA scene targets resolve from tile instead of storing every sample (VPKEngine 0034).
             ("VP_MSAA_TILE", Self.msaaOnTile ? "1" : "0"),
             ("VP_CB_ORDER", trackedOrder ? "2" : "1"),
@@ -510,7 +516,7 @@ final class AVPSettings: ObservableObject {
             ("VPVK_RUNTIME_OPTS", "0"),
             // Build 32: exclusive per-encoder timing only with the per-pass profiling (it costs sample buffers on every
             // encoder); gpu.enc detail (tile=/mem= per attachment, VPKEngine 0035) every 3000 core frames (~20 s).
-            ("VP_EXCL_TIMING", gpuPassProfiling ? "1" : "0"),
+            ("VP_EXCL_TIMING", gpuPassProfiling || shaderKnock ? "1" : "0"),
             ("VP_FRAME_DETAIL", "3000"),
             // Elisión de stores MSAA muertos, VPKEngine 0051.
             ("VPVK_MSAA_DEAD_STORE", "1"),
@@ -562,6 +568,8 @@ final class AVPSettings: ObservableObject {
         if gpuPassProfiling {
             env += [("KL_GPU_PASSES", "g5,g15,g30,g50,g80,g120,g180,g260,t25,t60,t100"), ("KL_GPU_PASSES_N", "24")]
         }
+        // Per-shader cost ranking: VPKEngine hides groups of draws in turns (see shaderKnock); VP_EXCL_TIMING is on above.
+        if shaderKnock { env.append(("VP_KNOCK", "auto")) }
         if let driver = AVPLaunch.driverPath { env.append(("KL_MVK_DYLIB", driver)) }
         // VPKEngine's persistent pipeline caches (recipes + Metal binary archive) and whether a full prewarm already
         // filled them for this VPVulkan build and this pipeline list (then neither the launcher nor the game replays).
