@@ -20,8 +20,8 @@ OUT=$(mktemp -d)
   done
 } > "$OUT/$NAME.txt"
 
-git config user.name "VisionQuestPro"
-git config user.email "dev@visionquestpro.invalid"
+git config user.name "avp-bot"
+git config user.email "avp-bot@users.noreply.github.com"
 WORK=$(mktemp -d)
 for ATTEMPT in 1 2 3 4 5; do
   rm -rf "$WORK"

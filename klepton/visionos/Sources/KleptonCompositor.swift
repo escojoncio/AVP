@@ -4487,7 +4487,7 @@ final class KleptonCompositor {
                     d.sampleCount = CpProfSlot.maxEnc * 2
                     do {
                         for _ in 0..<4 { cpProfFree.append(CpProfSlot(try device.makeCounterSampleBuffer(descriptor: d))) }
-                        device.sampleTimestamps(&cpProfCpu0, gpuTimestamp: &cpProfGpu0)
+                        (cpProfCpu0, cpProfGpu0) = device.sampleTimestamps()
                         cpProfWindowStart = CFAbsoluteTimeGetCurrent()
                         cpProfState = 1
                     } catch {
@@ -4561,8 +4561,7 @@ final class KleptonCompositor {
                 // ns per counter unit: cx_calibrate's method (kl_gpu_time.m; its result is static there): ns per GPU tick =
                 // CPU delta (taken as ns) / GPU delta since the pool was made, >= 1 s ago. Within 10 % of 1 the counters are
                 // ns; otherwise they are GPU ticks. No valid calibration: ns.
-                var cpu1: MTLTimestamp = 0, gpu1: MTLTimestamp = 0
-                device.sampleTimestamps(&cpu1, gpuTimestamp: &gpu1)
+                let (cpu1, gpu1) = device.sampleTimestamps()
                 let tick = gpu1 > cpProfGpu0 && cpu1 > cpProfCpu0 ? Double(cpu1 - cpProfCpu0) / Double(gpu1 - cpProfGpu0) : 1
                 let u = abs(tick - 1) < 0.1 ? 1.0 : tick
                 let f = k * u * 1e-6
