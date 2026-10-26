@@ -4,10 +4,18 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` + `vpkengine-patches/` 0011–0052; parche nuevo = `00NN-*.patch` con
 `git format-patch` sobre ref+parches; CI `scripts/apply-vpkengine-patches.sh`). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B63**, compilada OK).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B64**, pendiente de compilar).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
+- B64 (`KleptonCompositor.swift` ~740, `cpProfClaim` ~4510, `noteCompositePasses` ~4535-4620): Logs_Alyx_3 (B63) dio 0 líneas
+  `[cp] gpu passes` y 0 `not measured` → todo composite descartado en silencio. Ahora validación por encoder (descarta solo
+  el encoder malo, composite vale si ≥1 bueno; campo `badenc=`), contadores por motivo y línea 1/s
+  `[cp] gpu passes none skip= err= missed= nostart= long= resolve= short= bad= noslot= noenc= claims=`, y una vez
+  `[cp] gpu passes first resolve: encoders= bytes= first8= maxIdx= zeroIdx= cats=`. Con encoders malos, cat/sum infravalorados.
+  Riesgo (unverified): slots reutilizados pueden dar timestamps viejos en encoders sin muestrear.
+- Logs_Alyx_3 (B63, 65 %/65°): juego med 17,8 ms, comp med 6,9 ms; regulador sube a 50 y cae a 33,3 hasta el final;
+  prewarm 5161/5161 en 8 s; RAM pico 6,1 GB, mín. libre 2,1 GB; térmico nominal; sin cuelgues; Laboratorio ausente.
 - B63 compositor (`KleptonCompositor.swift` ~3184/3255/4488-4575): con `VP_EXCL_TIMING`/`KL_GPU_PASSES` mide GPU por encoder
   del CB de composición (MTLCounterSampleBuffer stage-boundary, pool 4×128, slot 0; exclusivo por orden): línea 1/s
   `[cp] gpu passes eye= layer= wide= recon= comp= other= sum= cb= n= enc= skip= phys= fov= raw= units=`. Blits/MetalFX = cb−sum.
@@ -29,7 +37,8 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   desde B17, MSAA 4x, amplificación de vértices, occlusion culling medido, `VP_CB_ORDER=2`; foveado VRR (periferia 10 %,
   VPKTAA en periferia; post NO foveado); compositor skip-same; regulador 50/33 (100 Hz) o 45/30 (90 Hz) con tiempo de
   GPU exclusivo; reloj del juego `klvr_game_hz`; OpenVR cabeza + 2 Sense, dedos, altura, subtítulos, idioma, pausa.
-- B63 al validar: `[cp] gpu passes` (¿recon/wide dominan?, units/raw coherentes), `pace.gov fallback avg=` (¿cerca de 17?), `[gputime]` comp ms, prewarm completo 1.ª vez sin OOM, sin Laboratorio.
+- B64 al validar: `[cp] gpu passes none` (qué motivo domina) o `[cp] gpu passes` con `badenc=`; `first resolve` (¿zeroIdx/maxIdx en todos?
+  → muestreo vertex-start/fragment-end no soportado); luego ¿recon/wide dominan el comp 4–8 ms?
 - Próximo objetivo: coste GPU del compositor 4–8 ms (B60 notó subida desde 2,4–6; posible RCAS fusionado, unverified).
 - Riesgos B60 sin verificar en visor: 0046/0049/0050 (Metal), `vpvk_mark_eye_image` vía dlsym. Parches 0047–0050 se conservan (los reutiliza VisionQuestPro).
 - Problema abierto: zona pesada juego ~23 ms > umbral (17 ms a 100 Hz, 18,9 a 90 Hz); térmico.

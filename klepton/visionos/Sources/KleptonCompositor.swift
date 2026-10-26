@@ -738,6 +738,11 @@ final class KleptonCompositor {
     private var cpProf: CpProfSlot?                 // the slot of the command buffer being composed (render thread only)
     private var cpProfSum = [Double](repeating: 0, count: 6)   // raw counter units per category, this second
     private var cpProfN = 0, cpProfEnc = 0, cpProfSkip = 0
+    // Discard reasons this second (index: 1 err, 2 missed, 3 nostart, 4 long, 5 resolve, 6 short, 7 bad, 8 noslot, 9 no encoder),
+    // composites claimed, encoders with unusable timestamps, and whether the first resolved sample was printed.
+    private var cpProfWhy = [Int](repeating: 0, count: 10)
+    private var cpProfClaims = 0, cpProfBadEnc = 0
+    private var cpProfLoggedFirst = false
     private var cpProfCb = 0.0                      // ms
     private var cpProfWindowStart = CFAbsoluteTimeGetCurrent()
     private var cpProfCpu0: MTLTimestamp = 0, cpProfGpu0: MTLTimestamp = 0   // tick calibration baseline
@@ -4501,7 +4506,8 @@ final class KleptonCompositor {
             if cpProfState == 2 { NSLog("[cp] gpu passes: not measured (\(why))") }
         }
         guard cpProfState == 1 else { return nil }
-        guard let s = cpProfFree.popLast() else { cpProfSkip += 1; return nil }
+        cpProfClaims += 1
+        guard let s = cpProfFree.popLast() else { cpProfSkip += 1; cpProfWhy[8] += 1; return nil }
         s.n = 0
         s.missed = false
         return s
@@ -4528,29 +4534,48 @@ final class KleptonCompositor {
     private func noteCompositePasses(_ b: MTLCommandBuffer, _ s: CpProfSlot) {
         let cbMs = (b.gpuEndTime - b.gpuStartTime) * 1000
         var data: Data? = nil
-        if b.error == nil, !s.missed, s.n > 0, b.gpuStartTime > 0, cbMs > 0, cbMs < 1000 {
+        var why = 0   // 0 usable; else the index into cpProfWhy
+        if b.error != nil { why = 1 }
+        else if s.missed { why = 2 }
+        else if s.n == 0 { why = 9 }
+        else if b.gpuStartTime <= 0 { why = 3 }
+        else if !(cbMs > 0 && cbMs < 1000) { why = 4 }
+        else {
             data = try? s.buf.resolveCounterRange(0..<(s.n * 2))
+            if data == nil { why = 5 }
         }
         var text: String? = nil
+        var first: String? = nil
         cpProfLock.lock()
-        var valid = false
-        if let data, data.count >= s.n * 16 {
-            valid = data.withUnsafeBytes { raw -> Bool in
-                func ts(_ k: Int) -> UInt64 { raw.loadUnaligned(fromByteOffset: k * 8, as: UInt64.self) }
-                for i in 0..<s.n {
-                    let a = ts(2 * i), e = ts(2 * i + 1)
-                    if a == 0 || a == UInt64.max || e == UInt64.max || e < a { return false }
+        var good = 0, badEnc = 0
+        if let data {
+            if data.count < s.n * 16 { why = 6 }
+            else {
+                data.withUnsafeBytes { raw in
+                    func ts(_ k: Int) -> UInt64 { raw.loadUnaligned(fromByteOffset: k * 8, as: UInt64.self) }
+                    if !cpProfLoggedFirst {
+                        cpProfLoggedFirst = true
+                        let m = min(data.count / 8, s.n * 2)
+                        let v = (0..<min(8, m)).map { String(ts($0)) }.joined(separator: ",")
+                        let mx = (0..<m).filter { ts($0) == UInt64.max }.map { String($0) }.joined(separator: ",")
+                        let z = (0..<m).filter { ts($0) == 0 }.map { String($0) }.joined(separator: ",")
+                        first = "[cp] gpu passes first resolve: encoders=\(s.n) bytes=\(data.count) first8=[\(v)] maxIdx=[\(mx)] zeroIdx=[\(z)] cats=\(s.cats[0..<s.n])"
+                    }
+                    var last: UInt64 = 0
+                    for i in 0..<s.n {
+                        let a = ts(2 * i), e = ts(2 * i + 1)
+                        // An encoder without usable samples (never ran, or unsampled) is left out; the others still count.
+                        if a == 0 || a == UInt64.max || e == UInt64.max || e < a { badEnc += 1; continue }
+                        good += 1
+                        if e > max(a, last) { cpProfSum[s.cats[i]] += Double(e - max(a, last)) }
+                        last = max(last, e)
+                    }
                 }
-                var last: UInt64 = 0
-                for i in 0..<s.n {
-                    let a = ts(2 * i), e = ts(2 * i + 1)
-                    if e > max(a, last) { cpProfSum[s.cats[i]] += Double(e - max(a, last)) }
-                    last = max(last, e)
-                }
-                return true
+                if good == 0 { why = 7 }
             }
         }
-        if valid { cpProfN += 1; cpProfEnc += s.n; cpProfCb += cbMs } else { cpProfSkip += 1 }
+        cpProfBadEnc += badEnc
+        if why == 0 { cpProfN += 1; cpProfEnc += good; cpProfCb += cbMs } else { cpProfSkip += 1; cpProfWhy[why] += 1 }
         cpProfFree.append(s)
         let now = CFAbsoluteTimeGetCurrent()
         if now - cpProfWindowStart >= 1 {
@@ -4565,17 +4590,22 @@ final class KleptonCompositor {
                 let tick = gpu1 > cpProfGpu0 && cpu1 > cpProfCpu0 ? Double(cpu1 - cpProfCpu0) / Double(gpu1 - cpProfGpu0) : 1
                 let u = abs(tick - 1) < 0.1 ? 1.0 : tick
                 let f = k * u * 1e-6
-                text = String(format: "[cp] gpu passes eye=%.2f layer=%.2f wide=%.2f recon=%.2f comp=%.2f other=%.2f sum=%.2f cb=%.2f n=%.0f enc=%.1f skip=%ld phys=%ld fov=%ld raw=%.0f units=%@",
+                text = String(format: "[cp] gpu passes eye=%.2f layer=%.2f wide=%.2f recon=%.2f comp=%.2f other=%.2f sum=%.2f cb=%.2f n=%.0f enc=%.1f skip=%ld phys=%ld fov=%ld raw=%.0f units=%@ badenc=%ld",
                               cpProfSum[0] * f, cpProfSum[1] * f, cpProfSum[2] * f, cpProfSum[3] * f, cpProfSum[4] * f, cpProfSum[5] * f,
                               raw * u * 1e-6, cbMean, Double(cpProfN) / (now - cpProfWindowStart), Double(cpProfEnc) * k, cpProfSkip,
                               Self.cpProfPhys ? 1 : 0, Self.cpProfFov ? 1 : 0, raw,
-                              u == 1 ? "ns" : String(format: "ticks(%.2fns)", u))
+                              u == 1 ? "ns" : String(format: "ticks(%.2fns)", u), cpProfBadEnc)
+            } else {
+                let w = cpProfWhy
+                text = "[cp] gpu passes none skip=\(cpProfSkip) err=\(w[1]) missed=\(w[2]) nostart=\(w[3]) long=\(w[4]) resolve=\(w[5]) short=\(w[6]) bad=\(w[7]) noslot=\(w[8]) noenc=\(w[9]) claims=\(cpProfClaims)"
             }
             for i in cpProfSum.indices { cpProfSum[i] = 0 }
-            cpProfN = 0; cpProfEnc = 0; cpProfSkip = 0; cpProfCb = 0
+            for i in cpProfWhy.indices { cpProfWhy[i] = 0 }
+            cpProfN = 0; cpProfEnc = 0; cpProfSkip = 0; cpProfCb = 0; cpProfClaims = 0; cpProfBadEnc = 0
             cpProfWindowStart = now
         }
         cpProfLock.unlock()
+        if let first { NSLog("%@", first) }
         if let text { NSLog("%@", text) }
     }
 
