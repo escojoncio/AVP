@@ -715,6 +715,32 @@ final class KleptonCompositor {
     private var cpGpuWindowStart = CFAbsoluteTimeGetCurrent()
     // The RCAS mode the window above was measured in: a change of mode starts a new window, so p50/p95 never mix modes.
     private var cpGpuMode = ""
+    // GPU time per pass of that same command buffer, only with "Medir el tiempo de GPU por pase" (avp.gpuPasses2 ->
+    // VP_EXCL_TIMING / KL_GPU_PASSES; off: none of this runs). A fixed pool of timestamp sample buffers, one per composite in
+    // flight (none free: that composite goes unmeasured, `skip`). The render encoders of the eye prep (FXAA, separate RCAS), the
+    // wide view, its reconstruction and the composite (per-layer composite = "layer") sample at their stage boundaries on
+    // attachment 0; the completion handler resolves them and once a second prints `[cp] gpu passes`. Blit encoders and
+    // MetalFX are not timed (cb - sum). No encoder feeds "other" yet. Window state under cpProfLock.
+    private static let cpPassProfOn = klEnvOn("VP_EXCL_TIMING", default: false) || klEnvOn("KL_GPU_PASSES", default: false)
+    private static let cpProfPhys = klEnvOn("KL_VRR_PHYS", default: false)
+    private static let cpProfFov = klEnvOn("KL_VRR", default: false)
+    private final class CpProfSlot: @unchecked Sendable {
+        static let maxEnc = 64
+        let buf: MTLCounterSampleBuffer
+        var cats = [Int](repeating: 5, count: CpProfSlot.maxEnc)   // eye, layer, wide, recon, comp, other: encoder i = samples 2i, 2i+1
+        var n = 0
+        var missed = false      // more encoders than the buffer holds: this composite is dropped
+        init(_ buf: MTLCounterSampleBuffer) { self.buf = buf }
+    }
+    private let cpProfLock = NSLock()
+    private var cpProfState = 0                     // 0 not set up, 1 pool ready, 2 not supported
+    private var cpProfFree: [CpProfSlot] = []
+    private var cpProf: CpProfSlot?                 // the slot of the command buffer being composed (render thread only)
+    private var cpProfSum = [Double](repeating: 0, count: 6)   // raw counter units per category, this second
+    private var cpProfN = 0, cpProfEnc = 0, cpProfSkip = 0
+    private var cpProfCb = 0.0                      // ms
+    private var cpProfWindowStart = CFAbsoluteTimeGetCurrent()
+    private var cpProfCpu0: MTLTimestamp = 0, cpProfGpu0: MTLTimestamp = 0   // tick calibration baseline
     // `sharpFused` as it stood when the frame being composed began (renderFrame): the whole frame uses this one value.
     private var sharpFusedFrame = true
     // Every composite command buffer that came back with an error (not only the first): build 12
@@ -1493,6 +1519,7 @@ final class KleptonCompositor {
         rp.colorAttachments[0].texture = out
         rp.colorAttachments[0].loadAction = .dontCare
         rp.colorAttachments[0].storeAction = .store
+        cpProfAttach(rp, 0)
         guard let enc = cmd.makeRenderCommandEncoder(descriptor: rp) else { return src }
         enc.label = "klepton eye FXAA"
         enc.setRenderPipelineState(ps)
@@ -1724,6 +1751,7 @@ final class KleptonCompositor {
             rp.colorAttachments[0].slice = s
             rp.colorAttachments[0].loadAction = .dontCare
             rp.colorAttachments[0].storeAction = .store
+            cpProfAttach(rp, 0)
             guard let enc = cmd.makeRenderCommandEncoder(descriptor: rp) else { return src }
             enc.label = "klepton eye sharpen"
             var zone = zones[min(s, zones.count - 1)]
@@ -3153,6 +3181,7 @@ final class KleptonCompositor {
                 || FrameCapture.takeManual())
         hudCount(rendered: rendered, haveRendered: haveRendered)
         loadingTick(originFromHead: originFromHead)
+        cpProf = cpProfClaim()   // no return between here and the completion handler below: the slot always comes back
         for (di, drawable) in drawables.enumerated() {
             // Per drawable, not once: each one is presented separately and each
             // is reprojected by the system against its own anchor.
@@ -3223,6 +3252,8 @@ final class KleptonCompositor {
         // drew black".
         let rcasMode = Self.centerSharp > 0 || eyeSharpen != nil
             ? ((sharpFusedFrame && eyeSharpen == nil) ? "fused" : "separate pass") : "off"
+        let passProf = cpProf
+        cpProf = nil
         cmd.addCompletedHandler { [weak self] b in
             guard let self else { return }
             self.cmdLock.lock()
@@ -3260,6 +3291,7 @@ final class KleptonCompositor {
             if n <= 12 { NSLog("[cp] cmdbuf #\(n) COMPLETED" + (b.error != nil ? " err=\(b.error!)" : "")) }
             if first { NSLog("[cp] composite command buffer error: \(b.error!)") }
             self.noteCompositeGpu(b, rcas: rcasMode)
+            if let passProf { self.noteCompositePasses(b, passProf) }
         }
         cmd.commit()
         cmdCommitted += 1
@@ -3873,6 +3905,7 @@ final class KleptonCompositor {
         // The composite's encoder is opened as late as it can be: the eye prep and the wide view are encoded on `cmd`
         // before it (a command buffer has one open encoder at a time), after the guest's fence wait that `cmd` starts with.
         func beginEncoder() -> MTLRenderCommandEncoder? {
+            cpProfAttach(pass, projLayerCount > 0 ? 1 : 4)   // the per-layer composite is "layer", the eye composite "comp"
             guard let e = cmd.makeRenderCommandEncoder(descriptor: pass) else { return nil }
             e.label = "klepton composite view\(viewIndices)"
             return e
@@ -4437,6 +4470,116 @@ final class KleptonCompositor {
                            window[window.count / 2], p95, window[window.count - 1], window.count) + " | rcas " + rcas)
     }
 
+    /// A free timestamp slot for the command buffer about to be composed, or nil (profiling off, no stage-boundary sampling,
+    /// every slot still in flight). The pool is made on the first call; what is missing is said once.
+    private func cpProfClaim() -> CpProfSlot? {
+        guard Self.cpPassProfOn else { return nil }
+        cpProfLock.lock()
+        defer { cpProfLock.unlock() }
+        if cpProfState == 0 {
+            cpProfState = 2
+            var why = "no timestamp counter set"
+            if let ts = device.counterSets?.first(where: { $0.name == MTLCommonCounterSet.timestamp.rawValue }) {
+                if device.supportsCounterSampling(.atStageBoundary) {
+                    let d = MTLCounterSampleBufferDescriptor()
+                    d.counterSet = ts
+                    d.storageMode = .shared
+                    d.sampleCount = CpProfSlot.maxEnc * 2
+                    do {
+                        for _ in 0..<4 { cpProfFree.append(CpProfSlot(try device.makeCounterSampleBuffer(descriptor: d))) }
+                        device.sampleTimestamps(&cpProfCpu0, gpuTimestamp: &cpProfGpu0)
+                        cpProfWindowStart = CFAbsoluteTimeGetCurrent()
+                        cpProfState = 1
+                    } catch {
+                        cpProfFree.removeAll()
+                        why = "counter sample buffer: \(error)"
+                    }
+                } else {
+                    why = "no stage-boundary timestamp sampling on this GPU"
+                }
+            }
+            if cpProfState == 2 { NSLog("[cp] gpu passes: not measured (\(why))") }
+        }
+        guard cpProfState == 1 else { return nil }
+        guard let s = cpProfFree.popLast() else { cpProfSkip += 1; return nil }
+        s.n = 0
+        s.missed = false
+        return s
+    }
+
+    /// Stage-boundary timestamps for the render encoder about to open on `d` (the composite's command buffer), counted in
+    /// category `cat` (0 eye, 1 layer, 2 wide, 3 recon, 4 comp, 5 other). A no-op unless this composite holds a slot.
+    private func cpProfAttach(_ d: MTLRenderPassDescriptor, _ cat: Int) {
+        guard let s = cpProf else { return }
+        guard s.n < CpProfSlot.maxEnc else { s.missed = true; return }
+        let i = s.n * 2
+        s.cats[s.n] = cat
+        s.n += 1
+        d.sampleBufferAttachments[0].sampleBuffer = s.buf
+        d.sampleBufferAttachments[0].startOfVertexSampleIndex = i
+        d.sampleBufferAttachments[0].endOfVertexSampleIndex = MTLCounterDontSample
+        d.sampleBufferAttachments[0].startOfFragmentSampleIndex = MTLCounterDontSample
+        d.sampleBufferAttachments[0].endOfFragmentSampleIndex = i + 1
+    }
+
+    /// Completion handler of the composite's command buffer, `s` its slot: the encoders' exclusive time (what each adds past
+    /// the latest end before it, as [gputime] does) goes into the second's window, the slot goes back to the pool, and once
+    /// a second the mean per composite is printed next to `[cp] gpu composite`.
+    private func noteCompositePasses(_ b: MTLCommandBuffer, _ s: CpProfSlot) {
+        let cbMs = (b.gpuEndTime - b.gpuStartTime) * 1000
+        var data: Data? = nil
+        if b.error == nil, !s.missed, s.n > 0, b.gpuStartTime > 0, cbMs > 0, cbMs < 1000 {
+            data = try? s.buf.resolveCounterRange(0..<(s.n * 2))
+        }
+        var text: String? = nil
+        cpProfLock.lock()
+        var valid = false
+        if let data, data.count >= s.n * 16 {
+            valid = data.withUnsafeBytes { raw -> Bool in
+                func ts(_ k: Int) -> UInt64 { raw.loadUnaligned(fromByteOffset: k * 8, as: UInt64.self) }
+                for i in 0..<s.n {
+                    let a = ts(2 * i), e = ts(2 * i + 1)
+                    if a == 0 || a == UInt64.max || e == UInt64.max || e < a { return false }
+                }
+                var last: UInt64 = 0
+                for i in 0..<s.n {
+                    let a = ts(2 * i), e = ts(2 * i + 1)
+                    if e > max(a, last) { cpProfSum[s.cats[i]] += Double(e - max(a, last)) }
+                    last = max(last, e)
+                }
+                return true
+            }
+        }
+        if valid { cpProfN += 1; cpProfEnc += s.n; cpProfCb += cbMs } else { cpProfSkip += 1 }
+        cpProfFree.append(s)
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - cpProfWindowStart >= 1 {
+            if cpProfN > 0 {
+                let k = 1.0 / Double(cpProfN)
+                let cbMean = cpProfCb * k
+                let raw = cpProfSum.reduce(0, +) * k
+                // ns per counter unit: cx_calibrate's method (kl_gpu_time.m; its result is static there): ns per GPU tick =
+                // CPU delta (taken as ns) / GPU delta since the pool was made, >= 1 s ago. Within 10 % of 1 the counters are
+                // ns; otherwise they are GPU ticks. No valid calibration: ns.
+                var cpu1: MTLTimestamp = 0, gpu1: MTLTimestamp = 0
+                device.sampleTimestamps(&cpu1, gpuTimestamp: &gpu1)
+                let tick = gpu1 > cpProfGpu0 && cpu1 > cpProfCpu0 ? Double(cpu1 - cpProfCpu0) / Double(gpu1 - cpProfGpu0) : 1
+                let u = abs(tick - 1) < 0.1 ? 1.0 : tick
+                let f = k * u * 1e-6
+                text = String(format: "[cp] gpu passes eye=%.2f layer=%.2f wide=%.2f recon=%.2f comp=%.2f other=%.2f sum=%.2f cb=%.2f n=%.0f enc=%.1f skip=%ld phys=%ld fov=%ld raw=%.0f units=%@",
+                              cpProfSum[0] * f, cpProfSum[1] * f, cpProfSum[2] * f, cpProfSum[3] * f, cpProfSum[4] * f, cpProfSum[5] * f,
+                              raw * u * 1e-6, cbMean, Double(cpProfN) / (now - cpProfWindowStart), Double(cpProfEnc) * k, cpProfSkip,
+                              Self.cpProfPhys ? 1 : 0, Self.cpProfFov ? 1 : 0, raw,
+                              u == 1 ? "ns" : String(format: "ticks(%.2fns)", u))
+            }
+            for i in cpProfSum.indices { cpProfSum[i] = 0 }
+            cpProfN = 0; cpProfEnc = 0; cpProfSkip = 0; cpProfCb = 0
+            cpProfWindowStart = now
+        }
+        cpProfLock.unlock()
+        if let text { NSLog("%@", text) }
+    }
+
     /// The round sharp zone's wide view: each visible eye's picture box-filtered to the periphery's density
     /// (kl_wide_f) into one slice of `wideTex`, slice = the view's eye. Rebuilt only when what it was built from
     /// changes (the guest picture, the texture, the grid, the size), so a composite of a picture already seen costs
@@ -4492,6 +4635,7 @@ final class KleptonCompositor {
                 pass.colorAttachments[0].loadAction = .dontCare   // the grid covers the whole target
                 pass.colorAttachments[0].storeAction = .store
                 pass.renderTargetArrayLength = 2
+                cpProfAttach(pass, 2)
                 guard let e = cmd.makeRenderCommandEncoder(descriptor: pass) else {
                     wideKey = [nil, nil]       // nothing counts as built, so the next composite tries again
                     return nil
@@ -4523,6 +4667,7 @@ final class KleptonCompositor {
             pass.colorAttachments[0].slice = vi
             pass.colorAttachments[0].loadAction = .dontCare   // the grid covers the whole target
             pass.colorAttachments[0].storeAction = .store
+            cpProfAttach(pass, 2)
             guard let e = cmd.makeRenderCommandEncoder(descriptor: pass) else {
                 // Whatever was encoded still runs; nothing counts as built, so the next composite tries again.
                 wideKey = [nil, nil]
@@ -4586,6 +4731,7 @@ final class KleptonCompositor {
                             pass.colorAttachments[0].loadAction = .dontCare   // the triangle covers the whole target
                             pass.colorAttachments[0].storeAction = .store
                             pass.renderTargetArrayLength = 2
+                            cpProfAttach(pass, 3)
                             if let e = cmd.makeRenderCommandEncoder(descriptor: pass) {
                                 e.label = "klepton wide view reconstruction both eyes"
                                 // KLWideRecon[2] in kl_reproject.c
@@ -4618,6 +4764,7 @@ final class KleptonCompositor {
                     pass.colorAttachments[0].slice = vi
                     pass.colorAttachments[0].loadAction = .dontCare   // the triangle covers the whole target
                     pass.colorAttachments[0].storeAction = .store
+                    cpProfAttach(pass, 3)
                     guard let e = cmd.makeRenderCommandEncoder(descriptor: pass) else { wideReconKey = [nil, nil]; ok = false; break }
                     e.label = "klepton wide view reconstruction eye \(vi)"
                     var p = (UInt32(vi), u.recon_strength, u.recon_sharp, u.recon_ref)   // KLWideRecon in kl_reproject.c
