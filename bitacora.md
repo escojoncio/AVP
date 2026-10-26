@@ -41,15 +41,14 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   GPU exclusivo; reloj del juego `klvr_game_hz`; OpenVR cabeza + 2 Sense, dedos, altura, subtítulos, idioma, pausa.
 - B65 al validar: `[cp] cb` (qué label/pases dominan los 5–8 ms), `pace plan` 45/30 a 90 y 50/33 a 100 Hz sin pin,
   `gpu.pso.miss` (qué pipelines faltan y por qué no están en prewarm/archivo), `archive` abiertos/skip por budget, RAM pico.
-- Pendiente: Steam en guest (`steamclient.so`); SSAO: decisiones dicen off pero `AVPSettings.swift:403-415` y
-  `app-convars.lua:15,41` ponen `r_ssao=1` (log B64 = 1).
+- Pendiente: Steam en guest (`steamclient.so` no encontrado).
 - Próximo objetivo: coste GPU del compositor 4–8 ms (B60 notó subida desde 2,4–6; posible RCAS fusionado, unverified).
 - Riesgos B60 sin verificar en visor: 0046/0049/0050 (Metal), `vpvk_mark_eye_image` vía dlsym. Parches 0047–0050 se conservan (los reutiliza VisionQuestPro).
 - Problema abierto: zona pesada juego ~23 ms > umbral (17 ms a 100 Hz, 18,9 a 90 Hz); térmico.
 
 ## Decisiones vigentes
 - Sin MetalFX; MoltenVK solo fallback automático; nada que cambie lo visible (LOD, cull, `vr_expand_cull_frustum`,
-  SSAO off, sombras, MSAA): el rendimiento sale de resolución y optimización pura.
+  SSAO on, sombras, MSAA): el rendimiento sale de resolución y optimización pura.
 - `VPVK_RUNTIME_OPTS=0`; clear skip (0038 bit1) nunca.
 - Comparar rendimiento con visor frío, misma zona, mismo tiempo, mismo «Medir GPU por pase».
 - Diagnóstico solo al log de la app (el usuario no tiene Mac ni `.ips`); nada de volcados pesados en mitad del juego.
