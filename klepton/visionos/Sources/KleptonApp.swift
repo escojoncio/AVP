@@ -108,6 +108,24 @@ enum Immersive {
     }
 }
 
+/// VPKEngine's background GPU pause (vpgpu_set_background / vpgpu_shutdown_background): visionOS fails every command
+/// buffer committed in the background, so the driver parks its commits. Found with dlsym (the driver is loaded
+/// RTLD_LOCAL: its image by RTLD_NOLOAD, as the pass dump does) so any other driver just does nothing.
+/// `set` from the main thread only (the driver exempts the thread that sets the background).
+enum VPGpuBackground {
+    private static func call(_ name: String, _ arg: Int32?) {
+        var handle: UnsafeMutableRawPointer? = nil
+        if let path = getenv("KL_MVK_DYLIB") { handle = dlopen(path, RTLD_NOW | RTLD_NOLOAD) }
+        guard let sym = dlsym(handle ?? UnsafeMutableRawPointer(bitPattern: -2), name) else { return }
+        if let arg { unsafeBitCast(sym, to: (@convention(c) (Int32) -> Void).self)(arg) }
+        else { unsafeBitCast(sym, to: (@convention(c) () -> Void).self)() }
+    }
+    static func set(_ on: Bool) { call("vpgpu_set_background", on ? 1 : 0) }
+    /// Releases the parked commits for good: before the guest and its device are torn down (a parked thread would
+    /// block the join). Never while the game stays alive.
+    static func shutdown() { call("vpgpu_shutdown_background", nil) }
+}
+
 /// What backgrounding means for this process: the end of it.
 ///
 /// ALVR's shape, and for the same reason. Everything the guest is holding when
@@ -245,6 +263,7 @@ enum Lifecycle {
     static func scenePhaseChanged(to phase: ScenePhase) {
         NSLog("[app] scene phase -> \(phase) (immersive open: \(immersiveOpen))")
         lastPhase = phase
+        if phase == .background { VPGpuBackground.set(true) } else if phase == .active { VPGpuBackground.set(false) }
         // Coming back is the audio's cue, and it needs one: this OS silently
         // stops calling CoreAudio's render callback across a scene transition —
         // the boot window being closed while the immersive space runs is one,

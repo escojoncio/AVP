@@ -10,7 +10,7 @@ WORK="$(mkdir -p "${2:-build/harness}" && cd "${2:-build/harness}" && pwd)"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 [ -d "$WORK/vpkengine/.git" ] || git clone -q "https://github.com/escojoncio/VPKEngine.git" "$WORK/vpkengine"
 git -C "$WORK/vpkengine" checkout -q -f "$(tr -d ' \n' < "$ROOT/vpkengine.ref")"
-for p in "$ROOT"/vpkengine-patches/*.patch; do git -C "$WORK/vpkengine" -c user.email=ci@localhost -c user.name=ci am -q --3way "$p"; done
+for p in "$ROOT"/vpkengine-patches/*.patch; do [ -e "$p" ] || continue; git -C "$WORK/vpkengine" -c user.email=ci@localhost -c user.name=ci am -q --3way "$p"; done
 cmake -S "$WORK/vpkengine/gpu" -B "$WORK/vp" -DCMAKE_BUILD_TYPE=RelWithDebInfo >/dev/null
 make -C "$WORK/vp" -j"$(nproc)" VPVulkan >/dev/null
 if [ ! -x "$WORK/fz/build/cli/fossilize-replay" ]; then

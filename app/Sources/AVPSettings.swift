@@ -514,6 +514,7 @@ final class AVPSettings: ObservableObject {
             ("VP_FRAME_DETAIL", "3000"),
             // Elisión de stores MSAA muertos, VPKEngine 0051.
             ("VPVK_MSAA_DEAD_STORE", "1"),
+            // Paridad con el motor anterior (primera build sobre VPKEngine sin parches): sin extensiones extra.
         ]
         // VPKTAA inputs not usable yet (build 17 log): VPKEngine's motion vectors are all zero (its "eye frame"
         // restarts at every depth-clearing multiview pass, 4-7 per game frame, so no draw ever finds last frame's
