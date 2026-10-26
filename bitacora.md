@@ -106,7 +106,6 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
     slot reuse por frame, resolve 1x→copia, indirect GPU → encoder heavy (más memoria MSAA, `heavy_indirect=` en
     `gpu.frame`), presupuesto archivo real (`gpu.pso.cache open/skipped/open_total used_mb=`), `gpu.pso.miss` en ruta real,
     `vk.perf` 1/s.
-- `gpu.shader.lib hit=0` en Alyx = contador sin función (índice solo de precompileDir/VisionQuestPro).
 - `prewarm=0` (`avp_config.c:42`) → no se emite `gpu.pso.recipe game hits=` → recorded.foz/recetas nunca invalidan `warm.stamp`.
 - B63 regulador (`klvr_platform_klepton.c:348`): línea `[openvr] pace.gov fallback avg= late= need= streak=` cada 10 s en fallback.
   Sin bug: mide juego+comp (`per = game + comp*fb/base`, l.281); subir a 50 exige avg < 17 ms 10–120 s; juego 15–19 + comp 4–8.
