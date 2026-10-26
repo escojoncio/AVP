@@ -300,8 +300,8 @@ struct AVPSettingsView: View {
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     Toggle(AVPL("Diagnóstico de coste por shader", "Per-shader cost diagnostic"), isOn: $s.shaderKnock)
-                    hint("Durante ~1 minuto oculta por turnos grupos de objetos para medir cuánto cuesta cada shader. Se verán parpadeos. Solo para diagnóstico. Se aplica al arrancar el juego.",
-                         "For ~1 minute it hides groups of objects in turns to measure what each shader costs. You will see flicker. For diagnostics only. Applied at game start.")
+                    hint("Dentro de la partida pulsa L3 + R3 para empezar. Durante 1–2 minutos oculta por turnos grupos de objetos para medir cuánto cuesta cada shader (verás parpadeos). Los pasos se marcan en pantalla. Solo para diagnóstico.",
+                         "In game, press L3 + R3 to start. For 1-2 minutes it hides groups of objects in turns to measure what each shader costs (you will see flicker). The steps are ticked off on screen. For diagnostics only.")
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     Toggle(AVPL("Occlusion culling medido (consultas de GPU)", "Measured occlusion culling (GPU queries)"), isOn: $s.occlusionQueries)

@@ -3224,6 +3224,7 @@ final class KleptonCompositor {
             && ((capScheduledOK && (FrameCapture.frames.contains(capGuestFrames) || capGuestFrames == overlayCapFrame))
                 || FrameCapture.takeManual())
         hudCount(rendered: rendered, haveRendered: haveRendered)
+        knockHudTick()
         loadingTick(originFromHead: originFromHead)
         for (di, drawable) in drawables.enumerated() {
             // Per drawable, not once: each one is presented separately and each
@@ -3598,6 +3599,137 @@ final class KleptonCompositor {
             uniforms.append(u)
         }
         // Always on top: the HUD must not be hidden by guest geometry nearer than 1 m.
+        if hudDepth == nil {
+            let d = MTLDepthStencilDescriptor()
+            d.depthCompareFunction = .always
+            d.isDepthWriteEnabled = true
+            hudDepth = device.makeDepthStencilState(descriptor: d)
+        }
+        if let hudDepth { enc.setDepthStencilState(hudDepth) }
+        enc.setRenderPipelineState(pipe)
+        enc.setFragmentTexture(tex, index: 0)
+        enc.setFragmentSamplerState(sampler, index: 0)
+        uniforms.withUnsafeBytes { buf in
+            enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+            enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
+        }
+        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+    }
+
+    // MARK: - Shader diagnostic HUD (VP_KNOCK)
+    //
+    // With VP_KNOCK set (app setting «Diagnóstico de coste por shader»), a head-locked panel below the FPS HUD marks the
+    // steps of VPKEngine's per-shader cost run (started in game with L3 + R3, KleptonControllers.stickClick). The progress
+    // is polled from vpgpu_metal2_knock_progress (resolved once; a missing symbol, an old engine, draws nothing) four
+    // times a second at most; the texture is rebuilt only when a line changes. Hidden 20 s after the run ended.
+    private typealias KnockProgressFn = @convention(c) (UnsafeMutablePointer<Int32>?, UnsafeMutablePointer<Int32>?,
+                                                        UnsafeMutablePointer<Int32>?) -> Int32
+    private let knockHudEnabled = getenv("VP_KNOCK") != nil
+    private var knockHudFn: KnockProgressFn?
+    private var knockHudResolved = false
+    private var knockHudPolledAt: TimeInterval = 0
+    private var knockHudDoneAt: TimeInterval?
+    private var knockHudKey = ""
+    private var knockHudTex: MTLTexture?
+
+    private func knockHudTick() {
+        guard knockHudEnabled else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - knockHudPolledAt >= 0.25 else { return }
+        knockHudPolledAt = now
+        if !knockHudResolved {
+            knockHudResolved = true
+            // The driver Klepton loaded (KL_MVK_DYLIB: VPVulkan), already in the process: RTLD_NOLOAD only finds it.
+            var handle: UnsafeMutableRawPointer? = nil
+            if let path = getenv("KL_MVK_DYLIB") { handle = dlopen(path, RTLD_NOW | RTLD_NOLOAD) }
+            if let sym = dlsym(handle ?? UnsafeMutableRawPointer(bitPattern: -2), "vpgpu_metal2_knock_progress") {
+                knockHudFn = unsafeBitCast(sym, to: KnockProgressFn.self)
+            } else {
+                NSLog("[knock] HUD off: vpgpu_metal2_knock_progress not found (old engine)")
+            }
+        }
+        guard let fn = knockHudFn else { return }
+        var phase: Int32 = 0, done: Int32 = 0, total: Int32 = 0
+        guard fn(&phase, &done, &total) != 0 else { return }
+        if phase >= 4 {
+            if knockHudDoneAt == nil { knockHudDoneAt = now }
+            if now - (knockHudDoneAt ?? now) > 20 { knockHudKey = ""; knockHudTex = nil; return }
+        } else {
+            knockHudDoneAt = nil
+        }
+        let p = phase
+        func mark(_ isDone: Bool, _ isCurrent: Bool) -> (String, CGColor) {
+            isDone ? ("✓ ", CGColor(red: 0.3, green: 1, blue: 0.4, alpha: 1))
+                : isCurrent ? ("▶ ", CGColor(red: 1, green: 0.85, blue: 0.2, alpha: 1))
+                : ("  ", CGColor(red: 0.7, green: 0.7, blue: 0.7, alpha: 1))
+        }
+        let m1 = mark(p >= 1, p == 0), m2 = mark(p >= 2, p == 1), m3 = mark(p == 4 || p == 5, p == 2 || p == 3)
+        let m4 = mark(p == 4 || p == 5, p == 6)   // 6: no data, try again
+        let warm = p == 1 ? "\(done)" : p >= 2 ? "300" : "0"
+        let meas = p >= 2 && p != 6 ? " \(done)/\(total)" : ""
+        let lines: [(String, CGColor)] = [
+            ("Diagnóstico de shaders", CGColor(red: 1, green: 1, blue: 1, alpha: 1)),
+            (m1.0 + "1. Carga la partida y pulsa L3 + R3", m1.1),
+            (m2.0 + "2. Calentando… \(warm)/300 (quédate mirando la escena)", m2.1),
+            (m3.0 + "3. Midiendo shaders…\(meas) (habrá parpadeos)", m3.1),
+            (m4.0 + (p == 6 ? "4. Sin datos (no se encontró la escena 3D): pulsa L3 + R3 de nuevo en la partida"
+                     : p == 5 ? "4. Terminado (tiempo agotado): envía los logs" : "4. Terminado: envía los logs"), m4.1)]
+        let key = lines.map { $0.0 }.joined(separator: "\n")
+        guard key != knockHudKey else { return }
+        knockHudKey = key
+        knockHudTex = makeKnockHudTexture(lines) ?? knockHudTex
+    }
+
+    /// 1024x240: a title and four step lines, left-aligned. CoreGraphics' origin is the bottom-left.
+    private func makeKnockHudTexture(_ lines: [(String, CGColor)]) -> MTLTexture? {
+        let w = 1024, h = 240
+        guard let cs = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 0.6))
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        for (i, l) in lines.enumerated() {
+            // 28 pt, smaller for a line that would not fit the 1024 px (Menlo's advance is 0.6 em).
+            let font = CTFontCreateWithName("Menlo-Bold" as CFString, min(28, 1000 / (0.6 * CGFloat(max(1, l.0.count)))), nil)
+            let attrs: [NSAttributedString.Key: Any] = [
+                NSAttributedString.Key(kCTFontAttributeName as String): font,
+                NSAttributedString.Key(kCTForegroundColorAttributeName as String): l.1]
+            let line = CTLineCreateWithAttributedString(NSAttributedString(string: l.0, attributes: attrs))
+            ctx.textPosition = CGPoint(x: 16, y: CGFloat(h - 40 - 44 * i))
+            CTLineDraw(line, ctx)
+        }
+        guard let data = ctx.data else { return nil }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm_srgb, width: w, height: h,
+                                                         mipmapped: false)
+        d.usage = [.shaderRead]
+        d.storageMode = .shared
+        guard let t = device.makeTexture(descriptor: d) else { return nil }
+        t.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: data, bytesPerRow: w * 4)
+        return t
+    }
+
+    private func drawKnockHud(_ enc: MTLRenderCommandEncoder, viewIndices: [Int],
+                              drawable: LayerRenderer.Drawable, originFromHead: simd_float4x4) {
+        guard knockHudEnabled, let tex = knockHudTex, let pipe = overlayPipeline, let sampler else { return }
+        var ov = kl_ovrp_overlay()
+        ov.layer_id = -97
+        ov.shape = 0
+        ov.tex_w = Int32(tex.width); ov.tex_h = Int32(tex.height)
+        // Head-locked, 1 m ahead and well below the line of sight (the FPS HUD is at -0.22 m); 0.6 m wide.
+        ov.pose = (0, 0, 0, 1, 0, -0.42, -1.0)
+        ov.size = (0.6, 0.6 * Float(tex.height) / Float(max(1, tex.width)))
+        ov.head_locked = 1
+        ov.origin_top_left = 1
+        var uniforms: [kl_overlay_uniforms] = []
+        for vi in viewIndices {
+            var u = kl_overlay_build(&ov, Int32(vi), originFromHead,
+                                     Self.headFromView(drawable.views[vi].transform,
+                                                       midpoint: eyeMidpointInDevice),
+                                     drawable.computeProjection(viewIndex: vi))
+            u.srgb_decode = 0   // our own sRGB texture: decoded by the sampler already
+            uniforms.append(u)
+        }
+        // Always on top, like the FPS HUD.
         if hudDepth == nil {
             let d = MTLDepthStencilDescriptor()
             d.depthCompareFunction = .always
@@ -4496,6 +4628,7 @@ final class KleptonCompositor {
                              writeDepth: visible == 0)
         drawLoadingPanel(enc, viewIndices: viewIndices, drawable: drawable, originFromHead: originFromHead)
         drawFpsHud(enc, viewIndices: viewIndices, drawable: drawable, originFromHead: originFromHead)
+        drawKnockHud(enc, viewIndices: viewIndices, drawable: drawable, originFromHead: originFromHead)
         enc.endEncoding()
         // "How many eyes got a picture", which is what the caller counts black
         // frames with — and a panel IS a picture. Without this a guest that

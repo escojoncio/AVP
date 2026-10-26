@@ -572,22 +572,33 @@ final class KleptonControllers {
     }
 
     /// Both sticks clicked together (L3 + R3): a diagnostic capture of what is on screen now (the eye pictures,
-    /// FrameCapture, and VPKEngine's pass-by-pass dump of the next frame). Only with KL_CAPTURE=1.
+    /// FrameCapture, and VPKEngine's pass-by-pass dump of the next frame). Only with KL_CAPTURE=1. With VP_KNOCK set
+    /// (per-shader cost diagnostic) the chord starts that run instead (VPKEngine's vpgpu_metal2_knock_arm).
     nonisolated(unsafe) private static var stickDown = [false, false]
     nonisolated(unsafe) private static var stickChordFired = false
     static func stickClick(hand: Int, down: Bool) {
-        guard FrameCapture.enabled, hand == 0 || hand == 1 else { return }
+        let knock = getenv("VP_KNOCK") != nil
+        guard FrameCapture.enabled || knock, hand == 0 || hand == 1 else { return }
         stickDown[hand] = down
         let both = stickDown[0] && stickDown[1]
         if !both { stickChordFired = false; return }
         if stickChordFired { return }
         stickChordFired = true
-        NSLog("[input] L3 + R3 -> diagnostic capture of the next frame")
-        FrameCapture.requestManual()
         typealias Req = @convention(c) () -> Void
         // The driver Klepton loaded (KL_MVK_DYLIB: VPVulkan), already in the process: RTLD_NOLOAD only finds it.
         var handle: UnsafeMutableRawPointer? = nil
         if let path = getenv("KL_MVK_DYLIB") { handle = dlopen(path, RTLD_NOW | RTLD_NOLOAD) }
+        if knock {
+            NSLog("[input] L3 + R3 -> shader cost diagnostic: arm")
+            if let sym = dlsym(handle ?? UnsafeMutableRawPointer(bitPattern: -2), "vpgpu_metal2_knock_arm") {
+                unsafeBitCast(sym, to: Req.self)()
+            } else {
+                NSLog("[input] shader cost diagnostic not available (vpgpu_metal2_knock_arm not found)")
+            }
+            return
+        }
+        NSLog("[input] L3 + R3 -> diagnostic capture of the next frame")
+        FrameCapture.requestManual()
         if let sym = dlsym(handle ?? UnsafeMutableRawPointer(bitPattern: -2), "vpgpu_metal2_request_dump") {
             unsafeBitCast(sym, to: Req.self)()
         } else {

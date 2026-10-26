@@ -79,9 +79,10 @@ final class AVPSettings: ObservableObject {
     /// Build 27: per-pass GPU timing windows (KL_GPU_PASSES, kl_gpu_time.m) + VPKEngine's exclusive per-encoder
     /// timing (VP_EXCL_TIMING). Off by default since build 32: sample buffers on 28-120 encoders per frame are not free.
     @Published var gpuPassProfiling: Bool { didSet { save() } }
-    /// Per-shader GPU cost ranking (VP_KNOCK=auto, VPKEngine): after ~300 frames of counting, takes turns leaving out groups
-    /// of draws of the heaviest pass and compares the pass time (needs VP_EXCL_TIMING, forced on). ~1 minute, visible
-    /// flicker; the ranking goes to the log. Off by default: diagnostics only.
+    /// Per-shader GPU cost ranking (VP_KNOCK=auto, VPKEngine): idle until the user presses L3 + R3 in game; then ~300
+    /// frames of counting, then it takes turns leaving out groups of draws of the heaviest pass and compares the pass
+    /// time (needs VP_EXCL_TIMING, forced on). 1-2 minutes, visible flicker, steps shown on screen (KleptonCompositor);
+    /// the ranking goes to the log. Off by default: diagnostics only.
     @Published var shaderKnock: Bool { didSet { save() } }
     @Published var movement: Movement { didSet { save() } }
     @Published var subtitles: SubtitlePlacement { didSet { save() } }
