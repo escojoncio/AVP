@@ -61,7 +61,7 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
 - Verificar B66 en visor: arranque/retraducción, imagen (dual-source, render area, occlusion), `[cp] cb` por pase con
   «Medir GPU por pase», RAM pico vs B65 (6368 MB) y `used_mb` ≤1280, 0 `gpu.err code=7` al salir, `gpu.pso.miss`.
   Después A/B `VPVK_ASYNC_PIPELINES=0` y `VPVK_MSAA_TILE=0`.
-- VPKEngine: `avp-port-main` sin unir a main; `avp-port` remoto quedó en base vieja (force-push denegado). Al unir: avisar a VisionQuestPro.
+- VPKEngine main = `3f7da04` (fast-forward de `avp-port-main`; VisionQuestPro avisado para subir su ref). `avp-port` remoto obsoleto (base vieja).
 - Pendiente: Steam en guest (`steamclient.so` no encontrado).
 - Próximo objetivo: coste GPU del compositor 4–8 ms (B60 notó subida desde 2,4–6; posible RCAS fusionado, unverified).
 - Problema abierto: zona pesada juego ~23 ms > umbral (17 ms a 100 Hz, 18,9 a 90 Hz); térmico.
