@@ -155,11 +155,6 @@ final class AVPSettings: ObservableObject {
     static let gpuQueueDepth = 12
     /// The compositor composes only new pictures (build 26/27, KL_CP_SKIP_SAME): 3.3 ms of GPU per frame, no downside.
     static let composeNewOnly = true
-    /// The guest is told 90 Hz (Klepton's pin: Steam Link's VR client dereferences a null frametime container on a
-    /// measured rate) and paced to half of it; the pacer takes the measured display rate (100 Hz on the Vision Pro),
-    /// so the game runs at 50 fps when the GPU fits, else 33 (KLVR_PACE_FALLBACK). The old 90/100 Hz picker only
-    /// changed what the game was told, never what the headset does.
-    static let guestHz = 90
     /// The round sharp zone (P.T.'s circle, build 27) is the sharp zone: the rectangular one is gone.
     static let roundSharpZone = true
     /// MSAA scene targets resolve from tile (VPKEngine 0034, VP_MSAA_TILE=1). Logs 23: never applied yet
@@ -450,8 +445,6 @@ final class AVPSettings: ObservableObject {
         var env: [(String, String)] = [
             ("KL_ALYX_PROFILE_ARGS", args),
             ("KLVR_EYE_SIZE", "\(eye.width),\(eye.height)"),
-            ("KL_DISPLAY_HZ", String(Self.guestHz)),
-            ("KL_GUEST_PACE_HZ", String(Self.guestHz / 2)),
             // B51: 9 ms (was 6). Logs_Alyx_37 [gap]: frames whose main command buffer was committed late left the GPU idle
             // 2-3 ms and overran the 45 fps budget (pictures held 3 refreshes: the judder in menus).
             ("KL_GUEST_PACE_LEAD_MS", runningStart ? "9" : "0"),
@@ -579,6 +572,9 @@ final class AVPSettings: ObservableObject {
                                                    engineSignature: signature, archive: true)
             env.append(("VP_PIPELINE_CACHE_DIR", cache.dir.path))
             if cache.archiveOff { env.append(("VP_PIPELINE_ARCHIVE", "0")) }
+            // B65: 1280 MB of footprint for opening the binary archives (VPKEngine's default is 768): with 768 the three
+            // largest files (2614 pipelines) stayed unopened and their pipelines compiled in game (Logs_Alyx 26/10).
+            env.append(("VP_PIPELINE_ARCHIVE_BUDGET_MB", "1280"))
             env.append(("KL_VK_FOZ_GAME_REPLAY", cache.warm ? "0" : "1"))
         }
 
@@ -597,8 +593,8 @@ final class AVPSettings: ObservableObject {
         try videoSettings().write(to: p.configDir.appendingPathComponent("video2.txt"), atomically: true, encoding: .utf8)
         try fidelityTable().write(to: p.configDir.appendingPathComponent("vr_fidelity_levels_override.csv"), atomically: true, encoding: .utf8)
         try convarsLua().write(to: p.configDir.appendingPathComponent("alyx-convars.lua"), atomically: true, encoding: .utf8)
-        AVPLog.log("Config: \(p.configDir.path): ojo \(eye.width)x\(eye.height) (\(Int(renderPercent)) %), juego a \(Self.guestHz / 2) "
-                   + "(o 50/33 según la pantalla), texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveationOn) (zona nítida "
+        AVPLog.log("Config: \(p.configDir.path): ojo \(eye.width)x\(eye.height) (\(Int(renderPercent)) %), juego a 45/30 (90 Hz) o 50/33 (100 Hz) según la pantalla "
+                   + "(plan del pacer), texturas \(texturePoolMB) MB tope \(textureCap), foveado \(foveationOn) (zona nítida "
                    + "\(Int(wideDegrees))°, periferia \(Int((periphery * 100).rounded())) %), VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % "
                    + "nitidez \(vpktaaSharpness), nitidez del centro \(Int((centerSharpness * 100).rounded())) %, MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "

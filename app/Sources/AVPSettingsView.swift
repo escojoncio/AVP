@@ -47,7 +47,7 @@ struct AVPSettingsView: View {
     }
 
     // Build 32: one screen anyone can read. What a run showed to be the only sane value is no longer a setting
-    // (AVPSettings: gpuQueueDepth, composeNewOnly, guestHz, roundSharpZone, msaaOnTile; dynamic resolution, the
+    // (AVPSettings: gpuQueueDepth, composeNewOnly, roundSharpZone, msaaOnTile; dynamic resolution, the
     // texture pool are gone). Build 53: picture presets M2/M5/Personalizado.
     // Every option carries its own grey help line (hint): what it does, when to touch it, the recommended value.
 

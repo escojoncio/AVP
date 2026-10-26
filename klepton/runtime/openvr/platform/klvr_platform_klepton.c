@@ -143,7 +143,7 @@ static double host_period(void) {
 
 // ---- Pace plan and governor (KLVR_PACE_FALLBACK=1) ----------------------------
 // Quality first. The panel rate is visionOS's choice (90 or 120 Hz on the M5 unit;
-// kl_app paces the guest at 1/N of it, KL_GUEST_PACE_HZ=60). The "base" pace is
+// kl_app paces the guest at 1/N of it, to the base below: klvr_plat_pace_base). The "base" pace is
 // 60 at 120 Hz, 45 at 90, 60 at 60; the "fallback" is the next divider when it
 // keeps 40 fps or more (40 at 120 Hz; none at 90 or 60).
 //  - The game budgets for 60 (vr_target_fps 60) and is told its GPU time as a
@@ -163,6 +163,7 @@ void kl_guest_pace_extra(unsigned extra);
 __attribute__((weak)) void kl_guest_pace_extra(unsigned extra) { (void)extra; }
 float kl_guest_display_rate(void);
 __attribute__((weak)) float kl_guest_display_rate(void) { return 0; }
+extern float kl_guest_pace_fps(void) __attribute__((weak_import));   // only the visionOS app (kl_app.c) defines it
 static unsigned g_pace_extra;
 static float g_plan_panel;   // the panel rate pace_plan last planned from (hand prediction, B56)
 static void pace_plan(float *base, float *fallback) {
@@ -181,6 +182,10 @@ static void pace_plan(float *base, float *fallback) {
         static float peak;
         if (measured > 20 && measured > peak) peak = measured;
         panel = peak > 20 ? roundf(peak) : kl_ovrp_display_frequency();
+        // The headset app (kl_guest_pace_fps is its) before the compositor has pushed a panel rate (kl_guest_set_panel_hz sets what
+        // kl_guest_display_rate reads, together with kl_ovrp_set_display_frequency): the display seam still holds the Quest 2
+        // default, 72, which would plan base 36. 90 until measured. The Mac and other targets keep the seam's value.
+        if (&kl_guest_pace_fps && !(peak > 20)) panel = 90;
     }
     if (!(panel > 20)) panel = 90;
     g_plan_panel = panel;
@@ -190,6 +195,14 @@ static void pace_plan(float *base, float *fallback) {
     // 100 Hz: 50 -> 33.3; 90 Hz: 45 -> 30 (B52: Logs_Alyx_38, in a level with the GPU at 25-30 ms a frame and no
     // fallback allowed at 90 Hz, pictures alternated 2 and 3 refreshes for minutes, worse than a steady 30).
     *fallback = panel / (div + 1) >= 29.5f ? panel / (div + 1) : 0;
+}
+// The plan's base pace, for kl_app's pacer (guest_pace_wait takes it as its target when no rate is configured): the pacer holds the
+// guest at exactly the base this plan reports to the game, whatever the panel's rate (90 or 100 Hz).
+float klvr_plat_pace_base(void);
+float klvr_plat_pace_base(void) {
+    float base, fb;
+    pace_plan(&base, &fb);
+    return base;
 }
 // os_proc_available_memory(): visionOS/iOS only, so weak (NULL on the Mac, where the answer is "unknown").
 extern size_t os_proc_available_memory(void) __attribute__((weak_import));

@@ -1449,6 +1449,7 @@ static void guest_finished(void) {
 // KL_GUEST_PACE_HZ=F instead picks N from the rate poses actually arrive at, so a
 // panel that visionOS moves between 60, 90 and 120 Hz mid-session keeps the guest
 // at or under F (N = ceil(rate / F), at least 1): 45 on 90 Hz, 40 on 120, 30 on 60.
+// The AVP app sets no F: its F is the OpenVR shim's pace plan base (klvr_plat_pace_base: 45 on 90 Hz, 50 on 100).
 // Never above F on purpose: a fixed N=2 on the M5 unit's 120 Hz asked for 60 fps the
 // GPU cannot hold, ran it flat out at ~51 and heated the headset from "nominal" to
 // "fair" in two minutes. The rate is measured over ~1 s of publishes, a new N
@@ -1467,7 +1468,7 @@ static _Atomic float g_pace_fps;
 float kl_guest_pace_fps(void);
 float kl_guest_pace_fps(void) { return g_pace_fps; }
 // The panel rate poses really arrive at (0 until measured): the OpenVR shim's pace plan uses it, since the
-// rate the game is TOLD (KL_DISPLAY_HZ, 90) is not the panel's (100 Hz on the M2 unit).
+// rate the game is TOLD (the plan's pace, not the panel's) differs from the panel's (90 or 100 Hz on the M2 unit).
 static _Atomic float g_disp_rate;
 float kl_guest_display_rate(void);
 float kl_guest_display_rate(void) { return g_disp_rate; }
@@ -1500,11 +1501,21 @@ static void guest_pace_wait(void) {
     static unsigned div;
     static double pace_hz = -1, win_t0, last_rate;
     static uint64_t win_p0;
+    static int plan_pace;   // the target is the OpenVR shim's pace plan base, not a configured rate
     if (!div) {
         div = kl_env_uint("KL_GUEST_PACE_DIV", 1);
         if (div < 1) div = 1;
         const char *h = getenv("KL_GUEST_PACE_HZ");
         pace_hz = h && *h ? atof(h) : 0;
+#ifdef KL_APP_ALYX
+        // No configured rate (the app no longer sets one): pace to the plan's base (klvr_platform_klepton.c pace_plan,
+        // the pace the game is budgeted and told), so the pacer and the plan cannot disagree: 45 / 30 on 90 Hz, 50 / 33.3 on 100.
+        if (!(pace_hz > 0)) {
+            extern float klvr_plat_pace_base(void);
+            pace_hz = klvr_plat_pace_base();
+            plan_pace = 1;
+        }
+#endif
         if (pace_hz > 0) printf("[guest] frames paced to ~%.0f fps from the measured display rate (KL_GUEST_PACE_HZ)\n", pace_hz);
         else if (div > 1) printf("[guest] frames paced at 1/%u of the display rate (KL_GUEST_PACE_DIV)\n", div);
     }
@@ -1529,7 +1540,7 @@ static void guest_pace_wait(void) {
                 printf("[guest] pace switch at %.1f s after the first guest frame: ~%.0f -> ~%.0f fps (KL_GUEST_PACE_SWITCH)\n",
                        t - t_first, pace_hz, sw_hz);
                 fflush(stdout);
-                pace_hz = sw_hz; sw_at = -1;
+                pace_hz = sw_hz; sw_at = -1; plan_pace = 0;
             }
         }
         if (!win_t0) { win_t0 = t; win_p0 = p; }
@@ -1549,6 +1560,12 @@ static void guest_pace_wait(void) {
                     fflush(stdout);
                 }
             }
+#ifdef KL_APP_ALYX
+            if (plan_pace) {
+                extern float klvr_plat_pace_base(void);
+                pace_hz = klvr_plat_pace_base();   // follows the plan (the panel re-latched upward, a new peak)
+            }
+#endif
             // Up to 15 % over the target: 100 Hz panels pace 1/2 = 50 (not 1/3 = 33), 90 Hz 45, 120 Hz 40.
             unsigned want = (unsigned)ceil(rate / (pace_hz * 1.15) - 0.05);
             if (want < 1) want = 1;

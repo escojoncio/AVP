@@ -746,6 +746,16 @@ final class KleptonCompositor {
     private var cpProfCb = 0.0                      // ms
     private var cpProfWindowStart = CFAbsoluteTimeGetCurrent()
     private var cpProfCpu0: MTLTimestamp = 0, cpProfGpu0: MTLTimestamp = 0   // tick calibration baseline
+    // The counter-sample-buffer path above (cpProfClaim / cpProfAttach / noteCompositePasses) is DISCONNECTED: on device every
+    // sample came back unusable (bad = 100 %). Same gate, other source: the GPU time of each command buffer under a label that
+    // says what it holds. Passes encoded on the composite's command buffer (bit = index into cpPassNames; render thread only,
+    // cleared when the label is made), and the window state of `[cp] cb` under cpProfLock.
+    private static let cpPassNames = ["fxaa", "layer", "wide", "recon", "comp", "sharp", "mfx", "mip"]
+    private var cpPassMask = 0
+    private var cpCbMs: [String: (n: Int, ms: Double)] = [:]   // label -> command buffers and GPU ms this second
+    private var cpCbFrames = 0, cpCbBad = 0                    // composites completed, buffers without a usable time
+    private var cpCbSkipSeen = 0, cpCbSkipBase = -1            // skippedTotal at the latest commit / at the window's start (-1: first call sets it)
+    private var cpCbWindowStart = CFAbsoluteTimeGetCurrent()
     // `sharpFused` as it stood when the frame being composed began (renderFrame): the whole frame uses this one value.
     private var sharpFusedFrame = true
     // Every composite command buffer that came back with an error (not only the first): build 12
@@ -1401,6 +1411,7 @@ final class KleptonCompositor {
         sc.colorTexture = inV
         sc.outputTexture = outV
         sc.inputContentWidth = src.width; sc.inputContentHeight = src.height
+        cpPassTag(6)
         sc.encode(commandBuffer: cmd)
         return out
     }
@@ -1524,7 +1535,7 @@ final class KleptonCompositor {
         rp.colorAttachments[0].texture = out
         rp.colorAttachments[0].loadAction = .dontCare
         rp.colorAttachments[0].storeAction = .store
-        cpProfAttach(rp, 0)
+        cpPassTag(0)
         guard let enc = cmd.makeRenderCommandEncoder(descriptor: rp) else { return src }
         enc.label = "klepton eye FXAA"
         enc.setRenderPipelineState(ps)
@@ -1756,7 +1767,7 @@ final class KleptonCompositor {
             rp.colorAttachments[0].slice = s
             rp.colorAttachments[0].loadAction = .dontCare
             rp.colorAttachments[0].storeAction = .store
-            cpProfAttach(rp, 0)
+            cpPassTag(5)
             guard let enc = cmd.makeRenderCommandEncoder(descriptor: rp) else { return src }
             enc.label = "klepton eye sharpen"
             var zone = zones[min(s, zones.count - 1)]
@@ -3186,7 +3197,6 @@ final class KleptonCompositor {
                 || FrameCapture.takeManual())
         hudCount(rendered: rendered, haveRendered: haveRendered)
         loadingTick(originFromHead: originFromHead)
-        cpProf = cpProfClaim()   // no return between here and the completion handler below: the slot always comes back
         for (di, drawable) in drawables.enumerated() {
             // Per drawable, not once: each one is presented separately and each
             // is reprojected by the system against its own anchor.
@@ -3257,8 +3267,23 @@ final class KleptonCompositor {
         // drew black".
         let rcasMode = Self.centerSharp > 0 || eyeSharpen != nil
             ? ((sharpFusedFrame && eyeSharpen == nil) ? "fused" : "separate pass") : "off"
-        let passProf = cpProf
-        cpProf = nil
+        // What this composite showed, for the label below and the next refresh's skip check (0: no guest picture, never skipped against).
+        let shownPicture: UInt64 = encoded > 0 && haveRendered && completeStage >= 0
+            ? Self.pictureId(completeStage, UInt64(rendered.serial)) : 0
+        // Gate on: what the buffer holds, as its label ("comp.<kind>(<passes>)"). The kind is the refresh accounting's (new
+        // picture / same picture again / black), so `[cp] cb` splits the seconds by it.
+        let cbLabel: String?
+        if Self.cpPassProfOn {
+            let held = Self.cpPassNames.indices.filter { cpPassMask & (1 << $0) != 0 }.map { Self.cpPassNames[$0] }
+            let kind = encoded == 0 ? "black" : (shownPicture != 0 && shownPicture == lastPresentedPicture ? "same" : "new")
+            let label = "comp.\(kind)(" + held.joined(separator: "+") + ")"
+            if cmd.label == nil { cmd.label = label }
+            cbLabel = label
+            cpPassMask = 0
+        } else {
+            cbLabel = nil
+        }
+        let skipSeen = skippedTotal
         cmd.addCompletedHandler { [weak self] b in
             guard let self else { return }
             self.cmdLock.lock()
@@ -3296,7 +3321,7 @@ final class KleptonCompositor {
             if n <= 12 { NSLog("[cp] cmdbuf #\(n) COMPLETED" + (b.error != nil ? " err=\(b.error!)" : "")) }
             if first { NSLog("[cp] composite command buffer error: \(b.error!)") }
             self.noteCompositeGpu(b, rcas: rcasMode)
-            if let passProf { self.noteCompositePasses(b, passProf) }
+            if let cbLabel { self.noteCompositeCb(b, cbLabel, skipped: skipSeen) }
         }
         cmd.commit()
         cmdCommitted += 1
@@ -3317,9 +3342,7 @@ final class KleptonCompositor {
             cadHist = [0, 0, 0, 0, 0, 0]
             cadCount = 0
         }
-        // What this composite showed, for the next refresh's skip check (0: no guest picture, never skipped against).
-        let shownPicture: UInt64 = encoded > 0 && haveRendered && completeStage >= 0
-            ? Self.pictureId(completeStage, UInt64(rendered.serial)) : 0
+        // shownPicture (above): what this composite showed, for the next refresh's skip check.
         // Build 54: account this composite (see acctNew). Classified before skippedInARow is reset: the cap reason
         // needs it.
         if encoded == 0 {
@@ -3910,7 +3933,7 @@ final class KleptonCompositor {
         // The composite's encoder is opened as late as it can be: the eye prep and the wide view are encoded on `cmd`
         // before it (a command buffer has one open encoder at a time), after the guest's fence wait that `cmd` starts with.
         func beginEncoder() -> MTLRenderCommandEncoder? {
-            cpProfAttach(pass, projLayerCount > 0 ? 1 : 4)   // the per-layer composite is "layer", the eye composite "comp"
+            cpPassTag(projLayerCount > 0 ? 1 : 4)   // the per-layer composite is "layer", the eye composite "comp"
             guard let e = cmd.makeRenderCommandEncoder(descriptor: pass) else { return nil }
             e.label = "klepton composite view\(viewIndices)"
             return e
@@ -4095,6 +4118,7 @@ final class KleptonCompositor {
                     m1 = s1 === s0 ? m0 : sharpenedEye(s1, slot: 1, bottomUp: bu1, cmd: cmd)
                 }
                 if eyeMipsOn, let blit = cmd.makeBlitCommandEncoder() {
+                    cpPassTag(7)
                     let u0 = m0, u1 = m1
                     m0 = mippedEye(u0, slot: 0, blit: blit)
                     m1 = u1 === u0 ? m0 : mippedEye(u1, slot: 1, blit: blit)
@@ -4475,6 +4499,44 @@ final class KleptonCompositor {
                            window[window.count / 2], p95, window[window.count - 1], window.count) + " | rcas " + rcas)
     }
 
+    /// Marks pass `bit` (index into cpPassNames) as encoded on the composite's command buffer. Render thread; nothing with the gate off.
+    private func cpPassTag(_ bit: Int) {
+        guard Self.cpPassProfOn else { return }
+        cpPassMask |= 1 << bit
+    }
+
+    /// Completion handler of the composite's command buffer (gate on): its GPU time goes under `label` in the second's window, and
+    /// once a second prints `[cp] cb n=<buffers per composite> frames=<composites> skipped=<refreshes left to visionOS>` and each
+    /// label as `label=<buffers>x<mean ms>`, the most expensive first. `skipped` is skippedTotal as of this buffer's commit.
+    private func noteCompositeCb(_ b: MTLCommandBuffer, _ label: String, skipped: Int) {
+        let ms = (b.gpuEndTime - b.gpuStartTime) * 1000
+        var text: String? = nil
+        cpProfLock.lock()
+        if cpCbSkipBase < 0 { cpCbSkipBase = skipped; cpCbWindowStart = CFAbsoluteTimeGetCurrent() }   // the first window starts here
+        cpCbFrames += 1
+        cpCbSkipSeen = max(cpCbSkipSeen, skipped)
+        if b.error == nil && b.gpuStartTime > 0 && ms > 0 && ms < 1000 {
+            cpCbMs[label, default: (n: 0, ms: 0)].n += 1
+            cpCbMs[label, default: (n: 0, ms: 0)].ms += ms
+        } else {
+            cpCbBad += 1
+        }
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - cpCbWindowStart >= 1 {
+            let items = cpCbMs.sorted { $0.value.ms > $1.value.ms }
+            let bufs = items.reduce(0) { $0 + $1.value.n }
+            text = String(format: "[cp] cb n=%.2f frames=%ld skipped=%ld bad=%ld", Double(bufs) / Double(cpCbFrames),
+                          cpCbFrames, cpCbSkipSeen - cpCbSkipBase, cpCbBad)
+            for (k, v) in items { text! += " \(k)=\(v.n)x" + String(format: "%.2f", v.ms / Double(v.n)) }
+            cpCbMs.removeAll(keepingCapacity: true)
+            cpCbFrames = 0; cpCbBad = 0
+            cpCbSkipBase = cpCbSkipSeen
+            cpCbWindowStart = now
+        }
+        cpProfLock.unlock()
+        if let text { NSLog("%@", text) }
+    }
+
     /// A free timestamp slot for the command buffer about to be composed, or nil (profiling off, no stage-boundary sampling,
     /// every slot still in flight). The pool is made on the first call; what is missing is said once.
     private func cpProfClaim() -> CpProfSlot? {
@@ -4664,7 +4726,7 @@ final class KleptonCompositor {
                 pass.colorAttachments[0].loadAction = .dontCare   // the grid covers the whole target
                 pass.colorAttachments[0].storeAction = .store
                 pass.renderTargetArrayLength = 2
-                cpProfAttach(pass, 2)
+                cpPassTag(2)
                 guard let e = cmd.makeRenderCommandEncoder(descriptor: pass) else {
                     wideKey = [nil, nil]       // nothing counts as built, so the next composite tries again
                     return nil
@@ -4696,7 +4758,7 @@ final class KleptonCompositor {
             pass.colorAttachments[0].slice = vi
             pass.colorAttachments[0].loadAction = .dontCare   // the grid covers the whole target
             pass.colorAttachments[0].storeAction = .store
-            cpProfAttach(pass, 2)
+            cpPassTag(2)
             guard let e = cmd.makeRenderCommandEncoder(descriptor: pass) else {
                 // Whatever was encoded still runs; nothing counts as built, so the next composite tries again.
                 wideKey = [nil, nil]
@@ -4760,7 +4822,7 @@ final class KleptonCompositor {
                             pass.colorAttachments[0].loadAction = .dontCare   // the triangle covers the whole target
                             pass.colorAttachments[0].storeAction = .store
                             pass.renderTargetArrayLength = 2
-                            cpProfAttach(pass, 3)
+                            cpPassTag(3)
                             if let e = cmd.makeRenderCommandEncoder(descriptor: pass) {
                                 e.label = "klepton wide view reconstruction both eyes"
                                 // KLWideRecon[2] in kl_reproject.c
@@ -4793,7 +4855,7 @@ final class KleptonCompositor {
                     pass.colorAttachments[0].slice = vi
                     pass.colorAttachments[0].loadAction = .dontCare   // the triangle covers the whole target
                     pass.colorAttachments[0].storeAction = .store
-                    cpProfAttach(pass, 3)
+                    cpPassTag(3)
                     guard let e = cmd.makeRenderCommandEncoder(descriptor: pass) else { wideReconKey = [nil, nil]; ok = false; break }
                     e.label = "klepton wide view reconstruction eye \(vi)"
                     var p = (UInt32(vi), u.recon_strength, u.recon_sharp, u.recon_ref)   // KLWideRecon in kl_reproject.c
