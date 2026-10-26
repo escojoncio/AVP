@@ -4,10 +4,25 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` = rama `avp-port-main`, **sin parches**: `vpkengine-patches/` vacío; cambios del
 motor se hacen en VPKEngine, mapa en su bitácora). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B68**, sin verificar en visor).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B69**, sin verificar en visor).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
+- B69: motor `6151f72` (export `vpgpu_metal2_cb_busy_intervals`; HeavyGeometry sin doble conteo en multiview por
+  instancing — Alyx usa amplificación y NO estaba afectado; `verts=` en `gpu.frame`).
+  - Regulador (`klvr_platform_klepton.c` `pace_up_frac` ~237, promoción ~346): sube a la base si avg < min(`KL_PACE_UP_PCT`
+    (92 %), 0,95·presupuesto − comp·(1−fb/base)) con ≤5 % late; log `pace.gov ... need=<barra> comp=`.
+  - `kl_gpu_time.m`: compositor sin solape con el juego (anillo 2048 intervalos del motor, resta perezosa en
+    `kl_gpu_time_frame_ms`, en ticks; guarda nspt ±5 %); `KL_COMP_OVERLAP=0` off; logs `[gputime] overlap on/off nspt`,
+    `comp_raw=` en `[gputime]`.
+  - Compositor: `kl_reproject_f` con function constants 0–5 (recon, srgb, rcas, round, lod0, chroma; variantes async,
+    genérico hasta listo; `KL_CP_SPECIALIZE=0` off); funciones del lib reproject creadas con constantValues vacío
+    (`reprojFn`, `kl_view_mtl.m` ~68); `level(0)` en taps del ojo si 1 mip; wide/recon en par con 2 texturas
+    (`kl_wide2t_f`, 4→2 encoders por composite; `KL_CP_WIDE2=0` off). MSL/Swift sin compilar fuera de CI.
+- Logs_Alyx_11/12 (B68, 100 Hz): freno de CPU resuelto (submit 1,2 ms). MSAA2/60°: juego 13,5–15 + comp 3,9 →
+  ventanas avg 17,3–17,9 con 0 % late NO subían (barra 17,0). MSAA4/65° (térmico fair): juego 18,1, comp 8,9 inflado
+  por contención (wide 202x163: 0,19→2,7 ms); real ≈ juego + 3,9. Escena MSAA4: 1 encoder Clear+Resolve, sin store de
+  muestras, HeavyGeometry real (>3M vértices ×2 vistas, memBacked); stencil sin uso (census `stencil 0`).
 - B68 (`939f447`): motor `6b6fe91` (elisión de estado por draw `VP_STATE_ELIDE`; revertidos blit merge y `VPVK_REPORT_ADRENO`).
   `VPVK_MAX_PENDING_CHUNKS=6` (defecto 2 bloqueaba ~13 ms/frame en vkQueueSubmit), `VP_FRAMES_IN_FLIGHT=16` (cambia `sigKeys`:
   1.er arranque re-prewarm). Ajuste «Identidad GPU Adreno» quitado.

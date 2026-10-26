@@ -65,7 +65,15 @@ static id<MTLRenderPipelineState> klvm_pipeline_blend(const char *msl, const cha
     id<MTLLibrary> lib = [g_dev newLibraryWithSource:[NSString stringWithUTF8String:msl]
                                              options:nil error:&err];
     id<MTLFunction> vf = [lib newFunctionWithName:[NSString stringWithUTF8String:vfn]];
-    id<MTLFunction> ff = [lib newFunctionWithName:[NSString stringWithUTF8String:ffn]];
+    id<MTLFunction> ff = nil;
+    if (!strncmp(ffn, "kl_reproject_", 13)) {
+        // kl_reproject.c's fragments may use function constants (kl_fc_*), and a function that does cannot build a
+        // pipeline from newFunctionWithName:. An empty set leaves every constant undefined: the uniforms decide.
+        ff = [lib newFunctionWithName:[NSString stringWithUTF8String:ffn]
+                       constantValues:[MTLFunctionConstantValues new] error:&err];
+    } else {
+        ff = [lib newFunctionWithName:[NSString stringWithUTF8String:ffn]];
+    }
     if (!vf || !ff) {
         fprintf(stderr, "  [vmtl] %s shader failed to compile: %s\n", what,
                 err.localizedDescription.UTF8String ?: "?");

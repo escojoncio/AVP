@@ -223,6 +223,21 @@ final class KleptonCompositor {
     // is about the lifecycle rather than the picture.
     private var queue: MTLCommandQueue?
     private var pipeline: MTLRenderPipelineState!
+    /// kl_reproject_f specialised by function constants (kl_reproject.c `kl_fc_*`) for what the views of a composite have in
+    /// common (compositePipeline). -1 = that constant is left undefined, so the per-view uniform decides, as in `pipeline`.
+    private struct CompositeVariant: Hashable {
+        var recon: Int8, srgb: Int8, rcas: Int8, round: Int8, chroma: Int8
+        var lod0: Bool
+    }
+    private var reprojLib: MTLLibrary?
+    private var variantPipes: [CompositeVariant: MTLRenderPipelineState] = [:]
+    /// Variants being compiled, or that failed to: asked for once only. Under `variantLock` with `variantPipes`.
+    private var variantBusy: Set<CompositeVariant> = []
+    private let variantLock = NSLock()
+    /// KL_CP_SPECIALIZE=0 — only the generic `pipeline` (the A/B for the specialised variants).
+    private let variantsOn = klEnvOn("KL_CP_SPECIALIZE", default: true)
+    /// KL_CP_WIDE2=0 — no two-texture wide pair (`widePairTwoPipeline`): one wide pass per eye when the eyes are two textures.
+    private let wide2On = klEnvOn("KL_CP_WIDE2", default: true)
     /// VPKTAA (KleptonTAA.swift); nil when the setting is off. Per-eye resolved textures for
     /// the guest frame being composited, filled by prepareTAA before the render pass.
     private lazy var taa: KleptonTAA? = KleptonTAA(device: device)
@@ -371,6 +386,8 @@ final class KleptonCompositor {
     private var widePipeline: MTLRenderPipelineState?
     /// The same for both eyes of a shared eye texture in one draw of two instances (instance = array layer).
     private var widePairPipeline: MTLRenderPipelineState?
+    /// ...and for two eye textures (one swapchain per eye): kl_wide2t_f reads texture 0 for eye 0 and texture 1 for eye 1.
+    private var widePairTwoPipeline: MTLRenderPipelineState?
     private var wideTex: MTLTexture?
     private struct WideKey: Equatable {
         var picture: UInt64
@@ -1193,9 +1210,10 @@ final class KleptonCompositor {
         let color = layerRenderer.configuration.colorFormat
         do {
             let lib = try device.makeLibrary(source: src, options: nil)
+            reprojLib = lib
             let desc = MTLRenderPipelineDescriptor()
             desc.vertexFunction   = lib.makeFunction(name: "kl_reproject_v")
-            desc.fragmentFunction = lib.makeFunction(name: "kl_reproject_f")
+            desc.fragmentFunction = reprojFn("kl_reproject_f")
             desc.colorAttachments[0].pixelFormat = color
             desc.depthAttachmentPixelFormat = .depth32Float
             // Both eyes in one pass — see encodeComposite. Declared whatever
@@ -1221,6 +1239,13 @@ final class KleptonCompositor {
             wdesc2.colorAttachments[0].pixelFormat = .rgba16Float
             wdesc2.inputPrimitiveTopology = .triangle
             widePairPipeline = try? device.makeRenderPipelineState(descriptor: wdesc2)
+            // The same for the two-texture eyes (one swapchain per eye). Failing to link leaves one pass per eye for them.
+            let wdesc3 = MTLRenderPipelineDescriptor()
+            wdesc3.vertexFunction   = lib.makeFunction(name: "kl_wide2_v")
+            wdesc3.fragmentFunction = lib.makeFunction(name: "kl_wide2t_f")
+            wdesc3.colorAttachments[0].pixelFormat = .rgba16Float
+            wdesc3.inputPrimitiveTopology = .triangle
+            widePairTwoPipeline = try? device.makeRenderPipelineState(descriptor: wdesc3)
             let rdesc = MTLRenderPipelineDescriptor()
             rdesc.vertexFunction   = lib.makeFunction(name: "kl_widerecon_v")
             rdesc.fragmentFunction = lib.makeFunction(name: "kl_widerecon_f")
@@ -1234,15 +1259,16 @@ final class KleptonCompositor {
             rdesc2.inputPrimitiveTopology = .triangle
             wideReconPairPipeline = try? device.makeRenderPipelineState(descriptor: rdesc2)
             NSLog("[cp] wide-view pair pipelines (both eyes in one pass): wide " + (widePairPipeline == nil ? "FAILED" : "ready")
+                  + ", wide for two eye textures " + (widePairTwoPipeline == nil ? "FAILED" : "ready")
                   + ", reconstruction " + (wideReconPairPipeline == nil ? "FAILED" : "ready"))
             if Self.gameDepth {
                 // Same pass, the fragment that also writes [[depth(any)]]. Linked here so a failure says so once and
                 // the composite simply keeps the quad's depth.
-                desc.fragmentFunction = lib.makeFunction(name: "kl_reproject_depth_f")
+                desc.fragmentFunction = reprojFn("kl_reproject_depth_f")
                 depthPipeline = try? device.makeRenderPipelineState(descriptor: desc)
                 NSLog("[cp] game-depth pipeline: " + (depthPipeline == nil ? "FAILED to link — quad depth only" : "ready"))
-                desc.fragmentFunction = lib.makeFunction(name: "kl_reproject_f")
-                let dd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: 1, height: 1, mipmapped: false)
+                desc.fragmentFunction = reprojFn("kl_reproject_f")
+                let dd =MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: 1, height: 1, mipmapped: false)
                 dd.usage = .shaderRead
                 depthDummy = device.makeTexture(descriptor: dd)
             }
@@ -1352,11 +1378,11 @@ final class KleptonCompositor {
                 case 2:  d.vertexFunction   = lib.makeFunction(name: "kl_reproject_v")
                          d.fragmentFunction = lib.makeFunction(name: "kl_probe_solid_f")
                 case 3:  d.vertexFunction   = lib.makeFunction(name: "kl_reproject_v")
-                         d.fragmentFunction = lib.makeFunction(name: "kl_probe_opaque_f")
+                         d.fragmentFunction = reprojFn("kl_probe_opaque_f")
                 case 4:  d.vertexFunction   = lib.makeFunction(name: "kl_probe_full_v")
-                         d.fragmentFunction = lib.makeFunction(name: "kl_probe_full_f")
+                         d.fragmentFunction = reprojFn("kl_probe_full_f")
                 default: d.vertexFunction   = lib.makeFunction(name: "kl_reproject_v")
-                         d.fragmentFunction = lib.makeFunction(name: "kl_reproject_f")
+                         d.fragmentFunction = reprojFn("kl_reproject_f")
                 }
                 if probe >= 2 && probe <= 4 {
                     probePipeline = try? device.makeRenderPipelineState(descriptor: d)
@@ -4437,7 +4463,8 @@ final class KleptonCompositor {
             guard let enc = openComposite() else { return 0 }
             openedEnc = enc
             let useDepth = depthTex[0] != nil || depthTex[1] != nil
-            enc.setRenderPipelineState(probePipeline ?? (useDepth ? depthPipeline! : pipeline))
+            enc.setRenderPipelineState(probePipeline ?? (useDepth ? depthPipeline!
+                                       : compositePipeline(uniforms: uniforms, bind0: bind0, bind1: bind1)))
             if let depthState { enc.setDepthStencilState(depthState) }
             enc.setFragmentTexture(bind0, index: 0)
             enc.setFragmentTexture(bind1, index: 1)
@@ -4476,6 +4503,85 @@ final class KleptonCompositor {
         // its menu correctly, which is an instrument contradicting the display.
         if visible > 0 { return visible }
         return panels > 0 ? viewIndices.count : 0
+    }
+
+    /// A function of the reprojection library that may use the `kl_fc_*` function constants (kl_reproject.c), made with an
+    /// EMPTY constant set: a function that uses function constants cannot build a pipeline from `makeFunction(name:)`,
+    /// and with none given every constant is undefined, i.e. the per-view uniforms decide.
+    private func reprojFn(_ name: String) -> MTLFunction? {
+        guard let lib = reprojLib else { return nil }
+        do {
+            return try lib.makeFunction(name: name, constantValues: MTLFunctionConstantValues())
+        } catch {
+            NSLog("[cp] \(name) failed to specialise: \(error)")
+            return nil
+        }
+    }
+
+    /// The pipeline of the eye pass: kl_reproject_f with a function constant fixed wherever EVERY visible view gives the
+    /// same answer (a view that disagrees leaves that constant undefined: the uniform decides, as in `pipeline`), so the
+    /// code behind the other answer is not in the shader. Same picture as `pipeline`, less GPU time. A variant not seen
+    /// before is compiled on a background queue; until it is ready the generic `pipeline` draws (so no frame waits on a
+    /// compile, and a settings change just costs a few generic frames). A failed variant stays generic.
+    private func compositePipeline(uniforms: [kl_reproject_uniforms], bind0: MTLTexture, bind1: MTLTexture) -> MTLRenderPipelineState {
+        guard variantsOn, let lib = reprojLib else { return pipeline }
+        let vis = uniforms.filter { $0.visible != 0 }
+        guard let v0 = vis.first else { return pipeline }
+        func agree(_ f: (kl_reproject_uniforms) -> Bool) -> Int8 {
+            let v = f(v0)
+            return vis.allSatisfy { f($0) == v } ? (v ? 1 : 0) : -1
+        }
+        let chromaSame = v0.chroma_on <= 7 && vis.allSatisfy { $0.chroma_on == v0.chroma_on }
+        // One mip level: the implicit LOD of the eye taps is 0 whatever the derivatives say (linear/linear, no mip filter,
+        // no anisotropy: `sampler`), so the shader may state it. KL_EYE_MIPS keeps the implicit LOD.
+        let key = CompositeVariant(recon: agree { $0.recon_on != 0 }, srgb: agree { $0.srgb_decode != 0 },
+                                   rcas: agree { $0.rcas_con > 0 }, round: agree { $0.fov_on != 0 },
+                                   chroma: chromaSame ? Int8(v0.chroma_on) : -1,
+                                   lod0: !eyeMipsOn && bind0.mipmapLevelCount == 1 && bind1.mipmapLevelCount == 1)
+        if key == CompositeVariant(recon: -1, srgb: -1, rcas: -1, round: -1, chroma: -1, lod0: false) { return pipeline }
+        variantLock.lock()
+        let ready = variantPipes[key]
+        let first = ready == nil && variantBusy.insert(key).inserted
+        variantLock.unlock()
+        if let ready { return ready }
+        if first {
+            let dev: MTLDevice = device
+            let color = layerRenderer.configuration.colorFormat
+            let amp = amplification
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let t0 = CACurrentMediaTime()
+                let cv = MTLFunctionConstantValues()
+                // Constant indices as declared in kl_reproject.c: 0 recon, 1 srgb, 2 rcas, 3 round, 4 lod0, 5 chroma bit set.
+                for (i, v) in [key.recon, key.srgb, key.rcas, key.round].enumerated() where v >= 0 {
+                    var b = v != 0
+                    cv.setConstantValue(&b, type: .bool, index: i)
+                }
+                if key.lod0 {
+                    var b = true
+                    cv.setConstantValue(&b, type: .bool, index: 4)
+                }
+                if key.chroma >= 0 {
+                    var c = UInt32(key.chroma)
+                    cv.setConstantValue(&c, type: .uint, index: 5)
+                }
+                let desc = MTLRenderPipelineDescriptor()
+                desc.vertexFunction   = lib.makeFunction(name: "kl_reproject_v")
+                desc.fragmentFunction = try? lib.makeFunction(name: "kl_reproject_f", constantValues: cv)
+                desc.colorAttachments[0].pixelFormat = color
+                desc.depthAttachmentPixelFormat = .depth32Float
+                desc.maxVertexAmplificationCount = amp
+                var ps: MTLRenderPipelineState? = nil
+                if desc.fragmentFunction != nil { ps = try? dev.makeRenderPipelineState(descriptor: desc) }
+                self?.variantLock.lock()
+                if let ps { self?.variantPipes[key] = ps }
+                self?.variantLock.unlock()
+                NSLog("[cp] composite variant recon=\(key.recon) srgb=\(key.srgb) rcas=\(key.rcas) round=\(key.round) "
+                      + "chroma=\(key.chroma) lod0=\(key.lod0): "
+                      + (ps == nil ? "FAILED — the generic pipeline stays" : "ready")
+                      + String(format: " (%.0f ms)", (CACurrentMediaTime() - t0) * 1000))
+            }
+        }
+        return pipeline
     }
 
     /// GPU time of the composite's command buffer (called from its completion handler); once a second prints
@@ -4704,7 +4810,8 @@ final class KleptonCompositor {
     /// changes (the guest picture, the texture, the grid, the size), so a composite of a picture already seen costs
     /// nothing here. Encoded on the composite's own `cmd`, ahead of the composite's encoder (so after the guest fence
     /// wait `cmd` starts with, and Metal orders the composite's read of `wideTex` after these writes). Both eyes
-    /// of a shared eye texture go in one draw of two instances (`widePairPipeline`); otherwise one pass per eye.
+    /// go in one draw of two instances (`widePairPipeline` for a shared eye texture, `widePairTwoPipeline` for one per eye);
+    /// otherwise one pass per eye.
     /// Returns the texture, or nil when it cannot be had (the composite then stays rectangular for this frame).
     private func buildWideView(viewIndices: [Int], uniforms: [kl_reproject_uniforms],
                                bind0: MTLTexture, bind1: MTLTexture, grid: MTLBuffer, gridVerts: Int,
@@ -4741,10 +4848,11 @@ final class KleptonCompositor {
             return WideKey(picture: picture, noRecord: !haveRendered, src: ObjectIdentifier(n == 0 ? bind0 : bind1), slice: u.slice,
                            flipY: u.flip_y, gridEye: u.grid_eye, grid: ObjectIdentifier(grid), taps: taps)
         }
-        // Both eyes, one shared eye texture, wide view slice = view index: one pass of two instances, instance = layer.
+        // Both eyes, wide view slice = view index: one pass of two instances, instance = layer. One shared eye texture
+        // (kl_wide2_f), or one texture per eye (kl_wide2t_f: instance 0 reads bind0, instance 1 bind1, as the per-eye passes do).
         let pair = viewIndices.count == 2 && viewIndices[0] == 0 && viewIndices[1] == 1 && uniforms.count >= 2
-            && uniforms[0].visible != 0 && uniforms[1].visible != 0 && bind0 === bind1 && wt.arrayLength == 2
-        let pairPipe = pair ? widePairPipeline : nil
+            && uniforms[0].visible != 0 && uniforms[1].visible != 0 && wt.arrayLength == 2
+        let pairPipe = pair ? (bind0 === bind1 ? widePairPipeline : (wide2On ? widePairTwoPipeline : nil)) : nil
         if let pipe2 = pairPipe {
             // A change in either eye's key rebuilds both (one draw).
             let k0 = wideKeyOf(0), k1 = wideKeyOf(1)
@@ -4768,6 +4876,7 @@ final class KleptonCompositor {
                 }
                 e.setVertexBuffer(grid, offset: 0, index: 1)
                 e.setFragmentTexture(bind0, index: 0)
+                if bind1 !== bind0 { e.setFragmentTexture(bind1, index: 1) }
                 e.setFragmentSamplerState(samp, index: 0)
                 e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: gridVerts, instanceCount: 2)
                 e.endEncoding()

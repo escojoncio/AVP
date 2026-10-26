@@ -176,6 +176,36 @@ static const char kl_msl_reproject[] =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
 "\n"
+// Function constants for kl_reproject_f (KleptonCompositor builds a variant per tuple of them). Each is the answer to a
+// question that is per-session rather than per-frame, which the per-view uniform below would otherwise ask of every pixel
+// and which keeps the code behind the other answer (the 15-tap reconstruction, the RCAS taps, the wide-view branch) in the
+// shader's register budget. UNDEFINED means "ask the uniform", exactly as before: the generic variant, the macOS viewer
+// (newFunctionWithName with no constants), the depth fragment and the probe rungs all take that road, so a constant that is
+// not given changes nothing. recon / srgb / rcas / round: the per-view flag, when every visible view agrees; chroma is the
+// whole `on` bit set of kl_chroma_apply; lod0: the eye textures have ONE mip level, so the implicit LOD of the eye taps is
+// 0 anyway (the sampler is linear/linear with no mip filter) and the derivative is not needed.
+"constant bool kl_fc_recon_in [[function_constant(0)]];\n"
+"constant bool kl_fc_recon_def = is_function_constant_defined(kl_fc_recon_in);\n"
+"constant bool kl_fc_recon = kl_fc_recon_def ? kl_fc_recon_in : false;\n"
+"constant bool kl_fc_srgb_in [[function_constant(1)]];\n"
+"constant bool kl_fc_srgb_def = is_function_constant_defined(kl_fc_srgb_in);\n"
+"constant bool kl_fc_srgb = kl_fc_srgb_def ? kl_fc_srgb_in : false;\n"
+"constant bool kl_fc_rcas_in [[function_constant(2)]];\n"
+"constant bool kl_fc_rcas_def = is_function_constant_defined(kl_fc_rcas_in);\n"
+"constant bool kl_fc_rcas = kl_fc_rcas_def ? kl_fc_rcas_in : false;\n"
+"constant bool kl_fc_round_in [[function_constant(3)]];\n"
+"constant bool kl_fc_round_def = is_function_constant_defined(kl_fc_round_in);\n"
+"constant bool kl_fc_round = kl_fc_round_def ? kl_fc_round_in : false;\n"
+"constant bool kl_fc_lod0_in [[function_constant(4)]];\n"
+"constant bool kl_fc_lod0 = is_function_constant_defined(kl_fc_lod0_in) ? kl_fc_lod0_in : false;\n"
+"constant uint kl_fc_chroma_in [[function_constant(5)]];\n"
+"constant bool kl_fc_chroma_def = is_function_constant_defined(kl_fc_chroma_in);\n"
+"constant uint kl_fc_chroma = kl_fc_chroma_def ? kl_fc_chroma_in : 0u;\n"
+"static bool kl_on_recon(uint v) { return kl_fc_recon_def ? kl_fc_recon : v != 0u; }\n"
+"static bool kl_on_srgb(uint v)  { return kl_fc_srgb_def  ? kl_fc_srgb  : v != 0u; }\n"
+"static bool kl_on_rcas(float con) { return kl_fc_rcas_def ? kl_fc_rcas : con > 0.0; }\n"
+"static bool kl_on_round(uint v) { return kl_fc_round_def ? kl_fc_round : v != 0u; }\n"
+"\n"
 "struct KLReproj {\n"
 "    float4x4 projection;\n"
 "    float4x4 modelView;\n"
@@ -225,9 +255,11 @@ static const char kl_msl_reproject[] =
 "static float4 kl_eye_sample(texture2d_array<float> tex, sampler samp,\n"
 "                            float2 uv, uint slice, uint srgbDecode)\n"
 "{\n"
-"    float4 t = tex.sample(samp, uv, slice);\n"
+"    float4 t;\n"
+"    if (kl_fc_lod0) t = tex.sample(samp, uv, slice, level(0.0));\n"
+"    else            t = tex.sample(samp, uv, slice);\n"
 "    float3 c = t.rgb;\n"
-"    return float4(srgbDecode != 0u ? kl_srgb_to_linear(c) : c, t.a);\n"
+"    return float4(kl_on_srgb(srgbDecode) ? kl_srgb_to_linear(c) : c, t.a);\n"
 "}\n"
 "\n"
 // `slice` travels as a flat varying because the fragment stage has no
@@ -351,9 +383,9 @@ static const char kl_msl_reproject[] =
 "    float2 dt = fw * (src == 0u ? float2(float(t0.get_width()), float(t0.get_height()))\n"
 "                                : float2(float(t1.get_width()), float(t1.get_height())));\n"
 "    float mag = max(dt.x, dt.y);\n"
-"    if (reconOn == 0u || mag >= 0.75 * k.z) return kl_eye_sample2(t0, t1, samp, uv, slice, srgbDecode, src);\n"
+"    if (!kl_on_recon(reconOn) || mag >= 0.75 * k.z) return kl_eye_sample2(t0, t1, samp, uv, slice, srgbDecode, src);\n"
 "    float4 r = src == 0u ? kl_eye_recon(t0, samp, uv, slice, mag, k) : kl_eye_recon(t1, samp, uv, slice, mag, k);\n"
-"    return float4(srgbDecode != 0u ? kl_srgb_to_linear(max(r.rgb, 0.0)) : r.rgb, r.a);\n"
+"    return float4(kl_on_srgb(srgbDecode) ? kl_srgb_to_linear(max(r.rgb, 0.0)) : r.rgb, r.a);\n"
 "}\n"
 "\n"
 "static float4 kl_eye_sample_main(texture2d_array<float> t0, texture2d_array<float> t1, sampler samp,\n"
@@ -370,8 +402,9 @@ static const char kl_msl_reproject[] =
 // is sampled anyway and needs no intermediate texture or command buffer. The weight is 1 deep inside `rect` (x0, y0,
 // x1, y1, normalised over the eye texture in its own memory layout, from KleptonCompositor.sharpZones) and fades to 0
 // over 12 texels to its border; outside it the caller's sample stands and no tap is read. `uv` is the texture's own
-// coordinate (the vertex stage has already applied flipY). The taps use the implicit LOD of the surrounding quad:
-// inside the zone the eye is magnified (LOD 0), and where a quad straddles the zone's border the weight is ~0.
+// coordinate (the vertex stage has already applied flipY). The taps use the implicit LOD of the surrounding quad
+// (explicit 0 when kl_fc_lod0 says the eye has one mip level, the same result): inside the zone the eye is magnified
+// (LOD 0), and where a quad straddles the zone's border the weight is ~0.
 // The centre is not clamped to 0..1 (an HDR eye keeps its values: with the centre above 1 the lobe is 0 and the
 // result is the centre itself).
 "static float3 kl_rcas_tap(texture2d_array<float> t0, texture2d_array<float> t1,\n"
@@ -429,9 +462,9 @@ static const char kl_msl_reproject[] =
 "{\n"
 "    float2 fw = fwidth(uv);\n"
 "    float2 fww = fwidth(wuv);\n"
-"    if (fovOn == 0u) {\n"
+"    if (!kl_on_round(fovOn)) {\n"
 "        float4 c = kl_eye_sample_fw(t0, t1, samp, uv, slice, srgbDecode, src, reconOn, k, fw);\n"
-"        if (rcasCon > 0.0) c.rgb = kl_rcas(t0, t1, samp, uv, c.rgb, rcasCon, rcasRect, slice, srgbDecode, src);\n"
+"        if (kl_on_rcas(rcasCon)) c.rgb = kl_rcas(t0, t1, samp, uv, c.rgb, rcasCon, rcasRect, slice, srgbDecode, src);\n"
 "        return c;\n"
 "    }\n"
 "    float r = length(ftan - float2(0.0, fovP.x)) / max(fovP.y, 1.0e-4);\n"
@@ -440,14 +473,14 @@ static const char kl_msl_reproject[] =
 "    float4 sharp = float4(0.0), outer = float4(0.0);\n"
 "    if (a > 0.0) {\n"
 "        sharp = kl_eye_sample2(t0, t1, samp, uv, slice, srgbDecode, src);\n"
-"        if (rcasCon > 0.0) sharp.rgb = kl_rcas(t0, t1, samp, uv, sharp.rgb, rcasCon, rcasRect, slice, srgbDecode, src);\n"
+"        if (kl_on_rcas(rcasCon)) sharp.rgb = kl_rcas(t0, t1, samp, uv, sharp.rgb, rcasCon, rcasRect, slice, srgbDecode, src);\n"
 "    }\n"
 "    if (a < 1.0) {\n"
 "        uint ws = uint(fovP.w + 0.5);\n"
 "        float2 dw = fww * float2(float(wide.get_width()), float(wide.get_height()));\n"
-"        float4 w = reconOn != 0u ? kl_eye_recon(wide, samp, wuv, ws, max(dw.x, dw.y), k)\n"
-"                                 : wide.sample(samp, wuv, ws, level(0.0));\n"
-"        outer = float4(srgbDecode != 0u ? kl_srgb_to_linear(max(w.rgb, 0.0)) : w.rgb, w.a);\n"
+"        float4 w = kl_on_recon(reconOn) ? kl_eye_recon(wide, samp, wuv, ws, max(dw.x, dw.y), k)\n"
+"                                        : wide.sample(samp, wuv, ws, level(0.0));\n"
+"        outer = float4(kl_on_srgb(srgbDecode) ? kl_srgb_to_linear(max(w.rgb, 0.0)) : w.rgb, w.a);\n"
 "    }\n"
 "    return mix(outer, sharp, a);\n"
 "}\n"
@@ -666,7 +699,7 @@ static const char kl_msl_reproject[] =
 // exists to answer "is the picture arriving", and one that could also be
 // keyed out would answer that question with the matte's opinion — which is the
 // failure mode this ladder was built to end.
-"    return kl_chroma_apply(c, in.chromaOn, in.chromaKey, in.chromaRange);\n"
+"    return kl_chroma_apply(c, kl_fc_chroma_def ? kl_fc_chroma : in.chromaOn, in.chromaKey, in.chromaRange);\n"
 "}\n"
 "\n"
 // ---- the wide view (round sharp zone, KleptonCompositor buildWideView) ----------------------------------------
@@ -723,9 +756,9 @@ static const char kl_msl_reproject[] =
 "    return o;\n"
 "}\n"
 "\n"
-"static float4 kl_wide_box(texture2d_array<float> tex, sampler samp, float2 uv, uint slice, uint taps)\n"
+// `dx`/`dy` are dfdx/dfdy(uv), taken by the caller: kl_wide2t_f picks its texture in a branch, and the derivatives must not be.
+"static float4 kl_wide_box_d(texture2d_array<float> tex, sampler samp, float2 uv, float2 dx, float2 dy, uint slice, uint taps)\n"
 "{\n"
-"    float2 dx = dfdx(uv), dy = dfdy(uv);\n"
 // Build 41: as many taps per axis as the texel's own footprint needs (each bilinear tap covers ~2 eye texels), up to
 // `taps`: 4 x 4 only in the full-rate rectangle's corners and bands, 1 where the eye is already at the periphery's
 // rate (most of the view), where 16 taps inside one texel averaged to that one bilinear sample anyway. B51: at most
@@ -744,6 +777,11 @@ static const char kl_msl_reproject[] =
 "    return acc * (inv * inv);\n"
 "}\n"
 "\n"
+"static float4 kl_wide_box(texture2d_array<float> tex, sampler samp, float2 uv, uint slice, uint taps)\n"
+"{\n"
+"    return kl_wide_box_d(tex, samp, uv, dfdx(uv), dfdy(uv), slice, taps);\n"
+"}\n"
+"\n"
 "fragment float4 kl_wide_f(KLWideOut in [[stage_in]],\n"
 "                          texture2d_array<float> tex [[texture(0)]],\n"
 "                          sampler samp [[sampler(0)]],\n"
@@ -758,6 +796,20 @@ static const char kl_msl_reproject[] =
 "                           constant KLWide *us [[buffer(0)]])\n"
 "{\n"
 "    return kl_wide_box(tex, samp, in.uv, us[in.eye].slice, us[in.eye].taps);\n"
+"}\n"
+"\n"
+// The pair for two eye textures (one swapchain per eye): the same pass and filter, instance 0 reads `tex`, instance 1 `tex1`
+// (the composite's own pattern), each at its own slice. The derivatives are taken before the texture is chosen.
+"fragment float4 kl_wide2t_f(KLWide2In in [[stage_in]],\n"
+"                            texture2d_array<float> tex [[texture(0)]],\n"
+"                            texture2d_array<float> tex1 [[texture(1)]],\n"
+"                            sampler samp [[sampler(0)]],\n"
+"                            constant KLWide *us [[buffer(0)]])\n"
+"{\n"
+"    float2 dx = dfdx(in.uv), dy = dfdy(in.uv);\n"
+"    uint slice = us[in.eye].slice, taps = us[in.eye].taps;\n"
+"    return in.eye == 0u ? kl_wide_box_d(tex, samp, in.uv, dx, dy, slice, taps)\n"
+"                        : kl_wide_box_d(tex1, samp, in.uv, dx, dy, slice, taps);\n"
 "}\n"
 "\n"
 // Build 41: the periphery reconstruction (kl_eye_recon) of the wide view, evaluated once per guest picture into a
