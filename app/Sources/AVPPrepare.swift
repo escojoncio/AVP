@@ -519,11 +519,30 @@ enum AVPPipelineCache {
     /// Decided at writeConfig (before the prewarm), read by AVPPrepare.prewarm.
     nonisolated(unsafe) static var current: State?
 
-    static func configure(data: URL, pipelines: URL, engine: String, engineSignature: String = "", archive: Bool = false) -> State {
+    static func configure(data: URL, pipelines: URL, engine: String, engineSignature: String = "", archive: Bool = false,
+                          robust: String = "default") -> State {
         let fm = FileManager.default
         let dir = data.appendingPathComponent("vpcache", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let stamp = dir.appendingPathComponent("warm.stamp")
+        // VPVK_ROBUST changes the MSL, hence every recipe key: what an earlier mode wrote (recipes, binary archives and
+        // their key lists, the stamp) can no longer be hit and the old archives would eat VP_PIPELINE_ARCHIVE_BUDGET_MB.
+        // Dropped once per change, before anything opens them; the prewarm rebuilds them from the pipeline lists, which
+        // live elsewhere (pipelines.foz in the cache folder, <data>/klfz/*.foz) and stay.
+        let robustURL = dir.appendingPathComponent("robust.mode")
+        let oldRobust = try? String(contentsOf: robustURL, encoding: .utf8)
+        if oldRobust != robust {
+            var purged = 0, failed = 0
+            for f in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+            where (f.hasPrefix("pipelines") && (f.hasSuffix(".metalar") || f.hasSuffix(".keys"))) || f == "pipelines.count"
+                || f == "recipes.bin" || f == "warm.stamp" {
+                if (try? fm.removeItem(at: dir.appendingPathComponent(f))) != nil { purged += 1 } else { failed += 1 }
+            }
+            if failed == 0 { try? robust.write(to: robustURL, atomically: true, encoding: .utf8) }
+            if purged > 0 || oldRobust != nil {
+                AVPLog.log("[prepare] robust mode change \(oldRobust ?? "?")->\(robust): purged \(purged) files")
+            }
+        }
         // Metal binary archives are off unless the lab's switch (`archive`) asks for them: opening one cost ~30x its file
         // size in memory (build 14: pipelines-4.metalar, 95 MB on disk -> +4.4 GB), and saving them re-compiles every
         // pipeline serially (minutes). The OS shader cache keeps compiled shaders between launches by itself. With the

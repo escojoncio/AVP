@@ -525,6 +525,8 @@ final class AVPSettings: ObservableObject {
             ("VPVK_ZERO_NEW_IMAGES", "0"),
             // El defecto 2 bloquea ~13 ms/frame el hilo de render del juego en vkQueueSubmit esperando a la GPU; 6 deja en vuelo un frame entero sin perder el tope de memoria (0 = sin límite).
             ("VPVK_MAX_PENDING_CHUNKS", "6"),
+            // El juego no pide robustBufferAccess: sin comprobaciones de límites en los SSBO del MSL (cambia las claves de las recetas: retraducción y prewarm en el primer arranque).
+            ("VPVK_ROBUST", "0"),
         ]
         // VPKTAA inputs not usable yet (build 17 log): VPKEngine's motion vectors are all zero (its "eye frame"
         // restarts at every depth-clearing multiview pass, 4-7 per game frame, so no draw ever finds last frame's
@@ -578,17 +580,22 @@ final class AVPSettings: ObservableObject {
             // The engine configuration the hang quarantine is valid for (AVPPipelineCache: quarantine.key). The values
             // are read back from the env so the signature cannot drift from what VPKEngine actually gets.
             let sigKeys = ["VPVK_AMPLIFY", "VPVK_FETCH_NATIVE", "VP_CB_ORDER", "KL_VRR", "KL_VRR_PHYS", "VPVK_FORCE_1X",
-                           "VPVK_MOTION", "VP_FRAMES_IN_FLIGHT", "VP_MSAA_TILE", "VPVK_MSAA_DEAD_STORE"]
+                           "VPVK_MOTION", "VP_FRAMES_IN_FLIGHT", "VP_MSAA_TILE", "VPVK_MSAA_DEAD_STORE", "VPVK_ROBUST"]
             let signature = sigKeys.map { k in "\(k)=\(env.last { $0.0 == k }?.1 ?? "-")" }.joined(separator: "|")
                 + "|msaa=\(gameMSAA)"
             let cache = AVPPipelineCache.configure(data: p.dataDir, pipelines: p.pipelines, engine: "vpkengine",
-                                                   engineSignature: signature, archive: true)
+                                                   engineSignature: signature, archive: true,
+                                                   robust: env.last { $0.0 == "VPVK_ROBUST" }?.1 ?? "default")
             env.append(("VP_PIPELINE_CACHE_DIR", cache.dir.path))
             if cache.archiveOff { env.append(("VP_PIPELINE_ARCHIVE", "0")) }
             // 2048 MB of footprint for opening the binary archives (VPKEngine's default is 768): the engine now measures the
             // real cost (~13x the size on disk) and B65 in practice used ~1973 MB; with 768 the three largest files
             // (2614 pipelines) stayed unopened and their pipelines compiled in game (Logs_Alyx 26/10).
             env.append(("VP_PIPELINE_ARCHIVE_BUDGET_MB", "2048"))
+            // Diagnóstico: MSL de seis shaders concretos en Logs Alyx/msl (solo se escribe al traducir; el motor falla en silencio si la carpeta no existe).
+            try? fm.createDirectory(at: AVPLog.mslDir, withIntermediateDirectories: true)
+            env.append(("VPVK_DUMP_MSL", AVPLog.mslDir.path))
+            env.append(("VPVK_DUMP_MSL_FILTER", "126bc47d4e6c414d,b6a4cab50a7e6885,00f1f8923af66428,6c0df6983d86576e,7385e545396101f2,67b60e7af57442e3"))
             env.append(("KL_VK_FOZ_GAME_REPLAY", cache.warm ? "0" : "1"))
         }
 
