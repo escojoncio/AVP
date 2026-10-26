@@ -246,6 +246,15 @@ static double pace_up_frac(void) {
     }
     return f;
 }
+// What the regulator did, for kl_app's [diag] line (read from another thread; a torn read only skews one line):
+// seconds at the base / at the fallback pace, base<->fallback switches the governor chose, and over its windows the
+// frames whose GPU work ran late (late of frames) and the pictures that missed their refresh (missed of pics).
+static struct { double s[2]; unsigned c[5]; } g_pstat;   // c: switches, late, frames, missed, pics
+void klvr_plat_pace_stats(double s[2], unsigned c[5]);
+void klvr_plat_pace_stats(double s[2], unsigned c[5]) {
+    s[0] = g_pstat.s[0]; s[1] = g_pstat.s[1];
+    for (int i = 0; i < 5; i++) c[i] = g_pstat.c[i];
+}
 static void pace_governor(void) {
     int on = __atomic_load_n(&g_governor_on, __ATOMIC_RELAXED);
     if (on < 0) {
@@ -255,6 +264,12 @@ static void pace_governor(void) {
         on = e && *e == '1' ? 1 : e && *e == '2' ? 2 : 0;
         __atomic_store_n(&g_governor_on, on, __ATOMIC_RELAXED);
         if (on) fprintf(stderr, "  [openvr] pace governor: %s\n", on == 2 ? "fixed at the fallback pace (steady)" : "automatic");
+    }
+    {   // time at each pace; gaps over 250 ms (loads) are not play, as in the late-picture count below
+        static double prev;
+        double t = klvr_plat_now();
+        if (prev > 0 && t - prev < 0.25) g_pstat.s[g_pace_extra != 0] += t - prev;
+        prev = t;
     }
     if (!on) return;
     float base, fb;
@@ -321,6 +336,7 @@ static void pace_governor(void) {
     int nl = late, nn = n, ne = nexcl, ncl = clate, ncc = nc;
     t0 = now; sum = 0; comp_sum = 0; n = 0; late = 0; nexcl = 0; clate = 0; nc = 0;
     if (!nn) return;
+    g_pstat.c[1] += nl; g_pstat.c[2] += nn; g_pstat.c[3] += ncl; g_pstat.c[4] += ncc;
     unsigned want = g_pace_extra;
     // Build 31 (Logs 22): at 100 Hz the choice is 50 or 33 and nothing between. The base was left after ONE
     // second with 2 late frames of 51 (3.9 %) at a 16 ms average, and taken back 5 s later: 33 fps most of
@@ -388,6 +404,7 @@ static void pace_governor(void) {
         fprintf(stderr, "  [openvr] pace governor: GPU %.2f ms per %.0f fps frame (%s; %d of %d frames late) -> %s\n", avg, base,
                 ne > nn / 2 ? "exclusive" : "union", nl, nn, want ? "fallback pace, top quality kept" : "base pace");
         g_pace_extra = want;
+        g_pstat.c[0]++;
         over = good = 0;
         kl_guest_pace_extra(want);
     }

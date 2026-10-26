@@ -592,10 +592,10 @@ final class AVPSettings: ObservableObject {
             // real cost (~13x the size on disk) and B65 in practice used ~1973 MB; with 768 the three largest files
             // (2614 pipelines) stayed unopened and their pipelines compiled in game (Logs_Alyx 26/10).
             env.append(("VP_PIPELINE_ARCHIVE_BUDGET_MB", "2048"))
-            // Diagnóstico: MSL de seis shaders concretos en Logs Alyx/msl (solo se escribe al traducir; el motor falla en silencio si la carpeta no existe).
+            // Diagnóstico: MSL de diez shaders concretos en Logs Alyx/msl (solo se escribe al traducir; el motor falla en silencio si la carpeta no existe).
             try? fm.createDirectory(at: AVPLog.mslDir, withIntermediateDirectories: true)
             env.append(("VPVK_DUMP_MSL", AVPLog.mslDir.path))
-            env.append(("VPVK_DUMP_MSL_FILTER", "126bc47d4e6c414d,b6a4cab50a7e6885,00f1f8923af66428,6c0df6983d86576e,7385e545396101f2,67b60e7af57442e3"))
+            env.append(("VPVK_DUMP_MSL_FILTER", "126bc47d4e6c414d,b6a4cab50a7e6885,00f1f8923af66428,6c0df6983d86576e,7385e545396101f2,67b60e7af57442e3,6ff7c440c61864c0,dd8a021103b6b752,3128e2cb45ca97ea,3f839e3bf3de6d72"))
             env.append(("KL_VK_FOZ_GAME_REPLAY", cache.warm ? "0" : "1"))
         }
 

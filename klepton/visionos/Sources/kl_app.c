@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>      // getrusage — the diag line's process CPU
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -929,6 +930,129 @@ static void mem_relief_tick(int ticks) {
     }
 }
 
+// Every 10 s, one line for the log, so a stutter report says what was busy instead of guessing:
+//   [diag] cpu proc=<%> thr=<n> top: <name>=<%>[spin?],... gpu ... pace ... mem foot=<MB>M peak=<MB>M avail_min=<MB>M thermal=<s> t=<s>
+// cpu is the delta of user+system time since the previous line (not the instantaneous cpu_usage), per thread by
+// thread_info(THREAD_BASIC_INFO) and for the process by getrusage (which keeps threads that already exited); 100% =
+// one core. A thread at > 80% whose name says wait/pace/compositor/present is marked spin?: a wait that burns a core.
+// A thread's run/wait split is its cpu% against the rest. peak and avail_min are tracked on every heartbeat tick
+// (250 ms), not only at the print. thermal is the state the compositor last reported (kl_app_note_thermal); t is the
+// time since the first tick. Fixed tables only: nothing grows per sample. The first tick only takes the baseline.
+#define DIAG_THREADS 256
+typedef struct { mach_port_t act; long long us; } diag_thr;
+static diag_thr g_dprev[DIAG_THREADS];
+static unsigned g_dnprev;
+static long long g_dproc_us, g_foot_peak, g_avail_min = -1;
+static double g_dt0, g_dlast;
+
+static long long tv_us(long long s, long long us) { return s * 1000000 + us; }
+
+// The game's side of the line, ahead of "mem":
+//   gpu busy=<ms/s> idle=<ms/s> pace fb=<% of time at the fallback pace since the last line>/<% in total> sw=<regulator
+//   switches since>/<in total> late=<frames late>/<frames> miss=<pictures that missed their refresh>/<pictures>
+// busy is the game's + the compositor's GPU ms per second (kl_gpu_time.m, the figures of its [gputime] line; no
+// VP_EXCL_TIMING needed), idle is the rest of the second. late/miss are the governor's own windows, since the last line.
+// Weak no-ops where the providers (kl_gpu_time.m, klvr_platform_klepton.c) are not linked.
+__attribute__((weak)) double kl_gpu_time_busy_total_ms(void) { return -1; }
+__attribute__((weak)) void klvr_plat_pace_stats(double s[2], unsigned c[5]) {
+    s[0] = s[1] = 0;
+    for (int i = 0; i < 5; i++) c[i] = 0;
+}
+static void diag_game(char *out, size_t cap, double dt, int have) {
+    static double busy0, s0[2];
+    static unsigned c0[5];
+    double busy = kl_gpu_time_busy_total_ms(), s[2];
+    unsigned c[5];
+    klvr_plat_pace_stats(s, c);
+    int o = 0;
+    if (busy < 0 || !have) o = snprintf(out, cap, " gpu n/a");
+    else {
+        const double b = (busy - busy0) / dt;
+        o = snprintf(out, cap, " gpu busy=%.0f idle=%.0f", b, b < 1000 ? 1000 - b : 0);
+    }
+    const double dtot = s[0] + s[1] - s0[0] - s0[1];
+    if (!(s[0] + s[1] > 0) || !have) snprintf(out + o, cap - o, " pace n/a");
+    else
+        snprintf(out + o, cap - o, " pace fb=%.0f%%/%.0f%% sw=%u/%u late=%u/%u miss=%u/%u",
+                 dtot > 0 ? 100.0 * (s[1] - s0[1]) / dtot : 0.0, 100.0 * s[1] / (s[0] + s[1]),
+                 c[0] - c0[0], c[0], c[1] - c0[1], c[2] - c0[2], c[3] - c0[3], c[4] - c0[4]);
+    busy0 = busy;
+    memcpy(s0, s, sizeof s0);
+    memcpy(c0, c, sizeof c0);
+}
+
+static void diag_tick(int ticks) {
+    const long long foot = kl_phys_footprint(), avail = kl_avail_memory();
+    if (foot > g_foot_peak) g_foot_peak = foot;
+    if (avail > 0 && (g_avail_min < 0 || avail < g_avail_min)) g_avail_min = avail;
+    if (ticks % 40) return;                 // 40 x 250 ms
+    struct timespec m;
+    clock_gettime(CLOCK_MONOTONIC, &m);
+    const double t = m.tv_sec + m.tv_nsec * 1e-9, dt = t - g_dlast;
+    const int have = g_dlast != 0 && dt > 0;
+    if (!g_dt0) g_dt0 = t;
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    const long long proc_us = tv_us(ru.ru_utime.tv_sec, ru.ru_utime.tv_usec) +
+                              tv_us(ru.ru_stime.tv_sec, ru.ru_stime.tv_usec);
+    thread_act_array_t list = NULL;
+    mach_msg_type_number_t n = 0;
+    if (task_threads(mach_task_self(), &list, &n) != KERN_SUCCESS) n = 0;
+    diag_thr cur[DIAG_THREADS];
+    unsigned ncur = 0, ntop = 0;
+    struct { mach_port_t act; double pct; } top[8];
+    char line[1024], game[192];
+    diag_game(game, sizeof game, dt, have);
+    for (mach_msg_type_number_t i = 0; i < n; i++) {
+        thread_basic_info_data_t bi;
+        mach_msg_type_number_t bc = THREAD_BASIC_INFO_COUNT;
+        if (ncur == DIAG_THREADS ||
+            thread_info(list[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &bc) != KERN_SUCCESS)
+            continue;
+        const long long us = tv_us(bi.user_time.seconds, bi.user_time.microseconds) +
+                             tv_us(bi.system_time.seconds, bi.system_time.microseconds);
+        long long was = 0;          // a thread new since the last line counts all its time; so does a reused port
+        for (unsigned j = 0; j < g_dnprev; j++)
+            if (g_dprev[j].act == list[i] && g_dprev[j].us <= us) { was = g_dprev[j].us; break; }
+        cur[ncur].act = list[i];
+        cur[ncur++].us = us;
+        const double pct = have ? 100.0 * (us - was) / (dt * 1e6) : 0;
+        if (have && (ntop < 8 || pct > top[7].pct)) {
+            unsigned k = ntop < 8 ? ntop++ : 7;
+            while (k && top[k - 1].pct < pct) { top[k] = top[k - 1]; k--; }
+            top[k].act = list[i];
+            top[k].pct = pct;
+        }
+    }
+    if (have) {     // names while the thread ports are still held
+        static const char *const therm[] = { "nominal", "fair", "serious", "critical" };
+        const int th = g_thermal;
+        int o = snprintf(line, sizeof line, "[diag] cpu proc=%.0f%% thr=%u top:",
+                         100.0 * (proc_us - g_dproc_us) / (dt * 1e6), (unsigned)n);
+        for (unsigned k = 0; k < ntop; k++) {
+            char nm[24] = "";
+            pthread_t pt = pthread_from_mach_thread_np(top[k].act);
+            if (pt) pthread_getname_np(pt, nm, sizeof nm);
+            if (!nm[0]) snprintf(nm, sizeof nm, "t%x", top[k].act);
+            for (char *c = nm; *c; c++) if (*c == ' ' || *c == ',') *c = '_';
+            const int spin = top[k].pct > 80 && (strcasestr(nm, "wait") || strcasestr(nm, "pace") ||
+                                                 strcasestr(nm, "compositor") || strcasestr(nm, "present"));
+            o += snprintf(line + o, sizeof line - o, "%s%s=%.0f%%%s", k ? "," : " ", nm, top[k].pct,
+                          spin ? "[spin?]" : "");
+        }
+        snprintf(line + o, sizeof line - o, "%s mem foot=%lldM peak=%lldM avail_min=%lldM thermal=%s t=%.0f",
+                 game, foot >> 20, g_foot_peak >> 20, g_avail_min >> 20,
+                 th >= 0 && th < 4 ? therm[th] : "unknown", t - g_dt0);
+    }
+    for (mach_msg_type_number_t i = 0; i < n; i++) mach_port_deallocate(mach_task_self(), list[i]);
+    if (n) vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof *list);
+    if (have) { fprintf(stderr, "%s\n", line); fflush(stderr); }
+    memcpy(g_dprev, cur, ncur * sizeof *cur);
+    g_dnprev = ncur;
+    g_dproc_us = proc_us;
+    g_dlast = t;
+}
+
 static void *heartbeat(void *arg) {
     (void)arg;
     // Polled faster than it prints, so a phase change is reported when it
@@ -968,6 +1092,7 @@ static void *heartbeat(void *arg) {
         }
         mem_relief_tick(ticks);
         perf_tick();
+        diag_tick(ticks);
         ticks++;
         struct timespec iv = { 0, 250000000 };  // nanosleep: usleep is EINVAL at >= 1e6
         nanosleep(&iv, NULL);
