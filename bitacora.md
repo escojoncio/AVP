@@ -4,7 +4,7 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` = rama `avp-port-main`, **sin parches**: `vpkengine-patches/` vacío; cambios del
 motor se hacen en VPKEngine, mapa en su bitácora). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B73**, sin verificar en visor).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B74**, sin verificar en visor).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
@@ -15,10 +15,18 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   warm.stamp; conserva pipelines.foz y klfz. `AVPLog.swift` ~30/100 `msl/*.metal` a espejo y compartir. 1.er arranque:
   retraducción + prewarm completo. Revisar en logs: `vk.robust app= mode=0 effective=0`, `[prepare] robust mode change`,
   `gpu.pso.miss`, ficheros en `msl/`, vtx del pase MSAA (antes 0,8–2,5 ms).
-- Logs_Alyx_15 (B72): knockout OK 48/48 (base 13,6–14,4 ms). Top d_ms: pipe5275 7,22 (vtx 2,21/frag 4,91, 33 draws),
-  pipe5349 6,83 (4,6 draws), pipe5273 2,12, 5334 1,45, 5183 1,17, resto <0,7. 5275/5349 mismo vs (17377 chars), fs
-  ~74k chars, 8 loops, discard → material principal (unverified). No aditivos. Juego no pide robustBufferAccess/robustness2
-  (el motor anunciaba y aplicaba robust siempre: `eo.robustBuffers=true`). Comp med. 2,5 ms; 0 gpu.err; 1 stall 5 s.
+- B74 (`3a43ce4`): motor `efe0ec5`: traductor (kLowerVersion 3/kEmitVersion 2 → retraducción) matrices row-major
+  float32 = 1 load vectorial por fila (`lower.cpp` loadMem ~1245); sin `vp_guard` en bucles sin Continue propio
+  (`msl.cpp` ~681); un solo killExit por cadena de discards con bloques puros (`lower.cpp` killChainBlock ~2346);
+  knockout (`metal_backend.mm` exclAccount ~6226, knockSample ~6503, report ~6561) descarta frames con encoders
+  dominantes sin timestamp (`partial_frames=` en done) y pases con base >25 % de la mediana (`unstable=1`).
+  `AVPPrepare.swift` ~521 `translator = "l3e2"`: marcador `robust.mode` = `<VPVK_ROBUST>|tr<translator>`; SUBIR a mano
+  cuando cambie la versión del traductor del motor (si no, archivos viejos se comen el presupuesto de 2048 MB).
+- Logs_Alyx_16 (B73, 2m23s, nominal): `vk.robust app=0 mode=0 effective=0`; 0 errores; ~34 compilaciones en juego (max
+  20,6 ms). Los 7 ms de B72 eran ARTEFACTO (frames con encoder dominante sin timestamp → base/knock ≈6,8 = medio frame).
+  Real: reparto plano; top estable fs `00f1f892` (124 draws, d 2,1 ms, frag 1,5), `c02393ed` 1,7. MSL volcado de 3 fs:
+  sin sample-rate, sin [[depth]], coste propio de Alyx (≈30 samples, PCF 4 taps ×3 cascadas, bucle de luces).
+  Juego mediana ~16,1 ms; regulador correcto: baja con 2 ventanas >19,0 ms (0,95·20) y sube <18,4; carga real 17–19,5.
 - B72: motor `c67c604` (knockout por hits dominantes; B71 se quedaba 0/192 → timeout: ~7 submits por frame).
 - Logs_Alyx_14 (B71): pase MSAA principal vtx 4,85 / frag 9,44 ms (antes 5,4/10,1; ~906 draws, térmico sin aislar);
   `gpu.sec n≈238` submits/s, ~33/s con el pase dominante.
@@ -110,7 +118,7 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   Después A/B `VPVK_ASYNC_PIPELINES=0` y `VPVK_MSAA_TILE=0`.
 - VPKEngine main = `3f7da04` (fast-forward de `avp-port-main`; VisionQuestPro avisado para subir su ref). `avp-port` remoto obsoleto (base vieja).
 - Pendiente: Steam en guest (`steamclient.so` no encontrado).
-- Próximo objetivo: con `msl/*.metal` de B73, optimizar en el traductor el fs del material principal (8 loops, discard).
+- Próximo objetivo: medir B74 (knockout fiable con L3+R3) vs B73 misma zona; carga 17–19,5 ms pegada a barra 19,0.
 - Problema abierto: zona pesada juego ~23 ms > umbral (17 ms a 100 Hz, 18,9 a 90 Hz); térmico.
 
 ## Decisiones vigentes
