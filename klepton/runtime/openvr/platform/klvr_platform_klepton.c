@@ -234,6 +234,18 @@ int klvr_plat_pace_hz(float *base, float *current) {
     if (current) *current = (__atomic_load_n(&g_pace_extra, __ATOMIC_RELAXED) && fb > 0) ? fb : b;
     return 1;
 }
+// Fallback -> base: a window counts as good under this share of the base frame. KL_PACE_UP_PCT (80-94, default 92).
+// The promotion bar is further capped by 0.95 of the budget minus the compositor time the fallback average leaves
+// out (see the g_pace_extra branch), so the average at the base stays under the 0.95 demotion bar.
+static double pace_up_frac(void) {
+    static double f;
+    if (!f) {
+        const char *e = getenv("KL_PACE_UP_PCT");
+        double v = e && *e ? atof(e) : 0;
+        f = v >= 80.0 && v <= 94.0 ? v / 100.0 : 0.92;
+    }
+    return f;
+}
 static void pace_governor(void) {
     int on = __atomic_load_n(&g_governor_on, __ATOMIC_RELAXED);
     if (on < 0) {
@@ -276,7 +288,7 @@ static void pace_governor(void) {
         started = 1; g_pace_extra = 1; kl_guest_pace_extra(1);
         fprintf(stderr, "  [openvr] pace governor: starting at the fallback, %.1f fps\n", fb);
     }
-    static double t0, sum, prev_call, base_since, need_s = 10;
+    static double t0, sum, comp_sum, prev_call, base_since, need_s = 10;
     static int n, late, over, good, nexcl, clate, nc;
     // Build 53 (Logs_Alyx_41, 70 %): at the base the GPU fit (12-15 ms of 22.2) yet the compositor got 16-20 new
     // pictures per 0.5 s instead of 22: frames spanned 34 ms with the GPU idle 21 ms inside (CPU / ordering, not GPU
@@ -292,7 +304,7 @@ static void pace_governor(void) {
         // The compositor draws once per panel refresh; at the fallback pace a frame
         // holds more refreshes than at the base, so scale its share to the base frame.
         float per = game + (g_pace_extra ? comp * fb / base : comp);
-        sum += per; n++;
+        sum += per; comp_sum += comp; n++;
         if (excl & 1) nexcl++;
         // Build 36: with the exclusive figure a "late" frame is one whose GPU work alone exceeds the base frame
         // (it cannot have met its refresh); with the union (no VPVulkan) the old 90/96 % margins stay.
@@ -305,9 +317,9 @@ static void pace_governor(void) {
     // while the picture alternated 2 and 3 refreshes. Drop as soon as 0.3 s hold 10+ frames with over 40 % late.
     int fast = !g_pace_extra && now - t0 >= 0.3 && ((n >= 10 && late > 0.40 * n) || (nc >= 10 && clate > 0.25 * nc));
     if (!fast && now - t0 < 1.0) return;
-    double avg = n ? sum / n : 0;
+    double avg = n ? sum / n : 0, comp_avg = n ? comp_sum / n : 0;
     int nl = late, nn = n, ne = nexcl, ncl = clate, ncc = nc;
-    t0 = now; sum = 0; n = 0; late = 0; nexcl = 0; clate = 0; nc = 0;
+    t0 = now; sum = 0; comp_sum = 0; n = 0; late = 0; nexcl = 0; clate = 0; nc = 0;
     if (!nn) return;
     unsigned want = g_pace_extra;
     // Build 31 (Logs 22): at 100 Hz the choice is 50 or 33 and nothing between. The base was left after ONE
@@ -330,13 +342,17 @@ static void pace_governor(void) {
     // with over 40 % late (or two over 25 % / 95 % average), back only after 5 s under 85 % with at most 5 % late.
     // Build 53: the way back needs 15 s in a row under 80 % of the base frame with at most 3 % late frames, so a
     // quiet second between two heavy ones no longer flips 30 <-> 45.
+    double up_bar = 0;                               // fallback -> base: the average a good window stays under
     if (fast) want = 1;
     else if (g_pace_extra) {
         // B55 (Logs_Alyx_45, 100 Hz): with < 80 % and <= 3 % late the base never came back in 5 min (GPU 12-17 ms
-        // + compositor ~3 of 20): locked at 33. Now 10 s under 85 % with <= 5 % late; the back-off still doubles.
+        // + compositor ~3 of 20): locked at 33. Now 10 s under KL_PACE_UP_PCT (92 %) of the base frame, and under
+        // 95 % (the demotion bar) once the compositor share is scaled to the base, with <= 5 % late; the back-off still doubles.
         double lim_ok = ne > nn / 2 ? 0.05 * nn : 0.08 * nn;
         if (lim_ok < 1.0) lim_ok = 1.0;
-        good = (avg < 0.85 * 1000.0 / base && nl <= lim_ok) ? good + 1 : 0;
+        double bud = 1000.0 / base, cap = 0.95 * bud - comp_avg * (1.0 - fb / base);
+        up_bar = pace_up_frac() * bud < cap ? pace_up_frac() * bud : cap;
+        good = (avg < up_bar && nl <= lim_ok) ? good + 1 : 0;
         if (good >= need_s) want = 0;
     } else if (ncc >= 10 && ncl > 0.15 * ncc) {     // at the base, pictures missing their refresh
         want = 1;
@@ -358,7 +374,7 @@ static void pace_governor(void) {
     static double said_gov;
     if (want && g_pace_extra && now - said_gov >= 10.0) {
         said_gov = now;
-        fprintf(stderr, "  [openvr] pace.gov fallback avg=%.2f late=%d/%d need=%.2f streak=%d/%.0f\n", avg, nl, nn, 0.85 * 1000.0 / base, good, need_s);
+        fprintf(stderr, "  [openvr] pace.gov fallback avg=%.2f late=%d/%d need=%.2f comp=%.2f streak=%d/%.0f\n", avg, nl, nn, up_bar, comp_avg, good, need_s);
     }
     if (want != g_pace_extra) {
         said_at = now;
