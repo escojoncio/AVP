@@ -2,9 +2,9 @@
 
 Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam oficial → descarga → ELF→Mach-O
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
-(`escojoncio/VPKEngine` @ `vpkengine.ref` + `vpkengine-patches/` 0011–0054; parche nuevo = `00NN-*.patch` con
-`git format-patch` sobre ref+parches; CI `scripts/apply-vpkengine-patches.sh`). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B65**).
+(`escojoncio/VPKEngine` @ `vpkengine.ref` = rama `avp-port-main`, **sin parches**: `vpkengine-patches/` vacío; cambios del
+motor se hacen en VPKEngine, mapa en su bitácora). Plan: `PLAN.md`.
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B66**, sin verificar en visor).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
@@ -13,11 +13,20 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   casi siempre en 33 (avg 11–26 vs need 17). 0 `gpu.pso.miss` pese a 238 compilaciones `gpu.pso f=` (log 0053 en ruta equivocada).
   0 fallos `archive_save`. Archivo: 14 abiertos, 2 skip budget, used 1973 MB (>1280: revisar qué cuenta). RAM pico 6368 MB, mín.
   libre 1823 MB (B64: 5641/2550). 41 `gpu.err code=7 Insufficient_Permission (background)` al salir. Stall 5 s cargando libmeshsystem.so.
-- Migración a VPKEngine main (rama `avp-port` en VPKEngine): fase 1a `d395a50` (identidad nativa por defecto, Quest opt-in
-  `vpvk_config_set_quest_identity`; VisionQuestPro ya la activa siempre, commit VQP `4088d28`, su CI fijado a `5b8432f`);
-  fase 1b `8080760` (separate_stencil_usage, swapchain_mutable_format, local_read, host_image_copy, EDS3 colorWriteMask,
-  memory_budget, A2C→alpha 1x; todo bajo `nativeExtras()`, Quest sin coste; ctest 245/245; 0007 timestamps GPU NO portado).
-  Siguiente: fase 2. Pendiente decisión: ir directos al motor nuevo o build intermedia con motor actual. Mapa: bitácora VPKEngine.
+- B66 (`b500edc`): primera build con VPKEngine main (`avp-port-main` `3f7da04` = main `5939c99` + fases 1–3 portadas;
+  ctest 254/254; .mm sin compilar hasta CI). No portado a propósito: bits `VPVK_RUNTIME_OPTS` (0038/0043/0045/0046),
+  motion (0009/0010/0020), census/knockout/opt_counters/dump_pipeline_msl (0039/0042: A/B de `kl_gpu_time.m` inoperante,
+  fallback dlsym), hang hunter/quarantine (0032), `vpvk_config_set_texture_cap` (nunca existió). `VPVK_MOTION`,
+  `VPVK_RUNTIME_OPTS`, `VPVK_TEXTURE_CAP` = no-op. Versiones traductor 13/1/1/1 → retraducción y AOT nuevo en 1.er arranque.
+  - `KleptonApp.swift` ~111 `VPGpuBackground` (dlsym vía `dlopen(KL_MVK_DYLIB,RTLD_NOLOAD)`); `Lifecycle.scenePhaseChanged`
+    ~265: .background → `vpgpu_set_background(1)`, .active → 0. `KleptonCompositor.swift` ~2380: `vpgpu_shutdown_background()`
+    antes de `kl_app_guest_stop()` (y antes de `kl_app_lifecycle_report()` en syncGuest); no en guest retenido.
+  - `KL_GPU_PASSES`: `cpCb` (~4512) → un cmdbuf por pase (mfx, fxaa, sharp, mip, wide, recon, comp/layer) en orden; `cmd`
+    solo fence+capturas+present. Sin flag idéntico. Splits fuera de `maxFenceBacklog`.
+  - Motor nuevo por defecto: extras 1.3 nativas ON (NO poner `VPVK_EXTRA_EXTENSIONS=0`: apaga dynamic_rendering, sync2…),
+    slot reuse por frame, resolve 1x→copia, indirect GPU → encoder heavy (más memoria MSAA, `heavy_indirect=` en
+    `gpu.frame`), presupuesto archivo real (`gpu.pso.cache open/skipped/open_total used_mb=`), `gpu.pso.miss` en ruta real,
+    `vk.perf` 1/s.
 - B65 (`3c982fc`, sin verificar en visor):
   - `KleptonCompositor.swift`: tiempo GPU por command buffer (gpuEnd−gpuStart, completion handler), label
     `comp.<new|same|black>(fxaa,layer,wide,recon,comp,sharp,mfx,mip)`; línea 1/s `[cp] cb n= frames= skipped= bad= <label>=<n>x<ms>`
@@ -49,16 +58,12 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   desde B17, MSAA 4x, amplificación de vértices, occlusion culling medido, `VP_CB_ORDER=2`; foveado VRR (periferia 10 %,
   VPKTAA en periferia; post NO foveado); compositor skip-same; regulador 50/33 (100 Hz) o 45/30 (90 Hz) con tiempo de
   GPU exclusivo; reloj del juego `klvr_game_hz`; OpenVR cabeza + 2 Sense, dedos, altura, subtítulos, idioma, pausa.
-- Siguiente build (con motor main sin parches): fase 2 VPKEngine (0022 suspend/resume, 0027 viewport_index, 0023, 0040,
-  0029/0031 CB_ORDER/AMPLIFY/FETCH_NATIVE), fase 3 (0019 presupuesto archivo — main abre todo sin presupuesto —, 0017
-  wait_compiles+VP_PIPELINE_ARCHIVE, 0015, 0018/0021/0032), de fase 4 lo que AVP usa (0036 cb_busy_ms, 0052, 0053, 0054).
-  AVP: `vpkengine.ref` → avp-port/main, `vpkengine-patches/` vacío; `vpgpu_set_background`/`vpgpu_shutdown_background` desde hilo
-  principal en transición de escena; `KL_GPU_PASSES` → un cmdbuf por pase; `gpu.pso.miss` en la ruta `gpu.pso f=`.
-  Primera build con motor nuevo: `VPVK_EXTRA_EXTENSIONS=0` (paridad con hoy) y A/B `VPVK_ASYNC_PIPELINES=0`, `VPVK_MSAA_TILE=0`.
-  Al unir avp-port a main: avisar a VisionQuestPro (suben su ref).
+- Verificar B66 en visor: arranque/retraducción, imagen (dual-source, render area, occlusion), `[cp] cb` por pase con
+  «Medir GPU por pase», RAM pico vs B65 (6368 MB) y `used_mb` ≤1280, 0 `gpu.err code=7` al salir, `gpu.pso.miss`.
+  Después A/B `VPVK_ASYNC_PIPELINES=0` y `VPVK_MSAA_TILE=0`.
+- VPKEngine: `avp-port-main` sin unir a main; `avp-port` remoto quedó en base vieja (force-push denegado). Al unir: avisar a VisionQuestPro.
 - Pendiente: Steam en guest (`steamclient.so` no encontrado).
 - Próximo objetivo: coste GPU del compositor 4–8 ms (B60 notó subida desde 2,4–6; posible RCAS fusionado, unverified).
-- Riesgos B60 sin verificar en visor: 0046/0049/0050 (Metal), `vpvk_mark_eye_image` vía dlsym. Parches 0047–0050 se conservan (los reutiliza VisionQuestPro).
 - Problema abierto: zona pesada juego ~23 ms > umbral (17 ms a 100 Hz, 18,9 a 90 Hz); térmico.
 
 ## Decisiones vigentes
@@ -76,7 +81,7 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
 - `klepton/.../klvr_platform_klepton.c` (`pace_plan`, `pace_governor`), `kl_app.c` (pacer), `kl_gpu_time.m`.
 - `klepton/visionos/Sources/KleptonCompositor.swift`, `klepton/runtime/gfx/kl_reproject.c`, `kl_gpu_time.m`,
   `kl_vulkan.c`; `app/Sources/AVPSettings*.swift`, `AVPLauncher.swift`, `app/Native/avp_config.c`.
-- `vpkengine-patches/0042–0054` (0053/0054 en `gpu/metal2/src/metal_backend.mm`).
+- VPKEngine `gpu/metal2/src/metal_backend.mm`, `gpu/vulkan/src/{pipelines,commands,recipes,entry}.cpp` (rama `avp-port-main`).
 
 ## Índice de notas
 - `notas/rendimiento.md`: reparto del frame, hallazgos Logs_34–47, conclusión e ideas pendientes de rendimiento.
