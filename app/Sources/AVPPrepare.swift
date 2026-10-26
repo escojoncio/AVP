@@ -518,6 +518,8 @@ enum AVPPipelineCache {
     }
     /// Decided at writeConfig (before the prewarm), read by AVPPrepare.prewarm.
     nonisolated(unsafe) static var current: State?
+    /// Raise when the engine's translator version changes (recipes.h kLowerVersion/kEmitVersion: l<lower>e<emit>).
+    static let translator = "l3e2"
 
     static func configure(data: URL, pipelines: URL, engine: String, engineSignature: String = "", archive: Bool = false,
                           robust: String = "default") -> State {
@@ -531,16 +533,17 @@ enum AVPPipelineCache {
         // live elsewhere (pipelines.foz in the cache folder, <data>/klfz/*.foz) and stay.
         let robustURL = dir.appendingPathComponent("robust.mode")
         let oldRobust = try? String(contentsOf: robustURL, encoding: .utf8)
-        if oldRobust != robust {
+        let mode = "\(robust)|tr\(translator)"
+        if oldRobust != mode {
             var purged = 0, failed = 0
             for f in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
             where (f.hasPrefix("pipelines") && (f.hasSuffix(".metalar") || f.hasSuffix(".keys"))) || f == "pipelines.count"
                 || f == "recipes.bin" || f == "warm.stamp" {
                 if (try? fm.removeItem(at: dir.appendingPathComponent(f))) != nil { purged += 1 } else { failed += 1 }
             }
-            if failed == 0 { try? robust.write(to: robustURL, atomically: true, encoding: .utf8) }
+            if failed == 0 { try? mode.write(to: robustURL, atomically: true, encoding: .utf8) }
             if purged > 0 || oldRobust != nil {
-                AVPLog.log("[prepare] robust mode change \(oldRobust ?? "?")->\(robust): purged \(purged) files")
+                AVPLog.log("[prepare] robust mode change \(oldRobust ?? "?")->\(mode): purged \(purged) files")
             }
         }
         // Metal binary archives are off unless the lab's switch (`archive`) asks for them: opening one cost ~30x its file
