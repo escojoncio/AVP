@@ -79,6 +79,8 @@ final class AVPSettings: ObservableObject {
     /// Build 27: per-pass GPU timing windows (KL_GPU_PASSES, kl_gpu_time.m) + VPKEngine's exclusive per-encoder
     /// timing (VP_EXCL_TIMING). Off by default since build 32: sample buffers on 28-120 encoders per frame are not free.
     @Published var gpuPassProfiling: Bool { didSet { save() } }
+    /// The game sees an Adreno GPU, as in B65 (VPVK_REPORT_ADRENO). Performance A/B test; off by default.
+    @Published var reportAdreno: Bool { didSet { save() } }
     @Published var movement: Movement { didSet { save() } }
     @Published var subtitles: SubtitlePlacement { didSet { save() } }
     @Published var subtitleSize: SubtitleSize { didSet { save() } }
@@ -196,6 +198,7 @@ final class AVPSettings: ObservableObject {
         trackedOrder = d.object(forKey: "avp.cbOrder2c") as? Bool ?? true
         diagCaptures = d.object(forKey: "avp.diagCaptures") as? Bool ?? false
         gpuPassProfiling = d.object(forKey: "avp.gpuPasses2") as? Bool ?? false
+        reportAdreno = d.object(forKey: "avp.reportAdreno") as? Bool ?? false
         movement = Movement(rawValue: d.object(forKey: "avp.movement") as? Int ?? 3) ?? .continuousHand
         subtitles = SubtitlePlacement(rawValue: d.object(forKey: "avp.subtitles") as? Int ?? 2) ?? .eyeLevel
         cloudSync = d.object(forKey: "avp.cloudSync") as? Bool ?? true
@@ -236,6 +239,7 @@ final class AVPSettings: ObservableObject {
         d.set(trackedOrder, forKey: "avp.cbOrder2c")
         d.set(diagCaptures, forKey: "avp.diagCaptures")
         d.set(gpuPassProfiling, forKey: "avp.gpuPasses2")
+        d.set(reportAdreno, forKey: "avp.reportAdreno")
         d.set(movement.rawValue, forKey: "avp.movement")
         d.set(subtitles.rawValue, forKey: "avp.subtitles")
         d.set(cloudSync, forKey: "avp.cloudSync")
@@ -263,7 +267,7 @@ final class AVPSettings: ObservableObject {
         foveationOn = fresh.foveationOn; wideDegrees = fresh.wideDegrees; periphery = fresh.periphery
         vpktaa = fresh.vpktaa; vpktaaPercent = fresh.vpktaaPercent; vpktaaSharpness = fresh.vpktaaSharpness
         anisotropy = fresh.anisotropy; centerSharpness = fresh.centerSharpness; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao; msaa = fresh.msaa; frameRate = fresh.frameRate; handHoldPredict = fresh.handHoldPredict
-        trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling
+        trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling; reportAdreno = fresh.reportAdreno
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
         postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
@@ -514,7 +518,9 @@ final class AVPSettings: ObservableObject {
             ("VP_FRAME_DETAIL", "3000"),
             // Elisión de stores MSAA muertos, VPKEngine 0051.
             ("VPVK_MSAA_DEAD_STORE", "1"),
-            // Paridad con el motor anterior (primera build sobre VPKEngine sin parches): sin extensiones extra.
+            // Paridad con el motor de B65: no poner a cero las imágenes nuevas.
+            ("VPVK_ZERO_NEW_IMAGES", "0"),
+            ("VPVK_REPORT_ADRENO", reportAdreno ? "1" : "0"),
         ]
         // VPKTAA inputs not usable yet (build 17 log): VPKEngine's motion vectors are all zero (its "eye frame"
         // restarts at every depth-clearing multiview pass, 4-7 per game frame, so no draw ever finds last frame's
@@ -573,9 +579,10 @@ final class AVPSettings: ObservableObject {
                                                    engineSignature: signature, archive: true)
             env.append(("VP_PIPELINE_CACHE_DIR", cache.dir.path))
             if cache.archiveOff { env.append(("VP_PIPELINE_ARCHIVE", "0")) }
-            // B65: 1280 MB of footprint for opening the binary archives (VPKEngine's default is 768): with 768 the three
-            // largest files (2614 pipelines) stayed unopened and their pipelines compiled in game (Logs_Alyx 26/10).
-            env.append(("VP_PIPELINE_ARCHIVE_BUDGET_MB", "1280"))
+            // 2048 MB of footprint for opening the binary archives (VPKEngine's default is 768): the engine now measures the
+            // real cost (~13x the size on disk) and B65 in practice used ~1973 MB; with 768 the three largest files
+            // (2614 pipelines) stayed unopened and their pipelines compiled in game (Logs_Alyx 26/10).
+            env.append(("VP_PIPELINE_ARCHIVE_BUDGET_MB", "2048"))
             env.append(("KL_VK_FOZ_GAME_REPLAY", cache.warm ? "0" : "1"))
         }
 
