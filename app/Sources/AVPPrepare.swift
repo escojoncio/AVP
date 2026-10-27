@@ -519,7 +519,7 @@ enum AVPPipelineCache {
     /// Decided at writeConfig (before the prewarm), read by AVPPrepare.prewarm.
     nonisolated(unsafe) static var current: State?
     /// Raise when the engine's translator version changes (recipes.h kLowerVersion/kEmitVersion: l<lower>e<emit>).
-    static let translator = "l3e2"
+    static let translator = "l3e3"
 
     static func configure(data: URL, pipelines: URL, engine: String, engineSignature: String = "", archive: Bool = false,
                           robust: String = "default") -> State {

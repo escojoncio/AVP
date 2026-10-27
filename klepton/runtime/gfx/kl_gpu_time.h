@@ -25,6 +25,9 @@ void kl_vrr_reload(void);
 // (< 0: that preset's default). Rebuilds the maps.
 void kl_vrr_set(int mode, float inner, float outer, float edge);   // mode: 0 centre, 1 soft, 2 wide (KL_VRR_MAP)
 void kl_vrr_s2p(void *ctx, float sx, float sy, float *px, float *py);
+// VPKEngine splits its two-layer passes per view (vpgpu_metal2_set_split_views): the scene passes then arrive as one-layer
+// encoders and get their eye's one-layer copy of the map. Off: passes are foveated exactly as without the split.
+void kl_vrr_set_split_views(int on);
 // The frame the guest is recording now (counts from 1; 0 before GPU timing is on).
 unsigned kl_gpu_time_frame(void);
 // The OpenVR shim: the game faded the grid in (to_grid = 1: a level load starts) or out (0: a scene is shown).

@@ -1183,10 +1183,20 @@ static int vrr_mode(void) {
     return m && !strcmp(m, "soft") ? 1 : m && !strcmp(m, "wide") ? 2 : 0;
 }
 static int vrr_soft(void) { return vrr_mode() == 1; }
-static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, NSUInteger h, NSUInteger layers) {
-    for (int i = 0; i < 8; i++)
-        if (g_vrr_maps[i].map && g_vrr_maps[i].w == w && g_vrr_maps[i].h == h && g_vrr_maps[i].layers == layers)
-            return (__bridge id<MTLRasterizationRateMap>)g_vrr_maps[i].map;
+// view >= 0 (layers 1): the one-layer map of that eye, identical to its layer of the two-layer map (vrr_fov_view_map);
+// it lives in its own cache, so the compositor's lookup (kl_vrr_map_for) only ever finds the two-layer one. zones0:
+// the zone count of that two-layer map, the only one tried.
+static struct { NSUInteger w, h; int view; void *map; } g_vrr_views[8];
+static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, NSUInteger h, NSUInteger layers, int view, int zones0) {
+    if (view >= 0) {
+        for (int i = 0; i < 8; i++)
+            if (g_vrr_views[i].map && g_vrr_views[i].w == w && g_vrr_views[i].h == h && g_vrr_views[i].view == view)
+                return (__bridge id<MTLRasterizationRateMap>)g_vrr_views[i].map;
+    } else {
+        for (int i = 0; i < 8; i++)
+            if (g_vrr_maps[i].map && g_vrr_maps[i].w == w && g_vrr_maps[i].h == h && g_vrr_maps[i].layers == layers)
+                return (__bridge id<MTLRasterizationRateMap>)g_vrr_maps[i].map;
+    }
     MTLRasterizationRateLayerDescriptor *ls[2];
     float cx[2] = { 0.5f, 0.5f }, cy = 0.5f, span_x = 2.732f, span_y = 2.192f;   // headset-like defaults
     for (int e = 0; e < 2; e++) {
@@ -1213,7 +1223,7 @@ static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, 
     }
     id<MTLRasterizationRateMap> map = nil;
     // The wide map at 32 zones per axis, 16 if Metal refuses it; the other maps at 16 as before.
-    for (int zones = wide ? kVrrZonesMax : kVrrZones; !map && zones >= kVrrZones; zones /= 2) {
+    for (int zones = zones0 ? zones0 : wide ? kVrrZonesMax : kVrrZones; !map && zones >= (zones0 ? zones0 : kVrrZones); zones /= 2) {
         float rx[2][kVrrZonesMax], ry[kVrrZonesMax];
         if (wide) {
             const float half = tanf(deg * 0.5f * (float)M_PI / 180.0f);
@@ -1232,7 +1242,7 @@ static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, 
         // Every zone rated at its own centre (wide included: see above).
         vrr_rates(cy, in_y, out_y, edge, ry, zones);
         for (NSUInteger l = 0; l < layers && l < 2; l++) {
-            vrr_rates(cx[layers > 1 ? l : 0], in_x, out_x, edge, rx[l], zones);
+            vrr_rates(cx[layers > 1 ? l : view > 0 ? view : 0], in_x, out_x, edge, rx[l], zones);
             ls[l] = [[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(zones, zones, 0)
                                                                          horizontal:rx[l] vertical:ry];
         }
@@ -1243,6 +1253,14 @@ static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, 
         else fprintf(stderr, "[vrr] Metal refused a %d-zone map\n", zones);
     }
     if (!map) return nil;
+    if (view >= 0) {
+        for (int i = 0; i < 8; i++)
+            if (!g_vrr_views[i].map) {
+                g_vrr_views[i].w = w; g_vrr_views[i].h = h; g_vrr_views[i].view = view;
+                g_vrr_views[i].map = (void *)CFBridgingRetain(map);
+                break;
+            }
+    } else
     for (int i = 0; i < 8; i++)
         if (!g_vrr_maps[i].map) {
             g_vrr_maps[i].w = w; g_vrr_maps[i].h = h; g_vrr_maps[i].layers = layers;
@@ -1256,7 +1274,7 @@ static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, 
             (unsigned long)w, (unsigned long)h, 100 * cx[0], 100 * cx[1], 100 * cy, 100 * in_x, 100 * in_y, edge, (unsigned long)p0.width,
             (unsigned long)p0.height, 100.0 * p0.width * p0.height / ((double)w * h));
     const char *dump = getenv("KL_VRR_DUMP");
-    if (dump && *dump) {
+    if (dump && *dump && view < 0) {
         FILE *df = fopen(dump, "w");
         if (df) {
             fprintf(df, "screen %lu %lu\n", (unsigned long)w, (unsigned long)h);
@@ -1270,6 +1288,51 @@ static id<MTLRasterizationRateMap> vrr_fov_map(id<MTLDevice> dev, NSUInteger w, 
             }
             fclose(df);
         }
+    }
+    return map;
+}
+// Whether VPKEngine splits its two-layer passes per view: the app's setting, told through kl_vrr_set_split_views (live)
+// and VPVK_SPLIT_VIEWS (the start value, read like the engine does). -1 = not read yet.
+static _Atomic int g_vrr_split = -1;
+void kl_vrr_set_split_views(int on) { atomic_store(&g_vrr_split, on != 0); }
+static int vrr_split_on(void) {
+    int v = atomic_load(&g_vrr_split);
+    if (v < 0) {
+        const char *e = getenv("VPVK_SPLIT_VIEWS");
+        int init = e && e[0] == '1' && !e[1];
+        atomic_compare_exchange_strong(&g_vrr_split, &v, init);
+        v = atomic_load(&g_vrr_split);
+    }
+    return v;
+}
+// View-split encoders (VPKEngine splitViews, vpgpu_metal2_set_split_views): each draws ONE layer of the two-layer eye
+// image as layer 0 of a one-layer render target, so renderTargetArrayLength is 1 and the eye is the attachment's slice
+// (colour 0, else depth) in a texture array of exactly 2 layers. Returns that slice (the eye), or -1 for any other pass
+// and always while the split is off (then nothing here differs from before). The map's size is the pass's own
+// (render target, else the texture), the one the two-layer map is built for.
+static int vrr_split_view(MTLRenderPassDescriptor *d) {
+    if (!vrr_split_on() || d.renderTargetArrayLength > 1) return -1;
+    id<MTLTexture> ct = d.colorAttachments[0].texture;
+    id<MTLTexture> t = ct ? ct : d.depthAttachment.texture;
+    NSUInteger s = ct ? d.colorAttachments[0].slice : d.depthAttachment.slice;
+    return t && t.arrayLength == 2 && s < 2 ? (int)s : -1;
+}
+// The map for the split encoder of eye `view`: a one-layer map equal to that layer of the two-layer `parent` (same screen
+// size, zones, rates, axis of that eye), so the slice's physical layout is the one the unsplit pass gave it and the
+// compositor unwarps with `parent` as always. Never published.
+static id<MTLRasterizationRateMap> vrr_fov_view_map(id<MTLDevice> dev, NSUInteger w, NSUInteger h,
+                                                    id<MTLRasterizationRateMap> parent, int view) {
+    int zones = 0;
+    for (int i = 0; i < 8; i++)
+        if (g_vrr_maps[i].map == (__bridge void *)parent) zones = g_vrr_maps[i].zones;
+    id<MTLRasterizationRateMap> map = vrr_fov_map(dev, w, h, 1, view, zones);
+    static int said;
+    if (said < 4) {
+        said++;
+        MTLSize a = [parent physicalSizeForLayer:view], b = map ? [map physicalSizeForLayer:0] : MTLSizeMake(0, 0, 0);
+        fprintf(stderr, "[vrr] split view %d: one-layer map physical %lux%lu, layer %d of the two-layer map %lux%lu%s\n", view,
+                (unsigned long)b.width, (unsigned long)b.height, view, (unsigned long)a.width, (unsigned long)a.height,
+                !map ? " (REFUSED)" : a.width == b.width && a.height == b.height ? "" : " (DIFFER)");
     }
     return map;
 }
@@ -1304,6 +1367,7 @@ void kl_vrr_set(int mode, float inner, float outer, float edge) {   // mode: 0 c
 static void vrr_forget_full(void);
 void kl_vrr_reload(void) {
     for (int i = 0; i < 8; i++) g_vrr_maps[i].map = NULL, g_vrr_maps[i].w = g_vrr_maps[i].h = 0;
+    for (int i = 0; i < 8; i++) g_vrr_views[i].map = NULL, g_vrr_views[i].w = g_vrr_views[i].h = 0;
     vrr_forget_full();   // KL_VRR_PHYS: a new physical size; every texture gets one full-area pass again
     fprintf(stderr, "[vrr] settings changed: maps rebuilt on the next frame\n");
 }
@@ -1743,7 +1807,11 @@ static id kl_rce(id self, SEL sel, MTLRenderPassDescriptor *d) {
             // the motion-vector target (RG16F) is left alone.
             id<MTLTexture> dt = d.depthAttachment.texture;
             id<MTLTexture> ct = d.colorAttachments[0].texture;
-            int scene1x = dt && dt.width >= 1024 && d.renderTargetArrayLength == 2 &&   // two eyes, not a cascade
+            // A view-split encoder (one eye of those passes, renderTargetArrayLength 1) counts as the two-layer pass it
+            // came from; a depth-only one stays out of the 1x cases (a cascade's slice looks the same).
+            int sv = vrr_split_view(d);
+            NSUInteger lay = sv >= 0 ? 2 : d.renderTargetArrayLength;
+            int scene1x = dt && dt.width >= 1024 && lay == 2 && (sv < 0 || ct) &&   // two eyes, not a cascade
                           (dt.textureType == MTLTextureType2DArray || dt.textureType == MTLTextureType2DMultisampleArray) &&
                           (!ct || ct.pixelFormat != MTLPixelFormatRG16Float);
             // Build 36: the VR subtitles (cc_vr_*) are one quad in a pass of their own after the post chain: the eye
@@ -1754,7 +1822,7 @@ static id kl_rce(id self, SEL sel, MTLRenderPassDescriptor *d) {
             // view without depth but this. KL_VRR_SRGB_1X=0 restores the old behaviour (A/B).
             static int srgb1x_on = -1;
             if (srgb1x_on < 0) { const char *e = getenv("KL_VRR_SRGB_1X"); srgb1x_on = !(e && *e == '0'); }
-            int srgb1x = srgb1x_on > 0 && !dt && ct && ct.sampleCount == 1 && ct.width >= 1024 && d.renderTargetArrayLength == 2 &&
+            int srgb1x = srgb1x_on > 0 && !dt && ct && ct.sampleCount == 1 && ct.width >= 1024 && lay == 2 &&
                          (ct.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB || ct.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB) &&
                          d.colorAttachments[0].loadAction == MTLLoadActionLoad;
             if (t && (t.sampleCount >= 2 || scene1x || srgb1x) && t.width >= 1024) {
@@ -1773,14 +1841,22 @@ static id kl_rce(id self, SEL sel, MTLRenderPassDescriptor *d) {
                             (unsigned long)t.width, (unsigned long)t.height, (unsigned long)d.renderTargetArrayLength,
                             (unsigned long)d.colorAttachments[0].storeAction, f);
                 }
-                NSUInteger layers = d.renderTargetArrayLength > 1 ? d.renderTargetArrayLength : 1;
+                NSUInteger layers = lay > 1 ? lay : 1;
                 NSUInteger w = d.renderTargetWidth ? d.renderTargetWidth : t.width;
                 NSUInteger h = d.renderTargetHeight ? d.renderTargetHeight : t.height;
-                id<MTLRasterizationRateMap> map = vrr_fov_map(cb.device, w, h, layers);
+                id<MTLRasterizationRateMap> map = vrr_fov_map(cb.device, w, h, layers, -1, 0);
                 if (map) {
-                    d.rasterizationRateMap = map;
+                    // Split encoder: its eye's one-layer copy of the map; `map` (two layers) is what gets published.
+                    id<MTLRasterizationRateMap> pass_map = sv >= 0 ? vrr_fov_view_map(cb.device, w, h, map, sv) : map;
+                    if (!pass_map) {   // Metal refused the one-layer copy: the one-layer map the pass got before the split
+                        static int saidFall;
+                        if (saidFall++ < 4) fprintf(stderr, "[vrr] split view %d: no one-layer map, using the old one-layer map\n", sv);
+                        pass_map = vrr_fov_map(cb.device, w, h, 1, -1, 0);
+                    }
+                    d.rasterizationRateMap = pass_map;
                     vrr_phys_env();
-                    if (g_vrr_phys > 0) vrr_constrain(d, map, w, h, 0);
+                    // Split encoders keep the full render area (vrr_textures_known tracks textures, not slices).
+                    if (g_vrr_phys > 0 && sv < 0) vrr_constrain(d, map, w, h, 0);
                     static void *published;
                     if ((__bridge void *)map != published) {   // the compositor unwarps the eye image with it
                         published = (__bridge void *)map;

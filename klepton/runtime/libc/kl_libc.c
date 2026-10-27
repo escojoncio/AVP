@@ -351,7 +351,18 @@ void klb_sysprop_read(const void *p, char *n, char *v) {
     if (n) { if (prop) snprintf(n, 32, "%s", prop); else n[0] = 0; }
     if (v) klb_sysprop_get(prop, v);
 }
-int  klb_prctl(int op, ...)                  { (void)op; return 0; }
+// Fixed-arity like klb_openat: the guest's variadic arguments arrive in x1-x4. PR_SET_NAME (15) names the calling
+// thread (Linux keeps the first 15 bytes; Darwin names only the current thread, so that is the whole job); the rest is a no-op.
+int  klb_prctl(int op, unsigned long a2, unsigned long a3, unsigned long a4, unsigned long a5) {
+    (void)a3; (void)a4; (void)a5;
+    if (op == 15 && a2) {
+        char nm[16];
+        strncpy(nm, (const char *)(uintptr_t)a2, 15);
+        nm[15] = 0;
+        pthread_setname_np(nm);
+    }
+    return 0;
+}
 int  klb_sched_getaffinity(int p, size_t sz, void *m) {
     (void)p; if (m && sz) memset(m, 0xFF, sz);       // pretend every CPU is available
     return 0;

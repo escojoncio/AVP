@@ -121,6 +121,11 @@ final class AVPSettings: ObservableObject {
     /// "always visible": Source 2 then skips what its occlusion test found hidden (r_occlusion_culling 1).
     /// Off = every query reads visible, the behaviour up to build 38 (VPVK_OCCLUSION).
     @Published var occlusionQueries: Bool { didSet { save() } }
+    /// Experimental (VPKEngine 2994d15, off): each eye of the heavy two-layer passes drawn by its own encoder, to ease the
+    /// geometry. VPVK_SPLIT_VIEWS at launch, vpgpu_metal2_set_split_views live (applyLive). It changes no shader, so it
+    /// stays out of the prewarm signature (sigKeys).
+    @Published var splitViews: Bool { didSet { save() } }
+    private var splitViewsApplied = false
     /// Build 43/44: the refresh rate the OpenVR shim tells Alyx (Prop_DisplayFrequency). Alyx steps its clock by
     /// 1/this per frame and fixes its tick interval to 1/this at map load (Logs_Alyx_32/3_2/2_11). `measured` (the
     /// default) = automatic since build 44: the pace governor's current rate, the base while loading
@@ -212,6 +217,7 @@ final class AVPSettings: ObservableObject {
         heightOffsetCm = d.object(forKey: "avp.heightCm") as? Double ?? 0
         realFloor = d.object(forKey: "avp.realFloor") as? Bool ?? true
         occlusionQueries = d.object(forKey: "avp.occlusion") as? Bool ?? true
+        splitViews = d.object(forKey: "avp.splitViews") as? Bool ?? false
         reportedHz = ReportedHz(rawValue: d.object(forKey: "avp.reportHz") as? Int ?? 0) ?? .measured
         runningStart = d.object(forKey: "avp.runStart") as? Bool ?? true
         subtitleSize = SubtitleSize(rawValue: d.object(forKey: "avp.subSize") as? Int ?? 0) ?? .small
@@ -253,6 +259,7 @@ final class AVPSettings: ObservableObject {
         d.set(heightOffsetCm, forKey: "avp.heightCm")
         d.set(realFloor, forKey: "avp.realFloor")
         d.set(occlusionQueries, forKey: "avp.occlusion")
+        d.set(splitViews, forKey: "avp.splitViews")
         d.set(reportedHz.rawValue, forKey: "avp.reportHz")
         d.set(runningStart, forKey: "avp.runStart")
         d.set(preset.rawValue, forKey: "avp.preset")
@@ -272,7 +279,7 @@ final class AVPSettings: ObservableObject {
         anisotropy = fresh.anisotropy; centerSharpness = fresh.centerSharpness; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao; msaa = fresh.msaa; frameRate = fresh.frameRate; handHoldPredict = fresh.handHoldPredict
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling; shaderKnock = fresh.shaderKnock
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
-        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries
+        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries; splitViews = fresh.splitViews
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
         reportedHz = fresh.reportedHz; runningStart = fresh.runningStart
         preset = fresh.preset
@@ -505,6 +512,7 @@ final class AVPSettings: ObservableObject {
             ("KLVR_REAL_FLOOR", realFloor ? "1" : "0"),   // B58: KleptonFloor.swift
             ("KL_VRR_SRGB_1X", "1"),   // build 42: always (B41 log: the A/B toggle left off = the B35 subtitle bug again)
             ("VPVK_OCCLUSION", occlusionQueries ? "1" : "0"),
+            ("VPVK_SPLIT_VIEWS", splitViews ? "1" : "0"),
             ("KLVR_REPORT_HZ_FIXED", reportedHz.env),
             // 3 = native half fetch + native unorm/snorm unpack (mask: 1 half, 2 unpack). Build 31 had native half fetch
             // alone (the translator's conversion is exact); logs 22: the scene pass is vertex-bound (vtx 11 ms).
@@ -605,6 +613,7 @@ final class AVPSettings: ObservableObject {
         KleptonCompositor.setPeripheryRecon(on: reconActive, percent: Float(vpktaaPercent), sharpness: Float(vpktaaSharpness))
         KleptonCompositor.skipSameEnabled = Self.composeNewOnly
         KleptonCompositor.setCenterSharpness(Float(centerSharpness))
+        splitViewsApplied = splitViews   // the engine reads VPVK_SPLIT_VIEWS at start; applyLive only acts on a change
         // Round sharp zone (P.T.'s circle) over the wide map: its degrees are the map's (KL_VRR_WIDE_DEG above).
         KleptonCompositor.setRoundFovea(on: foveationUsable && Self.roundSharpZone, degrees: Float(wideDegrees.rounded()),
                                         edge: Float(periphery))
@@ -735,8 +744,20 @@ end, nil)
             // The round sharp zone follows the map, at its live periphery (degrees stay the launch's).
             KleptonCompositor.setRoundFovea(on: Self.roundSharpZone, degrees: nil, edge: Float(periphery))
         }
+        applySplitViews()
+        if splitViews != splitViewsApplied {
+            splitViewsApplied = splitViews
+            AVPLog.log("[cp] split views -> \(splitViews ? "on" : "off") t=\(String(format: "%.1f", ProcessInfo.processInfo.systemUptime))")
+        }
         applyToVPKEngine()
         AVPLog.log("Ajustes en vivo: foveado \(foveationOn) periferia \(Int((periphery * 100).rounded())) %, VPKTAA periferia \(reconActive) \(Int(vpktaaPercent)) % nitidez \(vpktaaSharpness), nitidez del centro \(Int((centerSharpness * 100).rounded())) %, FPS \(showFps), altura \(Int(heightOffsetCm)) cm, altura real \(realFloor)")
+    }
+
+    /// The saved split value to the engine and to the foveation hook (kl_gpu_time.m): every live apply, and once the game
+    /// shows its first picture (the driver is loaded by then).
+    func applySplitViews() {
+        kl_vrr_set_split_views(splitViews ? 1 : 0)
+        VPGpuBackground.setSplitViews(splitViews)
     }
 
     func applyToVPKEngine() {

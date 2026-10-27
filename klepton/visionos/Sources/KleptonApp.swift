@@ -121,6 +121,8 @@ enum VPGpuBackground {
         else { unsafeBitCast(sym, to: (@convention(c) () -> Void).self)() }
     }
     static func set(_ on: Bool) { call("vpgpu_set_background", on ? 1 : 0) }
+    /// Experimental view split (one encoder per eye); takes effect on the next frame the engine submits.
+    static func setSplitViews(_ on: Bool) { call("vpgpu_metal2_set_split_views", on ? 1 : 0) }
     /// Releases the parked commits for good: before the guest and its device are torn down (a parked thread would
     /// block the join). Never while the game stays alive.
     static func shutdown() { call("vpgpu_shutdown_background", nil) }

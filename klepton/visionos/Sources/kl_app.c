@@ -952,18 +952,17 @@ static long long tv_us(long long s, long long us) { return s * 1000000 + us; }
 //   switches since>/<in total> late=<frames late>/<frames> miss=<pictures that missed their refresh>/<pictures>
 // busy is the game's + the compositor's GPU ms per second (kl_gpu_time.m, the figures of its [gputime] line; no
 // VP_EXCL_TIMING needed), idle is the rest of the second. late/miss are the governor's own windows, since the last line.
-// Weak no-ops where the providers (kl_gpu_time.m, klvr_platform_klepton.c) are not linked.
-__attribute__((weak)) double kl_gpu_time_busy_total_ms(void) { return -1; }
-__attribute__((weak)) void klvr_plat_pace_stats(double s[2], unsigned c[5]) {
-    s[0] = s[1] = 0;
-    for (int i = 0; i < 5; i++) c[i] = 0;
-}
+// Weak REFERENCES, not weak stubs defined here: the stubs may have won over the providers' strong definitions
+// (kl_gpu_time.m, klvr_platform_klepton.c, both in libklepton.a; unverified) and the line read "pace n/a" with the
+// regulator running. NULL where the providers are not linked.
+extern double kl_gpu_time_busy_total_ms(void) __attribute__((weak_import));
+extern void klvr_plat_pace_stats(double s[2], unsigned c[5]) __attribute__((weak_import));
 static void diag_game(char *out, size_t cap, double dt, int have) {
     static double busy0, s0[2];
     static unsigned c0[5];
-    double busy = kl_gpu_time_busy_total_ms(), s[2];
-    unsigned c[5];
-    klvr_plat_pace_stats(s, c);
+    double busy = &kl_gpu_time_busy_total_ms ? kl_gpu_time_busy_total_ms() : -1, s[2] = { 0, 0 };
+    unsigned c[5] = { 0, 0, 0, 0, 0 };
+    if (&klvr_plat_pace_stats) klvr_plat_pace_stats(s, c);
     int o = 0;
     if (busy < 0 || !have) o = snprintf(out, cap, " gpu n/a");
     else {
@@ -971,7 +970,7 @@ static void diag_game(char *out, size_t cap, double dt, int have) {
         o = snprintf(out, cap, " gpu busy=%.0f idle=%.0f", b, b < 1000 ? 1000 - b : 0);
     }
     const double dtot = s[0] + s[1] - s0[0] - s0[1];
-    if (!(s[0] + s[1] > 0) || !have) snprintf(out + o, cap - o, " pace n/a");
+    if (!(s[0] + s[1] > 0) || !have) snprintf(out + o, cap - o, &klvr_plat_pace_stats ? " pace n/a" : " pace n/a(no symbol)");
     else
         snprintf(out + o, cap - o, " pace fb=%.0f%%/%.0f%% sw=%u/%u late=%u/%u miss=%u/%u",
                  dtot > 0 ? 100.0 * (s[1] - s0[1]) / dtot : 0.0, 100.0 * s[1] / (s[0] + s[1]),

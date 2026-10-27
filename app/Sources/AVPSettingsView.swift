@@ -309,6 +309,11 @@ struct AVPSettingsView: View {
                          "The game stops drawing what the GPU finds hidden behind other objects (less load). Off, everything counts as visible. Turn it off only if you see objects vanishing or flickering. Recommended: on.")
                 }
                 VStack(alignment: .leading, spacing: 4) {
+                    Toggle(AVPL("Un pase por ojo (experimental)", "One pass per eye (experimental)"), isOn: $s.splitViews)
+                    hint("Dibuja cada ojo por separado para aliviar la geometría; en caliente",
+                         "Draws each eye separately to ease the geometry; applied live")
+                }
+                VStack(alignment: .leading, spacing: 4) {
                     Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
                            role: .destructive) { confirmQuarantine = true }
                         .disabled(quarantined == 0)

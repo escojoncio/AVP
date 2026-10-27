@@ -2368,7 +2368,7 @@ final class KleptonCompositor {
                 continue loop
             default:
                 autoreleasepool { presented += renderFrame() }
-                if presented > 0 && !Lifecycle.firstPicture { Lifecycle.firstPicture = true; NSLog("[cp] first frame with a picture") }
+                if presented > 0 && !Lifecycle.firstPicture { Lifecycle.firstPicture = true; NSLog("[cp] first frame with a picture"); AVPSettings.shared.applySplitViews() }
             }
             iterations += 1
             if Date() >= nextReport {
