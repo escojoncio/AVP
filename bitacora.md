@@ -4,10 +4,24 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` = rama `avp-port-main`, **sin parches**: `vpkengine-patches/` vacío; cambios del
 motor se hacen en VPKEngine, mapa en su bitácora). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B75**, sin verificar en visor).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B76**, sin verificar en visor).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
+- B76 (`ae4087c`): motor `2994d15` = split views: `VPVK_SPLIT_VIEWS`/`vpgpu_metal2_set_split_views` (en caliente, por
+  frame): pase multiview 2 capas amplificado, elegible (frame_compiler.cpp splitBlocker ~597) y HeavyGeometry →
+  2 encoders (slice v, renderTargetArrayLength 1, amp 1, vs `+ vp_view_base [[buffer(27)]]`, kEmitVersion 3); no parte
+  si cada vista sigue heavy por geometría (`still_heavy`). Defaults tileMaxDraws 2000, tileMaxVertices 3M. Logs:
+  `gpu.split pass= eligible= reason= view_verts= draws= heavy_after=`, `gpu.split mode=`, `view=` en gpu.excl,
+  `split=` en gpu.frame, `verts=` en gpu.knock. AVP: toggle «Un pase por ojo (experimental)» en Ajustes > Diagnóstico
+  (applyLive + primer frame, `AVPSettings.applySplitViews`); `kl_gpu_time.m` `kl_vrr_set_split_views`: con split,
+  mapa VRR de 1 capa = capa v (cx[v]); se publica el de 2 capas; log `[vrr] split view`. Diag: weak_import pace/gpu,
+  `klb_prctl` PR_SET_NAME → nombres de hilo. translator `l3e3`.
+- Logs_Alyx_18 (B75, 4m22s, fair a t≈170 s): knock fsr: pipe5336 (6 draws) skip −7,03 / fs trivial −0,12;
+  pipe5184 (140) −6,89 / −1,12; pipe5262 (5) −6,60 / −0,25 → NO es coste de fs: acantilado de geometría (pase
+  HeavyGeometry, ~4,14M vértices-vista, attachments con memoria → probable partial render del tiler; unverified).
+  El pase MSAA YA está foveado por Klepton (kl_gpu_time.m ~1735 vrr_fov_map, 36 % físico); el `decline msaa` del
+  motor es su foveado propio, no usado en AVP. gpu.tex 2,28 GB todo BC nativo. CPU sin spin; RAM pico 5,85 GB.
 - B75 (`6edfa37`): motor `93147c6`. Diagnóstico siempre activo: `kl_app.c` diag_tick (~933, llamada en heartbeat ~1060)
   línea `[diag]` 10 s a stderr: `cpu proc= thr= top:` 8 hilos (delta user+sys, `[spin?]` >80 % con nombre wait/pace/
   compositor/present), `gpu busy= idle=` (`kl_gpu_time_busy_total_ms`, -1 → n/a), `pace fb=%/% sw= late= miss=`
@@ -19,20 +33,6 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   13,3 ms (1013 draws, vtx 4,1/frag 9,2). Sombras (D32F 1024², fmt=-) <0,4 ms. Knock partial_frames=0: r1 pipe122
   fs 6ff7c440c61864c0 3,8 draws d 6,77 (frag 4,74) unstable=0 → posible real (superficies grandes); r2 fs dd8a0211
   124 draws 2,11; r3 3128e2cb 1,37. Falta ~1,5–2 ms para 50 fps estables (bajada con 2 ventanas >19,0).
-- B73 (`0710210`): motor `55506b0` = main (c67c604 + fd90770 VQP opt-in + `VPVK_ROBUST`/`VPVK_DUMP_MSL_FILTER`).
-  `AVPSettings.swift` ~529 `VPVK_ROBUST=0` (en `sigKeys` → cuarentena se resetea 1 vez), ~594 `VPVK_DUMP_MSL=Logs Alyx/msl`
-  + filtro 6 ids (fs 126bc47d4e6c414d, b6a4cab50a7e6885, 00f1f8923af66428 no cambian con robust=0; vs sí → no coincidirán).
-  `AVPPrepare.swift` ~532 purga única (`vpcache/robust.mode`): pipelines*.metalar/.keys, pipelines.count, recipes.bin,
-  warm.stamp; conserva pipelines.foz y klfz. `AVPLog.swift` ~30/100 `msl/*.metal` a espejo y compartir. 1.er arranque:
-  retraducción + prewarm completo. Revisar en logs: `vk.robust app= mode=0 effective=0`, `[prepare] robust mode change`,
-  `gpu.pso.miss`, ficheros en `msl/`, vtx del pase MSAA (antes 0,8–2,5 ms).
-- B74 (`3a43ce4`): motor `efe0ec5`: traductor (kLowerVersion 3/kEmitVersion 2 → retraducción) matrices row-major
-  float32 = 1 load vectorial por fila (`lower.cpp` loadMem ~1245); sin `vp_guard` en bucles sin Continue propio
-  (`msl.cpp` ~681); un solo killExit por cadena de discards con bloques puros (`lower.cpp` killChainBlock ~2346);
-  knockout (`metal_backend.mm` exclAccount ~6226, knockSample ~6503, report ~6561) descarta frames con encoders
-  dominantes sin timestamp (`partial_frames=` en done) y pases con base >25 % de la mediana (`unstable=1`).
-  `AVPPrepare.swift` ~521 `translator = "l3e2"`: marcador `robust.mode` = `<VPVK_ROBUST>|tr<translator>`; SUBIR a mano
-  cuando cambie la versión del traductor del motor (si no, archivos viejos se comen el presupuesto de 2048 MB).
 - Logs_Alyx_16 (B73, 2m23s, nominal): `vk.robust app=0 mode=0 effective=0`; 0 errores; ~34 compilaciones en juego (max
   20,6 ms). Los 7 ms de B72 eran ARTEFACTO (frames con encoder dominante sin timestamp → base/knock ≈6,8 = medio frame).
   Real: reparto plano; top estable fs `00f1f892` (124 draws, d 2,1 ms, frag 1,5), `c02393ed` 1,7. MSL volcado de 3 fs:
@@ -125,7 +125,7 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   Después A/B `VPVK_ASYNC_PIPELINES=0` y `VPVK_MSAA_TILE=0`.
 - VPKEngine main = `3f7da04` (fast-forward de `avp-port-main`; VisionQuestPro avisado para subir su ref). `avp-port` remoto obsoleto (base vieja).
 - Pendiente: Steam en guest (`steamclient.so` no encontrado).
-- Próximo objetivo: B75 con L3+R3 → `fsr_ms` de fs 6ff7c440 (¿4,7 ms reales?) + MSL volcado; [diag] CPU/térmico.
+- Próximo objetivo: B76 A/B split ON/OFF misma zona (gpu.excl pase MSAA, gpu.split reason, [vrr] split view sin DIFFER).
 - Problema abierto: zona pesada juego ~23 ms > umbral (17 ms a 100 Hz, 18,9 a 90 Hz); térmico.
 
 ## Decisiones vigentes
