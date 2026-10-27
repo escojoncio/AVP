@@ -8,6 +8,13 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
+- B78: motor `38d6fef` (`vpvk_dump_pending`, prefijo `vk.pending`: fences/eventos/timelines/queries consultados
+  sin éxito en 2 s, PSO pendientes, submits en vuelo, gpu.hang de metal2; no bloqueante). `kl_app.c` stall_dump_thread
+  ~140 lo llama por dlsym en los stalls de 5/15 s (sin dlclose).
+- Logs_Alyx_22 (B77): al abrir el menú de pausa (`[Client] unnamed paused the game` 23:05:01) el juego dejó de
+  enviar frames (stall 5 s y 15 s → negro). Hilo 0xa963: libengine2→libclient→libpanorama→libresourcesystem→
+  librendersystemvulkan→cond_wait; VKRenderThread y pools ociosos. Primera vez (pausas OK en B76). Causa sin
+  confirmar: espera de una señal de la capa Vulkan (fence/evento/subida). RAM pico 7,36 GB, avail_min 827 MB.
 - B77 (`a6536dc`): compilada, sin verificar en visor.
   Motor sigue `493d7da`. Pacer `kl_app.c` guest_pace_wait ~1779-1823: antes, un frame tarde se liberaba al instante
   y el siguiente volvía a la rejilla (hueco eff−f). Ahora re-fase: tras tarde (`late`, con seen_first y avail≤eff+2)
@@ -26,15 +33,6 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   frame canario `vpgpu_metal2_set_tile_max_vertices`, `gpu.amp` por razón) + toggle en AVP (NO hecho; vpkengine.ref
   sigue en `493d7da`); ganancia esperada baja (diagnóstico). Única palanca grande = LOD (baja calidad: descartado).
   `[diag]` sigue `pace n/a` (weak_import no resolvió; sin investigar).
-- B76 (`3691b1c`): motor `493d7da` = split views: `VPVK_SPLIT_VIEWS`/`vpgpu_metal2_set_split_views` (en caliente, por
-  frame): pase multiview 2 capas amplificado, elegible (frame_compiler.cpp splitBlocker ~597) y HeavyGeometry →
-  2 encoders (slice v, renderTargetArrayLength 1, amp 1, vs `+ vp_view_base [[buffer(27)]]`, kEmitVersion 3); no parte
-  si cada vista sigue heavy por geometría (`still_heavy`). Defaults tileMaxDraws 2000, tileMaxVertices 3M. Logs:
-  `gpu.split pass= eligible= reason= view_verts= draws= heavy_after=`, `gpu.split mode=`, `view=` en gpu.excl,
-  `split=` en gpu.frame, `verts=` en gpu.knock. AVP: toggle «Un pase por ojo (experimental)» en Ajustes > Diagnóstico
-  (applyLive + primer frame, `AVPSettings.applySplitViews`); `kl_gpu_time.m` `kl_vrr_set_split_views`: con split,
-  mapa VRR de 1 capa = capa v (cx[v]); se publica el de 2 capas; log `[vrr] split view`. Diag: weak_import pace/gpu,
-  `klb_prctl` PR_SET_NAME → nombres de hilo. translator `l3e3`.
 - Logs_Alyx_16 (B73, 2m23s, nominal): `vk.robust app=0 mode=0 effective=0`; 0 errores; ~34 compilaciones en juego (max
   20,6 ms). Los 7 ms de B72 eran ARTEFACTO (frames con encoder dominante sin timestamp → base/knock ≈6,8 = medio frame).
   Real: reparto plano; top estable fs `00f1f892` (124 draws, d 2,1 ms, frag 1,5), `c02393ed` 1,7. MSL volcado de 3 fs:
@@ -125,7 +123,7 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   Después A/B `VPVK_ASYNC_PIPELINES=0` y `VPVK_MSAA_TILE=0`.
 - VPKEngine main = `a74ffba` (fast-forward de `avp-port-main`; VisionQuestPro avisado para subir su ref). `avp-port` remoto obsoleto (base vieja).
 - Pendiente: Steam en guest (`steamclient.so` no encontrado).
-- Próximo objetivo: ninguno (pausa). Ver primera entrada de Últimos hechos.
+- Próximo objetivo: si se repite el negro al pausar, leer `vk.pending` del stall y arreglar la señal que falta.
 - Problema abierto: zona pesada juego ~23 ms > umbral (17 ms a 100 Hz, 18,9 a 90 Hz); térmico.
 
 ## Decisiones vigentes
