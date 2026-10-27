@@ -486,7 +486,12 @@ final class KleptonCompositor {
     private var skippedInARow = 0                  // refreshes abandoned since the last composite
     private var cadHist = [0, 0, 0, 0, 0, 0]       // build 42: composites by refreshes shown (index 1...5+)
     private var cadCount = 0
-    private var skippedTotal = 0                   // for the liveness line
+    // Per NEW guest picture composited: panel refreshes since the previous new one (= how long that one was up), 1/s as
+    // "[cp] cadence hist" (logCadenceHist). refreshSerial counts every refresh: each composite plus the ones skipped before it.
+    private var refreshSerial = 0, lastNewSerial = 0
+    private var newGapHist = [0, 0, 0, 0, 0, 0]    // index 1...5+
+    private var newGapSince = Date()
+    private var skippedTotal = 0                  // for the liveness line
     // Build 54 (Logs_Alyx_42/43): proof of what each panel refresh cost, one line every 5 s ("[cp] refreshes/s").
     // Those logs read as ~70 composites/s against 30-45 game pictures/s, but the x70.4 was the first 30 s window
     // (loading panel at the full panel rate, skip off while loading) and the 211x173/633x519 passes are the round
@@ -2390,6 +2395,7 @@ final class KleptonCompositor {
                 NSLog("[cp] \(cadenceSummary())")
                 NSLog("[cp] \(stageSummary())")
                 logRefreshAccounting()
+                logCadenceHist()
             }
         }
         NSLog("[cp] render loop ended after \(presented) presented frames, "
@@ -2686,6 +2692,19 @@ final class KleptonCompositor {
         acctNew = 0; acctSameCap = 0; acctSameNotAllowed = 0; acctSameTiming = 0; acctBlack = 0
         acctSkipped = skippedTotal
         acctSince = now
+    }
+
+    /// Every ~1 s: how many refreshes each new guest picture stayed up before the next new one (1, 2, 3, 4, 5+), and the
+    /// refreshes the pacer expects per picture (panel Hz / the pacer's fps; 0 until both are measured). 2 and 3 mixed
+    /// at base=3 = a picture shown for 2 refreshes (a catch-up) next to the ones held for 4.
+    private func logCadenceHist() {
+        let now = Date()
+        guard now.timeIntervalSince(newGapSince) >= 1 else { return }
+        newGapSince = now
+        let fps = kl_guest_pace_fps(), hz = kl_guest_display_rate()
+        let base = fps > 1 && hz > 1 ? Int((hz / fps).rounded()) : 0
+        NSLog("[cp] cadence hist 1=\(newGapHist[1]) 2=\(newGapHist[2]) 3=\(newGapHist[3]) 4=\(newGapHist[4]) 5+=\(newGapHist[5]) base=\(base)")
+        newGapHist = [0, 0, 0, 0, 0, 0]
     }
 
     /// The guest's newest complete picture is the one the last composite showed.
@@ -3377,10 +3396,16 @@ final class KleptonCompositor {
         // shownPicture (above): what this composite showed, for the next refresh's skip check.
         // Build 54: account this composite (see acctNew). Classified before skippedInARow is reset: the cap reason
         // needs it.
+        refreshSerial += skippedInARow + 1
         if encoded == 0 {
             acctBlack += 1
+            lastNewSerial = 0   // like a loading panel: the next new picture has no previous one to measure from
         } else if shownPicture == 0 || shownPicture != lastPresentedPicture {
             acctNew += 1
+            if shownPicture != 0 {
+                if lastNewSerial > 0 { newGapHist[min(refreshSerial - lastNewSerial, 5)] += 1 }
+                lastNewSerial = refreshSerial
+            } else { lastNewSerial = 0 }   // a loading panel: the next picture has no previous one to measure from
         } else if Self.skipSameEnabled && skippedInARow >= Self.skipMax {
             acctSameCap += 1
         } else if !skipAllowed() {

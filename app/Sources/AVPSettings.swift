@@ -126,6 +126,10 @@ final class AVPSettings: ObservableObject {
     /// stays out of the prewarm signature (sigKeys).
     @Published var splitViews: Bool { didSet { save() } }
     private var splitViewsApplied = false
+    /// "Ritmo sin recuperación" (default on): after a late game frame the pacer re-phases to the next refresh instead of
+    /// going back to the original grid, which showed a picture for 2 refreshes right after the late one. KL_PACE_REPHASE
+    /// at launch, kl_app_set_pace_rephase live (applyLive). Changes no shader: stays out of the prewarm signature.
+    @Published var paceRephase: Bool { didSet { save() } }
     /// Build 43/44: the refresh rate the OpenVR shim tells Alyx (Prop_DisplayFrequency). Alyx steps its clock by
     /// 1/this per frame and fixes its tick interval to 1/this at map load (Logs_Alyx_32/3_2/2_11). `measured` (the
     /// default) = automatic since build 44: the pace governor's current rate, the base while loading
@@ -218,6 +222,7 @@ final class AVPSettings: ObservableObject {
         realFloor = d.object(forKey: "avp.realFloor") as? Bool ?? true
         occlusionQueries = d.object(forKey: "avp.occlusion") as? Bool ?? true
         splitViews = d.object(forKey: "avp.splitViews") as? Bool ?? false
+        paceRephase = d.object(forKey: "avp.paceRephase") as? Bool ?? true
         reportedHz = ReportedHz(rawValue: d.object(forKey: "avp.reportHz") as? Int ?? 0) ?? .measured
         runningStart = d.object(forKey: "avp.runStart") as? Bool ?? true
         subtitleSize = SubtitleSize(rawValue: d.object(forKey: "avp.subSize") as? Int ?? 0) ?? .small
@@ -260,6 +265,7 @@ final class AVPSettings: ObservableObject {
         d.set(realFloor, forKey: "avp.realFloor")
         d.set(occlusionQueries, forKey: "avp.occlusion")
         d.set(splitViews, forKey: "avp.splitViews")
+        d.set(paceRephase, forKey: "avp.paceRephase")
         d.set(reportedHz.rawValue, forKey: "avp.reportHz")
         d.set(runningStart, forKey: "avp.runStart")
         d.set(preset.rawValue, forKey: "avp.preset")
@@ -279,7 +285,7 @@ final class AVPSettings: ObservableObject {
         anisotropy = fresh.anisotropy; centerSharpness = fresh.centerSharpness; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao; msaa = fresh.msaa; frameRate = fresh.frameRate; handHoldPredict = fresh.handHoldPredict
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling; shaderKnock = fresh.shaderKnock
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
-        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries; splitViews = fresh.splitViews
+        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries; splitViews = fresh.splitViews; paceRephase = fresh.paceRephase
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
         reportedHz = fresh.reportedHz; runningStart = fresh.runningStart
         preset = fresh.preset
@@ -513,6 +519,7 @@ final class AVPSettings: ObservableObject {
             ("KL_VRR_SRGB_1X", "1"),   // build 42: always (B41 log: the A/B toggle left off = the B35 subtitle bug again)
             ("VPVK_OCCLUSION", occlusionQueries ? "1" : "0"),
             ("VPVK_SPLIT_VIEWS", splitViews ? "1" : "0"),
+            ("KL_PACE_REPHASE", paceRephase ? "1" : "0"),
             ("KLVR_REPORT_HZ_FIXED", reportedHz.env),
             // 3 = native half fetch + native unorm/snorm unpack (mask: 1 half, 2 unpack). Build 31 had native half fetch
             // alone (the translator's conversion is exact); logs 22: the scene pass is vertex-bound (vtx 11 ms).
@@ -600,10 +607,6 @@ final class AVPSettings: ObservableObject {
             // real cost (~13x the size on disk) and B65 in practice used ~1973 MB; with 768 the three largest files
             // (2614 pipelines) stayed unopened and their pipelines compiled in game (Logs_Alyx 26/10).
             env.append(("VP_PIPELINE_ARCHIVE_BUDGET_MB", "2048"))
-            // Diagnóstico: MSL de diez shaders concretos en Logs Alyx/msl (solo se escribe al traducir; el motor falla en silencio si la carpeta no existe).
-            try? fm.createDirectory(at: AVPLog.mslDir, withIntermediateDirectories: true)
-            env.append(("VPVK_DUMP_MSL", AVPLog.mslDir.path))
-            env.append(("VPVK_DUMP_MSL_FILTER", "126bc47d4e6c414d,b6a4cab50a7e6885,00f1f8923af66428,6c0df6983d86576e,7385e545396101f2,67b60e7af57442e3,6ff7c440c61864c0,dd8a021103b6b752,3128e2cb45ca97ea,3f839e3bf3de6d72"))
             env.append(("KL_VK_FOZ_GAME_REPLAY", cache.warm ? "0" : "1"))
         }
 
@@ -744,6 +747,7 @@ end, nil)
             // The round sharp zone follows the map, at its live periphery (degrees stay the launch's).
             KleptonCompositor.setRoundFovea(on: Self.roundSharpZone, degrees: nil, edge: Float(periphery))
         }
+        kl_app_set_pace_rephase(paceRephase ? 1 : 0)   // a C function of this binary (kl_app.c); logs "[pace] rephase" on a change
         applySplitViews()
         if splitViews != splitViewsApplied {
             splitViewsApplied = splitViews

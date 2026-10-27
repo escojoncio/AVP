@@ -314,6 +314,11 @@ struct AVPSettingsView: View {
                          "Draws each eye separately to ease the geometry; applied live")
                 }
                 VStack(alignment: .leading, spacing: 4) {
+                    Toggle(AVPL("Ritmo sin recuperación", "Pacing without catch-up"), isOn: $s.paceRephase)
+                    hint("Tras un fotograma tarde, el siguiente espera al refresco que le toca en lugar de adelantarse para recuperar (evita un fotograma de solo 2 refrescos). Recomendado: activado; en caliente",
+                         "After a late frame, the next one waits for its refresh instead of running ahead to catch up (avoids a frame shown for only 2 refreshes). Recommended: on; applied live")
+                }
+                VStack(alignment: .leading, spacing: 4) {
                     Button(AVPL("Restablecer shaders en cuarentena (\(quarantined))", "Reset quarantined shaders (\(quarantined))"),
                            role: .destructive) { confirmQuarantine = true }
                         .disabled(quarantined == 0)

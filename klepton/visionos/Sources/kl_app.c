@@ -955,27 +955,41 @@ static long long tv_us(long long s, long long us) { return s * 1000000 + us; }
 // Weak REFERENCES, not weak stubs defined here: the stubs may have won over the providers' strong definitions
 // (kl_gpu_time.m, klvr_platform_klepton.c, both in libklepton.a; unverified) and the line read "pace n/a" with the
 // regulator running. NULL where the providers are not linked.
+// game_ms is the game's own GPU ms per frame over the window (kl_gpu_time.m, without the compositor's), to set against thermal=.
+// rephased=<in the window>/<total>: late guest frames after which the pacer re-phased (guest_pace_wait, KL_PACE_REPHASE).
+// "pace n/a(zero)": the symbol is there and the regulator's seconds still read 0.
 extern double kl_gpu_time_busy_total_ms(void) __attribute__((weak_import));
+extern double kl_gpu_time_game_total_ms(unsigned *frames) __attribute__((weak_import));
 extern void klvr_plat_pace_stats(double s[2], unsigned c[5]) __attribute__((weak_import));
+static _Atomic unsigned g_pace_rephased;   // late guest frames the pacer re-phased after
+static _Atomic int g_pace_rephase = -1;    // -1: not read yet (KL_PACE_REPHASE, default on), else 0/1; kl_app_set_pace_rephase
 static void diag_game(char *out, size_t cap, double dt, int have) {
-    static double busy0, s0[2];
-    static unsigned c0[5];
+    static double busy0, gms0, s0[2];
+    static unsigned c0[5], gn0, rp0;
     double busy = &kl_gpu_time_busy_total_ms ? kl_gpu_time_busy_total_ms() : -1, s[2] = { 0, 0 };
-    unsigned c[5] = { 0, 0, 0, 0, 0 };
+    unsigned gn = 0, c[5] = { 0, 0, 0, 0, 0 };
+    const double gms = &kl_gpu_time_game_total_ms ? kl_gpu_time_game_total_ms(&gn) : -1;
     if (&klvr_plat_pace_stats) klvr_plat_pace_stats(s, c);
     int o = 0;
     if (busy < 0 || !have) o = snprintf(out, cap, " gpu n/a");
     else {
         const double b = (busy - busy0) / dt;
         o = snprintf(out, cap, " gpu busy=%.0f idle=%.0f", b, b < 1000 ? 1000 - b : 0);
+        if (gms >= 0 && gn > gn0) o += snprintf(out + o, cap - o, " game_ms=%.1f", (gms - gms0) / (gn - gn0));
+        else o += snprintf(out + o, cap - o, " game_ms=n/a");
     }
     const double dtot = s[0] + s[1] - s0[0] - s0[1];
-    if (!(s[0] + s[1] > 0) || !have) snprintf(out + o, cap - o, &klvr_plat_pace_stats ? " pace n/a" : " pace n/a(no symbol)");
+    if (!(s[0] + s[1] > 0) || !have)
+        o += snprintf(out + o, cap - o, !&klvr_plat_pace_stats ? " pace n/a(no symbol)" : have ? " pace n/a(zero)" : " pace n/a");
     else
-        snprintf(out + o, cap - o, " pace fb=%.0f%%/%.0f%% sw=%u/%u late=%u/%u miss=%u/%u",
-                 dtot > 0 ? 100.0 * (s[1] - s0[1]) / dtot : 0.0, 100.0 * s[1] / (s[0] + s[1]),
-                 c[0] - c0[0], c[0], c[1] - c0[1], c[2] - c0[2], c[3] - c0[3], c[4] - c0[4]);
+        o += snprintf(out + o, cap - o, " pace fb=%.0f%%/%.0f%% sw=%u/%u late=%u/%u miss=%u/%u",
+                      dtot > 0 ? 100.0 * (s[1] - s0[1]) / dtot : 0.0, 100.0 * s[1] / (s[0] + s[1]),
+                      c[0] - c0[0], c[0], c[1] - c0[1], c[2] - c0[2], c[3] - c0[3], c[4] - c0[4]);
+    const unsigned rp = atomic_load(&g_pace_rephased);
+    snprintf(out + o, cap - o, " rephased=%u/%u", rp - rp0, rp);
     busy0 = busy;
+    if (gms >= 0) { gms0 = gms; gn0 = gn; }
+    rp0 = rp;
     memcpy(s0, s, sizeof s0);
     memcpy(c0, c, sizeof c0);
 }
@@ -1000,7 +1014,7 @@ static void diag_tick(int ticks) {
     diag_thr cur[DIAG_THREADS];
     unsigned ncur = 0, ntop = 0;
     struct { mach_port_t act; double pct; } top[8];
-    char line[1024], game[192];
+    char line[1024], game[256];
     diag_game(game, sizeof game, dt, have);
     for (mach_msg_type_number_t i = 0; i < n; i++) {
         thread_basic_info_data_t bi;
@@ -1619,6 +1633,32 @@ void kl_guest_set_paused(int on) {
 }
 int kl_guest_paused(void) { return __atomic_load_n(&g_guest_paused, __ATOMIC_ACQUIRE); }
 
+// Re-phase after a late frame (KL_PACE_REPHASE, default on; live from the app's "Ritmo sin recuperación" setting).
+// The pacer counts publishes since the last release and coalesces (consumed = published), so a frame that comes back
+// late is released at once, between two publishes, and the next release is eff publishes after the LAST one: eff - f
+// refreshes later (f < 1 is how late), back on the original grid. The picture then gets a short interval (2 of 3) after
+// the late one. Re-phased, that late release also counts the NEXT publish as its own (`owed`), so the next frame comes
+// at least eff refreshes after the real moment, aligned to a refresh.
+static int pace_rephase_on(void) {
+    int v = atomic_load(&g_pace_rephase);
+    if (v < 0) {
+        int want = kl_env_uint("KL_PACE_REPHASE", 1) != 0, unset = -1;
+        if (atomic_compare_exchange_strong(&g_pace_rephase, &unset, want)) {
+            printf("[pace] rephase -> %s (KL_PACE_REPHASE)\n", want ? "on" : "off");
+            fflush(stdout);
+        }
+        v = atomic_load(&g_pace_rephase);
+    }
+    return v;
+}
+// Releases re-phased so far: the OpenVR shim's regulator (klvr_platform_klepton.c) skips the interval after one, which is
+// eff + 1 - f refreshes long on purpose and is no missed refresh.
+unsigned kl_app_pace_rephased(void) { return atomic_load(&g_pace_rephased); }
+void kl_app_set_pace_rephase(int on) {
+    const int want = on ? 1 : 0;
+    if (atomic_exchange(&g_pace_rephase, want) != want) { printf("[pace] rephase -> %s\n", want ? "on" : "off"); fflush(stdout); }
+}
+
 unsigned long long kl_vulkan_frame_serial(void);   // kl_vulkan.c: guest frames so far (0 before the first)
 static void guest_pace_wait(void) {
     while (__atomic_load_n(&g_guest_paused, __ATOMIC_ACQUIRE) && !g_guest.stop) usleep(20000);
@@ -1749,6 +1789,12 @@ static void guest_pace_wait(void) {
     ts.tv_sec += 1;
     pthread_mutex_lock(&g_guest.mu);
 #define KL_AVAIL() ((long long)(g_guest.published - g_guest.consumed) - owed)
+    // Already due on arrival (eff > 1: at 1 every frame is), so released at once: late, between two publishes. Not the
+    // first call, and not a resume (a pause leaves a backlog of publishes well over eff + 2): those are not late frames.
+    static int seen_first;
+    const int late = seen_first && eff > 1 && KL_AVAIL() >= (long long)eff
+                     && (long long)(g_guest.published - g_guest.consumed) <= (long long)eff + 2;
+    seen_first = 1;
     int early_release = 0;
     // B51: a lead at or past the refresh period is held at 90 % of it (it used to turn running start off).
     const double lead = period > 0 && lead_s >= period ? period * 0.9 : lead_s;
@@ -1781,6 +1827,7 @@ static void guest_pace_wait(void) {
     }
 #undef KL_AVAIL
     owed = early_release;
+    if (late && pace_rephase_on()) { owed = 1; atomic_fetch_add(&g_pace_rephased, 1); }
     // Coalesce, do not queue: everything published since the last frame is one
     // turn. A guest that is behind then skips frames — which reprojection covers
     // — rather than being owed a backlog it can never work off.

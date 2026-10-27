@@ -245,4 +245,12 @@ void kl_app_memprobe(const char *resources, const char *container);
 void kl_guest_set_paused(int on);
 int  kl_guest_paused(void);
 
+// What the guest pacer holds now in fps (0 when not measured yet) and the panel rate it divides (0 until the compositor latched one);
+// the compositor's "[cp] cadence hist" derives its base (refreshes per picture) from them.
+float kl_guest_pace_fps(void);
+float kl_guest_display_rate(void);
+
+// The pacer's re-phase after a late guest frame (KL_PACE_REPHASE, default on): live switch, any thread. Logs "[pace] rephase -> on|off".
+void kl_app_set_pace_rephase(int on);
+
 #endif

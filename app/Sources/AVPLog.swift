@@ -27,13 +27,6 @@ enum AVPLog {
     /// The previous launch's game console (kl_app.c keep_previous_console moves it here before the game starts):
     /// after a crash, the next launch would otherwise start that file over and lose the game's last words.
     static var consolePreviousLog: URL { directory.appendingPathComponent("console-previous.log") }
-    /// MSL of the shaders VPKEngine dumps for diagnosis (VPVK_DUMP_MSL, AVPSettings): <id>.<stage>.metal.
-    static var mslDir: URL { directory.appendingPathComponent("msl", isDirectory: true) }
-    static var mslFiles: [URL] {
-        ((try? FileManager.default.contentsOfDirectory(at: mslDir, includingPropertiesForKeys: nil)) ?? [])
-            .filter { $0.pathExtension == "metal" }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-    }
     /// One boot/crash log per graphics engine (kl_app.c, KL_LOG_TAG), plus each one's previous run.
     static var engineLogs: [URL] {
         ["vpkengine", "moltenvk"].flatMap { e in
@@ -52,7 +45,7 @@ enum AVPLog {
         try? FileManager.default.removeItem(at: previousLog)
         try? FileManager.default.moveItem(at: appLog, to: previousLog)
         for old in captures { try? FileManager.default.removeItem(at: old) }
-        // Logs of earlier builds' names (untagged, and the engine's old name): they only confuse a shared folder.
+        // Logs of earlier builds' names (untagged, and the engine's old name; the msl shader dump folder): they only confuse a shared folder.
         for name in legacyNames { try? FileManager.default.removeItem(at: directory.appendingPathComponent(name)) }
         FileManager.default.createFile(atPath: appLog.path, contents: nil)
         handle = try? FileHandle(forWritingTo: appLog)
@@ -71,7 +64,7 @@ enum AVPLog {
 
     private static let mirrorLock = NSLock()
     private static let legacyNames = ["klepton-boot.log", "klepton-boot.prev.log", "klepton-crash.log", "klepton-boot-vpengine.log",
-                                      "klepton-boot-vpengine.prev.log", "klepton-crash-vpengine.log"]
+                                      "klepton-boot-vpengine.prev.log", "klepton-crash-vpengine.log", "msl"]
     nonisolated(unsafe) private static var mirrorTimer: DispatchSourceTimer?
 
     /// While the game runs: the logs are copied to the AVP folder every 20 s, so a zip taken during or after a
@@ -97,23 +90,13 @@ enum AVPLog {
             try? FileManager.default.removeItem(at: dest)
             try? FileManager.default.copyItem(at: url, to: dest)
         }
-        let msl = mslFiles
-        if !msl.isEmpty {
-            let mslDest = dir.appendingPathComponent("msl", isDirectory: true)
-            try? FileManager.default.createDirectory(at: mslDest, withIntermediateDirectories: true)
-            for url in msl {
-                let dest = mslDest.appendingPathComponent(url.lastPathComponent)
-                try? FileManager.default.removeItem(at: dest)
-                try? FileManager.default.copyItem(at: url, to: dest)
-            }
-        }
     }
 
     /// The logs that exist, for the share button.
     static var shareable: [URL] {
         all
             .filter { FileManager.default.fileExists(atPath: $0.path) }
-            + captures + mslFiles
+            + captures
     }
 
     /// Frame captures written by the compositor (capture-<frame>-*.png).

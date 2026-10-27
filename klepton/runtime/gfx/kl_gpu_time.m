@@ -3191,6 +3191,13 @@ void kl_gpu_time_watch_compositor(void *mtl_queue) { watch(mtl_queue, 1); }
 // line; read from another thread, a torn read only skews one line.
 static double g_busy_total_ms;
 double kl_gpu_time_busy_total_ms(void) { return g_commit ? g_busy_total_ms : -1.0; }
+// The game's own GPU ms (without the compositor's) and the frames they add up over, for the [diag] line's game_ms=.
+static double g_game_total_ms;
+static unsigned g_game_total_n;
+double kl_gpu_time_game_total_ms(unsigned *frames) {
+    if (frames) *frames = g_game_total_n;
+    return g_commit ? g_game_total_ms : -1.0;
+}
 
 void kl_gpu_time_frame_end(void) {
     os_unfair_lock_lock(&g_lk);
@@ -3216,6 +3223,7 @@ void kl_gpu_time_frame_end(void) {
     if (f && f != last_f) {
         last_f = f; sum += ms; csum += comp; craw += g_comp_raw_last; n++; if (ms > worst) worst = ms;
         g_busy_total_ms += ms + comp;
+        g_game_total_ms += ms; g_game_total_n++;
         if (prof_in(f)) { g_prof_union += ms; g_prof_union_n++; }   // the profiled window's own [gputime]
     }
     // KL_GPU_TIME_LOG: the report interval in seconds (default 5).

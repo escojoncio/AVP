@@ -164,6 +164,7 @@ __attribute__((weak)) void kl_guest_pace_extra(unsigned extra) { (void)extra; }
 float kl_guest_display_rate(void);
 __attribute__((weak)) float kl_guest_display_rate(void) { return 0; }
 extern float kl_guest_pace_fps(void) __attribute__((weak_import));   // only the visionOS app (kl_app.c) defines it
+extern unsigned kl_app_pace_rephased(void) __attribute__((weak_import));   // same: releases the pacer re-phased so far
 static unsigned g_pace_extra;
 static float g_plan_panel;   // the panel rate pace_plan last planned from (hand prediction, B56)
 static void pace_plan(float *base, float *fallback) {
@@ -284,9 +285,8 @@ static void pace_governor(void) {
     if (on == 2) {                                   // fixed steady pace: the fallback whenever there is one
         unsigned w = fb > 0;
         if (g_pace_extra != w) { g_pace_extra = w; kl_guest_pace_extra(w); }
-        return;
-    }
-    if (fb <= 0) {                                   // no slower pace to choose: stay at the base
+        // No return: the windows below also feed the [diag] late/miss counts (they stop short of any decision)
+    } else if (fb <= 0) {                            // no slower pace to choose: stay at the base
         if (g_pace_extra) { g_pace_extra = 0; kl_guest_pace_extra(0); }
         started = 0;
         return;
@@ -299,7 +299,7 @@ static void pace_governor(void) {
     static int measured;
     if (game > 0) measured = 1;
     if (!measured) return;
-    if (!started) {
+    if (!started && on == 1) {
         started = 1; g_pace_extra = 1; kl_guest_pace_extra(1);
         fprintf(stderr, "  [openvr] pace governor: starting at the fallback, %.1f fps\n", fb);
     }
@@ -313,7 +313,18 @@ static void pace_governor(void) {
     {
         double tc = klvr_plat_now(), dtc = prev_call > 0 ? (tc - prev_call) * 1000.0 : 0;
         prev_call = tc;
-        if (dtc > 0 && dtc < 250.0) { nc++; if (!g_pace_extra && dtc > 1.25 * 1000.0 / base && dtc < 3.0 * 1000.0 / base) clate++; }
+        // Against the pace the game is held at: at the fallback too, so the [diag] miss count is not 0 there (the base
+        // branch of the decision below only reads it with g_pace_extra == 0, where this is the base period as before).
+        const double pms = 1000.0 / (g_pace_extra && fb > 0 ? fb : base);
+        // The interval after a re-phased release (kl_app.c guest_pace_wait, KL_PACE_REPHASE) is longer on purpose: the
+        // re-phase happens in wait k, is seen here at call k+1, and the long wait is in k+1, so call k+2 measures it.
+        // Skipped, not counted as a miss. Never changes with the re-phase off.
+        static unsigned rp_seen;
+        static int rp_hist;
+        const unsigned rp = &kl_app_pace_rephased ? kl_app_pace_rephased() : 0;
+        rp_hist = ((rp_hist << 1) | (rp != rp_seen)) & 3;
+        rp_seen = rp;
+        if (dtc > 0 && dtc < 250.0 && !(rp_hist & 2)) { nc++; if (dtc > 1.25 * pms && dtc < 3.0 * pms) clate++; }
     }
     if (game > 0) {
         // The compositor draws once per panel refresh; at the fallback pace a frame
@@ -337,6 +348,7 @@ static void pace_governor(void) {
     t0 = now; sum = 0; comp_sum = 0; n = 0; late = 0; nexcl = 0; clate = 0; nc = 0;
     if (!nn) return;
     g_pstat.c[1] += nl; g_pstat.c[2] += nn; g_pstat.c[3] += ncl; g_pstat.c[4] += ncc;
+    if (on == 2) return;                             // fixed pace: counted, nothing to decide
     unsigned want = g_pace_extra;
     // Build 31 (Logs 22): at 100 Hz the choice is 50 or 33 and nothing between. The base was left after ONE
     // second with 2 late frames of 51 (3.9 %) at a 16 ms average, and taken back 5 s later: 33 fps most of
