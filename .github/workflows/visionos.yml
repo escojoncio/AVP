@@ -36,8 +36,8 @@ jobs:
           fetch-depth: 1
       - name: AVP's VPKEngine patches
         run: |
-          git -C vpkengine config user.email ci@localhost
-          git -C vpkengine config user.name ci
+          git -C vpkengine config user.email noreply@anthropic.com
+          git -C vpkengine config user.name Claude
           bash scripts/apply-vpkengine-patches.sh vpkengine vpkengine-patches
       - name: Xcode
         run: |
