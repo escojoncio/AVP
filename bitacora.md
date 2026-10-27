@@ -8,7 +8,7 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
-- B77 (`a6536dc`, SIN COMPILAR: CI no arrancó por facturación de GitHub Actions; relanzar con dispatch manual).
+- B77 (`a6536dc`): compilada, sin verificar en visor.
   Motor sigue `493d7da`. Pacer `kl_app.c` guest_pace_wait ~1779-1823: antes, un frame tarde se liberaba al instante
   y el siguiente volvía a la rejilla (hueco eff−f). Ahora re-fase: tras tarde (`late`, con seen_first y avail≤eff+2)
   owed=1 → el siguiente ≥eff desde el real; `kl_app_set_pace_rephase`/`KL_PACE_REPHASE` (defecto 1), toggle «Ritmo
