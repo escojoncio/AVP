@@ -8,6 +8,14 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
+- PROYECTO EN PAUSA (decisión del usuario). Conclusión medida: cuello = geometría del pase principal (~7,6M
+  vértices-vista/frame, ~3,78M por vista, HeavyGeometry >3M heurístico), no píxeles: MSAA2/70 % y MSAA4/60 % no
+  mejoran (Logs_Alyx_20: 60 %, juego 15–17 ms, 8 saltos 50↔33 en ~3 min = trompicones, fair a ~2 min).
+  Logs_Alyx_19 (B76): split views ON sin efecto: pase principal `not_amplified` (pocos draws por instancing) y
+  además still_heavy (3,78M/vista). Pendiente si se retoma: B77 = motor `b64e9f9` (umbral tile en caliente con
+  frame canario `vpgpu_metal2_set_tile_max_vertices`, `gpu.amp` por razón) + toggle en AVP (NO hecho; vpkengine.ref
+  sigue en `2994d15`); ganancia esperada baja (diagnóstico). Única palanca grande = LOD (baja calidad: descartado).
+  `[diag]` sigue `pace n/a` (weak_import no resolvió; sin investigar).
 - B76 (`ae4087c`): motor `2994d15` = split views: `VPVK_SPLIT_VIEWS`/`vpgpu_metal2_set_split_views` (en caliente, por
   frame): pase multiview 2 capas amplificado, elegible (frame_compiler.cpp splitBlocker ~597) y HeavyGeometry →
   2 encoders (slice v, renderTargetArrayLength 1, amp 1, vs `+ vp_view_base [[buffer(27)]]`, kEmitVersion 3); no parte
@@ -22,17 +30,6 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   HeavyGeometry, ~4,14M vértices-vista, attachments con memoria → probable partial render del tiler; unverified).
   El pase MSAA YA está foveado por Klepton (kl_gpu_time.m ~1735 vrr_fov_map, 36 % físico); el `decline msaa` del
   motor es su foveado propio, no usado en AVP. gpu.tex 2,28 GB todo BC nativo. CPU sin spin; RAM pico 5,85 GB.
-- B75 (`6edfa37`): motor `93147c6`. Diagnóstico siempre activo: `kl_app.c` diag_tick (~933, llamada en heartbeat ~1060)
-  línea `[diag]` 10 s a stderr: `cpu proc= thr= top:` 8 hilos (delta user+sys, `[spin?]` >80 % con nombre wait/pace/
-  compositor/present), `gpu busy= idle=` (`kl_gpu_time_busy_total_ms`, -1 → n/a), `pace fb=%/% sw= late= miss=`
-  (`klvr_plat_pace_stats`), `mem foot= peak= avail_min=`, `thermal= t=`. Motor: `gpu.tex live= mb= ml= by:` cada 60 s
-  (metal_backend.mm texLive/texLine ~1802). Knockout fsr (`VP_KNOCK_FSR`, on con knock): pase extra con fs trivial
-  `vp_knock_fs` → `fsr_ms= fsr_frag=` (coste puro de fragment, misma cobertura). Filtro MSL +4 fs top B74.
-- Logs_Alyx_17 (B74, ~3 min, nominal→fair a 1,5 min): purga OK (`0->0|trl3e2: purged 25`); 20 compilaciones en juego;
-  juego 15,3–18,6 ms por ventana (sin ganancia apreciable vs B73). gpu.excl busy 538/idle 462 ms/s a 33 fps. Pase MSAA
-  13,3 ms (1013 draws, vtx 4,1/frag 9,2). Sombras (D32F 1024², fmt=-) <0,4 ms. Knock partial_frames=0: r1 pipe122
-  fs 6ff7c440c61864c0 3,8 draws d 6,77 (frag 4,74) unstable=0 → posible real (superficies grandes); r2 fs dd8a0211
-  124 draws 2,11; r3 3128e2cb 1,37. Falta ~1,5–2 ms para 50 fps estables (bajada con 2 ventanas >19,0).
 - Logs_Alyx_16 (B73, 2m23s, nominal): `vk.robust app=0 mode=0 effective=0`; 0 errores; ~34 compilaciones en juego (max
   20,6 ms). Los 7 ms de B72 eran ARTEFACTO (frames con encoder dominante sin timestamp → base/knock ≈6,8 = medio frame).
   Real: reparto plano; top estable fs `00f1f892` (124 draws, d 2,1 ms, frag 1,5), `c02393ed` 1,7. MSL volcado de 3 fs:
@@ -125,7 +122,7 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   Después A/B `VPVK_ASYNC_PIPELINES=0` y `VPVK_MSAA_TILE=0`.
 - VPKEngine main = `3f7da04` (fast-forward de `avp-port-main`; VisionQuestPro avisado para subir su ref). `avp-port` remoto obsoleto (base vieja).
 - Pendiente: Steam en guest (`steamclient.so` no encontrado).
-- Próximo objetivo: B76 A/B split ON/OFF misma zona (gpu.excl pase MSAA, gpu.split reason, [vrr] split view sin DIFFER).
+- Próximo objetivo: ninguno (pausa). Ver primera entrada de Últimos hechos.
 - Problema abierto: zona pesada juego ~23 ms > umbral (17 ms a 100 Hz, 18,9 a 90 Hz); térmico.
 
 ## Decisiones vigentes
