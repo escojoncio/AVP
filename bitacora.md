@@ -4,10 +4,20 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` = rama `avp-port-main`, **sin parches**: `vpkengine-patches/` vacío; cambios del
 motor se hacen en VPKEngine, mapa en su bitácora). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B76**, sin verificar en visor).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última compilada: **B76**; B77 pendiente de CI).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
+- B77 (`60bde75`, SIN COMPILAR: CI no arrancó por facturación de GitHub Actions; relanzar con dispatch manual).
+  Motor sigue `2994d15`. Pacer `kl_app.c` guest_pace_wait ~1779-1823: antes, un frame tarde se liberaba al instante
+  y el siguiente volvía a la rejilla (hueco eff−f). Ahora re-fase: tras tarde (`late`, con seen_first y avail≤eff+2)
+  owed=1 → el siguiente ≥eff desde el real; `kl_app_set_pace_rephase`/`KL_PACE_REPHASE` (defecto 1), toggle «Ritmo
+  sin recuperación»; regulador ignora el intervalo re-fasado (`kl_app_pace_rephased`, klvr_platform_klepton.c ~318).
+  Coste: con lateness marginal sostenida el ritmo medio baja (~eff+0,5). `[cp] cadence hist 1= 2= 3= 4= 5+= base=`.
+  Modo fijo 30/33 ya alimenta ventanas late/miss. [diag] `pace n/a(zero)` (causa de suma 0 sin resolver), rephased=,
+  game_ms=. Quitado VPVK_DUMP_MSL; carpeta msl en legacyNames (se borra).
+- Logs_Alyx_21 (B76, modo 30/33 fijo, 100 Hz): juego avg 22,25 ms (máx ventana 34,5) > 30 ms a veces → 42/95 s con
+  <32 frames nuevos (repetidos) y 11/95 con >33,5 (recuperación probable). Sin métrica de intervalos (añadida en B77).
 - PROYECTO EN PAUSA (decisión del usuario). Conclusión medida: cuello = geometría del pase principal (~7,6M
   vértices-vista/frame, ~3,78M por vista, HeavyGeometry >3M heurístico), no píxeles: MSAA2/70 % y MSAA4/60 % no
   mejoran (Logs_Alyx_20: 60 %, juego 15–17 ms, 8 saltos 50↔33 en ~3 min = trompicones, fair a ~2 min).
@@ -25,11 +35,6 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   (applyLive + primer frame, `AVPSettings.applySplitViews`); `kl_gpu_time.m` `kl_vrr_set_split_views`: con split,
   mapa VRR de 1 capa = capa v (cx[v]); se publica el de 2 capas; log `[vrr] split view`. Diag: weak_import pace/gpu,
   `klb_prctl` PR_SET_NAME → nombres de hilo. translator `l3e3`.
-- Logs_Alyx_18 (B75, 4m22s, fair a t≈170 s): knock fsr: pipe5336 (6 draws) skip −7,03 / fs trivial −0,12;
-  pipe5184 (140) −6,89 / −1,12; pipe5262 (5) −6,60 / −0,25 → NO es coste de fs: acantilado de geometría (pase
-  HeavyGeometry, ~4,14M vértices-vista, attachments con memoria → probable partial render del tiler; unverified).
-  El pase MSAA YA está foveado por Klepton (kl_gpu_time.m ~1735 vrr_fov_map, 36 % físico); el `decline msaa` del
-  motor es su foveado propio, no usado en AVP. gpu.tex 2,28 GB todo BC nativo. CPU sin spin; RAM pico 5,85 GB.
 - Logs_Alyx_16 (B73, 2m23s, nominal): `vk.robust app=0 mode=0 effective=0`; 0 errores; ~34 compilaciones en juego (max
   20,6 ms). Los 7 ms de B72 eran ARTEFACTO (frames con encoder dominante sin timestamp → base/knock ≈6,8 = medio frame).
   Real: reparto plano; top estable fs `00f1f892` (124 draws, d 2,1 ms, frag 1,5), `c02393ed` 1,7. MSL volcado de 3 fs:
