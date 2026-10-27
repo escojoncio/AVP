@@ -1,4 +1,5 @@
 // See kl_app.h.
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach.h>          // task_info(TASK_VM_INFO) — the heartbeat's footprint
@@ -133,6 +134,15 @@ static void *stall_dump_thread(void *arg) {
              "(merges %u, real ends %u)", secs, held, merged, flushed);
     fprintf(stderr, "[stall] %s\n", why);
     kl_sample_snapshot(stderr, why);
+    // What the game could be waiting on in VPKEngine's driver (vk.pending lines: polled fences / events / timeline
+    // semaphores / queries still "not yet", pipelines compiling, command buffers in flight). The driver was dlopen'ed
+    // RTLD_LOCAL (kl_vulkan.c): RTLD_NOLOAD on its path finds the loaded image.
+    const char *vkpath = getenv("KL_MVK_DYLIB");
+    void *vkh = vkpath && *vkpath ? dlopen(vkpath, RTLD_NOW | RTLD_NOLOAD) : NULL;
+    void (*dump_pending)(void) = (void (*)(void))dlsym(vkh ? vkh : RTLD_DEFAULT, "vpvk_dump_pending");
+    if (dump_pending) dump_pending();
+    else fprintf(stderr, "[stall] vpvk_dump_pending not found in the Vulkan driver\n");
+    // no dlclose: NOLOAD handle; closing could unload the driver mid-game
     return NULL;
 }
 void kl_guest_stall_check(unsigned stale) {
