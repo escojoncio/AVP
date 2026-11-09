@@ -4,13 +4,20 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` = rama `avp-port-main`, **sin parches**: `vpkengine-patches/` vacío; cambios del
 motor se hacen en VPKEngine, mapa en su bitácora). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B77**, sin verificar en visor).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B79**, sin verificar en visor).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
-- B78: motor `38d6fef` (`vpvk_dump_pending`, prefijo `vk.pending`: fences/eventos/timelines/queries consultados
-  sin éxito en 2 s, PSO pendientes, submits en vuelo, gpu.hang de metal2; no bloqueante). `kl_app.c` stall_dump_thread
-  ~140 lo llama por dlsym en los stalls de 5/15 s (sin dlclose).
+- B79: motor `ede5a89` (main; >480 commits desde `38d6fef`, historial reescrito; traductor kLowerVersion 13 /
+  kEmitVersion 12 / kDriverVersion 1). `AVPPrepare.swift` ~522 marcador `translator` "l13e12" (purga única de recetas;
+  subirlo si cambian lower/emit). Nuevo `VPVK_AMPLIFY_CLIP` (opt-in, solo con `VPVK_AMPLIFY=1`): vertex shaders con
+  ClipDistance independiente de la vista siguen amplificados → el pase principal podría pasar de `not_amplified` a ok
+  con «Un pase por ojo»; toggle «Amplificación con recorte (experimental)» (`amplifyClip`, `avp.amplifyClip`). Mirar
+  `gpu.split reason`, `gpu.amp`, `gpu.mem.rt`. El motor activa `VPVK_INVARIANT_POS` por defecto (`[[position, invariant]]`,
+  coste sin medir): toggle «Posición invariante» (`invariantPos`, defecto ON; apagado exporta `=0`; `AVPLaunch.swift` ~56
+  hace `unsetenv` antes). `warm.stamp` incluye clip/invariante solo si no son los valores por defecto. Sin medir en visor.
+- B78: motor `38d6fef` (`vpvk_dump_pending`, prefijo `vk.pending`: fences/eventos/timelines/queries sin éxito en 2 s, PSO
+  pendientes, submits en vuelo). `kl_app.c` stall_dump_thread ~140 lo llama por dlsym en los stalls de 5/15 s.
 - Logs_Alyx_22 (B77): al abrir el menú de pausa (`[Client] unnamed paused the game` 23:05:01) el juego dejó de
   enviar frames (stall 5 s y 15 s → negro). Hilo 0xa963: libengine2→libclient→libpanorama→libresourcesystem→
   librendersystemvulkan→cond_wait; VKRenderThread y pools ociosos. Primera vez (pausas OK en B76). Causa sin
@@ -30,18 +37,12 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   mejoran (Logs_Alyx_20: 60 %, juego 15–17 ms, 8 saltos 50↔33 en ~3 min = trompicones, fair a ~2 min).
   Logs_Alyx_19 (B76): split views ON sin efecto: pase principal `not_amplified` (pocos draws por instancing) y
   además still_heavy (3,78M/vista). Pendiente si se retoma: B77 = motor `ff68e9f` (umbral tile en caliente con
-  frame canario `vpgpu_metal2_set_tile_max_vertices`, `gpu.amp` por razón) + toggle en AVP (NO hecho; vpkengine.ref
-  sigue en `493d7da`); ganancia esperada baja (diagnóstico). Única palanca grande = LOD (baja calidad: descartado).
+  frame canario `vpgpu_metal2_set_tile_max_vertices`, `gpu.amp` por razón) + toggle en AVP (NO hecho); ganancia
+  esperada baja (diagnóstico). Única palanca grande = LOD (baja calidad: descartado).
   `[diag]` sigue `pace n/a` (weak_import no resolvió; sin investigar).
-- Logs_Alyx_16 (B73, 2m23s, nominal): `vk.robust app=0 mode=0 effective=0`; 0 errores; ~34 compilaciones en juego (max
-  20,6 ms). Los 7 ms de B72 eran ARTEFACTO (frames con encoder dominante sin timestamp → base/knock ≈6,8 = medio frame).
-  Real: reparto plano; top estable fs `00f1f892` (124 draws, d 2,1 ms, frag 1,5), `c02393ed` 1,7. MSL volcado de 3 fs:
-  sin sample-rate, sin [[depth]], coste propio de Alyx (≈30 samples, PCF 4 taps ×3 cascadas, bucle de luces).
-  Juego mediana ~16,1 ms; regulador correcto: baja con 2 ventanas >19,0 ms (0,95·20) y sube <18,4; carga real 17–19,5.
-- B71: motor `6344a7e`. B70 medía el knockout en menú/carga (arrancaba al inicio). Ahora: L3+R3 en partida con
-  «Diagnóstico de coste por shader» → `vpgpu_metal2_knock_arm` (`KleptonControllers.swift stickClick` ~574, prioridad
-  sobre FrameCapture); HUD de pasos head-locked capa -97 (`KleptonCompositor.swift` knockHudTick/drawKnockHud, sondeo
-  4 Hz de `vpgpu_metal2_knock_progress`, se oculta 20 s tras terminar).
+- Logs_Alyx_16 (B73): reparto de shaders plano; coste propio de Alyx (≈30 samples, PCF 4 taps ×3 cascadas, bucle de
+  luces); regulador correcto (baja con 2 ventanas >19,0 ms, sube <18,4). Knockout: L3+R3 en partida con
+  «Diagnóstico de coste por shader» (`KleptonControllers.swift stickClick` ~574; HUD `KleptonCompositor.swift` drawKnockHud).
 - B70: motor `0122e9d` (unpack nativo de vértices, kill-exit, buffers inmutables, `VP_KNOCK`; detalle en bitácora de
   VPKEngine). `AVPSettings.swift`: `VPVK_FETCH_NATIVE=3` (~509; cambia translator id → retraducción + prewarm en 1.er
   arranque); ajuste «Diagnóstico de coste por shader» (`shaderKnock`, `avp.shaderKnock`) → `VP_KNOCK=auto` + fuerza
@@ -121,7 +122,8 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
 - Verificar B66 en visor: arranque/retraducción, imagen (dual-source, render area, occlusion), `[cp] cb` por pase con
   «Medir GPU por pase», RAM pico vs B65 (6368 MB) y `used_mb` ≤1280, 0 `gpu.err code=7` al salir, `gpu.pso.miss`.
   Después A/B `VPVK_ASYNC_PIPELINES=0` y `VPVK_MSAA_TILE=0`.
-- VPKEngine main = `a74ffba` (fast-forward de `avp-port-main`; VisionQuestPro avisado para subir su ref). `avp-port` remoto obsoleto (base vieja).
+- `vpkengine.ref` = VPKEngine main `ede5a89` (B79). Pendiente de medir en visor: `VPVK_AMPLIFY_CLIP` con split views, y A/B de
+  `VPVK_INVARIANT_POS`; cuelgue al pausar sin causa confirmada (el motor trae cambios en pipelines async/timeline semaphores).
 - Pendiente: Steam en guest (`steamclient.so` no encontrado).
 - Próximo objetivo: si se repite el negro al pausar, leer `vk.pending` del stall y arreglar la señal que falta.
 - Problema abierto: zona pesada juego ~23 ms > umbral (17 ms a 100 Hz, 18,9 a 90 Hz); térmico.
