@@ -522,7 +522,7 @@ enum AVPPipelineCache {
     static let translator = "l13e12"
 
     static func configure(data: URL, pipelines: URL, engine: String, engineSignature: String = "", archive: Bool = false,
-                          robust: String = "default") -> State {
+                          robust: String = "default", warmVariant: String = "") -> State {
         let fm = FileManager.default
         let dir = data.appendingPathComponent("vpcache", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -567,7 +567,7 @@ enum AVPPipelineCache {
         // The OS version too: Metal binary archives and the system's shader cache are only valid for the OS (and GPU
         // driver) that wrote them.
         let os = ProcessInfo.processInfo.operatingSystemVersionString
-        let key = "avp-vpcache-2|vpvulkan \(driver)|list \(list)|os \(os)|archive \(archiveOff ? "off" : "on")"
+        let key = "avp-vpcache-2|vpvulkan \(driver)|list \(list)|os \(os)|archive \(archiveOff ? "off" : "on")\(warmVariant)"   // warmVariant: "" with the defaults, so the key is unchanged
         // The previous boot log is judged only if that session ran with this same key (last.key, written below for
         // the session about to start): after a new driver, list or OS its misses say nothing about this cache.
         let lastKeyURL = dir.appendingPathComponent("last.key")

@@ -319,6 +319,11 @@ struct AVPSettingsView: View {
                          "Vertex shaders with clipping that does not depend on the eye stay amplified. Meant to be tried together with «One pass per eye» to take the main pass out of HeavyGeometry; not measured on the headset. Only acts with vertex amplification on. Recommended: off. Applied at game start.")
                 }
                 VStack(alignment: .leading, spacing: 4) {
+                    Toggle(AVPL("Posición invariante (desactivar para probar rendimiento)", "Invariant position (turn off to test performance)"), isOn: $s.invariantPos)
+                    hint("El motor la fuerza para evitar z-fighting entre pases. Desactivarla puede dar más rendimiento en geometría pesada, pero puede causar parpadeo de profundidad; sin medir en el visor. Recomendado: activado. Se aplica al arrancar el juego.",
+                         "The engine forces it to avoid z-fighting between passes. Turning it off may give more performance on heavy geometry, but can cause depth flicker; not measured on the headset. Recommended: on. Applied at game start.")
+                }
+                VStack(alignment: .leading, spacing: 4) {
                     Toggle(AVPL("Ritmo sin recuperación", "Pacing without catch-up"), isOn: $s.paceRephase)
                     hint("Tras un fotograma tarde, el siguiente espera al refresco que le toca en lugar de adelantarse para recuperar (evita un fotograma de solo 2 refrescos). Recomendado: activado; en caliente",
                          "After a late frame, the next one waits for its refresh instead of running ahead to catch up (avoids a frame shown for only 2 refreshes). Recommended: on; applied live")

@@ -129,8 +129,13 @@ final class AVPSettings: ObservableObject {
     /// Experimental (VPKEngine ede5a89, off): with VPVK_AMPLIFY=1, vertex shaders whose ClipDistance does not depend on the
     /// view stay amplified instead of going back to instancing. Meant to be tried with splitViews to take the main pass out
     /// of HeavyGeometry; not measured on the headset. VPVK_AMPLIFY_CLIP at launch only, and only when `amplify` is on. It
-    /// changes the MSL (translator mode), so it enters the recipe signature (sigKeys) when on.
+    /// changes the MSL (translator mode), so it enters the quarantine signature when on.
     @Published var amplifyClip: Bool { didSet { save() } }
+    /// Experimental (VPKEngine ede5a89, default on = the engine's behaviour): gl_Position invariant in the vertex shaders, which
+    /// the engine forces to avoid z-fighting between passes. Off may give more speed on heavy geometry but can flicker the
+    /// depth; not measured on the headset. VPVK_INVARIANT_POS=0 at launch, exported only when off. It changes the MSL, so it
+    /// enters the quarantine signature when off.
+    @Published var invariantPos: Bool { didSet { save() } }
     /// "Ritmo sin recuperación" (default on): after a late game frame the pacer re-phases to the next refresh instead of
     /// going back to the original grid, which showed a picture for 2 refreshes right after the late one. KL_PACE_REPHASE
     /// at launch, kl_app_set_pace_rephase live (applyLive). Changes no shader: stays out of the prewarm signature.
@@ -228,6 +233,7 @@ final class AVPSettings: ObservableObject {
         occlusionQueries = d.object(forKey: "avp.occlusion") as? Bool ?? true
         splitViews = d.object(forKey: "avp.splitViews") as? Bool ?? false
         amplifyClip = d.object(forKey: "avp.amplifyClip") as? Bool ?? false
+        invariantPos = d.object(forKey: "avp.invariantPos") as? Bool ?? true
         paceRephase = d.object(forKey: "avp.paceRephase") as? Bool ?? true
         reportedHz = ReportedHz(rawValue: d.object(forKey: "avp.reportHz") as? Int ?? 0) ?? .measured
         runningStart = d.object(forKey: "avp.runStart") as? Bool ?? true
@@ -272,6 +278,7 @@ final class AVPSettings: ObservableObject {
         d.set(occlusionQueries, forKey: "avp.occlusion")
         d.set(splitViews, forKey: "avp.splitViews")
         d.set(amplifyClip, forKey: "avp.amplifyClip")
+        d.set(invariantPos, forKey: "avp.invariantPos")
         d.set(paceRephase, forKey: "avp.paceRephase")
         d.set(reportedHz.rawValue, forKey: "avp.reportHz")
         d.set(runningStart, forKey: "avp.runStart")
@@ -292,7 +299,7 @@ final class AVPSettings: ObservableObject {
         anisotropy = fresh.anisotropy; centerSharpness = fresh.centerSharpness; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao; msaa = fresh.msaa; frameRate = fresh.frameRate; handHoldPredict = fresh.handHoldPredict
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling; shaderKnock = fresh.shaderKnock
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
-        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries; splitViews = fresh.splitViews; amplifyClip = fresh.amplifyClip; paceRephase = fresh.paceRephase
+        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries; splitViews = fresh.splitViews; amplifyClip = fresh.amplifyClip; invariantPos = fresh.invariantPos; paceRephase = fresh.paceRephase
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
         reportedHz = fresh.reportedHz; runningStart = fresh.runningStart
         preset = fresh.preset
@@ -551,6 +558,7 @@ final class AVPSettings: ObservableObject {
             // El juego no pide robustBufferAccess: sin comprobaciones de límites en los SSBO del MSL (cambia las claves de las recetas: retraducción y prewarm en el primer arranque).
             ("VPVK_ROBUST", "0"),
         ]
+        if !invariantPos { env.append(("VPVK_INVARIANT_POS", "0")) }   // engine ede5a89: on by default, so nothing is exported when on
         // VPKTAA inputs not usable yet (build 17 log): VPKEngine's motion vectors are all zero (its "eye frame"
         // restarts at every depth-clearing multiview pass, 4-7 per game frame, so no draw ever finds last frame's
         // data) yet are flagged as full screen motion, which turns the reprojection OFF; and the eye depth needs a
@@ -607,9 +615,12 @@ final class AVPSettings: ObservableObject {
             let signature = sigKeys.map { k in "\(k)=\(env.last { $0.0 == k }?.1 ?? "-")" }.joined(separator: "|")
                 + "|msaa=\(gameMSAA)"
                 + (env.last { $0.0 == "VPVK_AMPLIFY_CLIP" }?.1 == "1" ? "|VPVK_AMPLIFY_CLIP=1" : "")   // only when not the default
+                + (env.last { $0.0 == "VPVK_INVARIANT_POS" }?.1 == "0" ? "|VPVK_INVARIANT_POS=0" : "")   // only when not the default
             let cache = AVPPipelineCache.configure(data: p.dataDir, pipelines: p.pipelines, engine: "vpkengine",
                                                    engineSignature: signature, archive: true,
-                                                   robust: env.last { $0.0 == "VPVK_ROBUST" }?.1 ?? "default")
+                                                   robust: env.last { $0.0 == "VPVK_ROBUST" }?.1 ?? "default",
+                                                   warmVariant: (env.last { $0.0 == "VPVK_AMPLIFY_CLIP" }?.1 == "1" ? "|clip" : "")
+                                                       + (env.last { $0.0 == "VPVK_INVARIANT_POS" }?.1 == "0" ? "|invpos0" : ""))
             env.append(("VP_PIPELINE_CACHE_DIR", cache.dir.path))
             if cache.archiveOff { env.append(("VP_PIPELINE_ARCHIVE", "0")) }
             // 2048 MB of footprint for opening the binary archives (VPKEngine's default is 768): the engine now measures the
@@ -641,7 +652,7 @@ final class AVPSettings: ObservableObject {
                    + "nitidez \(vpktaaSharpness), nitidez del centro \(Int((centerSharpness * 100).rounded())) %, MSAA \(gameMSAA) (en tile \(Self.msaaOnTile)), aniso x\(anisotropy), "
                    + "idioma \(lang.name) (\(lang.reason)), movimiento \(movement), subtítulos \(subtitles), FPS \(showFps), capturas \(diagCaptures), "
                    + "medir GPU \(gpuPassProfiling), cola GPU \(Self.gpuQueueDepth), orden por recursos \(trackedOrder), SSAO \(ssao), "
-                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, altura real \(realFloor), oclusión medida \(occlusionQueries), Hz al juego \(reportedHz), arranque anticipado \(runningStart), preset \(preset.rawValue), fps \(frameRate), manos al centro \(handHoldPredict)")
+                   + "dedos por manos \(handFingers), amplificación de vértices \(amplify), post al área física \(postPhysical), ojos sin copia \(eyeDirect), altura \(Int(heightOffsetCm)) cm, altura real \(realFloor), oclusión medida \(occlusionQueries), amplificación con recorte \(amplifyClip), posición invariante \(invariantPos), Hz al juego \(reportedHz), arranque anticipado \(runningStart), preset \(preset.rawValue), fps \(frameRate), manos al centro \(handHoldPredict)")
         return env
     }
 
