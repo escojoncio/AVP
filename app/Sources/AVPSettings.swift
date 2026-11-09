@@ -126,6 +126,11 @@ final class AVPSettings: ObservableObject {
     /// stays out of the prewarm signature (sigKeys).
     @Published var splitViews: Bool { didSet { save() } }
     private var splitViewsApplied = false
+    /// Experimental (VPKEngine ede5a89, off): with VPVK_AMPLIFY=1, vertex shaders whose ClipDistance does not depend on the
+    /// view stay amplified instead of going back to instancing. Meant to be tried with splitViews to take the main pass out
+    /// of HeavyGeometry; not measured on the headset. VPVK_AMPLIFY_CLIP at launch only, and only when `amplify` is on. It
+    /// changes the MSL (translator mode), so it enters the recipe signature (sigKeys) when on.
+    @Published var amplifyClip: Bool { didSet { save() } }
     /// "Ritmo sin recuperación" (default on): after a late game frame the pacer re-phases to the next refresh instead of
     /// going back to the original grid, which showed a picture for 2 refreshes right after the late one. KL_PACE_REPHASE
     /// at launch, kl_app_set_pace_rephase live (applyLive). Changes no shader: stays out of the prewarm signature.
@@ -222,6 +227,7 @@ final class AVPSettings: ObservableObject {
         realFloor = d.object(forKey: "avp.realFloor") as? Bool ?? true
         occlusionQueries = d.object(forKey: "avp.occlusion") as? Bool ?? true
         splitViews = d.object(forKey: "avp.splitViews") as? Bool ?? false
+        amplifyClip = d.object(forKey: "avp.amplifyClip") as? Bool ?? false
         paceRephase = d.object(forKey: "avp.paceRephase") as? Bool ?? true
         reportedHz = ReportedHz(rawValue: d.object(forKey: "avp.reportHz") as? Int ?? 0) ?? .measured
         runningStart = d.object(forKey: "avp.runStart") as? Bool ?? true
@@ -265,6 +271,7 @@ final class AVPSettings: ObservableObject {
         d.set(realFloor, forKey: "avp.realFloor")
         d.set(occlusionQueries, forKey: "avp.occlusion")
         d.set(splitViews, forKey: "avp.splitViews")
+        d.set(amplifyClip, forKey: "avp.amplifyClip")
         d.set(paceRephase, forKey: "avp.paceRephase")
         d.set(reportedHz.rawValue, forKey: "avp.reportHz")
         d.set(runningStart, forKey: "avp.runStart")
@@ -285,7 +292,7 @@ final class AVPSettings: ObservableObject {
         anisotropy = fresh.anisotropy; centerSharpness = fresh.centerSharpness; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao; msaa = fresh.msaa; frameRate = fresh.frameRate; handHoldPredict = fresh.handHoldPredict
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling; shaderKnock = fresh.shaderKnock
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
-        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries; splitViews = fresh.splitViews; paceRephase = fresh.paceRephase
+        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries; splitViews = fresh.splitViews; amplifyClip = fresh.amplifyClip; paceRephase = fresh.paceRephase
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
         reportedHz = fresh.reportedHz; runningStart = fresh.runningStart
         preset = fresh.preset
@@ -513,6 +520,7 @@ final class AVPSettings: ObservableObject {
             // Build 34: vertex amplification ON by default (validated in Logs_Alyx_2_8/2_9: both eyes and the foveation
             // correct, no GPU faults, scene vertex time 8-12 -> ~4 ms). B29 had it off after B27's faults.
             ("VPVK_AMPLIFY", amplify ? "1" : "0"),
+            ("VPVK_AMPLIFY_CLIP", amplify && amplifyClip ? "1" : "0"),   // engine ede5a89: only acts with VPVK_AMPLIFY=1
             ("KLVR_EYE_DIRECT", eyeDirect ? "1" : "0"),
             ("KLVR_HEIGHT_OFFSET", String(format: "%.3f", heightOffsetCm / 100)),
             ("KLVR_REAL_FLOOR", realFloor ? "1" : "0"),   // B58: KleptonFloor.swift
@@ -598,6 +606,7 @@ final class AVPSettings: ObservableObject {
                            "VPVK_MOTION", "VP_FRAMES_IN_FLIGHT", "VP_MSAA_TILE", "VPVK_MSAA_DEAD_STORE", "VPVK_ROBUST"]
             let signature = sigKeys.map { k in "\(k)=\(env.last { $0.0 == k }?.1 ?? "-")" }.joined(separator: "|")
                 + "|msaa=\(gameMSAA)"
+                + (env.last { $0.0 == "VPVK_AMPLIFY_CLIP" }?.1 == "1" ? "|VPVK_AMPLIFY_CLIP=1" : "")   // only when not the default
             let cache = AVPPipelineCache.configure(data: p.dataDir, pipelines: p.pipelines, engine: "vpkengine",
                                                    engineSignature: signature, archive: true,
                                                    robust: env.last { $0.0 == "VPVK_ROBUST" }?.1 ?? "default")

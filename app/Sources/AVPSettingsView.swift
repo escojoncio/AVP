@@ -314,6 +314,11 @@ struct AVPSettingsView: View {
                          "Draws each eye separately to ease the geometry; applied live")
                 }
                 VStack(alignment: .leading, spacing: 4) {
+                    Toggle(AVPL("Amplificación con recorte (experimental)", "Amplification with clipping (experimental)"), isOn: $s.amplifyClip)
+                    hint("Los shaders de vértices con recorte que no depende del ojo siguen amplificados. Pensado para probarlo junto con «Un pase por ojo» y sacar el pase principal de HeavyGeometry; sin medir en el visor. Solo actúa con la amplificación de vértices activa. Recomendado: desactivado. Se aplica al arrancar el juego.",
+                         "Vertex shaders with clipping that does not depend on the eye stay amplified. Meant to be tried together with «One pass per eye» to take the main pass out of HeavyGeometry; not measured on the headset. Only acts with vertex amplification on. Recommended: off. Applied at game start.")
+                }
+                VStack(alignment: .leading, spacing: 4) {
                     Toggle(AVPL("Ritmo sin recuperación", "Pacing without catch-up"), isOn: $s.paceRephase)
                     hint("Tras un fotograma tarde, el siguiente espera al refresco que le toca en lugar de adelantarse para recuperar (evita un fotograma de solo 2 refrescos). Recomendado: activado; en caliente",
                          "After a late frame, the next one waits for its refresh instead of running ahead to catch up (avoids a frame shown for only 2 refreshes). Recommended: on; applied live")
