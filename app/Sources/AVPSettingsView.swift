@@ -314,14 +314,14 @@ struct AVPSettingsView: View {
                          "Draws each eye separately to ease the geometry; applied live")
                 }
                 VStack(alignment: .leading, spacing: 4) {
-                    Toggle(AVPL("Amplificación con recorte (experimental)", "Amplification with clipping (experimental)"), isOn: $s.amplifyClip)
-                    hint("Los shaders de vértices con recorte que no depende del ojo siguen amplificados. Pensado para probarlo junto con «Un pase por ojo» y sacar el pase principal de HeavyGeometry; sin medir en el visor. Solo actúa con la amplificación de vértices activa. Recomendado: desactivado. Se aplica al arrancar el juego.",
-                         "Vertex shaders with clipping that does not depend on the eye stay amplified. Meant to be tried together with «One pass per eye» to take the main pass out of HeavyGeometry; not measured on the headset. Only acts with vertex amplification on. Recommended: off. Applied at game start.")
+                    Toggle(AVPL("Amplificación con recorte", "Amplification with clipping"), isOn: $s.amplifyClip)
+                    hint("Los shaders de vértices con recorte que no depende del ojo se calculan una vez para los dos ojos en lugar de dos (menos trabajo de geometría). Solo actúa con la amplificación de vértices activa. Desactívalo solo si ves geometría mal recortada en un ojo. Recomendado: activado. Se aplica al arrancar el juego.",
+                         "Vertex shaders whose clipping does not depend on the eye run once for both eyes instead of twice (less geometry work). Only acts with vertex amplification on. Turn it off only if you see geometry clipped wrongly in one eye. Recommended: on. Applied at game start.")
                 }
                 VStack(alignment: .leading, spacing: 4) {
-                    Toggle(AVPL("Posición invariante (desactivar para probar rendimiento)", "Invariant position (turn off to test performance)"), isOn: $s.invariantPos)
-                    hint("El motor la fuerza para evitar z-fighting entre pases. Desactivarla puede dar más rendimiento en geometría pesada, pero puede causar parpadeo de profundidad; sin medir en el visor. Recomendado: activado. Se aplica al arrancar el juego.",
-                         "The engine forces it to avoid z-fighting between passes. Turning it off may give more performance on heavy geometry, but can cause depth flicker; not measured on the headset. Recommended: on. Applied at game start.")
+                    Toggle(AVPL("Posición invariante", "Invariant position"), isOn: $s.invariantPos)
+                    hint("Fuerza el mismo cálculo de posición en todos los pases (evita parpadeo de profundidad) a costa de rendimiento en los vértices. Las builds hasta la 78 iban sin ella. Actívala solo si ves parpadeo de profundidad en superficies. Recomendado: desactivado. Se aplica al arrancar el juego.",
+                         "Forces the same position math in every pass (avoids depth flicker) at a cost in vertex performance. Builds up to 78 ran without it. Turn it on only if you see depth flicker on surfaces. Recommended: off. Applied at game start.")
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     Toggle(AVPL("Ritmo sin recuperación", "Pacing without catch-up"), isOn: $s.paceRephase)

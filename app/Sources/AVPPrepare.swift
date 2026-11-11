@@ -533,7 +533,9 @@ enum AVPPipelineCache {
         // live elsewhere (pipelines.foz in the cache folder, <data>/klfz/*.foz) and stay.
         let robustURL = dir.appendingPathComponent("robust.mode")
         let oldRobust = try? String(contentsOf: robustURL, encoding: .utf8)
-        let mode = "\(robust)|tr\(translator)"
+        // warmVariant (amplify-clip / invariant-position modes) changes the vertex MSL too: same purge, so the other
+        // mode's archives are not opened against the budget.
+        let mode = "\(robust)|tr\(translator)\(warmVariant)"
         if oldRobust != mode {
             var purged = 0, failed = 0
             for f in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
@@ -567,7 +569,7 @@ enum AVPPipelineCache {
         // The OS version too: Metal binary archives and the system's shader cache are only valid for the OS (and GPU
         // driver) that wrote them.
         let os = ProcessInfo.processInfo.operatingSystemVersionString
-        let key = "avp-vpcache-2|vpvulkan \(driver)|list \(list)|os \(os)|archive \(archiveOff ? "off" : "on")\(warmVariant)"   // warmVariant: "" with the defaults, so the key is unchanged
+        let key = "avp-vpcache-2|vpvulkan \(driver)|list \(list)|os \(os)|archive \(archiveOff ? "off" : "on")\(warmVariant)"   // warmVariant: the translator modes in force ("" with the engine's own defaults)
         // The previous boot log is judged only if that session ran with this same key (last.key, written below for
         // the session about to start): after a new driver, list or OS its misses say nothing about this cache.
         let lastKeyURL = dir.appendingPathComponent("last.key")

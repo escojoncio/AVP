@@ -927,6 +927,31 @@ static void mem_relief_tick(int ticks) {
                 avail >> 20, got >> 20, foot >> 20, after >> 20);
         fflush(stderr);
     }
+    // Emergency: under 768 MB of headroom, ask the engine to drop what it can (vpvk_trim_memory level 2: the MSAA
+    // scene backing etc.), at most every 30 s. The allocator relief above never reached the engine's Metal memory.
+    static long long last_trim;
+    if (avail > 0 && avail < (768LL << 20) && now - last_trim >= 30) {
+        last_trim = now;
+        static size_t (*trim)(int, char *, size_t);
+        static int trim_missing_said;
+        if (!trim) {   // looked up again while missing (the driver may not be loaded yet)
+            const char *vkpath = getenv("KL_MVK_DYLIB");
+            void *vkh = vkpath && *vkpath ? dlopen(vkpath, RTLD_NOW | RTLD_NOLOAD) : NULL;
+            trim = (size_t (*)(int, char *, size_t))dlsym(vkh ? vkh : RTLD_DEFAULT, "vpvk_trim_memory");
+            // no dlclose: NOLOAD handle; closing could unload the driver mid-game
+            if (!trim && !trim_missing_said) {
+                trim_missing_said = 1;
+                fprintf(stderr, "[mem] vpvk_trim_memory not found in the Vulkan driver\n");
+            }
+        }
+        if (trim) {
+            char rep[512];
+            rep[0] = 0;
+            size_t freed = trim(2, rep, sizeof rep);
+            fprintf(stderr, "[mem] engine trim (%lld MB available): freed %zu MB; %s\n", avail >> 20, freed >> 20, rep);
+        }
+        fflush(stderr);
+    }
     if (ticks > 0 && ticks % 120 == 0) {   // every 30 s (not at launch: Metal loads on first use)
         static long long first_foot, first_t;
         if (!first_t && foot > (2048LL << 20)) { first_foot = foot; first_t = now; }

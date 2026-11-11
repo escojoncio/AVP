@@ -4,129 +4,52 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` = rama `avp-port-main`, **sin parches**: `vpkengine-patches/` vacío; cambios del
 motor se hacen en VPKEngine, mapa en su bitácora). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B79**, sin verificar en visor).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B80**, sin verificar en visor).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
-- B79: motor `ede5a89` (main; >480 commits desde `38d6fef`, historial reescrito; traductor kLowerVersion 13 /
-  kEmitVersion 12 / kDriverVersion 1). `AVPPrepare.swift` ~522 marcador `translator` "l13e12" (purga única de recetas;
-  subirlo si cambian lower/emit). Nuevo `VPVK_AMPLIFY_CLIP` (opt-in, solo con `VPVK_AMPLIFY=1`): vertex shaders con
-  ClipDistance independiente de la vista siguen amplificados → el pase principal podría pasar de `not_amplified` a ok
-  con «Un pase por ojo»; toggle «Amplificación con recorte (experimental)» (`amplifyClip`, `avp.amplifyClip`). Mirar
-  `gpu.split reason`, `gpu.amp`, `gpu.mem.rt`. El motor activa `VPVK_INVARIANT_POS` por defecto (`[[position, invariant]]`,
-  coste sin medir): toggle «Posición invariante» (`invariantPos`, defecto ON; apagado exporta `=0`; `AVPLaunch.swift` ~56
-  hace `unsetenv` antes). `warm.stamp` incluye clip/invariante solo si no son los valores por defecto. Sin medir en visor.
-- B78: motor `38d6fef` (`vpvk_dump_pending`, prefijo `vk.pending`: fences/eventos/timelines/queries sin éxito en 2 s, PSO
-  pendientes, submits en vuelo). `kl_app.c` stall_dump_thread ~140 lo llama por dlsym en los stalls de 5/15 s.
-- Logs_Alyx_22 (B77): al abrir el menú de pausa (`[Client] unnamed paused the game` 23:05:01) el juego dejó de
-  enviar frames (stall 5 s y 15 s → negro). Hilo 0xa963: libengine2→libclient→libpanorama→libresourcesystem→
-  librendersystemvulkan→cond_wait; VKRenderThread y pools ociosos. Primera vez (pausas OK en B76). Causa sin
-  confirmar: espera de una señal de la capa Vulkan (fence/evento/subida). RAM pico 7,36 GB, avail_min 827 MB.
-- B77 (`a6536dc`): compilada, sin verificar en visor.
-  Motor sigue `493d7da`. Pacer `kl_app.c` guest_pace_wait ~1779-1823: antes, un frame tarde se liberaba al instante
-  y el siguiente volvía a la rejilla (hueco eff−f). Ahora re-fase: tras tarde (`late`, con seen_first y avail≤eff+2)
-  owed=1 → el siguiente ≥eff desde el real; `kl_app_set_pace_rephase`/`KL_PACE_REPHASE` (defecto 1), toggle «Ritmo
-  sin recuperación»; regulador ignora el intervalo re-fasado (`kl_app_pace_rephased`, klvr_platform_klepton.c ~318).
-  Coste: con lateness marginal sostenida el ritmo medio baja (~eff+0,5). `[cp] cadence hist 1= 2= 3= 4= 5+= base=`.
-  Modo fijo 30/33 ya alimenta ventanas late/miss. [diag] `pace n/a(zero)` (causa de suma 0 sin resolver), rephased=,
-  game_ms=. Quitado VPVK_DUMP_MSL; carpeta msl en legacyNames (se borra).
-- Logs_Alyx_21 (B76, modo 30/33 fijo, 100 Hz): juego avg 22,25 ms (máx ventana 34,5) > 30 ms a veces → 42/95 s con
-  <32 frames nuevos (repetidos) y 11/95 con >33,5 (recuperación probable). Sin métrica de intervalos (añadida en B77).
-- PROYECTO EN PAUSA (decisión del usuario). Conclusión medida: cuello = geometría del pase principal (~7,6M
-  vértices-vista/frame, ~3,78M por vista, HeavyGeometry >3M heurístico), no píxeles: MSAA2/70 % y MSAA4/60 % no
-  mejoran (Logs_Alyx_20: 60 %, juego 15–17 ms, 8 saltos 50↔33 en ~3 min = trompicones, fair a ~2 min).
-  Logs_Alyx_19 (B76): split views ON sin efecto: pase principal `not_amplified` (pocos draws por instancing) y
-  además still_heavy (3,78M/vista). Pendiente si se retoma: B77 = motor `ff68e9f` (umbral tile en caliente con
-  frame canario `vpgpu_metal2_set_tile_max_vertices`, `gpu.amp` por razón) + toggle en AVP (NO hecho); ganancia
-  esperada baja (diagnóstico). Única palanca grande = LOD (baja calidad: descartado).
-  `[diag]` sigue `pace n/a` (weak_import no resolvió; sin investigar).
-- Logs_Alyx_16 (B73): reparto de shaders plano; coste propio de Alyx (≈30 samples, PCF 4 taps ×3 cascadas, bucle de
-  luces); regulador correcto (baja con 2 ventanas >19,0 ms, sube <18,4). Knockout: L3+R3 en partida con
-  «Diagnóstico de coste por shader» (`KleptonControllers.swift stickClick` ~574; HUD `KleptonCompositor.swift` drawKnockHud).
-- B70: motor `0122e9d` (unpack nativo de vértices, kill-exit, buffers inmutables, `VP_KNOCK`; detalle en bitácora de
-  VPKEngine). `AVPSettings.swift`: `VPVK_FETCH_NATIVE=3` (~509; cambia translator id → retraducción + prewarm en 1.er
-  arranque); ajuste «Diagnóstico de coste por shader» (`shaderKnock`, `avp.shaderKnock`) → `VP_KNOCK=auto` + fuerza
-  `VP_EXCL_TIMING=1`; toggle en `AVPSettingsView.swift` ~301. Siguiente: leer `gpu.knock.top` y atacar los shaders top.
-- Logs_Alyx_13 (B69, MSAA4/65°, nominal, 100 Hz, ~1,5 min): `overlap on nspt 1.0/1.0`; comp corregido med. 1,2 ms
-  (raw 3,7); juego med. 16,3 (7–19,9); 50 fps 17 s y caída rápida (21,09 ms, 13/14 late); variante compositor lista
-  167 ms; wide par 33/s; 0 errores; RAM pico 6,2 GB. Sin API pública para elegir Hz (solo `minimumFrameRepeatCount`).
-- Archivo_12 (B69, MSAA4/65°, 5m27s): térmico nominal→fair 2:03→serious 4:38; juego sube 16,6→19,5 ms por minuto
-  (sin cambio de zona = throttling); comp 1,2 (raw 3–7); ~17 s a 50 fps, resto 33; ventanas avg 18,5–19,6 vs barra
-  18,4, distribución unimodal (sin frames alternos; pase MSAA ~965 draws, vtx 5,4/frag 10,1 ms cada frame); 1 stall 5 s.
-- Descartado quitar stencil: escena = VK 129 D24S8 (→ Metal D32FS8), stencil usado (máscara VR, separate stencil usage
-  0xa3, input attachment). `GetHiddenAreaMesh` vacío a propósito (`klvr_system.cpp:97`, reproyección puede mostrar
-  todo el ojo); periferia ya al 10 % por VRR → ganancia de máscara pequeña (unverified).
-- B69: motor `5faf1cf` (export `vpgpu_metal2_cb_busy_intervals`; HeavyGeometry sin doble conteo en multiview por
-  instancing — Alyx usa amplificación y NO estaba afectado; `verts=` en `gpu.frame`).
-  - Regulador (`klvr_platform_klepton.c` `pace_up_frac` ~237, promoción ~346): sube a la base si avg < min(`KL_PACE_UP_PCT`
-    (92 %), 0,95·presupuesto − comp·(1−fb/base)) con ≤5 % late; log `pace.gov ... need=<barra> comp=`.
-  - `kl_gpu_time.m`: compositor sin solape con el juego (anillo 2048 intervalos del motor, resta perezosa en
-    `kl_gpu_time_frame_ms`, en ticks; guarda nspt ±5 %); `KL_COMP_OVERLAP=0` off; logs `[gputime] overlap on/off nspt`,
-    `comp_raw=` en `[gputime]`.
-  - Compositor: `kl_reproject_f` con function constants 0–5 (recon, srgb, rcas, round, lod0, chroma; variantes async,
-    genérico hasta listo; `KL_CP_SPECIALIZE=0` off); funciones del lib reproject creadas con constantValues vacío
-    (`reprojFn`, `kl_view_mtl.m` ~68); `level(0)` en taps del ojo si 1 mip; wide/recon en par con 2 texturas
-    (`kl_wide2t_f`, 4→2 encoders por composite; `KL_CP_WIDE2=0` off). MSL/Swift sin compilar fuera de CI.
-- Logs_Alyx_11/12 (B68, 100 Hz): freno de CPU resuelto (submit 1,2 ms). MSAA2/60°: juego 13,5–15 + comp 3,9 →
-  ventanas avg 17,3–17,9 con 0 % late NO subían (barra 17,0). MSAA4/65° (térmico fair): juego 18,1, comp 8,9 inflado
-  por contención (wide 202x163: 0,19→2,7 ms); real ≈ juego + 3,9. Escena MSAA4: 1 encoder Clear+Resolve, sin store de
-  muestras, HeavyGeometry real (>3M vértices ×2 vistas, memBacked); stencil sin uso (census `stencil 0`).
-- B68 (`5c1733d`): motor `ec0e68d` (elisión de estado por draw `VP_STATE_ELIDE`; revertidos blit merge y `VPVK_REPORT_ADRENO`).
-  `VPVK_MAX_PENDING_CHUNKS=6` (defecto 2 bloqueaba ~13 ms/frame en vkQueueSubmit), `VP_FRAMES_IN_FLIGHT=16` (cambia `sigKeys`:
-  1.er arranque re-prewarm). Ajuste «Identidad GPU Adreno» quitado.
-- Logs_Alyx_8/9/10 (B67): presupuesto 2048 OK (pico RAM 5,9–6,4 GB, avail mín. ~2 GB, 4 archivos saltados, 0 compilaciones extra);
-  Adreno sin efecto; blit merge 0 fusiones. CUELLO REAL = CPU del motor: render del juego 25–30 ms/frame, 88 % dentro de
-  vkQueueSubmit (Σ backend 22–27 ms, ~13 de espera de chunks), GPU ociosa ~10 ms/frame; bajar calidad (MSAA 2x, aniso 8, 60°)
-  bajó GPU 18,8→14,5 ms sin subir fps. Estimación tras quitar freno: con MSAA 2x 45 fps a 90 Hz probable, 50 al límite (unverified).
-  MSAA 2x sin variantes en caché → compila en juego la 1.ª vez (prewarm no incluye MSAA en firma).
-- B67 (`d9c096d`): motor `76652ac`. Presupuesto de archivos corregido en motor
-  (B66 abría 29 archivos: filtro de ruido >4×bytes ignoraba el coste real ~13×; +1,2–1,4 GB) → `VP_PIPELINE_ARCHIVE_BUDGET_MB=2048`
-  (B65 usaba ~1973), orden más reciente primero. Fusión de blits sin hazard (`gpu.frame blit_barriers= blits_merged=`,
-  `VP_BLIT_MERGE=0` off). `VPVK_ZERO_NEW_IMAGES=0` (B65 no ponía a cero). Ajuste «Identidad GPU Adreno» (`reportAdreno`,
-  `VPVK_REPORT_ADRENO`): solo vendor/nombre Adreno; B65 tenía identidad Adreno completa (límites Adreno) → A/B no idéntico.
-- Logs_Alyx_6/7 (B66 frío/caliente, misma zona): juego `[gputime]` 18,8 ms = B65 (sin regresión; el «15,5» de B62 era `gpu.time`,
-  otra métrica); escena 15,9 (vtx 5,7 vs 4,1 en B65, frag 10,1 vs 11,3); compositor 5,1 (B65 8,1); pace.gov 22–24 vs need 17 →
-  33 fps. Prewarm frío 211 s (traductor nuevo), caliente 5,6 s; compilación en juego caliente 0,3 s. RAM pico 7,5 GB / avail
-  mín. 616 MB (causa: presupuesto de archivos roto, ver B67). Coste por shader ya medido antes (logs 35/36): plano, ninguno >0,8 ms.
-- Logs_Alyx_5 (B65, 2m15s a1_intro_world, térmico nominal, panel 100 Hz): `[cp] cb` OK (bad=0): comp.new(wide+recon+comp)
-  ~7,5 ms, same ~7,1, black ~1,7 → los 3 pases en 1 cmdbuf, falta reparto por pase. Plan y pacer coinciden (50/33,3); gobernador
-  casi siempre en 33 (avg 11–26 vs need 17). 0 `gpu.pso.miss` pese a 238 compilaciones `gpu.pso f=` (log 0053 en ruta equivocada).
-  0 fallos `archive_save`. Archivo: 14 abiertos, 2 skip budget, used 1973 MB (>1280: revisar qué cuenta). RAM pico 6368 MB, mín.
-  libre 1823 MB (B64: 5641/2550). 41 `gpu.err code=7 Insufficient_Permission (background)` al salir. Stall 5 s cargando libmeshsystem.so.
-- B66 (`c57d09b`): primera build con VPKEngine main (`avp-port-main` `a74ffba` = main `5cf5c80` + fases 1–3 portadas;
-  ctest 254/254; .mm sin compilar hasta CI). No portado a propósito: bits `VPVK_RUNTIME_OPTS` (0038/0043/0045/0046),
-  motion (0009/0010/0020), census/knockout/opt_counters/dump_pipeline_msl (0039/0042: A/B de `kl_gpu_time.m` inoperante,
-  fallback dlsym), hang hunter/quarantine (0032), `vpvk_config_set_texture_cap` (nunca existió). `VPVK_MOTION`,
-  `VPVK_RUNTIME_OPTS`, `VPVK_TEXTURE_CAP` = no-op. Versiones traductor 13/1/1/1 → retraducción y AOT nuevo en 1.er arranque.
-  - `KleptonApp.swift` ~111 `VPGpuBackground` (dlsym vía `dlopen(KL_MVK_DYLIB,RTLD_NOLOAD)`); `Lifecycle.scenePhaseChanged`
-    ~265: .background → `vpgpu_set_background(1)`, .active → 0. `KleptonCompositor.swift` ~2380: `vpgpu_shutdown_background()`
-    antes de `kl_app_guest_stop()` (y antes de `kl_app_lifecycle_report()` en syncGuest); no en guest retenido.
-  - `KL_GPU_PASSES`: `cpCb` (~4512) → un cmdbuf por pase (mfx, fxaa, sharp, mip, wide, recon, comp/layer) en orden; `cmd`
-    solo fence+capturas+present. Sin flag idéntico. Splits fuera de `maxFenceBacklog`.
-  - Motor nuevo por defecto: extras 1.3 nativas ON (NO poner `VPVK_EXTRA_EXTENSIONS=0`: apaga dynamic_rendering, sync2…),
-    slot reuse por frame, resolve 1x→copia, indirect GPU → encoder heavy (más memoria MSAA, `heavy_indirect=` en
-    `gpu.frame`), presupuesto archivo real (`gpu.pso.cache open/skipped/open_total used_mb=`), `gpu.pso.miss` en ruta real,
-    `vk.perf` 1/s.
-- B63 regulador (`klvr_platform_klepton.c:348`): línea `[openvr] pace.gov fallback avg= late= need= streak=` cada 10 s en fallback.
-  Sin bug: mide juego+comp (`per = game + comp*fb/base`, l.281); subir a 50 exige avg < 17 ms 10–120 s; juego 15–19 + comp 4–8.
-- Logs B62 65 %/65°/edge 0,10: busy juego 15,5 ms (vs 21,6 a 70 %/70°), regulador 33 por compositor 4–8 ms (`[gputime]`).
-  RAM pico 6,1 GB, mín. libre 2,1 GB. `KL_DISPLAY_HZ=90` con panel 100 Hz (unverified).
-- Reparto GPU (fov ON 70 %): scene-msaa 16,6 (vtx 4,0/frag 12,6) + eye-1x 3,4 + blit 1,0; fov OFF scene-msaa 23,7.
-  `MTLMathModeFast` ya activo. Mediciones previas: `notas/rendimiento.md`, `notas/builds.md`.
+- B80 (motor sigue `ede5a89`): `AVPSettings.swift` `amplifyClip` ON por defecto (clave `avp.amplifyClip2`) e
+  `invariantPos` OFF (`avp.invariantPos2`, = código de vértices de B78); env `VPVK_MSAA_RELEASE_FRAMES=0` (respaldo
+  MSAA pegajoso: en Logs_22 se liberó/reasignó 3 veces, 352 MB, 1.ª reasignación `vk.hitch backend_ms=74`);
+  `kl_app.c mem_relief_tick`: con avail < 768 MB llama a `vpvk_trim_memory(2)` (dlsym, ≥30 s; antes solo
+  `malloc_zone_pressure_relief`, que devolvía 0 MB); `AVPPrepare.swift` `robust.mode` incluye `warmVariant`
+  (`|clip`, `|invpos0`): purga recetas/archivos al cambiar esos modos (1.er arranque: prewarm completo).
+- Revisión de código y logs (2026-11-11, sin visor), hechos medidos:
+  - El coste escala con píxeles físicos: Logs_20 60 % (2,25M px) juego med. 13,3 ms; Logs_19 65 % (2,74M) 16,9;
+    Logs_21 85 % + periferia 30 % + zona 70° (6,28M, térmico fair/serious) med. 21,1, p90 30,8.
+  - Pase principal (Logs_18/19, 65 %, ~930 draws): excl 12,3–13,1 ms = vtx 3,8–4,1 + frag 8,8–9,0; cadena post
+    (16 encoders) 1,56 ms; knockout: vs `6a91ac74` + fs `3f839e3b` (140 draws) = 6,9 ms, su fs trivial solo 1,1.
+  - Juego a periodo fijo (20/30 ms), sin correlación con la GPU (no va serializado). Los CB del compositor esperan
+    al encoder principal (sin preempción): commit→fin 7–8,7 ms.
+  - Samplers: el juego crea 2 estados aniso 16 y 2 aniso 8; `VPVK_ANISO=16` fuerza 16 además en trilineal+wrap sin
+    aniso y sube 8→16 (13/64). Con VRR, donde tasa x ≠ tasa y la huella es anisótropa (hasta 1/periferia): coste sin medir.
+  - El juego usa queries de oclusión (pool tipo 0) y timestamps (tipo 2).
+  - Motor `ede5a89` vs `38d6fef`, sin medir y sin tocar: varyings enteras < 4 comp. salen como uint4 (también
+    `vp_view`, loc 63), `bias(sbN)` en cada muestreo, guardas por atributo en el fetch de vértices (no dependen de
+    `VPVK_ROBUST`). Main `09a6e9b` activa por defecto depth-tile y dead-store nuevos (sin probar en Alyx): no adoptado.
+- B79: motor `ede5a89` (historial reescrito; traductor lower 13 / emit 12 / driver 1). `AVPPrepare.swift` marcador
+  `translator` "l13e12" (subirlo si cambian lower/emit). `VPVK_AMPLIFY_CLIP`: vertex shaders con ClipDistance
+  independiente de la vista siguen amplificados. `VPVK_INVARIANT_POS` (motor: ON por defecto, `[[position, invariant]]`);
+  `AVPLaunch.swift` ~56 hace `unsetenv` antes de aplicar el env. Logs: `gpu.amp`, `gpu.split`, `vk.query_stats`.
+- B78: motor `38d6fef` (`vpvk_dump_pending`, prefijo `vk.pending`). `kl_app.c` stall_dump_thread ~140 lo llama por
+  dlsym en los stalls de 5/15 s.
+- Logs_Alyx_22 (B77): al abrir el menú de pausa (23:05:01) el juego dejó de enviar frames (stall 5 y 15 s → negro).
+  Hilo 0xa963: libengine2→libclient→libpanorama→libresourcesystem→librendersystemvulkan→cond_wait. Causa sin
+  confirmar. RAM pico 7,36 GB, avail_min 827 MB (80 % + MSAA 4x).
+- B77: re-fase del pacer (`kl_app.c` guest_pace_wait ~1779-1823, `KL_PACE_REPHASE` defecto 1; el regulador ignora el
+  intervalo re-fasado, klvr_platform_klepton.c ~318); `[cp] cadence hist`; modo fijo 30/33 alimenta late/miss;
+  `[diag] pace n/a(zero)` sin resolver. Detalle de B62–B76: `notas/builds.md`.
 
 ## Estado actual
 - 100 % funcional (visor): Steam (login+Guard, Cloud), firma, 90 libs, prewarm ~4150 pipelines; VPKEngine 0 cuelgues
-  desde B17, MSAA 4x, amplificación de vértices, occlusion culling medido, `VP_CB_ORDER=2`; foveado VRR (periferia 10 %,
-  VPKTAA en periferia; post NO foveado); compositor skip-same; regulador 50/33 (100 Hz) o 45/30 (90 Hz) con tiempo de
-  GPU exclusivo; reloj del juego `klvr_game_hz`; OpenVR cabeza + 2 Sense, dedos, altura, subtítulos, idioma, pausa.
-- Verificar B66 en visor: arranque/retraducción, imagen (dual-source, render area, occlusion), `[cp] cb` por pase con
-  «Medir GPU por pase», RAM pico vs B65 (6368 MB) y `used_mb` ≤1280, 0 `gpu.err code=7` al salir, `gpu.pso.miss`.
-  Después A/B `VPVK_ASYNC_PIPELINES=0` y `VPVK_MSAA_TILE=0`.
-- `vpkengine.ref` = VPKEngine main `ede5a89` (B79). Pendiente de medir en visor: `VPVK_AMPLIFY_CLIP` con split views, y A/B de
-  `VPVK_INVARIANT_POS`; cuelgue al pausar sin causa confirmada (el motor trae cambios en pipelines async/timeline semaphores).
-- Pendiente: Steam en guest (`steamclient.so` no encontrado).
-- Próximo objetivo: si se repite el negro al pausar, leer `vk.pending` del stall y arreglar la señal que falta.
-- Problema abierto: zona pesada juego ~23 ms > umbral (17 ms a 100 Hz, 18,9 a 90 Hz); térmico.
+  desde B17, MSAA 4x, amplificación de vértices, `VP_CB_ORDER=2`; foveado VRR (VPKTAA en periferia; post NO foveado);
+  compositor skip-same; regulador 50/33 (100 Hz) o 45/30 (90 Hz) con tiempo de GPU exclusivo; OpenVR cabeza + 2 Sense.
+- B80 sin verificar en visor. Medir con sus logs: `gpu.amp draws_amp= draws_inst= by: clip=` (cuántos draws eran
+  instancing por ClipDistance), `vk.query_stats`, `[mem] engine trim`, `[gputime]` en la misma zona que B78/B79.
+- Sin hacer: umbral de tile en caliente (`vpgpu_metal2_set_tile_max_vertices`, canario) → respaldo MSAA memoryless
+  (−350 MB) con riesgo de tirón al materializar; aniso solo en samplers que el juego marca (cambia lo visible).
+- Abierto: negro al pausar (leer `vk.pending` si se repite); `[diag] pace n/a`; Steam en guest (`steamclient.so`).
+- Límite medido: a 85 %/periferia 30 % la GPU (21–31 ms) solo da 30/33 fps; 50 fps cabe a 60–65 %/periferia 10 %.
 
 ## Decisiones vigentes
 - Sin MetalFX; MoltenVK solo fallback automático; nada que cambie lo visible (LOD, cull, `vr_expand_cull_frustum`,
@@ -147,4 +70,4 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
 
 ## Índice de notas
 - `notas/rendimiento.md`: reparto del frame, hallazgos Logs_34–47, conclusión e ideas pendientes de rendimiento.
-- `notas/builds.md`: qué hace cada mecanismo de B46–B59 (VPKEngine 0038–0041, regulador, compositor, app).
+- `notas/builds.md`: qué hace cada mecanismo de B46–B59 e historial de B62–B76 (logs, regulador, compositor, motor).

@@ -126,14 +126,14 @@ final class AVPSettings: ObservableObject {
     /// stays out of the prewarm signature (sigKeys).
     @Published var splitViews: Bool { didSet { save() } }
     private var splitViewsApplied = false
-    /// Experimental (VPKEngine ede5a89, off): with VPVK_AMPLIFY=1, vertex shaders whose ClipDistance does not depend on the
-    /// view stay amplified instead of going back to instancing. Meant to be tried with splitViews to take the main pass out
-    /// of HeavyGeometry; not measured on the headset. VPVK_AMPLIFY_CLIP at launch only, and only when `amplify` is on. It
-    /// changes the MSL (translator mode), so it enters the quarantine signature when on.
+    /// VPKEngine ede5a89 (default on): with VPVK_AMPLIFY=1, vertex shaders whose ClipDistance does not depend on the
+    /// view stay amplified instead of going back to instancing (one shader run for both eyes). VPVK_AMPLIFY_CLIP at
+    /// launch only, and only when `amplify` is on. It changes the MSL (translator mode), so it enters the quarantine
+    /// signature when on.
     @Published var amplifyClip: Bool { didSet { save() } }
-    /// Experimental (VPKEngine ede5a89, default on = the engine's behaviour): gl_Position invariant in the vertex shaders, which
-    /// the engine forces to avoid z-fighting between passes. Off may give more speed on heavy geometry but can flicker the
-    /// depth; not measured on the headset. VPVK_INVARIANT_POS=0 at launch, exported only when off. It changes the MSL, so it
+    /// VPKEngine ede5a89 (default off = the behaviour of the builds up to 78): gl_Position invariant in the vertex shaders.
+    /// The engine forces it by default, which costs optimisations in the position math; turn it on only if depth flicker
+    /// shows up. VPVK_INVARIANT_POS=0 at launch, exported only when off. It changes the MSL, so it
     /// enters the quarantine signature when off.
     @Published var invariantPos: Bool { didSet { save() } }
     /// "Ritmo sin recuperación" (default on): after a late game frame the pacer re-phases to the next refresh instead of
@@ -232,8 +232,8 @@ final class AVPSettings: ObservableObject {
         realFloor = d.object(forKey: "avp.realFloor") as? Bool ?? true
         occlusionQueries = d.object(forKey: "avp.occlusion") as? Bool ?? true
         splitViews = d.object(forKey: "avp.splitViews") as? Bool ?? false
-        amplifyClip = d.object(forKey: "avp.amplifyClip") as? Bool ?? false
-        invariantPos = d.object(forKey: "avp.invariantPos") as? Bool ?? true
+        amplifyClip = d.object(forKey: "avp.amplifyClip2") as? Bool ?? true
+        invariantPos = d.object(forKey: "avp.invariantPos2") as? Bool ?? false
         paceRephase = d.object(forKey: "avp.paceRephase") as? Bool ?? true
         reportedHz = ReportedHz(rawValue: d.object(forKey: "avp.reportHz") as? Int ?? 0) ?? .measured
         runningStart = d.object(forKey: "avp.runStart") as? Bool ?? true
@@ -277,8 +277,8 @@ final class AVPSettings: ObservableObject {
         d.set(realFloor, forKey: "avp.realFloor")
         d.set(occlusionQueries, forKey: "avp.occlusion")
         d.set(splitViews, forKey: "avp.splitViews")
-        d.set(amplifyClip, forKey: "avp.amplifyClip")
-        d.set(invariantPos, forKey: "avp.invariantPos")
+        d.set(amplifyClip, forKey: "avp.amplifyClip2")
+        d.set(invariantPos, forKey: "avp.invariantPos2")
         d.set(paceRephase, forKey: "avp.paceRephase")
         d.set(reportedHz.rawValue, forKey: "avp.reportHz")
         d.set(runningStart, forKey: "avp.runStart")
@@ -551,6 +551,8 @@ final class AVPSettings: ObservableObject {
             ("VP_FRAME_DETAIL", "3000"),
             // Elisión de stores MSAA muertos, VPKEngine 0051.
             ("VPVK_MSAA_DEAD_STORE", "1"),
+            // El respaldo MSAA 4x de la escena (~350 MB) ya no se libera tras 120 frames ligeros (cada reasignación al volver a la escena pesada era un tirón de ~75 ms, Logs_Alyx_22: 3 ciclos); un aviso de memoria (vpvk_trim_memory) lo sigue liberando.
+            ("VPVK_MSAA_RELEASE_FRAMES", "0"),
             // Paridad con el motor de B65: no poner a cero las imágenes nuevas.
             ("VPVK_ZERO_NEW_IMAGES", "0"),
             // El defecto 2 bloquea ~13 ms/frame el hilo de render del juego en vkQueueSubmit esperando a la GPU; 6 deja en vuelo un frame entero sin perder el tope de memoria (0 = sin límite).
@@ -614,8 +616,8 @@ final class AVPSettings: ObservableObject {
                            "VPVK_MOTION", "VP_FRAMES_IN_FLIGHT", "VP_MSAA_TILE", "VPVK_MSAA_DEAD_STORE", "VPVK_ROBUST"]
             let signature = sigKeys.map { k in "\(k)=\(env.last { $0.0 == k }?.1 ?? "-")" }.joined(separator: "|")
                 + "|msaa=\(gameMSAA)"
-                + (env.last { $0.0 == "VPVK_AMPLIFY_CLIP" }?.1 == "1" ? "|VPVK_AMPLIFY_CLIP=1" : "")   // only when not the default
-                + (env.last { $0.0 == "VPVK_INVARIANT_POS" }?.1 == "0" ? "|VPVK_INVARIANT_POS=0" : "")   // only when not the default
+                + (env.last { $0.0 == "VPVK_AMPLIFY_CLIP" }?.1 == "1" ? "|VPVK_AMPLIFY_CLIP=1" : "")   // only when on (the engine's default is off)
+                + (env.last { $0.0 == "VPVK_INVARIANT_POS" }?.1 == "0" ? "|VPVK_INVARIANT_POS=0" : "")   // only when off (the engine's default is on)
             let cache = AVPPipelineCache.configure(data: p.dataDir, pipelines: p.pipelines, engine: "vpkengine",
                                                    engineSignature: signature, archive: true,
                                                    robust: env.last { $0.0 == "VPVK_ROBUST" }?.1 ?? "default",
