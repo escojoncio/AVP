@@ -16,7 +16,7 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   MSAA dead-store (sin probar en Alyx; riesgo: regresión visual/PSO). ABI vpvk_* usada por AVP sin cambios (solo
   añadidas `vpvk_texture_budget`, `vpvk_hide_index_count`, no conectadas); `vpvk_motion_get` y
   `vpvk_config_set_texture_cap` no existen en el motor (dlsym tolera; TAA sin vectores, texture_cap sin efecto).
-  Pendiente: revisión adversarial Opus, build única.
+  Revisión adversarial limpia (3.ª pasada). Riesgo sin verificar: `AVPSettings.swift` ~624-634 firma con 4 ternarios encadenados (si falla 'unable to type-check', sacar cada parte a un `let`). Build B81 lanzada.
 - B80 (motor sigue `ede5a89`): `AVPSettings.swift` `amplifyClip` ON por defecto (clave `avp.amplifyClip2`) e
   `invariantPos` OFF (`avp.invariantPos2`, = código de vértices de B78); env `VPVK_MSAA_RELEASE_FRAMES=0` (respaldo
   MSAA pegajoso: en Logs_22 se liberó/reasignó 3 veces, 352 MB, 1.ª reasignación `vk.hitch backend_ms=74`);
