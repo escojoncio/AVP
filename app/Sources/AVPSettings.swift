@@ -625,7 +625,8 @@ final class AVPSettings: ObservableObject {
                 + "|msaa=\(gameMSAA)"
                 + (env.last { $0.0 == "VPVK_AMPLIFY_CLIP" }?.1 == "1" ? "|VPVK_AMPLIFY_CLIP=1" : "")   // only when on (the engine's default is off)
                 + (env.last { $0.0 == "VPVK_INVARIANT_POS" }?.1 == "0" ? "|VPVK_INVARIANT_POS=0" : "")   // only when off (the engine's default is on)
-                + (env.last { $0.0 == "VPVK_DEPTH_TILE" }?.1 == "0" ? "|VPVK_DEPTH_TILE=0" : "")   // only when off (the engine's default is on)            let cache = AVPPipelineCache.configure(data: p.dataDir, pipelines: p.pipelines, engine: "vpkengine",
+                + (env.last { $0.0 == "VPVK_DEPTH_TILE" }?.1 == "0" ? "|VPVK_DEPTH_TILE=0" : "")   // only when off (the engine's default is on)
+            let cache = AVPPipelineCache.configure(data: p.dataDir, pipelines: p.pipelines, engine: "vpkengine",
                                                    engineSignature: signature, archive: true,
                                                    robust: env.last { $0.0 == "VPVK_ROBUST" }?.1 ?? "default",
                                                    warmVariant: (env.last { $0.0 == "VPVK_AMPLIFY_CLIP" }?.1 == "1" ? "|clip" : "")

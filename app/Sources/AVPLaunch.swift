@@ -54,7 +54,8 @@ enum AVPLaunch {
                                                  pipelines: prepared.pipelines))
         // Also in this process's environment, for anything that reads it before AlyxBoot parses the file.
         unsetenv("VPVK_INVARIANT_POS")  // only exported when off; a second launch must not inherit it
-        unsetenv("VPVK_DEPTH_TILE")  // same: only exported when off        for (k, v) in env { setenv(k, v, 1) }
+        unsetenv("VPVK_DEPTH_TILE")  // same: only exported when off
+        for (k, v) in env { setenv(k, v, 1) }
         setenv("KL_AUTOBOOT", "1", 1)
         setenv("KL_IMMERSIVE", "1", 1)
         settings.applyToVPKEngine()
