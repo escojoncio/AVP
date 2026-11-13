@@ -136,6 +136,12 @@ final class AVPSettings: ObservableObject {
     /// shows up. VPVK_INVARIANT_POS=0 at launch, exported only when off. It changes the MSL, so it
     /// enters the quarantine signature when off.
     @Published var invariantPos: Bool { didSet { save() } }
+    /// VPKEngine 66bb76d (default on): depth attachment of the MSAA scene passes kept on tile. VPVK_DEPTH_TILE=0 at launch,
+    /// exported only when off. Changes no shader, but it enters the quarantine signature when off.
+    @Published var depthTile: Bool { didSet { save() } }
+    /// VPKEngine 66bb76d (default on): umbrella of the MSAA-on-tile paths; VPVK_MSAA_STRICT=0 also turns depthTile off in the
+    /// engine. Exported only when off; enters the quarantine signature when off.
+    @Published var msaaStrict: Bool { didSet { save() } }
     /// "Ritmo sin recuperación" (default on): after a late game frame the pacer re-phases to the next refresh instead of
     /// going back to the original grid, which showed a picture for 2 refreshes right after the late one. KL_PACE_REPHASE
     /// at launch, kl_app_set_pace_rephase live (applyLive). Changes no shader: stays out of the prewarm signature.
@@ -234,6 +240,8 @@ final class AVPSettings: ObservableObject {
         splitViews = d.object(forKey: "avp.splitViews") as? Bool ?? false
         amplifyClip = d.object(forKey: "avp.amplifyClip2") as? Bool ?? true
         invariantPos = d.object(forKey: "avp.invariantPos2") as? Bool ?? false
+        depthTile = d.object(forKey: "avp.depthTile") as? Bool ?? true
+        msaaStrict = d.object(forKey: "avp.msaaStrict") as? Bool ?? true
         paceRephase = d.object(forKey: "avp.paceRephase") as? Bool ?? true
         reportedHz = ReportedHz(rawValue: d.object(forKey: "avp.reportHz") as? Int ?? 0) ?? .measured
         runningStart = d.object(forKey: "avp.runStart") as? Bool ?? true
@@ -279,6 +287,8 @@ final class AVPSettings: ObservableObject {
         d.set(splitViews, forKey: "avp.splitViews")
         d.set(amplifyClip, forKey: "avp.amplifyClip2")
         d.set(invariantPos, forKey: "avp.invariantPos2")
+        d.set(depthTile, forKey: "avp.depthTile")
+        d.set(msaaStrict, forKey: "avp.msaaStrict")
         d.set(paceRephase, forKey: "avp.paceRephase")
         d.set(reportedHz.rawValue, forKey: "avp.reportHz")
         d.set(runningStart, forKey: "avp.runStart")
@@ -299,7 +309,7 @@ final class AVPSettings: ObservableObject {
         anisotropy = fresh.anisotropy; centerSharpness = fresh.centerSharpness; systemLanguage = fresh.systemLanguage; showFps = fresh.showFps; ssao = fresh.ssao; msaa = fresh.msaa; frameRate = fresh.frameRate; handHoldPredict = fresh.handHoldPredict
         trackedOrder = fresh.trackedOrder; diagCaptures = fresh.diagCaptures; gpuPassProfiling = fresh.gpuPassProfiling; shaderKnock = fresh.shaderKnock
         movement = fresh.movement; subtitles = fresh.subtitles; cloudSync = fresh.cloudSync; handFingers = fresh.handFingers; amplify = fresh.amplify
-        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries; splitViews = fresh.splitViews; amplifyClip = fresh.amplifyClip; invariantPos = fresh.invariantPos; paceRephase = fresh.paceRephase
+        postPhysical = fresh.postPhysical; eyeDirect = fresh.eyeDirect; heightOffsetCm = fresh.heightOffsetCm; realFloor = fresh.realFloor; occlusionQueries = fresh.occlusionQueries; splitViews = fresh.splitViews; amplifyClip = fresh.amplifyClip; invariantPos = fresh.invariantPos; depthTile = fresh.depthTile; msaaStrict = fresh.msaaStrict; paceRephase = fresh.paceRephase
         subtitleSize = fresh.subtitleSize; subtitleFoveation = fresh.subtitleFoveation
         reportedHz = fresh.reportedHz; runningStart = fresh.runningStart
         preset = fresh.preset
@@ -561,6 +571,8 @@ final class AVPSettings: ObservableObject {
             ("VPVK_ROBUST", "0"),
         ]
         if !invariantPos { env.append(("VPVK_INVARIANT_POS", "0")) }   // engine ede5a89: on by default, so nothing is exported when on
+        if !depthTile { env.append(("VPVK_DEPTH_TILE", "0")) }   // engine 66bb76d: on by default, exported only when off
+        if !msaaStrict { env.append(("VPVK_MSAA_STRICT", "0")) }   // engine 66bb76d: on by default, exported only when off
         // VPKTAA inputs not usable yet (build 17 log): VPKEngine's motion vectors are all zero (its "eye frame"
         // restarts at every depth-clearing multiview pass, 4-7 per game frame, so no draw ever finds last frame's
         // data) yet are flagged as full screen motion, which turns the reprojection OFF; and the eye depth needs a
@@ -618,6 +630,8 @@ final class AVPSettings: ObservableObject {
                 + "|msaa=\(gameMSAA)"
                 + (env.last { $0.0 == "VPVK_AMPLIFY_CLIP" }?.1 == "1" ? "|VPVK_AMPLIFY_CLIP=1" : "")   // only when on (the engine's default is off)
                 + (env.last { $0.0 == "VPVK_INVARIANT_POS" }?.1 == "0" ? "|VPVK_INVARIANT_POS=0" : "")   // only when off (the engine's default is on)
+                + (env.last { $0.0 == "VPVK_DEPTH_TILE" }?.1 == "0" ? "|VPVK_DEPTH_TILE=0" : "")   // only when off (the engine's default is on)
+                + (env.last { $0.0 == "VPVK_MSAA_STRICT" }?.1 == "0" ? "|VPVK_MSAA_STRICT=0" : "")   // only when off (the engine's default is on)
             let cache = AVPPipelineCache.configure(data: p.dataDir, pipelines: p.pipelines, engine: "vpkengine",
                                                    engineSignature: signature, archive: true,
                                                    robust: env.last { $0.0 == "VPVK_ROBUST" }?.1 ?? "default",

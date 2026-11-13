@@ -8,6 +8,15 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
+- B81 (en curso, sin compilar ni probar): motor `66bb76d` (origin/main, 40 commits desde `ede5a89`; lower 13 / emit 12 /
+  driver 1 sin cambios → marker `translator` "l13e12" sin tocar). `vpkengine.ref` actualizado. `AVPSettings.swift`:
+  `depthTile` (`avp.depthTile`) y `msaaStrict` (`avp.msaaStrict`), ON por defecto = motor; solo exportan
+  `VPVK_DEPTH_TILE=0` / `VPVK_MSAA_STRICT=0` cuando están apagados (firma de cuarentena igual); `AVPLaunch.swift`
+  `unsetenv` de ambas; `AVPSettingsView.swift` 2 Toggle en Diagnóstico. Motor nuevo activa por defecto depth-tile y
+  MSAA dead-store (sin probar en Alyx; riesgo: regresión visual/PSO). ABI vpvk_* usada por AVP sin cambios (solo
+  añadidas `vpvk_texture_budget`, `vpvk_hide_index_count`, no conectadas); `vpvk_motion_get` y
+  `vpvk_config_set_texture_cap` no existen en el motor (dlsym tolera; TAA sin vectores, texture_cap sin efecto).
+  Pendiente: revisión adversarial Opus, build única.
 - B80 (motor sigue `ede5a89`): `AVPSettings.swift` `amplifyClip` ON por defecto (clave `avp.amplifyClip2`) e
   `invariantPos` OFF (`avp.invariantPos2`, = código de vértices de B78); env `VPVK_MSAA_RELEASE_FRAMES=0` (respaldo
   MSAA pegajoso: en Logs_22 se liberó/reasignó 3 veces, 352 MB, 1.ª reasignación `vk.hitch backend_ms=74`);
