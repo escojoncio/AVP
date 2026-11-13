@@ -8,6 +8,8 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
+- Pin del motor `0e2e282` (1 commit sobre `66bb76d`: solo arregla el test `lift_batch_names` de gcn con emulador;
+  sin cambios de código, cabeceras, env ni versiones → binario del motor igual que B81, sin build nueva).
 - B81 (compila en CI, sin probar en visor): motor `66bb76d` (origin/main, 40 commits desde `ede5a89`; lower 13 / emit 12 /
   driver 1 sin cambios → marker `translator` "l13e12" sin tocar). `vpkengine.ref` actualizado. `AVPSettings.swift`:
   `depthTile` (`avp.depthTile`), ON = motor; solo exporta `VPVK_DEPTH_TILE=0` si se apaga (entra en firma de cuarentena
