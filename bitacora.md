@@ -8,6 +8,9 @@ IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (últi
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
+- Auditoría del motor (su bitacora.md l.40-66: contrato GLES present/shutdown, embedder `vp_map_fixed_over`/`vp_unmap_fixed`/
+  `vp_register_native` int, copias OnDemand renombradas): no aplica a AVP (0 usos de `vpgles_*`, `vp_loader`, `vp_register_native`;
+  loader propio = Klepton `kl_image.c`; sin submódulo, motor por `vpkengine.ref`; OnDemand es de `VPConversion.swift`, no de AVP).
 - Pin del motor `0e2e282` (1 commit sobre `66bb76d`: solo arregla el test `lift_batch_names` de gcn con emulador;
   sin cambios de código, cabeceras, env ni versiones → binario del motor igual que B81, sin build nueva).
 - B81 (compila en CI, sin probar en visor): motor `66bb76d` (origin/main, 40 commits desde `ede5a89`; lower 13 / emit 12 /
