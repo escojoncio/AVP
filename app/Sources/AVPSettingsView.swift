@@ -325,13 +325,8 @@ struct AVPSettingsView: View {
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     Toggle(AVPL("Profundidad MSAA en tile", "MSAA depth on tile"), isOn: $s.depthTile)
-                    hint("Mantiene la profundidad de los pases con MSAA en la memoria de tile en vez de guardarla (menos ancho de banda). Desactívalo solo si ves artefactos de profundidad o geometría mal ordenada. Recomendado: activado. Se aplica al arrancar el juego.",
-                         "Keeps the depth of MSAA passes in tile memory instead of storing it (less bandwidth). Turn it off only if you see depth artifacts or wrongly ordered geometry. Recommended: on. Applied at game start.")
-                }
-                VStack(alignment: .leading, spacing: 4) {
-                    Toggle(AVPL("MSAA estricto", "Strict MSAA"), isOn: $s.msaaStrict)
-                    hint("Interruptor general de los caminos MSAA en tile del motor; apagado también desactiva la profundidad MSAA en tile y vuelve a los caminos antiguos. Apágalo solo si ves artefactos con MSAA. Recomendado: activado. Se aplica al arrancar el juego.",
-                         "Master switch of the engine's MSAA-on-tile paths; off also disables MSAA depth on tile and goes back to the old paths. Turn it off only if you see MSAA artifacts. Recommended: on. Applied at game start.")
+                    hint("Mantiene la profundidad de los pases con MSAA en la memoria de tile en vez de guardarla (menos ancho de banda). Desactívalo solo si ves artefactos de profundidad o geometría mal ordenada. Recomendado: activado. Requiere reiniciar la app para aplicarse.",
+                         "Keeps the depth of MSAA passes in tile memory instead of storing it (less bandwidth). Turn it off only if you see depth artifacts or wrongly ordered geometry. Recommended: on. Requires restarting the app to apply.")
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     Toggle(AVPL("Ritmo sin recuperación", "Pacing without catch-up"), isOn: $s.paceRephase)

@@ -10,9 +10,9 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
 ## Últimos hechos
 - B81 (en curso, sin compilar ni probar): motor `66bb76d` (origin/main, 40 commits desde `ede5a89`; lower 13 / emit 12 /
   driver 1 sin cambios → marker `translator` "l13e12" sin tocar). `vpkengine.ref` actualizado. `AVPSettings.swift`:
-  `depthTile` (`avp.depthTile`) y `msaaStrict` (`avp.msaaStrict`), ON por defecto = motor; solo exportan
-  `VPVK_DEPTH_TILE=0` / `VPVK_MSAA_STRICT=0` cuando están apagados (firma de cuarentena igual); `AVPLaunch.swift`
-  `unsetenv` de ambas; `AVPSettingsView.swift` 2 Toggle en Diagnóstico. Motor nuevo activa por defecto depth-tile y
+  `depthTile` (`avp.depthTile`), ON = motor; solo exporta `VPVK_DEPTH_TILE=0` si se apaga (entra en firma de cuarentena
+  y en `warmVariant` como `|dtile0`; el motor lo cachea por proceso: exige reiniciar la app); `AVPLaunch.swift` `unsetenv`;
+  `AVPSettingsView.swift` Toggle en Diagnóstico. `VPVK_MSAA_STRICT` solo lo lee `depthTileOn()` (redundante, sin ajuste). Motor nuevo activa por defecto depth-tile y
   MSAA dead-store (sin probar en Alyx; riesgo: regresión visual/PSO). ABI vpvk_* usada por AVP sin cambios (solo
   añadidas `vpvk_texture_budget`, `vpvk_hide_index_count`, no conectadas); `vpvk_motion_get` y
   `vpvk_config_set_texture_cap` no existen en el motor (dlsym tolera; TAA sin vectores, texture_cap sin efecto).
