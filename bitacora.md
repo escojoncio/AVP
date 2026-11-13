@@ -4,11 +4,11 @@ Half-Life: Alyx (ARM64 Linux de Steam) nativo en Apple Vision Pro (M2). Steam of
 (`klepton_ld`) → firma on-device (`vp_codesign` + .p12) → prewarm de pipelines → juego. Gráficos: **solo VPKEngine**
 (`escojoncio/VPKEngine` @ `vpkengine.ref` = rama `avp-port-main`, **sin parches**: `vpkengine-patches/` vacío; cambios del
 motor se hacen en VPKEngine, mapa en su bitácora). Plan: `PLAN.md`.
-IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B80**, sin verificar en visor).
+IPA: https://github.com/escojoncio/AVP/releases/download/visionos/AVP.ipa (última: **B81**, sin verificar en visor).
 Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`.
 
 ## Últimos hechos
-- B81 (en curso, sin compilar ni probar): motor `66bb76d` (origin/main, 40 commits desde `ede5a89`; lower 13 / emit 12 /
+- B81 (compila en CI, sin probar en visor): motor `66bb76d` (origin/main, 40 commits desde `ede5a89`; lower 13 / emit 12 /
   driver 1 sin cambios → marker `translator` "l13e12" sin tocar). `vpkengine.ref` actualizado. `AVPSettings.swift`:
   `depthTile` (`avp.depthTile`), ON = motor; solo exporta `VPVK_DEPTH_TILE=0` si se apaga (entra en firma de cuarentena
   y en `warmVariant` como `|dtile0`; el motor lo cachea por proceso: exige reiniciar la app); `AVPLaunch.swift` `unsetenv`;
@@ -16,7 +16,7 @@ Builds: solo con `[build]` en el mensaje o dispatch manual; docs con `[skip ci]`
   MSAA dead-store (sin probar en Alyx; riesgo: regresión visual/PSO). ABI vpvk_* usada por AVP sin cambios (solo
   añadidas `vpvk_texture_budget`, `vpvk_hide_index_count`, no conectadas); `vpvk_motion_get` y
   `vpvk_config_set_texture_cap` no existen en el motor (dlsym tolera; TAA sin vectores, texture_cap sin efecto).
-  Revisión adversarial limpia (3.ª pasada). Riesgo sin verificar: `AVPSettings.swift` ~624-634 firma con 4 ternarios encadenados (si falla 'unable to type-check', sacar cada parte a un `let`). Build B81 lanzada.
+  Revisión adversarial limpia (3.ª pasada). Build B81 OK (run 43405260923).
 - B80 (motor sigue `ede5a89`): `AVPSettings.swift` `amplifyClip` ON por defecto (clave `avp.amplifyClip2`) e
   `invariantPos` OFF (`avp.invariantPos2`, = código de vértices de B78); env `VPVK_MSAA_RELEASE_FRAMES=0` (respaldo
   MSAA pegajoso: en Logs_22 se liberó/reasignó 3 veces, 352 MB, 1.ª reasignación `vk.hitch backend_ms=74`);
